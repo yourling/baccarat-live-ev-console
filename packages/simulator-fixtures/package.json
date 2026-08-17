@@ -1,0 +1,13 @@
+{
+  "name": "@baccarat/simulator-fixtures",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@baccarat/contracts": "0.1.0",
+    "@baccarat/probability": "0.1.0"
+  }
+}

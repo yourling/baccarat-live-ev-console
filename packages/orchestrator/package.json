@@ -1,0 +1,16 @@
+{
+  "name": "@baccarat/orchestrator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@baccarat/contracts": "0.1.0",
+    "@baccarat/probability": "0.1.0",
+    "@baccarat/ledger-state": "0.1.0",
+    "@baccarat/adapter-contract": "0.1.0",
+    "@baccarat/risk-execution": "0.1.0"
+  }
+}
