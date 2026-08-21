@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Baccarat Real Room Bridge",
+  "version": "0.1.0",
+  "description": "把真实游戏房间/牌桌数据从浏览器桥接到本机 EV 中控台，并预留真实下注执行通道。",
+  "permissions": [
+    "storage",
+    "tabs",
+    "debugger"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "network-hook.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "site-adapter.js",
+        "bet-executor.js",
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_title": "Baccarat Room Bridge"
+  }
+}

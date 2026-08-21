@@ -1,0 +1,37 @@
+import type { BetExecutionRequest } from '@baccarat/adapter-contract';
+import type { BetReceipt, NormalizedEvent, TableProfile } from '@baccarat/contracts';
+
+export interface BridgeTableDescriptor {
+  tableId: string;
+  profile?: Partial<TableProfile>;
+  monitorUrl?: string;
+}
+
+export interface BridgeRoomDescriptor {
+  roomId: string;
+  displayName?: string;
+  tables: BridgeTableDescriptor[];
+}
+
+export type BridgeClientMessage =
+  | { kind: 'hello'; extensionVersion: string; browser: string; timestamp: string }
+  | { kind: 'roomDiscovered'; room: BridgeRoomDescriptor }
+  | { kind: 'roomUpdated'; room: BridgeRoomDescriptor }
+  | { kind: 'tableEvent'; roomId: string; tableId: string; event: NormalizedEvent }
+  | { kind: 'tableDisconnected'; roomId: string; tableId: string; reason?: string }
+  | { kind: 'tableRestored'; roomId: string; tableId: string; proof: string }
+  | { kind: 'betResult'; requestId: string; receipt: BetReceipt | null; error?: string }
+  | { kind: 'diagnostic'; url: string; title: string; frame: string; readyState: string; bodyTextPreview: string; htmlPreview: string; candidateCount: number; canvasCount: number; videoCount: number; iframeCount: number }
+  | { kind: 'networkCapture'; source: string; url: string; data: string; encoding?: string; direction?: string }
+  | { kind: 'keepalive'; url: string; frame: string; timestamp: string; vw?: number; vh?: number; target?: { x: number; y: number; width: number; height: number } }
+  | { kind: 'sessionExpired'; url: string; frame: string; textPreview: string; timestamp: string; recovering?: boolean }
+  | { kind: 'sessionAction'; action: 'keepalive-click' | 'trusted-activity' | 'idle-dialog-dismissed' | 'inline-recovery-click' | 'reload-scheduled' | 'recovered' | 'recovery-failed' | 'beacon-failed' | 'socket-closed' | 'calibrated' | 'command-executed'; url: string; frame: string; detail?: string; attempt?: number; timestamp: string }
+  | { kind: 'heartbeat'; timestamp: string }
+  | { kind: 'command'; name: string };
+
+export type BridgeServerMessage =
+  | { kind: 'welcome'; serverVersion: string; timestamp: string }
+  | { kind: 'betRequest'; requestId: string; request: BetExecutionRequest }
+  | { kind: 'ping'; timestamp: string }
+  | { kind: 'observe'; message: BridgeClientMessage }
+  | { kind: 'command'; name: string };
