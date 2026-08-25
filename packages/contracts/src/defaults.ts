@@ -5,8 +5,10 @@ export const defaultRiskLimits: RiskLimits = {
   perTableLossLimit: 0,
   perShoeLossLimit: 0,
   perDayLossLimit: 0,
-  maxConcurrentExecutions: 1,
+  // 一手最多同时承载庄对与闲对两种独立市场。
+  maxConcurrentExecutions: 2,
   insufficientBehavior: 'skip',
+  betSizing: { mode: 'fixed' },
 };
 
 export const defaultProfile = (tableId: string): TableProfile => ({
@@ -22,5 +24,6 @@ export const defaultProfile = (tableId: string): TableProfile => ({
   limits: { minBet: 0, maxBet: 1000 },
   autoConfirmNewShoe: false,
   betStrategy: { type: 'both' },
+  betTiers: [],
   autoBetArmedByDefault: false,
 });

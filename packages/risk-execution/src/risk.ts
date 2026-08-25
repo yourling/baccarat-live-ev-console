@@ -34,6 +34,10 @@ function clampNonNegative(value: number): number {
   return Math.max(0, value);
 }
 
+function holdsRiskExposure(status: RiskReservation['status']): boolean {
+  return status === 'RESERVED' || status === 'UNKNOWN';
+}
+
 export function activeReservationKey(tableId: string, shoeId: string, handId: string, market: string): string {
   return `${tableId}:${shoeId}:${handId}:${market}`;
 }
@@ -74,7 +78,7 @@ export class RiskManager {
       let recomputedPending = 0;
       for (const r of this.store.listReservations()) {
         this.reservations.set(r.reservationId, r);
-        if (r.status === 'RESERVED') {
+        if (holdsRiskExposure(r.status)) {
           this.activeByKey.set(activeReservationKey(r.tableId, r.shoeId, r.handId, r.market), r.reservationId);
           recomputedExposure += r.maxLoss;
           recomputedPending += 1;
@@ -110,6 +114,13 @@ export class RiskManager {
 
   getState(): RiskExposureState {
     return structuredClone(this.state);
+  }
+
+  reset(asOfDate?: string): void {
+    this.reservations.clear();
+    this.activeByKey.clear();
+    this.state = emptyRiskState(asOfDate);
+    this.persistState();
   }
 
   snapshot(tableId?: string): RiskReservation[] {
@@ -202,12 +213,20 @@ export class RiskManager {
     nextState.pendingExecutions += 1;
 
     if (this.store) {
-      this.store.transaction(() => {
-        if (!this.store!.saveReservation(reservation)) {
-          throw new Error(`could not persist reservation ${reservation.reservationId}`);
+      try {
+        this.store.transaction(() => {
+          if (!this.store!.saveReservation(reservation)) {
+            throw new Error(`could not persist reservation ${reservation.reservationId}`);
+          }
+          this.store!.saveRiskState(nextState);
+        });
+      } catch (error) {
+        // 同键活跃预留仍存在(如重启后 placedKeys 未覆盖到的残留):降级为可观测的跳过,而非异常中断整桌事件流。
+        if (error instanceof Error && error.name === 'LedgerConflictError') {
+          return { ok: false, reason: 'reservation-key-conflict' };
         }
-        this.store!.saveRiskState(nextState);
-      });
+        throw error;
+      }
     }
     this.reservations.set(reservation.reservationId, reservation);
     this.activeByKey.set(key, reservation.reservationId);
@@ -231,6 +250,17 @@ export class RiskManager {
     return true;
   }
 
+  markUnknown(reservationId: string, reason: string, receiptId?: string): boolean {
+    const reservation = this.reservations.get(reservationId);
+    if (!reservation || reservation.status !== 'RESERVED') return false;
+    const updated = structuredClone(reservation);
+    updated.status = 'UNKNOWN';
+    updated.releaseReason = reason;
+    if (receiptId) updated.receiptId = receiptId;
+    this.commitReservationUpdate(updated, structuredClone(this.state));
+    return true;
+  }
+
 
   attachReceipt(reservationId: string, receiptId: string): void {
     const r = this.reservations.get(reservationId);
@@ -250,7 +280,7 @@ export class RiskManager {
   ): RiskReservation[] {
     this.rollDayIfNeeded();
     const matches = this.snapshot().filter(
-      r => r.status === 'RESERVED' && r.tableId === tableId && r.shoeId === shoeId && r.handId === handId,
+      r => holdsRiskExposure(r.status) && r.tableId === tableId && r.shoeId === shoeId && r.handId === handId,
     );
     if (matches.length === 0) return [];
 
@@ -261,18 +291,16 @@ export class RiskManager {
       const won = outcomes?.[r.market];
       if (won === undefined) {
         updated.status = 'UNKNOWN';
-        updated.releaseReason = 'hand-settled-without-outcome';
+        if (r.status === 'RESERVED') updated.releaseReason = 'hand-settled-without-outcome';
       } else {
         updated.status = 'SETTLED';
         updated.settledAt = new Date().toISOString();
         updated.realizedPnl = won
           ? updated.amount * profile.odds[r.market].netWin
           : -updated.amount * profile.odds[r.market].loss;
-      }
-      nextState.reservedExposure = clampNonNegative(nextState.reservedExposure - updated.maxLoss);
-      nextState.pendingExecutions = clampNonNegative(nextState.pendingExecutions - 1);
-      nextState.executedToday += updated.amount;
-      if (updated.realizedPnl !== undefined) {
+        nextState.reservedExposure = clampNonNegative(nextState.reservedExposure - updated.maxLoss);
+        nextState.pendingExecutions = clampNonNegative(nextState.pendingExecutions - 1);
+        nextState.executedToday += updated.amount;
         nextState.dayLoss -= updated.realizedPnl;
         nextState.tableLosses[tableId] = (nextState.tableLosses[tableId] ?? 0) - updated.realizedPnl;
         nextState.shoeLosses[shoeLossKey(tableId, shoeId)] = (nextState.shoeLosses[shoeLossKey(tableId, shoeId)] ?? 0) - updated.realizedPnl;
@@ -288,7 +316,9 @@ export class RiskManager {
     }
     for (const updated of settled) {
       this.reservations.set(updated.reservationId, updated);
-      this.activeByKey.delete(activeReservationKey(updated.tableId, updated.shoeId, updated.handId, updated.market));
+      const key = activeReservationKey(updated.tableId, updated.shoeId, updated.handId, updated.market);
+      if (holdsRiskExposure(updated.status)) this.activeByKey.set(key, updated.reservationId);
+      else this.activeByKey.delete(key);
     }
     this.state = nextState;
     return settled;
@@ -342,7 +372,9 @@ export class RiskManager {
       });
     }
     this.reservations.set(updated.reservationId, updated);
-    this.activeByKey.delete(activeReservationKey(updated.tableId, updated.shoeId, updated.handId, updated.market));
+    const key = activeReservationKey(updated.tableId, updated.shoeId, updated.handId, updated.market);
+    if (holdsRiskExposure(updated.status)) this.activeByKey.set(key, updated.reservationId);
+    else this.activeByKey.delete(key);
     this.state = nextState;
   }
 }

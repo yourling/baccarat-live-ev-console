@@ -23,7 +23,7 @@
   const CLICK_REPORT_INTERVAL_MS = 5 * 60 * 1000;
 
   // 只在游戏相关页面上工作:其他页面(控制台/搜索引擎/追踪器)不采集、不保活、不发心跳。
-  const GAME_PAGE = /dafabet\.net|df888evo\.com|egcvi\.com|evolution/i.test(location.hostname);
+  const GAME_PAGE = /dafabet\.net|df888evo\.com|egcvi\.com|evolution|mstrom-uno|673ing\.com/i.test(location.hostname);
 
   const knownRooms = new Map();
   let diagnosticSent = false;
@@ -67,6 +67,21 @@
 
   function sendDiagnostic() {
     const bodyText = document.body ? document.body.innerText : '';
+    // 附带本页全部 iframe 地址:用于确认新房间游戏框的实际域名。
+    const iframeSrcs = [];
+    try {
+      for (const f of document.querySelectorAll('iframe[src]')) {
+        let s = '';
+        try {
+          s = String(f.src || '');
+        } catch (_) {
+          s = '';
+        }
+        if (s) iframeSrcs.push(s.replace(/\\?.*$/, '').slice(0, 140));
+      }
+    } catch (_) {
+      // ignore
+    }
     sendToBackground({
       kind: 'diagnostic',
       url: location.href,
@@ -74,7 +89,8 @@
       frame: frameKind(),
       readyState: document.readyState,
       bodyTextPreview: bodyText.slice(0, 5000),
-      htmlPreview: (document.documentElement ? document.documentElement.outerHTML : '').slice(0, 8000),
+      htmlPreview: (document.documentElement ? document.documentElement.outerHTML : '').slice(0, 8000)
+        + '\n\n[BRIDGE-IFRAMES]\n' + iframeSrcs.join('\n'),
       candidateCount: document.querySelectorAll(
         '[class*="room"],[id*="room"],[class*="table"],[id*="table"],[class*="game"],[id*="game"]'
       ).length,
@@ -510,17 +526,20 @@
   }
 
   // 接收 MAIN world network-hook 发来的网络数据。
-  // WebSocket/SSE 全部转发，便于发现牌局数据源；fetch/XHR 只转发 Evolution 相关 URL。
+  // WebSocket/SSE/运行时牌面全部转发；普通 fetch/XHR 仍按游戏域名过滤。
   window.addEventListener('message', event => {
-    if (!GAME_PAGE) return;
+    if (!GAME_PAGE || event.source !== window) return;
     const data = event.data;
     if (!data || typeof data.source !== 'string' || !data.source.startsWith('baccarat-bridge-')) return;
     const url = String(data.url || '');
     const isRealtimeSocket = data.source === 'baccarat-bridge-ws'
       || data.source === 'baccarat-bridge-sse'
       || data.source === 'baccarat-bridge-decrypt'
-      || data.source === 'baccarat-bridge-jsonparse';
-    if (!isRealtimeSocket && !/evoad\.df888evo\.com|evolution|evo/i.test(url)) return;
+      || data.source === 'baccarat-bridge-jsonparse'
+      || data.source === 'baccarat-bridge-runtime-state'
+      || data.source === 'baccarat-bridge-runtime-selection'
+      || data.source === 'baccarat-bridge-worker-message';
+    if (!isRealtimeSocket && !/evoad\.df888evo\.com|evolution|evo|mstrom-uno|673ing\.com/i.test(url)) return;
     // 解析器需要完整 JSON:游戏数据消息的传输截断上限放宽到 120KB。
     const limit = data.source === 'baccarat-bridge-jsonparse' || data.source === 'baccarat-bridge-decrypt'
       ? 120000

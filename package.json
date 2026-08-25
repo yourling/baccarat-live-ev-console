@@ -14,7 +14,11 @@
     "dev:desktop": "npm run dev -w @baccarat/desktop",
     "electron": "npm run electron -w @baccarat/desktop",
     "demo": "tsx scripts/demo.ts",
-    "smoke": "tsx scripts/smoke-console.ts"
+    "bridge:observe": "tsx scripts/bridge-observe.ts",
+    "bridge:reload-extension": "tsx scripts/bridge-command.ts reloadExtension",
+    "smoke": "tsx scripts/smoke-console.ts",
+    "package:desktop:win": "npm run package:win -w @baccarat/desktop",
+    "package:desktop:win:installer": "npm run package:win:installer -w @baccarat/desktop"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

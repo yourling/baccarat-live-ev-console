@@ -1,5 +1,7 @@
+import type { DecisionHandRecord, MonitorSummary } from '@baccarat/ledger-state';
 import type {
   BetReceipt,
+  BettingMarket,
   DecisionSnapshot,
   NormalizedEvent,
   RiskExposureState,
@@ -13,7 +15,7 @@ export interface TableActorSnapshot {
   tableId: string;
   profile: TableProfile;
   projection: ShoeStateProjection;
-  executionMode: 'shadow' | 'simulated';
+  executionMode: 'shadow' | 'simulated' | 'live';
   defaultBetAmount: number;
   pendingEvents: number;
 }
@@ -32,13 +34,145 @@ export interface ReceiptRow {
   market: string;
 }
 
+export interface OneShotLiveBetCommand {
+  readonly tableId: string;
+  readonly shoeId: string;
+  readonly handId: string;
+  readonly market: BettingMarket;
+  readonly amount: number;
+  readonly confirmation: string;
+}
+
+export function oneShotConfirmationText(
+  command: Pick<OneShotLiveBetCommand, 'tableId' | 'shoeId' | 'handId' | 'market' | 'amount'>,
+): string {
+  return `ONE_SHOT_LIVE_BET|tableId=${command.tableId}|shoeId=${command.shoeId}|handId=${command.handId}|market=${command.market}|amount=${String(command.amount)}`;
+}
+
+export type OneShotLiveBetResult =
+  | {
+      readonly status: 'ACCEPTED';
+      readonly receipt: BetReceipt;
+      readonly snapshot: DesktopConsoleSnapshot;
+      readonly reason?: string;
+    }
+  | {
+      readonly status: 'REJECTED';
+      readonly receipt?: BetReceipt;
+      readonly snapshot: DesktopConsoleSnapshot;
+      readonly reason?: string;
+    }
+  | {
+      readonly status: 'UNKNOWN';
+      readonly receipt?: BetReceipt;
+      readonly snapshot: DesktopConsoleSnapshot;
+      readonly reason?: string;
+    };
+
+export function isExactOneShotLiveBetConfirmation(
+  command: Pick<OneShotLiveBetCommand, 'tableId' | 'shoeId' | 'handId' | 'market' | 'amount' | 'confirmation'>,
+): boolean {
+  return command.confirmation === oneShotConfirmationText(command);
+}
+
+export function parseOneShotLiveBetCommand(value: unknown): OneShotLiveBetCommand {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('one-shot live bet command must be an object');
+  }
+
+  const tableId = readOneShotString(value, 'tableId');
+  const shoeId = readOneShotString(value, 'shoeId');
+  const handId = readOneShotString(value, 'handId');
+  const market = Reflect.get(value, 'market');
+  const amount = Reflect.get(value, 'amount');
+  const confirmation = Reflect.get(value, 'confirmation');
+
+  if (market !== 'bankerPair' && market !== 'playerPair') {
+    throw new TypeError(`unsupported one-shot market: ${String(market)}`);
+  }
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+    throw new TypeError('one-shot amount must be a positive finite number');
+  }
+  if (
+    typeof confirmation !== 'string'
+    || !isExactOneShotLiveBetConfirmation({ tableId, shoeId, handId, market, amount, confirmation })
+  ) {
+    throw new TypeError('one-shot confirmation must match exactly');
+  }
+
+  return { tableId, shoeId, handId, market, amount, confirmation };
+}
+
+function readOneShotString(value: object, field: 'tableId' | 'shoeId' | 'handId'): string {
+  const raw = Reflect.get(value, field);
+  if (typeof raw !== 'string' || raw.length === 0 || raw.trim() !== raw) {
+    throw new TypeError(`one-shot ${field} must be a non-empty trimmed string`);
+  }
+  return raw;
+}
+
+export interface DesktopSnapshotOptions {
+  includeHistory?: boolean;
+  tableId?: string;
+  fromTime?: string;
+  toTime?: string;
+}
+
+export type DesktopRecordKind = 'events' | 'decisions' | 'ledger';
+
+export interface DesktopRecordQuery extends DesktopSnapshotOptions {
+  kind: DesktopRecordKind;
+  page: number;
+  pageSize: number;
+  market?: string;
+  eventType?: string;
+  search?: string;
+  eligible?: boolean;
+}
+
+export interface LedgerPageRow {
+  reservation: RiskReservation;
+  decision?: DecisionSnapshot;
+  receipt?: ReceiptRow;
+  outcome?: boolean;
+}
+
+export interface DesktopRecordPage {
+  kind: DesktopRecordKind;
+  page: number;
+  pageSize: number;
+  total: number;
+  events?: NormalizedEvent[];
+  decisions?: DecisionHandRecord[];
+  ledger?: LedgerPageRow[];
+}
+
+export interface MonitorTableCandidate {
+  roomId: string;
+  roomName?: string;
+  tableId: string;
+}
+
+export interface DesktopRecordCounts {
+  events: number;
+  decisions: number;
+  ledger: number;
+}
+
 export interface DesktopConsoleSnapshot {
   dbPath: string;
   isOpen: boolean;
   seed?: number;
   snapshot: OrchestratorSnapshot;
+  monitorTableIds: readonly string[];
+  monitorCandidates: readonly MonitorTableCandidate[];
+  recordCounts: DesktopRecordCounts;
   events: NormalizedEvent[];
   decisions: DecisionSnapshot[];
   receipts: ReceiptRow[];
   reservations: RiskReservation[];
+  demoRunning: boolean;
+  demoSpeed: number;
+  summary: MonitorSummary;
+  demoError?: string;
 }

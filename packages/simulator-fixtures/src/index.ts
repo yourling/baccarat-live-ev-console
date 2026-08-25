@@ -10,11 +10,20 @@ export interface FixtureBuilder {
   seq: number;
 }
 
+/** 两张牌同 rank 即为对子;与桌面演示 core-demo.ts 的 isPair 语义一致。 */
+export function isPair(cards: Card[]): boolean {
+  return cards.length >= 2 && cards[0].rank === cards[1].rank;
+}
+
 export class FixtureBuilder {
   events: NormalizedEvent[] = [];
   seq = 1;
 
-  constructor(private readonly tableId: string, private readonly baseTime = '2025-01-01T00:00:00.000Z') {}
+  constructor(
+    private readonly tableId: string,
+    private readonly baseTime = '2025-01-01T00:00:00.000Z',
+    private readonly eventIdNamespace?: string,
+  ) {}
 
   private nextTimestamp(): string {
     return new Date(Date.parse(this.baseTime) + this.seq * 1000).toISOString();
@@ -22,7 +31,7 @@ export class FixtureBuilder {
 
   private add(type: string, payload: Record<string, unknown>): this {
     this.events.push({
-      eventId: `ev_${this.tableId}_${this.seq}`,
+      eventId: `ev_${this.eventIdNamespace ?? this.tableId}_${this.seq}`,
       tableId: this.tableId,
       timestamp: this.nextTimestamp(),
       sourceSeq: this.seq,
@@ -64,7 +73,9 @@ export class FixtureBuilder {
     bankerCards: Card[],
     outcomes?: { bankerPair: boolean; playerPair: boolean },
   ): this {
-    return this.add('handSettled', { shoeId, handId, playerCards, bankerCards, outcomes });
+    // 单一事实源:未显式给 outcomes 时由牌面派生,杜绝"牌面与结算自相矛盾"的伪地面真值。
+    const resolved = outcomes ?? { bankerPair: isPair(bankerCards), playerPair: isPair(playerCards) };
+    return this.add('handSettled', { shoeId, handId, playerCards, bankerCards, outcomes: resolved });
   }
 
   build(): NormalizedEvent[] {
@@ -94,7 +105,7 @@ export function pairMarketStream(
       for (const c of bc) b.card(shoeId, handId, c, `banker${bc.indexOf(c)+1}`);
       b.closeWindow(shoeId, handId, 'bankerPair');
       b.closeWindow(shoeId, handId, 'playerPair');
-      b.settle(shoeId, handId, pc, bc, { bankerPair: hand % 2 === 0, playerPair: hand % 2 === 1 });
+      b.settle(shoeId, handId, pc, bc);
     }
   }
   return b.build();

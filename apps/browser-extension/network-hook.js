@@ -357,3 +357,246 @@
   wrapCryptoDecrypt();
   wrapJsonParse();
 })();
+
+// ---- 通道清查探针(2026-08-22 追加;纯只读观测,零注入)----
+// 目标:回答「渲染牌面的数据从哪个通道来」。清查:Worker、WebRTC、
+// 全量 HTTP 元数据(含图片资源)、crypto.subtle 全家桶。不改变任何原有行为。
+(function () {
+  function post(source, payload) {
+    try {
+      window.postMessage({
+        source,
+        url: location.href,
+        direction: 'recv',
+        encoding: 'text',
+        data: JSON.stringify(payload).slice(0, 12000),
+      }, '*');
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  // 1) Worker / SharedWorker:MAIN world 的 WS 钩子管不到 Worker 内部。
+  //    不注入 Worker、不发送消息；仅被动观察 Worker 返回给页面的已解码消息。
+  function workerBytesToBase64(bytes) {
+    let binary = '';
+    const limit = Math.min(bytes.length, 4096);
+    for (let index = 0; index < limit; index += 0x8000) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(index, Math.min(limit, index + 0x8000)));
+    }
+    return btoa(binary);
+  }
+
+  function workerPayloadSummary(value) {
+    if (typeof value === 'string') {
+      const relevant = /card|poke|round|hand|game|result|road|shoe|player|banker|table|vid|gmcode|bac/i.test(value);
+      return relevant
+        ? { kind: 'text', text: value.slice(0, 7000), truncated: value.length > 7000, relevant: true }
+        : { kind: 'text', length: value.length, relevant: false };
+    }
+    if (value instanceof ArrayBuffer) {
+      const bytes = new Uint8Array(value);
+      return { kind: 'binary', byteLength: bytes.length, base64: workerBytesToBase64(bytes), truncated: bytes.length > 4096, relevant: true };
+    }
+    if (ArrayBuffer.isView(value)) {
+      const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+      return { kind: 'binary', byteLength: bytes.length, base64: workerBytesToBase64(bytes), truncated: bytes.length > 4096, relevant: true };
+    }
+    if (!value || typeof value !== 'object') return { kind: typeof value, value: String(value), relevant: false };
+
+    const keys = Object.keys(value).slice(0, 40);
+    const typeHint = [value.type, value.event, value.action, value.kind].filter(Boolean).join('|');
+    const relevant = /card|poke|round|hand|game|result|road|shoe|player|banker|table|vid|gmcode|bac/i.test(keys.join('|') + '|' + typeHint);
+    if (!relevant) return { kind: 'object', keys, relevant: false };
+
+    try {
+      const seen = new WeakSet();
+      const json = JSON.stringify(value, (key, nested) => {
+        if (/^(key|secret|token|authorization|password|cookie)$/i.test(key)) return '[redacted]';
+        if (nested instanceof ArrayBuffer) {
+          const bytes = new Uint8Array(nested);
+          return { kind: 'binary', byteLength: bytes.length, base64: workerBytesToBase64(bytes), truncated: bytes.length > 4096 };
+        }
+        if (ArrayBuffer.isView(nested)) {
+          const bytes = new Uint8Array(nested.buffer, nested.byteOffset, nested.byteLength);
+          return { kind: 'binary', byteLength: bytes.length, base64: workerBytesToBase64(bytes), truncated: bytes.length > 4096 };
+        }
+        if (typeof nested === 'bigint') return String(nested);
+        if (nested && typeof nested === 'object') {
+          if (seen.has(nested)) return '[circular]';
+          seen.add(nested);
+        }
+        return nested;
+      });
+      return { kind: 'json', keys, json: String(json || '').slice(0, 7000), truncated: String(json || '').length > 7000, relevant: true };
+    } catch (_) {
+      return { kind: 'object', keys, serialization: 'failed', relevant: true };
+    }
+  }
+
+  function observeWorkerMessages(worker, url, kind) {
+    const observedShapes = new Set();
+    const capture = (direction, value) => {
+      const payload = workerPayloadSummary(value);
+      // Blob Workers use frequent check:<timestamp> heartbeats. They are neither
+      // state nor protocol data and would otherwise drown out actual cards.
+      if (payload.kind === 'text' && payload.relevant === false) return;
+      // Outbound binary data can contain transport/auth material; only inspect
+      // Worker-to-page binary responses, never Worker input frames.
+      if (direction === 'send' && payload.kind === 'binary') return;
+      const shape = payload.relevant === false
+        ? [direction, payload.kind, Array.isArray(payload.keys) ? payload.keys.join('|') : ''].join(':')
+        : '';
+      if (shape) {
+        if (observedShapes.has(shape)) return;
+        observedShapes.add(shape);
+      }
+      post('baccarat-bridge-worker-message', {
+        kind,
+        direction,
+        url: String(url).slice(0, 300),
+        payload,
+      });
+    };
+    try {
+      worker.addEventListener('message', event => capture('recv', event.data));
+      if (typeof worker.postMessage === 'function') {
+        const originalPostMessage = worker.postMessage;
+        worker.postMessage = function (data, ...args) {
+          capture('send', data);
+          return originalPostMessage.call(this, data, ...args);
+        };
+      }
+    } catch (_) {
+      // Worker may be terminating while the page navigates.
+    }
+  }
+
+  try {
+    const OW = window.Worker;
+    if (typeof OW === 'function') {
+      function PatchedWorker(url, opts) {
+        post('baccarat-bridge-worker', { kind: 'worker', url: String(url).slice(0, 300) });
+        const worker = opts === undefined ? new OW(url) : new OW(url, opts);
+        observeWorkerMessages(worker, url, 'worker');
+        return worker;
+      }
+      PatchedWorker.prototype = OW.prototype;
+      window.Worker = PatchedWorker;
+    }
+  } catch (_) {}
+  try {
+    const OSW = window.SharedWorker;
+    if (typeof OSW === 'function') {
+      function PatchedSharedWorker(url, opts) {
+        post('baccarat-bridge-worker', { kind: 'sharedworker', url: String(url).slice(0, 300) });
+        const worker = opts === undefined ? new OSW(url) : new OSW(url, opts);
+        if (worker.port) observeWorkerMessages(worker.port, url, 'sharedworker');
+        return worker;
+      }
+      PatchedSharedWorker.prototype = OSW.prototype;
+      window.SharedWorker = PatchedSharedWorker;
+    }
+  } catch (_) {}
+
+  // 2) WebRTC:直播视频常走 WebRTC;数据通道也可能夹带游戏状态。
+  try {
+    const ORTC = window.RTCPeerConnection;
+    if (typeof ORTC === 'function') {
+      function PatchedRTC(cfg, cfg2) {
+        const pc = new ORTC(cfg, cfg2);
+        post('baccarat-bridge-rtc', { kind: 'peerconnection' });
+        try {
+          if (typeof pc.createDataChannel === 'function') {
+            const oc = pc.createDataChannel.bind(pc);
+            pc.createDataChannel = function (label, o) {
+              post('baccarat-bridge-rtc', { kind: 'datachannel', label: String(label) });
+              return oc(label, o);
+            };
+          }
+          ['createOffer', 'createAnswer'].forEach(k => {
+            const om = pc[k] && pc[k].bind(pc);
+            if (om) pc[k] = function (...a) { post('baccarat-bridge-rtc', { kind: k }); return om(...a); };
+          });
+        } catch (_) {}
+        return pc;
+      }
+      PatchedRTC.prototype = ORTC.prototype;
+      window.RTCPeerConnection = PatchedRTC;
+    }
+  } catch (_) {}
+
+  // 3) 全量 HTTP 元数据:原 fetch/XHR 钩子只转发 evo 域,这里补齐所有端点的
+  //    url+大小;URL 或响应体命中牌类关键字的,附带响应体(截断)。
+  //    牌面贴图的 URL 文件名本身就是候选「数据通道」。
+  try {
+    const ofetch = window.fetch;
+    if (typeof ofetch === 'function') {
+      window.fetch = async function (...args) {
+        const res = await ofetch.apply(this, args);
+        try {
+          const u = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+          if (u && !/^data:/i.test(u) && !/\.(png|jpg|jpeg|webp|gif|svg|woff2?)(\?|$)/i.test(u)) {
+            const hit = /card|poke|\/pai|road|bead|history|round|result|deal|shoe/i.test(u);
+            let body;
+            if (hit) {
+              try { const t = await res.clone().text(); if (t && t.length < 40000) body = t; } catch (_) {}
+            }
+            post('baccarat-bridge-httpmeta', { u: String(u).slice(0, 400), len: Number(res.headers.get('content-length') || 0), st: res.status, body });
+          }
+        } catch (_) {}
+        return res;
+      };
+    }
+  } catch (_) {}
+
+  // 4) 资源时间线兜底:每 5s 上报新增资源 URL(含图片,fetch 钩子看不到的也能看到)。
+  try {
+    let seen = new Set();
+    setInterval(() => {
+      try {
+        const entries = performance.getEntriesByType('resource');
+        const fresh = [];
+        for (const e of entries) {
+          if (seen.has(e.name)) continue;
+          seen.add(e.name);
+          if (/card|poke|\/pai|road|bead|\.png|\.webp|\.jpg/i.test(e.name)) fresh.push({ u: e.name.slice(0, 300), len: e.transferSize });
+        }
+        if (seen.size > 20000) seen = new Set();
+        if (fresh.length) post('baccarat-bridge-perfmeta', { items: fresh.slice(0, 40) });
+      } catch (_) {}
+    }, 5000);
+  } catch (_) {}
+
+  // 5) crypto.subtle 扩展:decrypt 二进制输出转 base64(原钩子只收文本)、
+  //    importKey/deriveBits 只记录算法元数据(绝不记录密钥材料)。
+  try {
+    if (window.crypto && window.crypto.subtle) {
+      const subtle = window.crypto.subtle;
+      const proto = Object.getPrototypeOf(subtle);
+      const od = proto.decrypt;
+      if (typeof od === 'function') {
+        proto.decrypt = async function (...a) {
+          const out = await od.apply(this, a);
+          try {
+            if (out instanceof ArrayBuffer) {
+              const bytes = new Uint8Array(out);
+              let printable = bytes.length > 0 && bytes.length < 8192;
+              for (let i = 0; i < Math.min(bytes.length, 64); i++) { const c = bytes[i]; if (c !== 9 && c !== 10 && c !== 13 && (c < 32 || c > 126)) { printable = false; break; } }
+              if (printable) post('baccarat-bridge-decrypt2', { algo: a[0] && a[0].name, text: new TextDecoder().decode(out) });
+              else if (bytes.length > 0) {
+                let bin = ''; const chunk = 0x8000; for (let i = 0; i < bytes.length; i += chunk) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+                post('baccarat-bridge-decrypt2', { algo: a[0] && a[0].name, b64: btoa(bin).slice(0, 8000), n: bytes.length });
+              }
+            }
+          } catch (_) {}
+          return out;
+        };
+      }
+      const oi = proto.importKey;
+      if (typeof oi === 'function') {
+        proto.importKey = function (fmt, key, algo, ...rest) { post('baccarat-bridge-keymeta', { fmt: String(fmt), algo: algo && algo.name }); return oi.call(this, fmt, key, algo, ...rest); };
+      }
+    }
+  } catch (_) {}
+})();

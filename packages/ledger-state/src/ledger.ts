@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import {
   assertValidEventEnvelope,
   type BetReceipt,
+  type BettingMarket,
   type DecisionSnapshot,
   type NormalizedEvent,
   type RiskExposureState,
@@ -45,6 +46,288 @@ type ReservationRow = {
   created_at: string;
 };
 
+
+function semanticEventPayload(value: object): string {
+  const semanticFields: Record<string, unknown> = {};
+  for (const [key, fieldValue] of Object.entries(value)) {
+    if (key === 'timestamp' || key === 'sourceSeq') continue;
+    semanticFields[key] = fieldValue;
+  }
+  return stableStringify(semanticFields);
+}
+
+function semanticStoredEventPayload(payload: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+    return semanticEventPayload(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
+export interface MonitorSummaryRow {
+  tableId: string;
+  hands: number;
+  bets: number;
+  amount: number;
+  expectedPnl: number;
+  actualPnl: number;
+}
+
+export interface MonitorSummaryPoint {
+  createdAt: string;
+  expectedPnl: number;
+  actualPnl: number;
+}
+
+export interface MonitorSummary {
+  rows: MonitorSummaryRow[];
+  incomePoints: MonitorSummaryPoint[];
+}
+
+export interface MonitorSummaryOptions {
+  tableId?: string;
+  tableIds?: readonly string[];
+  fromTime?: string;
+  toTime?: string;
+}
+
+export interface RecordPageOptions extends MonitorSummaryOptions {
+  page: number;
+  pageSize: number;
+  market?: string;
+  eventType?: string;
+  search?: string;
+}
+
+export interface RecordPage<T> {
+  rows: T[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
+export type DecisionHandActualResult =
+  | {
+      readonly status: 'SETTLED';
+      readonly outcomes: {
+        readonly bankerPair: boolean;
+        readonly playerPair: boolean;
+      };
+    }
+  | { readonly status: 'UNKNOWN' }
+  | { readonly status: 'PENDING' };
+
+export interface DecisionHandRecord {
+  readonly tableId: string;
+  readonly shoeId: string;
+  readonly handId: string;
+  readonly markets: readonly BettingMarket[];
+  readonly selectedMarkets: readonly BettingMarket[];
+  readonly pMean: number;
+  readonly pLower: number;
+  readonly evMean: number;
+  readonly evLower: number;
+  readonly eligible: boolean;
+  readonly reasons: readonly string[];
+  readonly createdAt: string;
+  readonly actualResult: DecisionHandActualResult;
+}
+
+export interface DecisionHandPageOptions extends MonitorSummaryOptions {
+  readonly page: number;
+  readonly pageSize: number;
+  readonly market?: string;
+  readonly search?: string;
+  readonly eligible?: boolean;
+}
+
+export interface DecisionHandRecordPage {
+  readonly rows: DecisionHandRecord[];
+  readonly total: number;
+  readonly page: number;
+  readonly pageSize: number;
+}
+
+type DecisionHandGroupRow = {
+  table_id: string;
+  shoe_id: string;
+  hand_id: string;
+  created_at: string;
+  latest_created_at: string;
+};
+
+type DecisionHandDecisionRow = {
+  snapshot_id: string;
+  table_id: string;
+  shoe_id: string;
+  hand_id: string;
+  market: BettingMarket;
+  payload: string;
+  created_at: string;
+};
+
+type DecisionHandSettlementRow = {
+  id: number;
+  table_id: string;
+  payload: string;
+};
+
+const DECISION_MARKET_ORDER: readonly BettingMarket[] = ['bankerPair', 'playerPair'];
+
+function decisionMarketOrder(market: BettingMarket): number {
+  const index = DECISION_MARKET_ORDER.indexOf(market);
+  return index >= 0 ? index : DECISION_MARKET_ORDER.length;
+}
+
+function average(values: readonly number[]): number {
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function decisionHandKey(tableId: string, shoeId: string, handId: string): string {
+  return JSON.stringify([tableId, shoeId, handId]);
+}
+
+function decisionHandScope(options: DecisionHandPageOptions): {
+  readonly where: string;
+  readonly params: string[];
+  readonly having: string;
+  readonly havingParams: number[];
+} {
+  const clauses = ['1 = 1'];
+  const params: string[] = [];
+  if (options.tableId) {
+    clauses.push('table_id = ?');
+    params.push(options.tableId);
+  }
+  if (options.tableIds !== undefined) {
+    const tableIds = [...new Set(options.tableIds.filter(tableId => tableId.length > 0))];
+    if (tableIds.length === 0) {
+      clauses.push('1 = 0');
+    } else {
+      clauses.push('table_id IN (' + tableIds.map(() => '?').join(', ') + ')');
+      params.push(...tableIds);
+    }
+  }
+  if (options.market) {
+    clauses.push('market = ?');
+    params.push(options.market);
+  }
+  if (options.fromTime) {
+    clauses.push('created_at >= ?');
+    params.push(toIsoTime(options.fromTime));
+  }
+  if (options.toTime) {
+    clauses.push('created_at <= ?');
+    params.push(toIsoTime(options.toTime));
+  }
+  if (options.search) {
+    const term = '%' + options.search + '%';
+    clauses.push('(table_id LIKE ? OR payload LIKE ?)');
+    params.push(term, term);
+  }
+  return {
+    where: clauses.join(' AND '),
+    params,
+    having: options.eligible === undefined
+      ? ''
+      : "HAVING MAX(CASE WHEN json_extract(payload, '$.eligible') = 1 THEN 1 ELSE 0 END) = ?",
+    havingParams: options.eligible === undefined ? [] : [options.eligible ? 1 : 0],
+  };
+}
+
+function decisionHandPredicates(groups: readonly DecisionHandGroupRow[]): {
+  readonly sql: string;
+  readonly params: string[];
+} {
+  const clauses: string[] = [];
+  const params: string[] = [];
+  for (const group of groups) {
+    clauses.push('(table_id = ? AND shoe_id = ? AND hand_id = ?)');
+    params.push(group.table_id, group.shoe_id, group.hand_id);
+  }
+  return { sql: clauses.join(' OR '), params };
+}
+
+function summaryScope(alias: string, options: MonitorSummaryOptions): { where: string; params: string[] } {
+  const clauses = ['1 = 1'];
+  const params: string[] = [];
+  if (options.tableId) {
+    clauses.push(alias + '.table_id = ?');
+    params.push(options.tableId);
+  }
+  if (options.tableIds !== undefined) {
+    const tableIds = [...new Set(options.tableIds.filter((tableId): tableId is string => typeof tableId === 'string' && tableId.length > 0))];
+    if (tableIds.length === 0) {
+      clauses.push('1 = 0');
+    } else {
+      clauses.push(alias + '.table_id IN (' + tableIds.map(() => '?').join(', ') + ')');
+      params.push(...tableIds);
+    }
+  }
+  if (options.fromTime) {
+    clauses.push(alias + '.created_at >= ?');
+    params.push(toIsoTime(options.fromTime));
+  }
+  if (options.toTime) {
+    clauses.push(alias + '.created_at <= ?');
+    params.push(toIsoTime(options.toTime));
+  }
+  return { where: clauses.join(' AND '), params };
+}
+
+function toIsoTime(value: string): string {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.valueOf()) ? value : parsed.toISOString();
+}
+
+function recordScope(alias: string, options: RecordPageOptions, includeEventType = false): { where: string; params: string[] } {
+  const clauses = ['1 = 1'];
+  const params: string[] = [];
+  if (options.tableId) {
+    clauses.push(alias + '.table_id = ?');
+    params.push(options.tableId);
+  }
+  if (options.tableIds !== undefined) {
+    const tableIds = [...new Set(options.tableIds.filter((tableId): tableId is string => typeof tableId === 'string' && tableId.length > 0))];
+    if (tableIds.length === 0) {
+      clauses.push('1 = 0');
+    } else {
+      clauses.push(alias + '.table_id IN (' + tableIds.map(() => '?').join(', ') + ')');
+      params.push(...tableIds);
+    }
+  }
+  if (options.market) {
+    clauses.push(alias === 'e' ? "json_extract(e.payload, '$.market') = ?" : alias + '.market = ?');
+    params.push(options.market);
+  }
+  if (includeEventType && options.eventType) {
+    clauses.push(alias + '.type = ?');
+    params.push(options.eventType);
+  }
+  if (options.fromTime) {
+    clauses.push(alias + '.created_at >= ?');
+    params.push(toIsoTime(options.fromTime));
+  }
+  if (options.toTime) {
+    clauses.push(alias + '.created_at <= ?');
+    params.push(toIsoTime(options.toTime));
+  }
+  if (options.search) {
+    const term = '%' + options.search + '%';
+    clauses.push('(' + alias + '.table_id LIKE ? OR ' + alias + '.payload LIKE ?)');
+    params.push(term, term);
+  }
+  return { where: clauses.join(' AND '), params };
+}
+
+function pageValues(options: { page: number; pageSize: number }): { page: number; pageSize: number; offset: number } {
+  const page = Number.isInteger(options.page) && options.page > 0 ? options.page : 1;
+  const pageSize = Number.isInteger(options.pageSize) && options.pageSize > 0 ? Math.min(options.pageSize, 100) : 20;
+  return { page, pageSize, offset: (page - 1) * pageSize };
+}
+
 export class LedgerConflictError extends Error {
   constructor(message: string) {
     super(message);
@@ -54,7 +337,7 @@ export class LedgerConflictError extends Error {
 
 export type AppendEventResult = 'appended' | 'duplicate';
 
-const SCHEMA_VERSION = '1';
+const SCHEMA_VERSION = '2';
 
 export class SqliteLedger {
   private db: Database.Database;
@@ -90,6 +373,8 @@ export class SqliteLedger {
         UNIQUE(table_id, seq)
       );
       CREATE INDEX IF NOT EXISTS idx_events_table_seq ON events(table_id, seq);
+      CREATE INDEX IF NOT EXISTS idx_events_table_created ON events(table_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
       CREATE TABLE IF NOT EXISTS decisions (
         snapshot_id TEXT PRIMARY KEY,
         table_id TEXT NOT NULL,
@@ -103,6 +388,8 @@ export class SqliteLedger {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS uq_decisions_window
         ON decisions(table_id, shoe_id, hand_id, market, event_id);
+      CREATE INDEX IF NOT EXISTS idx_decisions_table_created ON decisions(table_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_decisions_created ON decisions(created_at);
       CREATE TABLE IF NOT EXISTS receipts (
         receipt_id TEXT PRIMARY KEY,
         intent_id TEXT NOT NULL UNIQUE,
@@ -115,6 +402,7 @@ export class SqliteLedger {
         UNIQUE(table_id, shoe_id, hand_id, market)
       );
       CREATE INDEX IF NOT EXISTS idx_receipts_table ON receipts(table_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_receipts_created ON receipts(created_at);
       CREATE TABLE IF NOT EXISTS reservations (
         reservation_id TEXT PRIMARY KEY,
         intent_id TEXT NOT NULL,
@@ -124,10 +412,8 @@ export class SqliteLedger {
         market TEXT NOT NULL,
         status TEXT NOT NULL,
         payload TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        UNIQUE(table_id, shoe_id, hand_id, market)
+        created_at TEXT NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS idx_reservations_status ON reservations(table_id, status);
       CREATE TABLE IF NOT EXISTS risk_state (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         payload TEXT NOT NULL,
@@ -140,14 +426,57 @@ export class SqliteLedger {
       );
     `);
     const row = this.db.prepare('SELECT value FROM ledger_meta WHERE key = ?').get('schema_version') as { value: string } | undefined;
-    if (row && row.value !== SCHEMA_VERSION) {
-      throw new Error(`Unsupported ledger schema version: ${row.value} (expected ${SCHEMA_VERSION})`);
+    if (!row) {
+      this.db.prepare('INSERT INTO ledger_meta (key, value) VALUES (?, ?)').run('schema_version', SCHEMA_VERSION);
+    } else if (row.value === SCHEMA_VERSION) {
+      // 当前版本,无需迁移
+    } else if (row.value === '1' && SCHEMA_VERSION === '2') {
+      this.rebuildReservationsTable();
+      this.db.prepare('UPDATE ledger_meta SET value = ? WHERE key = ?').run(SCHEMA_VERSION, 'schema_version');
+    } else {
+      throw new Error(`ledger schema version mismatch: db=${row.value}, code=${SCHEMA_VERSION}; refusing to open`);
     }
-    this.db.prepare('INSERT OR IGNORE INTO ledger_meta (key, value) VALUES (?, ?)').run('schema_version', SCHEMA_VERSION);
-    const existing = this.db.prepare('SELECT value FROM ledger_meta WHERE key = ?').get('schema_version') as { value: string } | undefined;
-    if (existing && existing.value !== SCHEMA_VERSION) {
-      throw new Error(`ledger schema version mismatch: db=${existing.value}, code=${SCHEMA_VERSION}; refusing to open`);
-    }
+    // 兜底:极早期未写版本号的库也可能带旧的全局唯一约束;该函数幂等,非旧形态时为空操作。
+    this.rebuildReservationsTable();
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_reservations_active
+        ON reservations(table_id, shoe_id, hand_id, market) WHERE status = 'RESERVED';
+      CREATE INDEX IF NOT EXISTS idx_reservations_status ON reservations(table_id, status);
+      CREATE INDEX IF NOT EXISTS idx_reservations_table_created ON reservations(table_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_reservations_created ON reservations(created_at);
+    `);
+  }
+
+  /**
+   * v1 → v2:旧 reservations 表带 UNIQUE(table_id, shoe_id, hand_id, market) 全历史约束,
+   * RELEASED/SETTLED 行会永久占用键位(墓碑),导致同键再预留必然冲突。
+   * 重建为无内联唯一约束的表,活跃键唯一性由部分唯一索引(WHERE status='RESERVED')承担。
+   */
+  private rebuildReservationsTable(): void {
+    const tableSql = (this.db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'reservations'",
+    ).get() as { sql?: string } | undefined)?.sql ?? '';
+    if (!/UNIQUE\s*\(\s*table_id\s*,/i.test(tableSql)) return;
+    this.db.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE reservations_v2 (
+          reservation_id TEXT PRIMARY KEY,
+          intent_id TEXT NOT NULL,
+          table_id TEXT NOT NULL,
+          shoe_id TEXT NOT NULL,
+          hand_id TEXT NOT NULL,
+          market TEXT NOT NULL,
+          status TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        INSERT INTO reservations_v2
+          SELECT reservation_id, intent_id, table_id, shoe_id, hand_id, market, status, payload, created_at
+          FROM reservations;
+        DROP TABLE reservations;
+        ALTER TABLE reservations_v2 RENAME TO reservations;
+      `);
+    })();
   }
 
   close(): void {
@@ -158,13 +487,101 @@ export class SqliteLedger {
     return this.db.transaction(fn)();
   }
 
+  clearMonitorData(): void {
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM events').run();
+      this.db.prepare('DELETE FROM decisions').run();
+      this.db.prepare('DELETE FROM receipts').run();
+      this.db.prepare('DELETE FROM reservations').run();
+      this.db.prepare('DELETE FROM risk_state').run();
+    });
+    this.db.exec('VACUUM');
+  }
+
+
+  listEventsTail(limit = 500): NormalizedEvent[] {
+    // sourceSeq is scoped to tableId, so only the SQLite insertion id is globally chronological.
+    const rows = this.db.prepare('SELECT payload FROM events ORDER BY id DESC LIMIT ?').all(limit) as unknown as { payload: string }[];
+    return rows.reverse().map(row => JSON.parse(row.payload) as NormalizedEvent);
+  }
+
+  listDecisionsTail(limit = 200): DecisionSnapshot[] {
+    const rows = this.db.prepare('SELECT payload FROM decisions ORDER BY created_at DESC, snapshot_id DESC LIMIT ?').all(limit) as unknown as { payload: string }[];
+    return rows.reverse().map(row => JSON.parse(row.payload) as DecisionSnapshot);
+  }
+
+  listReceiptsTail(limit = 200): { receipt: BetReceipt; tableId: string; shoeId: string; handId: string; market: string }[] {
+    const rows = this.db.prepare('SELECT * FROM receipts ORDER BY created_at DESC, receipt_id DESC LIMIT ?').all(limit) as unknown as ReceiptRow[];
+    return rows.reverse().map(row => ({
+      receipt: JSON.parse(row.payload) as BetReceipt,
+      tableId: row.table_id,
+      shoeId: row.shoe_id,
+      handId: row.hand_id,
+      market: row.market,
+    }));
+  }
+
+  getMonitorSummary(options: MonitorSummaryOptions = {}): MonitorSummary {
+    const eventScope = summaryScope('e', options);
+    const receiptScope = summaryScope('r', options);
+    const reservationScope = summaryScope('r', options);
+    const rowsByTable = new Map<string, MonitorSummaryRow>();
+    const ensureRow = (tableId: string): MonitorSummaryRow => {
+      const existing = rowsByTable.get(tableId);
+      if (existing) return existing;
+      const created = { tableId, hands: 0, bets: 0, amount: 0, expectedPnl: 0, actualPnl: 0 };
+      rowsByTable.set(tableId, created);
+      return created;
+    };
+
+    const handRows = this.db.prepare(
+      'SELECT e.table_id AS tableId, COUNT(*) AS hands FROM events e WHERE e.type = \'handSettled\' AND ' + eventScope.where + ' GROUP BY e.table_id'
+    ).all(...eventScope.params) as { tableId: string; hands: number }[];
+    for (const row of handRows) ensureRow(row.tableId).hands = Number(row.hands);
+
+    const receiptRows = this.db.prepare(
+      'SELECT r.table_id AS tableId, COUNT(*) AS bets, COALESCE(SUM(CAST(json_extract(r.payload, \'$.amount\') AS REAL)), 0) AS amount FROM receipts r WHERE json_extract(r.payload, \'$.status\') <> \'REJECTED\' AND ' + receiptScope.where + ' GROUP BY r.table_id'
+    ).all(...receiptScope.params) as { tableId: string; bets: number; amount: number }[];
+    for (const row of receiptRows) {
+      const target = ensureRow(row.tableId);
+      target.bets = Number(row.bets);
+      target.amount = Number(row.amount);
+    }
+
+    const expectedRows = this.db.prepare(
+      'SELECT r.table_id AS tableId, COALESCE(SUM(CAST(json_extract(r.payload, \'$.amount\') AS REAL) * COALESCE(CAST(json_extract(d.payload, \'$.evMean\') AS REAL), 0)), 0) AS expectedPnl FROM receipts r LEFT JOIN decisions d ON d.table_id = r.table_id AND d.shoe_id = r.shoe_id AND d.hand_id = r.hand_id AND d.market = r.market WHERE json_extract(r.payload, \'$.status\') <> \'REJECTED\' AND ' + receiptScope.where + ' GROUP BY r.table_id'
+    ).all(...receiptScope.params) as { tableId: string; expectedPnl: number }[];
+    for (const row of expectedRows) ensureRow(row.tableId).expectedPnl = Number(row.expectedPnl);
+
+    const actualRows = this.db.prepare(
+      'SELECT r.table_id AS tableId, COALESCE(SUM(CASE WHEN json_extract(r.payload, \'$.realizedPnl\') IS NULL THEN 0 ELSE CAST(json_extract(r.payload, \'$.realizedPnl\') AS REAL) END), 0) AS actualPnl FROM reservations r WHERE ' + reservationScope.where + ' GROUP BY r.table_id'
+    ).all(...reservationScope.params) as { tableId: string; actualPnl: number }[];
+    for (const row of actualRows) ensureRow(row.tableId).actualPnl = Number(row.actualPnl);
+
+    const pointRows = this.db.prepare(
+      'SELECT r.created_at AS createdAt, CAST(json_extract(r.payload, \'$.amount\') AS REAL) * COALESCE(CAST(json_extract(d.payload, \'$.evMean\') AS REAL), 0) AS expectedPnl, COALESCE(CAST(json_extract(res.payload, \'$.realizedPnl\') AS REAL), 0) AS actualPnl FROM receipts r LEFT JOIN decisions d ON d.table_id = r.table_id AND d.shoe_id = r.shoe_id AND d.hand_id = r.hand_id AND d.market = r.market LEFT JOIN reservations res ON res.table_id = r.table_id AND res.shoe_id = r.shoe_id AND res.hand_id = r.hand_id AND res.market = r.market WHERE json_extract(r.payload, \'$.status\') <> \'REJECTED\' AND ' + receiptScope.where + ' ORDER BY r.created_at ASC, r.receipt_id ASC'
+    ).all(...receiptScope.params) as { createdAt: string; expectedPnl: number; actualPnl: number }[];
+    let expected = 0;
+    let actual = 0;
+    const allPoints = pointRows.map(row => {
+      expected += Number(row.expectedPnl) || 0;
+      actual += Number(row.actualPnl) || 0;
+      return { createdAt: row.createdAt, expectedPnl: expected, actualPnl: actual };
+    });
+    const stride = Math.max(1, Math.ceil(allPoints.length / 1000));
+    const incomePoints = allPoints.filter((_, index) => index % stride === 0 || index === allPoints.length - 1);
+    return { rows: [...rowsByTable.values()].sort((a, b) => a.tableId.localeCompare(b.tableId, undefined, { numeric: true })), incomePoints };
+  }
+
   appendEvent(event: NormalizedEvent): AppendEventResult {
     assertValidEventEnvelope(event);
     const payload = stableStringify(event);
     const hash = sha256(payload);
-    const existing = this.db.prepare('SELECT payload_hash FROM events WHERE event_id = ?').get(event.eventId) as { payload_hash: string } | undefined;
+    const semanticPayload = semanticEventPayload(event);
+    const existing = this.db.prepare('SELECT payload_hash, payload FROM events WHERE event_id = ?').get(event.eventId) as { payload_hash: string; payload: string } | undefined;
     if (existing) {
-      if (existing.payload_hash !== hash) {
+      const existingSemanticPayload = semanticStoredEventPayload(existing.payload);
+      if (existing.payload_hash !== hash && existingSemanticPayload !== semanticPayload) {
         throw new LedgerConflictError(`event_id ${event.eventId} already exists with a different payload; append rejected`);
       }
       return 'duplicate';
@@ -201,6 +618,200 @@ export class SqliteLedger {
     const params = tableId ? [tableId] : [];
     const rows = this.db.prepare(sql).all(...params) as unknown as { payload: string }[];
     return rows.map(r => JSON.parse(r.payload) as NormalizedEvent);
+  }
+
+  listEventsPage(options: RecordPageOptions): RecordPage<NormalizedEvent> {
+    const scope = recordScope('e', options, true);
+    const page = pageValues(options);
+    const totalRow = this.db.prepare('SELECT COUNT(*) AS total FROM events e WHERE ' + scope.where).get(...scope.params) as { total: number };
+    const rows = this.db.prepare('SELECT e.payload FROM events e WHERE ' + scope.where + ' ORDER BY e.id DESC LIMIT ? OFFSET ?').all(...scope.params, page.pageSize, page.offset) as { payload: string }[];
+    return { rows: rows.map(row => JSON.parse(row.payload) as NormalizedEvent), total: Number(totalRow.total), page: page.page, pageSize: page.pageSize };
+  }
+
+  listDecisionsPage(options: RecordPageOptions): RecordPage<DecisionSnapshot> {
+    const scope = recordScope('d', options);
+    const page = pageValues(options);
+    const totalRow = this.db.prepare('SELECT COUNT(*) AS total FROM decisions d WHERE ' + scope.where).get(...scope.params) as { total: number };
+    const rows = this.db.prepare('SELECT d.payload FROM decisions d WHERE ' + scope.where + ' ORDER BY d.created_at DESC, d.snapshot_id DESC LIMIT ? OFFSET ?').all(...scope.params, page.pageSize, page.offset) as { payload: string }[];
+    return { rows: rows.map(row => JSON.parse(row.payload) as DecisionSnapshot), total: Number(totalRow.total), page: page.page, pageSize: page.pageSize };
+  }
+
+  listDecisionHandsPage(options: DecisionHandPageOptions): DecisionHandRecordPage {
+    const page = pageValues(options);
+    const scope = decisionHandScope(options);
+    const groupedFrom = `
+      FROM decisions
+      WHERE ${scope.where}
+      GROUP BY table_id, shoe_id, hand_id
+      ${scope.having}
+    `;
+    const totalRow = this.db.prepare(`
+      SELECT COUNT(*) AS total
+      FROM (
+        SELECT table_id, shoe_id, hand_id
+        ${groupedFrom}
+      ) AS decision_hands
+    `).get(...scope.params, ...scope.havingParams) as { total: number };
+    const groups = this.db.prepare(`
+      SELECT
+        table_id,
+        shoe_id,
+        hand_id,
+        MIN(created_at) AS created_at,
+        MAX(created_at) AS latest_created_at
+      ${groupedFrom}
+      ORDER BY latest_created_at DESC, table_id ASC, shoe_id ASC, hand_id ASC
+      LIMIT ? OFFSET ?
+    `).all(...scope.params, ...scope.havingParams, page.pageSize, page.offset) as DecisionHandGroupRow[];
+
+    if (groups.length === 0) {
+      return {
+        rows: [],
+        total: Number(totalRow.total),
+        page: page.page,
+        pageSize: page.pageSize,
+      };
+    }
+
+    const groupPredicates = decisionHandPredicates(groups);
+    const decisionRows = this.db.prepare(`
+      SELECT snapshot_id, table_id, shoe_id, hand_id, market, payload, created_at
+      FROM decisions
+      WHERE (${groupPredicates.sql}) AND ${scope.where}
+      ORDER BY created_at ASC, snapshot_id ASC
+    `).all(...groupPredicates.params, ...scope.params) as DecisionHandDecisionRow[];
+
+    const settlementTableIds = [...new Set(groups.map(group => group.table_id))];
+    const settlementRows = this.db.prepare(`
+      SELECT
+        id,
+        table_id,
+        payload
+      FROM events
+      WHERE type = 'handSettled'
+        AND table_id IN (${settlementTableIds.map(() => '?').join(', ')})
+      ORDER BY id DESC
+    `).all(...settlementTableIds) as DecisionHandSettlementRow[];
+    const latestDecisionRows = this.db.prepare(`
+      SELECT table_id, MAX(created_at) AS latest_created_at
+      FROM decisions
+      WHERE table_id IN (${settlementTableIds.map(() => '?').join(', ')})
+      GROUP BY table_id
+    `).all(...settlementTableIds) as { table_id: string; latest_created_at: string }[];
+    const latestDecisionAtByTable = new Map(
+      latestDecisionRows.map(row => [row.table_id, row.latest_created_at]),
+    );
+
+    const decisionsByKey = new Map<string, DecisionSnapshot[]>();
+    for (const row of decisionRows) {
+      const key = decisionHandKey(row.table_id, row.shoe_id, row.hand_id);
+      const decisions = decisionsByKey.get(key) ?? [];
+      decisions.push(JSON.parse(row.payload) as DecisionSnapshot);
+      decisionsByKey.set(key, decisions);
+    }
+
+    const actualResultByKey = new Map<string, DecisionHandActualResult>();
+    for (const row of settlementRows) {
+      const settlement = JSON.parse(row.payload) as Extract<NormalizedEvent, { type: 'handSettled' }>;
+      const key = decisionHandKey(row.table_id, settlement.shoeId, settlement.handId);
+      if (!decisionsByKey.has(key)) continue;
+      if (actualResultByKey.has(key)) continue;
+      const outcomes = settlement.outcomes;
+      if (
+        outcomes
+        && typeof outcomes.bankerPair === 'boolean'
+        && typeof outcomes.playerPair === 'boolean'
+      ) {
+        actualResultByKey.set(key, {
+          status: 'SETTLED',
+          outcomes: {
+            bankerPair: outcomes.bankerPair,
+            playerPair: outcomes.playerPair,
+          },
+        });
+      } else {
+        actualResultByKey.set(key, { status: 'UNKNOWN' });
+      }
+    }
+
+    const rows = groups.map(group => {
+      const key = decisionHandKey(group.table_id, group.shoe_id, group.hand_id);
+      const decisions = decisionsByKey.get(key) ?? [];
+      if (decisions.length === 0) {
+        throw new LedgerConflictError(`decision hand group ${key} has no decision rows`);
+      }
+      const markets = [...new Set(decisions.map(decision => decision.market))]
+        .sort((left, right) => decisionMarketOrder(left) - decisionMarketOrder(right));
+      const selectedMarkets = [...new Set(
+        decisions.flatMap(decision => decision.strategyChoice ?? []),
+      )].sort((left, right) => decisionMarketOrder(left) - decisionMarketOrder(right));
+      const reasons = [...new Set(decisions.map(decision => decision.reason))];
+      const latestDecisionAt = latestDecisionAtByTable.get(group.table_id);
+      const actualResult: DecisionHandActualResult = actualResultByKey.get(key)
+        ?? (latestDecisionAt !== undefined && group.latest_created_at < latestDecisionAt
+          ? { status: 'UNKNOWN' }
+          : { status: 'PENDING' });
+
+      return {
+        tableId: group.table_id,
+        shoeId: group.shoe_id,
+        handId: group.hand_id,
+        markets,
+        selectedMarkets,
+        pMean: average(decisions.map(decision => decision.pMean)),
+        pLower: average(decisions.map(decision => decision.pLower)),
+        evMean: average(decisions.map(decision => decision.evMean)),
+        evLower: average(decisions.map(decision => decision.evLower)),
+        eligible: decisions.some(decision => decision.eligible),
+        reasons,
+        createdAt: group.created_at,
+        actualResult,
+      };
+    });
+
+    return {
+      rows,
+      total: Number(totalRow.total),
+      page: page.page,
+      pageSize: page.pageSize,
+    };
+  }
+
+  listReservationsPage(options: RecordPageOptions): RecordPage<RiskReservation> {
+    const scope = recordScope('r', options);
+    const page = pageValues(options);
+    const totalRow = this.db.prepare('SELECT COUNT(*) AS total FROM reservations r WHERE ' + scope.where).get(...scope.params) as { total: number };
+    const rows = this.db.prepare('SELECT r.payload FROM reservations r WHERE ' + scope.where + ' ORDER BY r.created_at DESC, r.reservation_id DESC LIMIT ? OFFSET ?').all(...scope.params, page.pageSize, page.offset) as { payload: string }[];
+    return { rows: rows.map(row => JSON.parse(row.payload) as RiskReservation), total: Number(totalRow.total), page: page.page, pageSize: page.pageSize };
+  }
+
+  getDecision(tableId: string, shoeId: string, handId: string, market: string): DecisionSnapshot | undefined {
+    const row = this.db.prepare('SELECT payload FROM decisions WHERE table_id = ? AND shoe_id = ? AND hand_id = ? AND market = ? ORDER BY created_at DESC, snapshot_id DESC LIMIT 1').get(tableId, shoeId, handId, market) as { payload: string } | undefined;
+    return row ? JSON.parse(row.payload) as DecisionSnapshot : undefined;
+  }
+
+  getReceipt(tableId: string, shoeId: string, handId: string, market: string): { receipt: BetReceipt; tableId: string; shoeId: string; handId: string; market: string } | undefined {
+    const row = this.db.prepare('SELECT * FROM receipts WHERE table_id = ? AND shoe_id = ? AND hand_id = ? AND market = ? ORDER BY created_at DESC, receipt_id DESC LIMIT 1').get(tableId, shoeId, handId, market) as ReceiptRow | undefined;
+    return row ? { receipt: JSON.parse(row.payload) as BetReceipt, tableId: row.table_id, shoeId: row.shoe_id, handId: row.hand_id, market: row.market } : undefined;
+  }
+
+  getSettledOutcome(tableId: string, shoeId: string, handId: string, market: string): boolean | undefined {
+    const row = this.db.prepare('SELECT payload FROM events WHERE table_id = ? AND type = \'handSettled\' AND json_extract(payload, \'$.shoeId\') = ? AND json_extract(payload, \'$.handId\') = ? ORDER BY id DESC LIMIT 1').get(tableId, shoeId, handId) as { payload: string } | undefined;
+    if (!row) return undefined;
+    const payload = JSON.parse(row.payload) as {
+      outcomes?: { bankerPair?: unknown; playerPair?: unknown } | null;
+    };
+    const outcomes = payload.outcomes;
+    if (
+      !outcomes
+      || typeof outcomes.bankerPair !== 'boolean'
+      || typeof outcomes.playerPair !== 'boolean'
+    ) {
+      return undefined;
+    }
+    if (market === 'bankerPair') return outcomes.bankerPair;
+    if (market === 'playerPair') return outcomes.playerPair;
+    return undefined;
   }
 
   replay(tableId?: string): { state: Map<string, ShoeStateProjection>; hash: string } {
@@ -301,30 +912,42 @@ export class SqliteLedger {
     }));
   }
 
+  /**
+   * 仅当同键已存在「活跃」(status='RESERVED')预留时才冲突;
+   * 终态行(RELEASED/SETTLED/EXPIRED/UNKNOWN)是审计历史,不再占用键位。
+   */
   saveReservation(reservation: RiskReservation): boolean {
-    const existing = this.db.prepare(
-      'SELECT reservation_id FROM reservations WHERE table_id = ? AND shoe_id = ? AND hand_id = ? AND market = ?'
+    const active = this.db.prepare(
+      "SELECT reservation_id FROM reservations WHERE table_id = ? AND shoe_id = ? AND hand_id = ? AND market = ? AND status = 'RESERVED' LIMIT 1"
     ).get(reservation.tableId, reservation.shoeId, reservation.handId, reservation.market) as { reservation_id: string } | undefined;
-    if (existing) {
-      if (existing.reservation_id === reservation.reservationId) return false;
-      throw new LedgerConflictError(`reservation already exists for ${reservation.tableId}/${reservation.shoeId}/${reservation.handId}/${reservation.market}`);
+    if (active) {
+      if (active.reservation_id === reservation.reservationId) return false;
+      throw new LedgerConflictError(`active reservation already exists for ${reservation.tableId}/${reservation.shoeId}/${reservation.handId}/${reservation.market}`);
     }
-    const result = this.db.prepare(`
-      INSERT INTO reservations
-        (reservation_id, intent_id, table_id, shoe_id, hand_id, market, status, payload, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      reservation.reservationId,
-      reservation.intentId,
-      reservation.tableId,
-      reservation.shoeId,
-      reservation.handId,
-      reservation.market,
-      reservation.status,
-      stableStringify(reservation),
-      reservation.createdAt,
-    );
-    return result.changes > 0;
+    try {
+      const result = this.db.prepare(`
+        INSERT INTO reservations
+          (reservation_id, intent_id, table_id, shoe_id, hand_id, market, status, payload, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        reservation.reservationId,
+        reservation.intentId,
+        reservation.tableId,
+        reservation.shoeId,
+        reservation.handId,
+        reservation.market,
+        reservation.status,
+        stableStringify(reservation),
+        reservation.createdAt,
+      );
+      return result.changes > 0;
+    } catch (error) {
+      // 并发/多连接下绕过前置探测时,由部分唯一索引 uq_reservations_active 兜底
+      if ((error as { code?: string }).code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        throw new LedgerConflictError(`active reservation already exists for ${reservation.tableId}/${reservation.shoeId}/${reservation.handId}/${reservation.market}`);
+      }
+      throw error;
+    }
   }
 
   updateReservation(reservation: RiskReservation): void {

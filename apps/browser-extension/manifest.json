@@ -6,7 +6,8 @@
   "permissions": [
     "storage",
     "tabs",
-    "debugger"
+    "debugger",
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -20,7 +21,8 @@
         "<all_urls>"
       ],
       "js": [
-        "network-hook.js"
+        "network-hook.js",
+        "runtime-state-hook.js"
       ],
       "run_at": "document_start",
       "all_frames": true,
@@ -31,8 +33,16 @@
         "<all_urls>"
       ],
       "js": [
-        "site-adapter.js",
-        "bet-executor.js",
+        "dom-probe.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
         "content.js"
       ],
       "run_at": "document_idle",

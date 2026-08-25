@@ -8,3 +8,6 @@ electron-dist/
 .DS_Store
 coverage/
 apps/desktop/node_modules/.vite/
+
+# Desktop packaging artifacts
+apps/desktop/release/

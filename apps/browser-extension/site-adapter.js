@@ -1,43 +1,149 @@
 /**
- * 真实游戏平台站点适配器。
+ * Dafabet/mstrom adapter boundary.
  *
- * 拿到目标域名后，在这里填写：
- * - matches：匹配的目标页面
- * - extractRooms：从 DOM 抽取房间/桌台列表
- * - extractTableEvent：从 DOM 抽取一条牌桌事件（必须返回 NormalizedEvent 或 null）
- * - executeBet：执行真实下注，返回 BetReceipt 或 null
+ * The adapter never enables real execution by itself. A caller must:
+ *   1. use BetExecutionRequest.mode = "live";
+ *   2. set chrome.storage.local.liveBetEnabled = true;
  *
- * 当前是占位实现，不绑定任何具体网站。
+ * Pair play types are taken from the site's public runtime constants:
+ *   bankerPair = 4, playerPair = 5.
  */
 (function () {
-  const adapter = {
-    id: 'placeholder',
-    matches: ['https://example.com/*'],
+  const PLAY_TYPES = Object.freeze({ bankerPair: 4, playerPair: 5 });
+  const POLL_INTERVAL_MS = 100;
+  const REQUEST_TIMEOUT_MS = 5000;
 
-    // TODO(platform): 填写目标站点的选择器
+  function playTypeForMarket(market) {
+    return market === 'bankerPair' ? PLAY_TYPES.bankerPair
+      : market === 'playerPair' ? PLAY_TYPES.playerPair
+      : null;
+  }
+
+  function getAmount(pool, playType) {
+    try {
+      return pool && typeof pool.getAmount === 'function'
+        ? Number(pool.getAmount(playType)) || 0
+        : 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function getStakeStatus(pool, playType) {
+    try {
+      if (!pool || typeof pool.getAllStakeData !== 'function') return null;
+      const rows = pool.getAllStakeData();
+      if (!Array.isArray(rows)) return null;
+      return rows.find(row => row && row.playType === playType) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function getBetStore(tableId) {
+    try {
+      const videoGameCore = globalThis.VideoGameCore;
+      const linkFactory = videoGameCore
+        && videoGameCore.LinkStoreFactory
+        && videoGameCore.LinkStoreFactory.instance;
+      if (linkFactory && typeof linkFactory.getBetTableStore === 'function') {
+        const store = linkFactory.getBetTableStore(tableId);
+        if (store) return store;
+      }
+
+      const gameBac = globalThis.GameBac;
+      const betStore = gameBac && gameBac.BetStore;
+      return betStore && betStore.instance ? betStore.instance : betStore;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function liveBetEnabled() {
+    try {
+      if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return false;
+      const stored = await chrome.storage.local.get({ liveBetEnabled: false });
+      return stored.liveBetEnabled === true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function receipt(request, status, playType, raw) {
+    return {
+      receiptId: `mstrom-${request.intent.intentId}-${Date.now()}`,
+      intentId: request.intent.intentId,
+      reservationId: request.reservationId || '',
+      status,
+      amount: request.intent.amount,
+      market: request.intent.market,
+      mode: 'live',
+      externalRef: `playType:${playType}`,
+      createdAt: new Date().toISOString(),
+      raw,
+    };
+  }
+
+  async function executeMstromBet(request) {
+    if (!request || request.mode !== 'live') return null;
+    if (!(await liveBetEnabled())) return null;
+
+    const intent = request.intent;
+    const playType = playTypeForMarket(intent.market);
+    if (playType === null || !Number.isFinite(intent.amount) || intent.amount <= 0) return null;
+
+    const store = getBetStore(intent.tableId);
+    const stakePool = store && store.stakePool;
+    if (!store || !stakePool || typeof stakePool.setAmount !== 'function' || typeof store.confirmBet !== 'function') {
+      return null;
+    }
+
+    const beforeStake = getAmount(stakePool, playType);
+    const beforeDone = getAmount(store.donePool, playType);
+    const targetStake = beforeStake + intent.amount;
+    try {
+      stakePool.setAmount(playType, targetStake);
+      store.confirmBet();
+    } catch (error) {
+      return receipt(request, 'REJECTED', playType, {
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    const deadline = Date.now() + REQUEST_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const doneAmount = getAmount(store.donePool, playType);
+      const response = getStakeStatus(store.diffPool, playType);
+      if (doneAmount >= beforeDone + intent.amount) {
+        return receipt(request, 'ACCEPTED', playType, { beforeDone, doneAmount });
+      }
+      if (response && response.pending === false && response.success === false) {
+        return receipt(request, 'REJECTED', playType, { beforeDone, response });
+      }
+      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+    }
+
+    // The request may have reached the platform but its ack was not observable.
+    // UNKNOWN deliberately keeps the reservation alive for later reconciliation.
+    return receipt(request, 'UNKNOWN', playType, { beforeDone, targetStake });
+  }
+
+  const adapter = {
+    id: 'dafabet-mstrom',
+    matches: ['https://www.dafabet.net/*', 'https://gci.agad.mstrom-uno.com/*', 'https://*.673ing.com/*'],
     roomSelector: '.room',
     tableSelector: '.table',
-
-    extractRooms(doc) {
-      // TODO(platform): 返回 [{ roomId, displayName?, tables: [{ tableId, profile?, monitorUrl? }] }]
+    extractRooms() {
       return [];
     },
-
-    // TODO(platform): 返回保活时要点击的元素（如右下角“对局记录表”按钮，
-    // 点击一次放大、再点一次缩小，content script 会自动双击恢复原状）。
-    // 返回 null/undefined 时 content script 使用右下角启发式兜底。
-    getKeepAliveTargets(doc) {
+    getKeepAliveTargets() {
       return null;
     },
-
-    extractTableEvent(doc, tableId) {
-      // TODO(platform): 返回 contracts.NormalizedEvent 形状，或 null
+    extractTableEvent() {
       return null;
     },
-
-    executeBet(doc, request) {
-      // TODO(platform): 根据 BetExecutionRequest 点击/调用真实下注并返回 BetReceipt
-      return null;
+    executeBet(_doc, request) {
+      return executeMstromBet(request);
     },
   };
 

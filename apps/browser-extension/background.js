@@ -6,7 +6,23 @@
 
 const DEFAULT_BRIDGE_URL = 'ws://127.0.0.1:17890';
 const CDP_MIN_INTERVAL_MS = 60 * 1000;
+const EXTENSION_RELOAD_DELAY_MS = 1000;
+const DAFABET_BACCARAT_POPUP_URL = 'https://www.dafabet.net/sc/live-dealer/popup-launch/live-baccarat-pa';
+const GAME_TAB_URL_PATTERN = /dafabet\.(?:net|com)|df888evo\.com|egcvi\.com|evolution|mstrom-uno|673ing\.com/i;
+const MSTROM_FRAME_HOST_PATTERN = /(^|\.)(?:mstrom-uno|673ing)\.com$/i;
+const betRequests = new Map();
+let liveBetSessionEnabled = false;
+
+if (typeof importScripts === 'function') {
+  importScripts('mstrom-bet-runtime.js');
+}
+
+function isGameTabUrl(url) {
+  return GAME_TAB_URL_PATTERN.test(String(url || ''));
+}
 let socket = null;
+let socketGeneration = 0;
+let activeSocketGeneration = 0;
 let reconnectTimer = null;
 let reconnectDelay = 1000;
 let keeperTabId = null;
@@ -52,9 +68,13 @@ async function connect() {
     return;
   }
 
-  socket = new WebSocket(url);
+  const generation = ++socketGeneration;
+  const connection = new WebSocket(url);
+  socket = connection;
+  activeSocketGeneration = generation;
 
-  socket.addEventListener('open', () => {
+  connection.addEventListener('open', () => {
+    if (!isCurrentSocket(connection, generation)) return;
     reconnectDelay = 1000;
     flushOutbox();
     send({
@@ -63,9 +83,11 @@ async function connect() {
       browser: navigator.userAgent,
       timestamp: new Date().toISOString(),
     });
+    void replayRuntimeStateInGameFrames();
   });
 
-  socket.addEventListener('message', event => {
+  connection.addEventListener('message', event => {
+    if (!isCurrentSocket(connection, generation)) return;
     let message;
     try {
       message = JSON.parse(event.data);
@@ -74,29 +96,220 @@ async function connect() {
     }
     if (!message) return;
     if (message.kind === 'betRequest') {
-      broadcastToTabs({
-        kind: 'executeBet',
-        requestId: message.requestId,
-        request: message.request,
-      });
+      void handleBetRequest(message, generation);
     }
     if (message.kind === 'command') {
-      void handleRemoteCommand(String(message.name || ''));
+      const tableIds = Array.isArray(message.tableIds)
+        ? message.tableIds.filter(value => typeof value === 'string')
+        : [];
+      void handleRemoteCommand(String(message.name || ''), tableIds, generation);
     }
   });
 
-  socket.addEventListener('close', () => {
-    socket = null;
-    scheduleReconnect();
+  connection.addEventListener('close', () => {
+    invalidateSocket(connection, generation);
   });
 
-  socket.addEventListener('error', () => {
+  connection.addEventListener('error', () => {
+    if (!invalidateSocket(connection, generation)) return;
     try {
-      socket.close();
+      connection.close();
     } catch (_) {
       // ignore
     }
   });
+}
+
+function isCurrentSocket(connection, generation) {
+  return socket === connection && activeSocketGeneration === generation;
+}
+
+function invalidateSocket(connection, generation) {
+  if (!isCurrentSocket(connection, generation)) return false;
+  liveBetSessionEnabled = false;
+  activeSocketGeneration = 0;
+  socket = null;
+  scheduleReconnect();
+  return true;
+}
+
+function assertLiveBetSession(generation) {
+  if (!liveBetSessionEnabled) {
+    throw new Error('live betting is disabled in the browser extension');
+  }
+  if (!isLiveBetSessionCurrent(generation)) {
+    throw new Error('live betting session is no longer active');
+  }
+}
+
+function isLiveBetSessionCurrent(generation) {
+  return liveBetSessionEnabled
+    && activeSocketGeneration === generation
+    && socket
+    && socket.readyState === WebSocket.OPEN;
+}
+
+function exactDafabetBaccaratPopup(url) {
+  try {
+    const parsed = new URL(String(url || ''));
+    return `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}` === DAFABET_BACCARAT_POPUP_URL;
+  } catch (_) {
+    return false;
+  }
+}
+
+function betErrorMessage(error) {
+  if (error && typeof error === 'object' && typeof error.message === 'string') {
+    return error.message.slice(0, 500);
+  }
+  return String(error || 'unknown live bet error').slice(0, 500);
+}
+
+function unknownBetReceipt(request, requestId, reason) {
+  const intent = request && request.intent ? request.intent : {};
+  const tableId = typeof intent.tableId === 'string' ? intent.tableId : '';
+  const handId = typeof intent.handId === 'string' ? intent.handId : '';
+  return {
+    receiptId: `mstrom-bridge-unknown-${requestId}-${Date.now()}`,
+    intentId: String(intent.intentId || ''),
+    reservationId: String(request && request.reservationId || ''),
+    status: 'UNKNOWN',
+    amount: intent.amount,
+    market: intent.market,
+    mode: 'live',
+    externalRef: `mstrom:${tableId}:${handId}`,
+    createdAt: new Date().toISOString(),
+    raw: {
+      reason,
+      commitPoint: 'confirmBet',
+      commitStarted: true,
+      tableId,
+      handId,
+    },
+  };
+}
+
+function validateLiveBetMessage(message) {
+  const request = message && message.request;
+  const intent = request && request.intent;
+  if (!message || typeof message.requestId !== 'string' || !message.requestId) {
+    throw new Error('invalid bet request id');
+  }
+  if (!request || request.mode !== 'live' || !intent || intent.mode !== 'live') {
+    throw new Error('only live bet requests can enter the Dafabet executor');
+  }
+  if (typeof intent.tableId !== 'string' || !/^[A-Z]\d{3}$/.test(intent.tableId)) {
+    throw new Error('invalid Dafabet table id');
+  }
+  return { requestId: message.requestId, request, tableId: intent.tableId };
+}
+
+async function executeUniqueMstromBet(message, generation) {
+  const parsed = validateLiveBetMessage(message);
+  assertLiveBetSession(generation);
+
+  const tabs = await chrome.tabs.query({
+    url: [`${DAFABET_BACCARAT_POPUP_URL}*`],
+  });
+  assertLiveBetSession(generation);
+  const targets = tabs.filter(tab => tab.id && exactDafabetBaccaratPopup(tab.url));
+  if (targets.length !== 1) {
+    throw new Error(`expected exactly one Dafabet baccarat popup tab, found ${targets.length}`);
+  }
+  const tabId = targets[0].id;
+
+  assertLiveBetSession(generation);
+  const probes = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    world: 'MAIN',
+    args: [parsed.tableId],
+    func: globalThis.probeMstromBetStore,
+  });
+  assertLiveBetSession(generation);
+  const candidates = probes.filter(entry => {
+    const result = entry && entry.result;
+    return result
+      && (result.status === 'ready' || result.ownsTargetStore === true)
+      && result.tableId === parsed.tableId
+      && MSTROM_FRAME_HOST_PATTERN.test(String(result.host || ''));
+  });
+  if (candidates.length !== 1 || !Number.isInteger(candidates[0].frameId)) {
+    throw new Error(`expected exactly one matching frame for ${parsed.tableId}, found ${candidates.length}`);
+  }
+
+  const frameId = candidates[0].frameId;
+  assertLiveBetSession(generation);
+  let executions;
+  try {
+    executions = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      world: 'MAIN',
+      args: [parsed.request],
+      func: globalThis.executeMstromBetOneShot,
+    });
+  } catch (error) {
+    return unknownBetReceipt(
+      parsed.request,
+      parsed.requestId,
+      `final-execute-failed:${betErrorMessage(error)}`,
+    );
+  }
+  if (!isLiveBetSessionCurrent(generation)) {
+    return unknownBetReceipt(
+      parsed.request,
+      parsed.requestId,
+      'bridge-disconnected-after-final-execute',
+    );
+  }
+  const receipt = executions.length === 1 ? executions[0].result : null;
+  if (!receipt || typeof receipt !== 'object') {
+    return unknownBetReceipt(
+      parsed.request,
+      parsed.requestId,
+      'final-execute-returned-no-receipt',
+    );
+  }
+  return receipt;
+}
+
+function handleBetRequest(message, generation) {
+  const requestId = message && typeof message.requestId === 'string'
+    ? message.requestId
+    : '';
+  if (requestId && betRequests.has(requestId)) return betRequests.get(requestId);
+
+  const operation = executeUniqueMstromBet(message, generation)
+    .then(receipt => {
+      if (
+        receipt
+        && typeof receipt === 'object'
+        && receipt.status !== 'UNKNOWN'
+        && receipt.raw
+        && receipt.raw.commitPoint === 'confirmBet'
+        && !isLiveBetSessionCurrent(generation)
+      ) {
+        receipt = unknownBetReceipt(
+          message.request,
+          requestId,
+          'bridge-disconnected-after-commit-point',
+        );
+      }
+      sendBetResult({ kind: 'betResult', requestId, receipt }, generation);
+      return receipt;
+    })
+    .catch(error => {
+      sendBetResult({
+        kind: 'betResult',
+        requestId,
+        receipt: null,
+        error: betErrorMessage(error),
+      }, generation);
+      return null;
+  });
+  if (requestId) {
+    betRequests.set(requestId, operation);
+  }
+  return operation;
 }
 
 function scheduleReconnect() {
@@ -111,7 +324,24 @@ function scheduleReconnect() {
 const OUTBOX_LIMIT = 500;
 const outbox = [];
 
+function sendBetResult(message, generation) {
+  if (
+    !socket
+    || !isCurrentSocket(socket, generation)
+    || socket.readyState !== WebSocket.OPEN
+  ) {
+    return false;
+  }
+  try {
+    socket.send(JSON.stringify(message));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 function send(message) {
+  if (message && message.kind === 'betResult') return;
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify(message));
     return;
@@ -125,6 +355,7 @@ function flushOutbox() {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   while (outbox.length > 0) {
     const message = outbox.shift();
+    if (message && message.kind === 'betResult') continue;
     try {
       socket.send(JSON.stringify(message));
     } catch (_) {
@@ -134,8 +365,160 @@ function flushOutbox() {
   }
 }
 
+/** 本机桥重连后，要求每个游戏 frame 重放当前已解码的运行时牌面和可见桌台选择。 */
+function runtimeProbeError(error) {
+  try {
+    if (error && typeof error === 'object' && typeof error.message === 'string') {
+      return error.message.slice(0, 300);
+    }
+    return String(error || '').slice(0, 300);
+  } catch (_) {
+    return 'unknown-error';
+  }
+}
+
+function sendRuntimeProbe(tabId, frameId, result, fallbackUrl) {
+  const frameUrl = result && typeof result.frameUrl === 'string' && result.frameUrl
+    ? result.frameUrl
+    : String(fallbackUrl || '');
+  const payload = {
+    tabId,
+    frameId: Number.isInteger(frameId) ? frameId : null,
+    ...(result && typeof result === 'object' ? result : { hook: 'unknown', replay: 'not-called' }),
+  };
+  send({
+    kind: 'networkCapture',
+    source: 'baccarat-bridge-runtime-probe',
+    url: frameUrl,
+    direction: 'recv',
+    encoding: 'text',
+    data: JSON.stringify(payload).slice(0, 8000),
+  });
+}
+
+async function replayRuntimeStateInGameFrames() {
+  const tabs = await chrome.tabs.query({});
+  let tabCount = 0;
+  let frameCount = 0;
+  let failureCount = 0;
+  for (const tab of tabs) {
+    if (!tab.id || !isGameTabUrl(tab.url)) continue;
+    tabCount += 1;
+    const injected = await injectRuntimeProbe(tab.id);
+    if (!injected) {
+      failureCount += 1;
+      sendRuntimeProbe(tab.id, null, {
+        frameUrl: String(tab.url || ''),
+        hook: 'injection-failed',
+        replay: 'not-called',
+      }, tab.url);
+      continue;
+    }
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: tab.id, allFrames: true },
+        world: 'MAIN',
+        func: () => {
+          const frameUrl = String(location.href || '');
+          const host = String(location.hostname || '');
+          const replay = globalThis.__baccaratRuntimeStateHookReplay;
+          const diagnostic = globalThis.__baccaratRuntimeStateHookDiagnostics;
+          let replayState = 'not-called';
+          let error = '';
+          let diagnostics = null;
+          if (typeof replay === 'function') {
+            try {
+              replay();
+              replayState = 'called';
+            } catch (caught) {
+              replayState = 'failed';
+              error = caught && typeof caught === 'object' && typeof caught.message === 'string'
+                ? caught.message.slice(0, 300)
+                : String(caught || '').slice(0, 300);
+            }
+          }
+          if (typeof diagnostic === 'function') {
+            try {
+              diagnostics = diagnostic();
+            } catch (caught) {
+              error = error || (caught && typeof caught === 'object' && typeof caught.message === 'string'
+                ? caught.message.slice(0, 300)
+                : String(caught || '').slice(0, 300));
+            }
+          }
+          return {
+            frameUrl,
+            host,
+            hook: typeof replay === 'function' ? 'present' : 'missing',
+            replay: replayState,
+            ...(error ? { error } : {}),
+            ...(diagnostics === null ? {} : { diagnostics }),
+          };
+        },
+      });
+      for (const entry of results) {
+        frameCount += 1;
+        sendRuntimeProbe(tab.id, entry.frameId, entry.result, tab.url);
+      }
+    } catch (error) {
+      failureCount += 1;
+      sendRuntimeProbe(tab.id, null, {
+        frameUrl: String(tab.url || ''),
+        hook: 'probe-failed',
+        replay: 'not-called',
+        error: runtimeProbeError(error),
+      }, tab.url);
+    }
+  }
+  return { tabCount, frameCount, failureCount };
+}
 /** 远程指令:由桥接服务/观察者经 WebSocket 下发,免去打开 SW 控制台。 */
-async function handleRemoteCommand(name) {
+async function handleRemoteCommand(name, tableIds = [], generation) {
+  if (generation !== activeSocketGeneration) return;
+  if (name === 'liveOn' || name === 'liveOff') {
+    const enabled = name === 'liveOn';
+    liveBetSessionEnabled = enabled;
+    await chrome.storage.local.set({ liveBetEnabled: enabled });
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: '',
+      detail: enabled ? 'liveBetEnabled' : 'liveBetDisabled',
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+  if (name === 'reloadExtension') {
+    await chrome.storage.local.set({ reloadGameTabsAfterExtensionReload: true });
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: '',
+      detail: 'reloadExtension-scheduled',
+      timestamp: new Date().toISOString(),
+    });
+    // 给确认消息留出发送时间，再由扩展自己重载；不依赖 chrome://extensions 页面。
+    setTimeout(() => chrome.runtime.reload(), EXTENSION_RELOAD_DELAY_MS);
+    return;
+  }
+  if (name === 'openMultiView') {
+    await openActiveGameTabInMultiplay(tableIds);
+    return;
+  }
+  if (name === 'replayRuntimeState') {
+    const outcome = await replayRuntimeStateInGameFrames();
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: '',
+      detail: `replayRuntimeState:tabs=${outcome.tabCount}:frames=${outcome.frameCount}:failures=${outcome.failureCount}`,
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
   if (name === 'calibrate') {
     await chrome.storage.local.set({ cdpCalibrate: true });
     await broadcastToTabs({ kind: 'armCalibration' });
@@ -177,6 +560,182 @@ async function handleRemoteCommand(name) {
   }
 }
 
+/**
+ * 在当前活动游戏标签的 mstrom iframe 内调用客户端自己的“多台”导航入口。
+ * 这是一次性的显式远程命令；不会触发下注，也不会写入任何下注开关。
+ */
+async function openActiveGameTabInMultiplay(tableIds = []) {
+  try {
+    const tabs = await chrome.tabs.query({ active: true });
+    const tab = tabs.find(candidate => {
+      const url = String(candidate && candidate.url ? candidate.url : '');
+      return /popup-launch\/live-baccarat/i.test(url);
+    }) || tabs.find(candidate => isGameTabUrl(candidate && candidate.url));
+    if (!tab || !tab.id) {
+      send({
+        kind: 'sessionAction',
+        action: 'command-executed',
+        url: '',
+        frame: '',
+        detail: 'openMultiView:no-active-game-tab',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, allFrames: true },
+      world: 'MAIN',
+      args: [tableIds],
+      func: requestedTableIds => {
+        const frameUrl = String(location.href || '');
+        if (!/(^|\.)(?:mstrom-uno|673ing)\.com$/i.test(location.hostname)) {
+          return { status: 'skipped', frameUrl };
+        }
+        try {
+          const page = globalThis;
+          const sdk = page.MicroSDK;
+          const plaza = page.Plaza || (sdk && sdk.Plaza);
+          const createInstance = sdk && sdk.Utils && sdk.Utils.createInstance;
+          const MultiplayStore = plaza && plaza.MultiplayStore;
+          const configuredTableIds = Array.isArray(requestedTableIds)
+            ? requestedTableIds
+              .filter(value => typeof value === 'string' && /^[A-Z]\d{3}$/.test(value))
+              .slice(0, 4)
+            : [];
+          const videoGameCore = page.VideoGameCore;
+          const gameLinkStore = videoGameCore
+            && videoGameCore.GameLinkStore
+            && videoGameCore.GameLinkStore.instance;
+          const plazaSdk = sdk && sdk.Plaza;
+          const rootPageStore = plazaSdk && typeof plazaSdk.getRootPageStore === 'function'
+            ? plazaSdk.getRootPageStore()
+            : plazaSdk && plazaSdk.RootPageStore && plazaSdk.RootPageStore.instance;
+          const gameLink = videoGameCore && videoGameCore.GAME_LINK;
+          if (
+            configuredTableIds.length > 1
+            && gameLinkStore
+            && typeof gameLinkStore.changeTable === 'function'
+          ) {
+            configuredTableIds.forEach((tableId, index) => gameLinkStore.changeTable(tableId, index));
+            if (typeof gameLinkStore.connectSocket === 'function') {
+              gameLinkStore.connectSocket();
+              if (rootPageStore && typeof rootPageStore.changeGame === 'function' && typeof gameLink === 'string' && gameLink) {
+                rootPageStore.changeGame(gameLink);
+              }
+              return {
+                status: 'opened',
+                frameUrl,
+                state: 'configured-game-link',
+                configuredCount: configuredTableIds.length,
+              };
+            }
+          }
+          if (typeof createInstance === 'function' && MultiplayStore) {
+            const store = createInstance(MultiplayStore);
+            if (store && typeof store.openMultiplayPage === 'function') {
+              store.openMultiplayPage({ fromEntry: 'MultiTab' });
+              return { status: 'opened', frameUrl, state: 'store' };
+            }
+          }
+
+          // PC builds expose the left-side “多台” path as a RootPageStore module transition.
+          // GAME_LINK is the casino's own multi-table module; this only changes the displayed game mode.
+          if (rootPageStore && typeof rootPageStore.changeGame === 'function' && typeof gameLink === 'string' && gameLink) {
+            rootPageStore.changeGame(gameLink);
+            return { status: 'opened', frameUrl, state: 'root-change-game' };
+          }
+
+          // PageNavigator retains the live GameBac page even when its module-private Plaza symbol
+          // is not exported to window. Calling its explicitly named multitable handler is equivalent
+          // to one click on the page's “多台” button and cannot execute a bet.
+          const navigator = page.Core && page.Core.pageNavigator;
+          const topPage = navigator && typeof navigator.getTopPage === 'function'
+            ? navigator.getTopPage()
+            : null;
+          const topPageClass = topPage && page.egret && typeof page.egret.getQualifiedClassName === 'function'
+            ? page.egret.getQualifiedClassName(topPage)
+            : '';
+          if (/^GameBac\./.test(topPageClass) && typeof topPage.onMultiplayButtonTap === 'function') {
+            topPage.onMultiplayButtonTap();
+            return { status: 'opened', frameUrl, state: 'navigator-handler' };
+          }
+
+          // 某些站点版本把 Plaza.MultiplayStore 保留在 GameBac 的模块闭包中，
+          // 不再暴露为 window 属性；此时只调用舞台上真实“多台”按钮的同一处理器。
+          // 处理器源码必须明确包含 openMultiplayPage，避免误触任何下注控件。
+          const stage = page.egret && page.egret.MainContext && page.egret.MainContext.instance
+            ? page.egret.MainContext.instance.stage
+            : null;
+          const queue = stage ? [stage] : [];
+          const visited = new Set();
+          let handlerOwner = null;
+          while (queue.length > 0 && visited.size < 4000) {
+            const node = queue.shift();
+            if (!node || visited.has(node)) continue;
+            visited.add(node);
+            // `multiplayButton` is the exact named UI component wired by GameBac to the “多台” action.
+            // The handler is invoked once, never coordinates or generic pointer input.
+            if (node.multiplayButton && typeof node.onMultiplayButtonTap === 'function') {
+              handlerOwner = node;
+              break;
+            }
+            try {
+              const childNodes = ['$_children', '$children', 'children', '_children']
+                .flatMap(key => Array.isArray(node[key]) ? node[key] : []);
+              if (childNodes.length > 0) {
+                for (const child of childNodes) queue.push(child);
+                continue;
+              }
+              const childCount = Number(node.numChildren);
+              if (Number.isInteger(childCount) && childCount > 0 && typeof node.getChildAt === 'function') {
+                for (let index = 0; index < childCount; index += 1) queue.push(node.getChildAt(index));
+              }
+            } catch (_) {
+              // A transient Egret display child must not prevent a later frame from being inspected.
+            }
+          }
+          if (handlerOwner) {
+            handlerOwner.onMultiplayButtonTap();
+            return { status: 'opened', frameUrl, state: 'stage-handler' };
+          }
+          return {
+            status: 'not-ready',
+            frameUrl,
+            state: `sdk=${!!sdk};plaza=${!!plaza};store=${!!MultiplayStore};factory=${typeof createInstance};stage=${!!stage}`,
+          };
+        } catch (_) {
+          return { status: 'failed', frameUrl };
+        }
+      },
+    });
+    const opened = results.filter(result => result && result.result && result.result.status === 'opened').length;
+    const states = results
+      .map(result => result && result.result && result.result.state ? String(result.result.state) : '')
+      .filter(Boolean)
+      .join('|')
+      .slice(0, 80);
+    const detail = opened > 0 ? `openMultiView:opened:${opened}` : `openMultiView:not-ready${states ? `:${states}` : ''}`;
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: 'allFrames',
+      detail,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (_) {
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: '',
+      detail: 'openMultiView:failed',
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+/** 一次性只读诊断当前游戏 frame 的页面导航对象；不读取牌面、不触发输入。 */
 async function broadcastToTabs(message) {
   const tabs = await chrome.tabs.query({});
   for (const tab of tabs) {
@@ -446,6 +1005,13 @@ chrome.runtime.onMessage.addListener((message, sender, _sendResponse) => {
   }
 });
 
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+  if (changeInfo.status !== 'complete' || !isGameTabUrl(tab.url)) return;
+  // document_start 的 hook 可能早于 document_idle relay 发出首个状态；
+  // load complete 后强制 replay 会清除其去重缓存并重新发出当前四桌快照。
+  void replayRuntimeStateInGameFrames();
+});
+
 chrome.tabs.onRemoved.addListener(tabId => {
   if (tabId === keeperTabId) {
     keeperTabId = null;
@@ -455,6 +1021,38 @@ chrome.tabs.onRemoved.addListener(tabId => {
     cdpAttachedTabId = null;
   }
 });
+
+async function injectRuntimeProbe(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      files: ['runtime-state-hook.js'],
+      world: 'MAIN',
+    });
+    return true;
+  } catch (_) {
+    // Chrome 内部页、已关闭标签或未授予 scripting 权限时忽略。
+    return false;
+  }
+}
+
+async function reloadPendingGameTabs() {
+  const stored = await chrome.storage.local.get({ reloadGameTabsAfterExtensionReload: false });
+  if (!stored.reloadGameTabsAfterExtensionReload) return;
+
+  // 先清标记，防止页面重载或 Service Worker 重启形成循环。
+  await chrome.storage.local.remove('reloadGameTabsAfterExtensionReload');
+  const tabs = await chrome.tabs.query({});
+  for (const tab of tabs) {
+    if (!tab.id || !isGameTabUrl(tab.url)) continue;
+    try {
+      await chrome.tabs.reload(tab.id);
+      setTimeout(() => { void replayRuntimeStateInGameFrames(); }, 3000);
+    } catch (_) {
+      // 某个标签页关闭不影响其他游戏页刷新。
+    }
+  }
+}
 
 chrome.runtime.onInstalled.addListener(() => {
   void loadFlags();
@@ -467,4 +1065,5 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 void loadFlags();
+void reloadPendingGameTabs();
 connect();

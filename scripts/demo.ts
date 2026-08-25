@@ -19,7 +19,7 @@ async function main() {
     .card('demo-shoe','h1',{rank:'Q'},'banker1')
     .card('demo-shoe','h1',{rank:'J'},'banker2')
     .closeWindow('demo-shoe','h1','bankerPair')
-    .settle('demo-shoe','h1',[{rank:'A'},{rank:'A'}],[{rank:'Q'},{rank:'J'}], { bankerPair: true, playerPair: false })
+    .settle('demo-shoe','h1',[{rank:'A'},{rank:'A'}],[{rank:'Q'},{rank:'J'}], { bankerPair: false, playerPair: true })
     .redCard('demo-shoe','h2')
     .settle('demo-shoe','h2',[{rank:'K'},{rank:'Q'}],[{rank:'A'},{rank:'2'}], { bankerPair: false, playerPair: false })
     .build();

@@ -34,4 +34,4 @@ export type BridgeServerMessage =
   | { kind: 'betRequest'; requestId: string; request: BetExecutionRequest }
   | { kind: 'ping'; timestamp: string }
   | { kind: 'observe'; message: BridgeClientMessage }
-  | { kind: 'command'; name: string };
+  | { kind: 'command'; name: string; tableIds?: readonly string[] };

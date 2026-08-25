@@ -43,6 +43,7 @@ function assertMarket(value: unknown, field: string, event: NormalizedEvent): vo
 export function emptyProjection(tableId: string): ShoeStateProjection {
   return {
     shoeId: '',
+    shoeBaseline: 'unknown-monitor-session',
     tableId,
     profileSnapshot: defaultProfile(tableId),
     modelRevision: 'initial-empty',
@@ -51,6 +52,7 @@ export function emptyProjection(tableId: string): ShoeStateProjection {
     remainingTotal: 0,
     seenCards: [],
     currentHandId: null,
+    observedHandIds: [],
     handNumber: 0,
     redCardSeen: false,
     burnModel: { kind: 'unknown' },
@@ -67,8 +69,21 @@ function cloneProjection(s: ShoeStateProjection): ShoeStateProjection {
     profileSnapshot: structuredClone(s.profileSnapshot),
     remainingCounts: { ...s.remainingCounts },
     seenCards: s.seenCards.map(c => ({ ...c })),
+    observedHandIds: [...s.observedHandIds],
     burnModel: structuredClone(s.burnModel),
   };
+}
+
+function beginHand(
+  projection: ShoeStateProjection,
+  handId: string,
+): 'new' | 'current' | 'stale' {
+  if (projection.currentHandId === handId) return 'current';
+  if (projection.observedHandIds.includes(handId)) return 'stale';
+  projection.observedHandIds.push(handId);
+  projection.currentHandId = handId;
+  projection.handNumber = projection.observedHandIds.length;
+  return 'new';
 }
 
 function withProfile(profile: TableProfile, tableId: string): TableProfile {
@@ -80,6 +95,7 @@ function withProfile(profile: TableProfile, tableId: string): TableProfile {
     odds: { ...base.odds, ...(profile.odds ?? {}) },
     burnModel: profile.burnModel ?? base.burnModel,
     limits: { ...base.limits, ...(profile.limits ?? {}) },
+    monitorUrl: typeof profile.monitorUrl === 'string' ? profile.monitorUrl : undefined,
   };
   assertValidTableProfile(merged);
   return merged;
@@ -93,6 +109,7 @@ export function modelRevisionFor(profile: TableProfile): string {
     minEV: profile.minEV,
     limits: profile.limits,
     strategy: profile.betStrategy,
+    betTiers: profile.betTiers ?? [],
   })).slice(0, 16);
 }
 
@@ -106,6 +123,7 @@ export function profileVersionFor(profile: TableProfile): number {
     minEV: profile.minEV,
     limits: profile.limits,
     strategy: profile.betStrategy,
+    betTiers: profile.betTiers ?? [],
     autoConfirmNewShoe: profile.autoConfirmNewShoe,
     autoBetArmedByDefault: profile.autoBetArmedByDefault,
   }));
@@ -161,20 +179,25 @@ export function applyEvent(
   switch (event.type) {
     case 'newShoeSignal': {
       const shoeId = nonEmptyString(event.shoeId, 'shoeId', event);
+      const shoeBaseline = event.baseline ?? (event.source === 'mstrom-protocol' || event.source === 'mstrom-runtime' ? 'unknown-monitor-session' : 'physical-shoe');
       const profile = withProfile({ ...(event.profile ?? {}) } as TableProfile, event.tableId);
       updated.shoeId = shoeId;
+      updated.shoeBaseline = shoeBaseline;
       updated.profileSnapshot = profile;
       updated.modelRevision = modelRevisionFor(profile);
       updated.remainingCounts = recomputeRemaining(profile.numberOfDecks, [], profile.burnModel) as ShoeStateProjection['remainingCounts'];
       updated.remainingTotal = sumCounts(updated.remainingCounts);
       updated.seenCards = [];
       updated.currentHandId = null;
+      updated.observedHandIds = [];
       updated.handNumber = 0;
       updated.redCardSeen = false;
       updated.burnModel = structuredClone(profile.burnModel);
       updated.sealed = false;
       updated.status = profile.autoConfirmNewShoe ? 'TRACKING' : 'WAITING_CONFIRMATION';
-      updated.autoBetStatus = profile.autoBetArmedByDefault ? 'ARMED' : 'DISARMED';
+      updated.autoBetStatus = shoeBaseline === 'unknown-monitor-session'
+        ? 'DISARMED'
+        : profile.autoBetArmedByDefault ? 'ARMED' : 'DISARMED';
       updated.connectionStatus = 'CONNECTED';
       break;
     }
@@ -191,17 +214,21 @@ export function applyEvent(
       assertValidCard(event.card);
       if (!isCurrentShoe(event.shoeId, current)) break;
       const rank = event.card.rank;
-      if (updated.remainingCounts[rank] <= 0) {
+      const physicalInventoryIsKnown = updated.shoeBaseline === 'physical-shoe';
+      if (physicalInventoryIsKnown && updated.remainingCounts[rank] <= 0) {
         fail(`card rank ${rank} observed more times than remaining shoe inventory allows`, event);
       }
-      updated.remainingCounts = { ...updated.remainingCounts, [rank]: updated.remainingCounts[rank] - 1 };
-      updated.remainingTotal -= 1;
+      updated.remainingCounts = {
+        ...updated.remainingCounts,
+        [rank]: Math.max(0, updated.remainingCounts[rank] - 1),
+      };
+      updated.remainingTotal = Math.max(0, updated.remainingTotal - 1);
       updated.seenCards.push({ ...event.card });
-      if (updated.currentHandId !== event.handId) {
-        updated.currentHandId = event.handId;
-        updated.handNumber += 1;
-      }
-      if (updated.status === 'BETTING_WINDOW' || updated.status === 'PENDING_SETTLEMENT') {
+      const handState = beginHand(updated, event.handId);
+      if (
+        handState !== 'stale'
+        && (updated.status === 'BETTING_WINDOW' || updated.status === 'PENDING_SETTLEMENT')
+      ) {
         updated.status = 'TRACKING';
       }
       break;
@@ -214,7 +241,8 @@ export function applyEvent(
       if (updated.redCardSeen || updated.status === 'INVALIDATED' || updated.status === 'RESYNCING' || updated.status === 'WAITING_CONFIRMATION') {
         break;
       }
-      updated.currentHandId = event.handId;
+      const handState = beginHand(updated, event.handId);
+      if (handState === 'stale' || (handState === 'current' && updated.status !== 'BETTING_WINDOW')) break;
       updated.status = 'BETTING_WINDOW';
       break;
     }
@@ -251,7 +279,7 @@ export function applyEvent(
         }
       }
       if (!isCurrentShoe(event.shoeId, current)) break;
-      updated.currentHandId = event.handId;
+      if (beginHand(updated, event.handId) === 'stale') break;
       if (updated.redCardSeen) {
         updated.status = 'WAITING_NEW_SHOE';
         updated.sealed = true;
@@ -335,7 +363,7 @@ export function applyEvent(
         updated.autoBetStatus = 'DISARMED';
         break;
       }
-      if (updated.redCardSeen || updated.status === 'INVALIDATED' || updated.status === 'RESYNCING' || updated.status === 'WAITING_CONFIRMATION') {
+      if (updated.shoeBaseline === 'unknown-monitor-session' || updated.redCardSeen || updated.status === 'INVALIDATED' || updated.status === 'RESYNCING' || updated.status === 'WAITING_CONFIRMATION') {
         break;
       }
       updated.autoBetStatus = 'ARMED';

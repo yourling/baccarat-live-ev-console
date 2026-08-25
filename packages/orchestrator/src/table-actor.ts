@@ -8,11 +8,14 @@ import {
   assertValidTableProfile,
   type BetIntent,
   type BetReceipt,
+  type BetTier,
   type DecisionSnapshot,
+  type ExecutionMode,
   type ManualCorrection,
   type NormalizedEvent,
   type RiskExposureState,
   type RiskLimits,
+  type RiskReservation,
   type ShoeStateProjection,
   type TableProfile,
   newId,
@@ -21,10 +24,16 @@ import {
   SqliteLedger,
   applyEvent,
   emptyProjection,
+  modelRevisionFor,
   profileVersionFor,
 } from '@baccarat/ledger-state';
 import { evaluatePairMarket } from '@baccarat/probability';
 import { RiskManager, emptyRiskState } from '@baccarat/risk-execution';
+import {
+  executeOneShotBet,
+  type OneShotBetCommand,
+  type OneShotBetResult,
+} from './one-shot-bet.js';
 import { selectMarkets } from './strategy.js';
 
 export interface TableActorOptions {
@@ -33,15 +42,14 @@ export interface TableActorOptions {
   ledger: SqliteLedger;
   riskManager: RiskManager;
   executor?: Pick<BrowserAdapter, 'requestBet'> | null;
-  executionMode: 'shadow' | 'simulated';
+  executionMode: 'shadow' | 'simulated' | 'live';
   defaultBetAmount: number;
   riskLimits: RiskLimits;
   requestTimeoutMs?: number;
 }
 
 interface QueueItem {
-  event: NormalizedEvent;
-  resolve: () => void;
+  run: () => Promise<void>;
   reject: (reason?: unknown) => void;
 }
 
@@ -49,18 +57,19 @@ export interface TableActorSnapshot {
   tableId: string;
   profile: TableProfile;
   projection: ShoeStateProjection;
-  executionMode: 'shadow' | 'simulated';
+  executionMode: 'shadow' | 'simulated' | 'live';
   defaultBetAmount: number;
   pendingEvents: number;
 }
 
+// allow: SIZE_OK — event-sourced per-table state machine; one-shot execution is extracted.
 export class TableActor {
   readonly tableId: string;
   private readonly ledger: SqliteLedger;
   private readonly riskManager: RiskManager;
   private executor: Pick<BrowserAdapter, 'requestBet'> | null;
   private profile: TableProfile;
-  private executionMode: 'shadow' | 'simulated';
+  private executionMode: 'shadow' | 'simulated' | 'live';
   private defaultBetAmount: number;
   private riskLimits: RiskLimits;
   private readonly requestTimeoutMs: number;
@@ -69,6 +78,7 @@ export class TableActor {
   private projection: ShoeStateProjection;
   private readonly reminderKeys = new Set<string>();
   private readonly placedKeys = new Set<string>();
+  private syntheticSeq = SYNTHETIC_SEQ_BASE;
   private alternateNext: 'bankerPair' | 'playerPair';
 
   constructor(options: TableActorOptions) {
@@ -83,7 +93,8 @@ export class TableActor {
     this.executionMode = options.executionMode;
     this.defaultBetAmount = options.defaultBetAmount;
     this.riskLimits = structuredClone(options.riskLimits);
-    this.requestTimeoutMs = options.requestTimeoutMs ?? 5_000;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 12_000;
+    this.syntheticSeq = Math.max(SYNTHETIC_SEQ_BASE, this.ledger.nextSourceSeq(this.tableId));
 
     const replay = this.ledger.replay(this.tableId);
     this.projection = replay.state.get(this.tableId) ?? emptyProjection(this.tableId);
@@ -114,10 +125,21 @@ export class TableActor {
     if (event.tableId !== this.tableId) {
       return Promise.reject(new Error(`event tableId ${event.tableId} does not match actor tableId ${this.tableId}`));
     }
-    return new Promise<void>((resolve, reject) => {
-      this.queue.push({ event, resolve, reject });
-      void this.drain();
-    });
+    return this.enqueueTask(() => this.handleEvent(event));
+  }
+
+  placeOneShotBet(command: OneShotBetCommand): Promise<OneShotBetResult> {
+    return this.enqueueTask(() => executeOneShotBet(command, {
+      tableId: this.tableId,
+      projection: this.projection,
+      profile: this.profile,
+      ledger: this.ledger,
+      riskManager: this.riskManager,
+      riskLimits: this.riskLimits,
+      executor: this.executor,
+      requestTimeoutMs: Math.max(this.requestTimeoutMs, 12_000),
+      recordReceipt: (receiptCommand, receipt) => this.recordOneShotReceipt(receiptCommand, receipt),
+    }));
   }
 
   async flush(): Promise<void> {
@@ -128,6 +150,10 @@ export class TableActor {
 
   getProjection(): ShoeStateProjection {
     return structuredClone(this.projection);
+  }
+
+  setExecutor(executor: Pick<BrowserAdapter, 'requestBet'> | null): void {
+    this.executor = executor;
   }
 
   getProfile(): TableProfile {
@@ -141,6 +167,25 @@ export class TableActor {
   updateRiskLimits(limits: RiskLimits): void {
     assertValidRiskLimits(limits);
     this.riskLimits = structuredClone(limits);
+  }
+
+  updateConfiguration(profile: TableProfile, defaultBetAmount: number): void {
+    assertValidTableProfile(profile);
+    if (profile.tableId !== this.tableId) throw new Error(`profile tableId ${profile.tableId} does not match actor tableId ${this.tableId}`);
+    if (!Number.isFinite(defaultBetAmount) || defaultBetAmount <= 0) {
+      throw new RangeError('defaultBetAmount must be a positive finite number');
+    }
+    this.profile = structuredClone(profile);
+    this.defaultBetAmount = defaultBetAmount;
+    this.projection = {
+      ...this.projection,
+      profileSnapshot: structuredClone(profile),
+      modelRevision: modelRevisionFor(profile),
+    };
+  }
+
+  setExecutionMode(mode: ExecutionMode): void {
+    this.executionMode = mode;
   }
 
   snapshot(): TableActorSnapshot {
@@ -159,10 +204,10 @@ export class TableActor {
     this.processing = true;
     try {
       while (this.queue.length > 0) {
-        const item = this.queue.shift()!;
+        const item = this.queue.shift();
+        if (!item) continue;
         try {
-          await this.handleEvent(item.event);
-          item.resolve();
+          await item.run();
         } catch (error) {
           item.reject(error instanceof Error ? error : new Error(String(error)));
         }
@@ -171,6 +216,19 @@ export class TableActor {
       this.processing = false;
     }
   }
+
+  private enqueueTask<T>(task: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.queue.push({
+        run: async () => {
+          resolve(await task());
+        },
+        reject,
+      });
+      void this.drain();
+    });
+  }
+
   private async handleEvent(event: NormalizedEvent): Promise<void> {
     const previousProjection = this.projection;
     const watermark = this.ledger.countEvents(this.tableId) + 1;
@@ -248,12 +306,16 @@ export class TableActor {
   ): Promise<void> {
     if (event.shoeId !== projection.shoeId || projection.sealed) return;
     if (projection.status !== 'BETTING_WINDOW') return;
+    if (projection.shoeBaseline === 'unknown-monitor-session') {
+      this.recordDecision(event, projection, false, 'physical-shoe-baseline-unknown', 'monitor-session-baseline-unknown');
+      return;
+    }
 
     const evaluation = evaluatePairMarket(this.profile, event.market, projection.seenCards);
-    const eligible = evaluation.evLower > this.profile.minEV;
+    const eligible = evaluation.evLower >= this.profile.minEV;
     const reason = eligible
-      ? `evLower=${evaluation.evLower.toFixed(6)} > minEV=${this.profile.minEV}`
-      : `evLower=${evaluation.evLower.toFixed(6)} <= minEV=${this.profile.minEV}`;
+      ? `evLower=${evaluation.evLower.toFixed(6)} >= minEV=${this.profile.minEV}`
+      : `evLower=${evaluation.evLower.toFixed(6)} < minEV=${this.profile.minEV}`;
 
     if (projection.autoBetStatus !== 'ARMED') {
       this.recordDecision(event, projection, eligible, reason, 'auto-not-armed');
@@ -277,6 +339,8 @@ export class TableActor {
     if (!snapshot) return;
 
     if (!eligible) return;
+    // 策略门控:策略未选中当前市场时,只记录决策审计,绝不创建 intent/下注。
+    if (!strategyResult.selected) return;
     const reminder = reminderKey(event.shoeId, event.handId, projection.modelRevision, event.market);
     if (this.reminderKeys.has(reminder)) return;
     this.reminderKeys.add(reminder);
@@ -292,7 +356,7 @@ export class TableActor {
       shoeId: event.shoeId,
       handId: event.handId,
       market: event.market,
-      amount: this.defaultBetAmount,
+      amount: selectBetAmount(this.profile, evaluation.evLower, this.defaultBetAmount, this.riskLimits),
       mode: this.executionMode,
       idempotencyKey: `${this.tableId}:${event.shoeId}:${event.handId}:${event.market}:${projection.modelRevision}`,
       strategy: this.profile.betStrategy,
@@ -308,6 +372,8 @@ export class TableActor {
     this.placedKeys.add(placed);
 
     if (this.executionMode === 'shadow') {
+      // 影子模式没有回执事件,轮替状态在成功下单(含影子)时推进,否则 alternate 永远停在 start 市场。
+      this.advanceAlternate(event.market);
       this.riskManager.release(reservation.reservationId, true, 'shadow-execution');
       return;
     }
@@ -317,16 +383,19 @@ export class TableActor {
       return;
     }
 
-    const req: BetExecutionRequest = { intent, mode: 'simulated', reservationId: reservation.reservationId };
+    const req: BetExecutionRequest = { intent, mode: this.executionMode, reservationId: reservation.reservationId };
     let receipt: BetReceipt | null;
     try {
       receipt = await withTimeout(this.executor.requestBet(req), this.requestTimeoutMs);
     } catch {
-      receipt = null;
+      receipt = unknownExecutionReceipt(intent, reservation, 'executor-timeout-or-error');
     }
+    receipt ??= unknownExecutionReceipt(intent, reservation, 'executor-no-receipt');
     if (receipt) {
-      this.placedKeys.add(placed);
-      this.ledger.saveReceipt(receipt, this.tableId, event.shoeId, event.handId, event.market);
+      if (!receiptMatchesIntent(receipt, intent, reservation)) {
+        this.riskManager.release(reservation.reservationId, false, 'receipt-mismatch', receipt.receiptId);
+        return;
+      }
       const receiptEvent: NormalizedEvent = {
         type: 'betReceipt',
         eventId: newId('evt'),
@@ -341,9 +410,6 @@ export class TableActor {
         receipt,
       };
       await this.handleEvent(receiptEvent);
-      this.riskManager.attachReceipt(reservation.reservationId, receipt.receiptId);
-    } else {
-      this.riskManager.release(reservation.reservationId, false, 'executor-timeout-or-rejected');
     }
   }
 
@@ -374,7 +440,7 @@ export class TableActor {
       reason: auditNote ? `${reason}; strategy=${auditNote}` : reason,
       strategyChoice: strategyChoice ?? [],
       conservativePolicy: 'worst-case-burn-composition-v1',
-      createdAt: new Date().toISOString(),
+      createdAt: event.timestamp,
     };
     return this.ledger.saveDecision(snapshot) ? snapshot : null;
   }
@@ -384,24 +450,68 @@ export class TableActor {
     handId: string,
     market: string,
   ): Promise<void> {
-    if (this.ledger.hasReceipt(this.tableId, shoeId, handId, market)) return;
-    this.ledger.saveReceipt(receipt, this.tableId, shoeId, handId, market);
+    if (!this.ledger.hasReceipt(this.tableId, shoeId, handId, market)) {
+      this.ledger.saveReceipt(receipt, this.tableId, shoeId, handId, market);
+    }
     this.placedKeys.add(placedKey(this.tableId, shoeId, handId, market));
-    if (this.profile.betStrategy.type === 'alternate') {
-      this.alternateNext = market === 'bankerPair' ? 'playerPair' : 'bankerPair';
+    if (receipt.status === 'ACCEPTED' || receipt.status === 'SIMULATED') {
+      this.advanceAlternate(market);
+      this.riskManager.attachReceipt(receipt.reservationId, receipt.receiptId);
+      return;
     }
     if (receipt.status === 'REJECTED') {
-      const reservation = this.riskManager.snapshot().find(
-        r => r.reservationId === receipt.reservationId && r.status === 'RESERVED',
-      );
-      if (reservation) {
-        this.riskManager.release(reservation.reservationId, false, 'receipt-rejected', receipt.receiptId);
-      }
+      this.riskManager.release(receipt.reservationId, false, 'receipt-rejected', receipt.receiptId);
+      return;
+    }
+    this.riskManager.markUnknown(
+      receipt.reservationId,
+      'platform-acknowledgement-unknown',
+      receipt.receiptId,
+    );
+    if (this.projection.autoBetStatus === 'ARMED') {
+      await this.handleEvent({
+        type: 'autoDisarmChanged',
+        eventId: newId('evt'),
+        tableId: this.tableId,
+        timestamp: new Date().toISOString(),
+        sourceSeq: this.nextSyntheticSeq(),
+        source: 'orchestrator',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        shoeId,
+        reason: 'platform-acknowledgement-unknown',
+      });
     }
   }
 
+  private async recordOneShotReceipt(
+    command: OneShotBetCommand,
+    receipt: BetReceipt,
+  ): Promise<void> {
+    await this.handleEvent({
+      type: 'betReceipt',
+      eventId: newId('evt'),
+      tableId: this.tableId,
+      timestamp: receipt.createdAt,
+      sourceSeq: this.nextSyntheticSeq(),
+      source: 'orchestrator-one-shot',
+      schemaVersion: EVENT_SCHEMA_VERSION,
+      shoeId: command.shoeId,
+      handId: command.handId,
+      market: command.market,
+      receipt,
+    });
+  }
+
+  /** alternate 策略轮替指针推进;仅在该策略下生效。 */
+  private advanceAlternate(market: string): void {
+    if (this.profile.betStrategy.type !== 'alternate') return;
+    this.alternateNext = market === 'bankerPair' ? 'playerPair' : 'bankerPair';
+  }
+
   private nextSyntheticSeq(): number {
-    return Math.max(SYNTHETIC_SEQ_BASE, this.ledger.nextSourceSeq(this.tableId));
+    const next = Math.max(SYNTHETIC_SEQ_BASE, this.ledger.nextSourceSeq(this.tableId), this.syntheticSeq);
+    this.syntheticSeq = next + 1;
+    return next;
   }
 
   async setAutoBet(armed: boolean, shoeId?: string): Promise<void> {
@@ -427,6 +537,46 @@ export class TableActor {
   }
 }
 
+function selectBetAmount(profile: TableProfile, ev: number, defaultBetAmount: number, riskLimits: RiskLimits): number {
+  const sizing = riskLimits.betSizing;
+  if (sizing?.mode === 'capitalPercent') {
+    const amount = (sizing.bankroll ?? 0) * (sizing.percent ?? 0);
+    return sizing.maxPerBet === undefined ? amount : Math.min(amount, sizing.maxPerBet);
+  }
+  let amount = defaultBetAmount;
+  for (const tier of profile.betTiers ?? []) {
+    if (ev >= tier.minEV) amount = tier.amount;
+    else break;
+  }
+  return amount;
+}
+
+function unknownExecutionReceipt(
+  intent: BetIntent,
+  reservation: RiskReservation,
+  reason: 'executor-timeout-or-error' | 'executor-no-receipt',
+): BetReceipt {
+  return {
+    receiptId: `unknown-${intent.intentId}`,
+    intentId: intent.intentId,
+    reservationId: reservation.reservationId,
+    status: 'UNKNOWN',
+    amount: intent.amount,
+    market: intent.market,
+    mode: intent.mode,
+    externalRef: `orchestrator:${intent.tableId}:${intent.handId}:${reason}`,
+    createdAt: new Date().toISOString(),
+    raw: { reason },
+  };
+}
+
+export interface TableSettingsUpdate {
+  minEV: number;
+  betTiers: BetTier[];
+  defaultBetAmount: number;
+  monitorUrl?: string;
+}
+
 export interface OrchestratorOptions {
   ledger: SqliteLedger;
   riskLimits: RiskLimits;
@@ -435,7 +585,7 @@ export interface OrchestratorOptions {
 
 export interface RegisteredTableConfig {
   profile: TableProfile;
-  executionMode: 'shadow' | 'simulated';
+  executionMode: 'shadow' | 'simulated' | 'live';
   defaultBetAmount: number;
 }
 
@@ -471,9 +621,14 @@ export class Orchestrator {
     this.restoreTables();
   }
 
+  setExecutor(executor: Pick<BrowserAdapter, 'requestBet'> | null): void {
+    this.executor = executor;
+    for (const actor of this.actors.values()) actor.setExecutor(executor);
+  }
+
   registerTable(
     profile: TableProfile,
-    executionMode: 'shadow' | 'simulated' = 'shadow',
+    executionMode: 'shadow' | 'simulated' | 'live' = 'shadow',
     defaultBetAmount = 100,
   ): TableActor {
     assertValidTableProfile(profile);
@@ -486,6 +641,60 @@ export class Orchestrator {
     const actor = this.createActor(configs[profile.tableId]!);
     this.actors.set(profile.tableId, actor);
     return actor;
+  }
+
+  updateTableSettings(tableId: string, settings: TableSettingsUpdate): void {
+    this.updateTableSettingsForTables([tableId], settings);
+  }
+
+  updateTableSettingsForTables(tableIds: readonly string[], settings: TableSettingsUpdate): void {
+    if (!Number.isFinite(settings.defaultBetAmount) || settings.defaultBetAmount <= 0) {
+      throw new RangeError('defaultBetAmount must be a positive finite number');
+    }
+    const updates = tableIds.map(tableId => {
+      const actor = this.actors.get(tableId);
+      if (!actor) throw new Error(`unknown table ${tableId}`);
+      const profile = {
+        ...actor.getProfile(),
+        minEV: settings.minEV,
+        betTiers: structuredClone(settings.betTiers),
+        ...(settings.monitorUrl === undefined ? {} : { monitorUrl: settings.monitorUrl.trim() }),
+      };
+      assertValidTableProfile(profile);
+      return {
+        tableId,
+        actor,
+        profile,
+        executionMode: actor.snapshot().executionMode,
+      };
+    });
+    const configs = this.listTableConfigs();
+    for (const update of updates) {
+      configs[update.tableId] = {
+        profile: structuredClone(update.profile),
+        executionMode: update.executionMode,
+        defaultBetAmount: settings.defaultBetAmount,
+      };
+    }
+    this.ledger.setConfig(TABLE_CONFIG_KEY, configs);
+    for (const update of updates) {
+      update.actor.updateConfiguration(update.profile, settings.defaultBetAmount);
+    }
+  }
+
+  updateTableExecutionMode(tableId: string, mode: ExecutionMode): void {
+    const actor = this.actors.get(tableId);
+    if (!actor) throw new Error(`unknown table ${tableId}`);
+    const configs = this.listTableConfigs();
+    const config = configs[tableId];
+    if (!config) throw new Error(`missing table config ${tableId}`);
+    configs[tableId] = {
+      profile: structuredClone(config.profile),
+      executionMode: mode,
+      defaultBetAmount: config.defaultBetAmount,
+    };
+    this.ledger.setConfig(TABLE_CONFIG_KEY, configs);
+    actor.setExecutionMode(mode);
   }
 
   unregisterTable(tableId: string): void {
@@ -549,6 +758,14 @@ export class Orchestrator {
     };
   }
 
+  async clearMonitorData(): Promise<void> {
+    await this.flush();
+    this.ledger.clearMonitorData();
+    this.riskManager.reset(todayUtc());
+    this.actors.clear();
+    this.restoreTables();
+  }
+
   async close(): Promise<void> {
     await Promise.all([...this.actors.values()].map(actor => actor.flush()));
     this.ledger.close();
@@ -574,6 +791,14 @@ export class Orchestrator {
       riskLimits: this.riskLimits,
     });
   }
+}
+
+function receiptMatchesIntent(receipt: BetReceipt, intent: BetIntent, reservation: { reservationId: string }): boolean {
+  return receipt.intentId === intent.intentId
+    && receipt.reservationId === reservation.reservationId
+    && receipt.market === intent.market
+    && receipt.amount === intent.amount
+    && receipt.mode === intent.mode;
 }
 
 function placedKey(tableId: string, shoeId: string, handId: string, market: string): string {
