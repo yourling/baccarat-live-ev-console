@@ -3,6 +3,9 @@ import type { BetTier, ManualCorrection, NormalizedEvent, RiskLimits, TableProfi
 import type {
   DesktopRecordPage,
   DesktopRecordQuery,
+  DesktopKeepaliveSettings,
+  DesktopOperationalWagerCommand,
+  DesktopOperationalWagerResult,
   DesktopSnapshotOptions,
   OneShotLiveBetCommand,
   OneShotLiveBetResult,
@@ -25,6 +28,10 @@ const api = {
     ipcRenderer.invoke('console:set-execution-mode', tableId, mode),
   executeOneShotLiveBet: (command: OneShotLiveBetCommand): Promise<OneShotLiveBetResult> =>
     ipcRenderer.invoke('console:execute-one-shot-live-bet', command),
+  executeOperationalWager: (command: DesktopOperationalWagerCommand): Promise<DesktopOperationalWagerResult> =>
+    ipcRenderer.invoke('console:execute-operational-wager', command),
+  updateKeepaliveSettings: (settings: DesktopKeepaliveSettings) =>
+    ipcRenderer.invoke('console:update-keepalive-settings', settings),
   confirmPhysicalShoe: (tableId: string) => ipcRenderer.invoke('console:confirm-physical-shoe', tableId),
   applyManualCorrection: (tableId: string, correction: ManualCorrection, shoeId?: string) =>
     ipcRenderer.invoke('console:manual-correction', tableId, correction, shoeId),

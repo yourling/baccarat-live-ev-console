@@ -172,6 +172,31 @@ function betErrorMessage(error) {
 }
 
 function unknownBetReceipt(request, requestId, reason) {
+  const wager = request && request.wager ? request.wager : null;
+  if (wager && typeof wager === 'object') {
+    const tableId = typeof wager.tableId === 'string' ? wager.tableId : '';
+    const handId = typeof wager.handId === 'string' ? wager.handId : '';
+    return {
+      receiptId: `mstrom-bridge-operational-unknown-${requestId}-${Date.now()}`,
+      wagerId: typeof wager.wagerId === 'string' ? wager.wagerId : '',
+      tableId,
+      shoeId: typeof wager.shoeId === 'string' ? wager.shoeId : '',
+      handId,
+      market: wager.market,
+      amount: wager.amount,
+      source: wager.source,
+      status: 'UNKNOWN',
+      externalRef: `mstrom:${tableId}:${handId}`,
+      createdAt: new Date().toISOString(),
+      raw: {
+        reason,
+        commitPoint: 'confirmBet',
+        commitStarted: true,
+        tableId,
+        handId,
+      },
+    };
+  }
   const intent = request && request.intent ? request.intent : {};
   const tableId = typeof intent.tableId === 'string' ? intent.tableId : '';
   const handId = typeof intent.handId === 'string' ? intent.handId : '';
@@ -197,17 +222,26 @@ function unknownBetReceipt(request, requestId, reason) {
 
 function validateLiveBetMessage(message) {
   const request = message && message.request;
-  const intent = request && request.intent;
   if (!message || typeof message.requestId !== 'string' || !message.requestId) {
     throw new Error('invalid bet request id');
   }
-  if (!request || request.mode !== 'live' || !intent || intent.mode !== 'live') {
+  if (!request || request.mode !== 'live') {
     throw new Error('only live bet requests can enter the Dafabet executor');
   }
-  if (typeof intent.tableId !== 'string' || !/^[A-Z]\d{3}$/.test(intent.tableId)) {
+  const intent = request.intent;
+  const wager = request.wager;
+  if (intent && wager) {
+    throw new Error('bet request cannot contain both an EV intent and an operational wager');
+  }
+  const tableId = intent && intent.mode === 'live'
+    ? intent.tableId
+    : wager && typeof wager === 'object'
+      ? wager.tableId
+      : null;
+  if (typeof tableId !== 'string' || !/^[A-Z]\d{3}$/.test(tableId)) {
     throw new Error('invalid Dafabet table id');
   }
-  return { requestId: message.requestId, request, tableId: intent.tableId };
+  return { requestId: message.requestId, request, tableId };
 }
 
 async function executeUniqueMstromBet(message, generation) {

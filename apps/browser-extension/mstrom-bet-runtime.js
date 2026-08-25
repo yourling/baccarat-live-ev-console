@@ -2,7 +2,7 @@ if (typeof chrome === 'undefined' || !chrome || !chrome.scripting) {
   // The page world intentionally receives no runtime exports.
 } else {
 function probeMstromBetStore(tableId) {
-  const PLAY_TYPES = Object.freeze({ bankerPair: 4, playerPair: 5 });
+  const PLAY_TYPES = Object.freeze({ banker: 1, player: 2, bankerPair: 4, playerPair: 5 });
 
   function isObject(value) {
     return value !== null && typeof value === 'object';
@@ -123,6 +123,8 @@ function probeMstromBetStore(tableId) {
     balance: store ? optionalBalance(store) : null,
     disabledPlayTypes,
     limits: store ? {
+      banker: optionalLimit(store, PLAY_TYPES.banker),
+      player: optionalLimit(store, PLAY_TYPES.player),
       bankerPair: optionalLimit(store, PLAY_TYPES.bankerPair),
       playerPair: optionalLimit(store, PLAY_TYPES.playerPair),
     } : null,
@@ -133,7 +135,7 @@ function probeMstromBetStore(tableId) {
 }
 
 async function executeMstromBetOneShot(request) {
-  const PLAY_TYPES = Object.freeze({ bankerPair: 4, playerPair: 5 });
+  const PLAY_TYPES = Object.freeze({ banker: 1, player: 2, bankerPair: 4, playerPair: 5 });
   const POLL_INTERVAL_MS = 50;
   const REQUEST_TIMEOUT_MS = 5000;
   const COMMIT_POINT = 'confirmBet';
@@ -254,44 +256,93 @@ async function executeMstromBetOneShot(request) {
   }
 
   function parseRequest(value) {
-    if (!isObject(value) || !isObject(value.intent)) return null;
-    const intent = value.intent;
-    if (value.mode !== 'live' || intent.mode !== 'live') return null;
+    if (!isObject(value) || value.mode !== 'live') return null;
+    if (isObject(value.intent)) {
+      const intent = value.intent;
+      if (intent.mode !== 'live') return null;
+      if (
+        !validTableId(intent.tableId)
+        || typeof intent.shoeId !== 'string'
+        || intent.shoeId.trim().length === 0
+        || typeof intent.handId !== 'string'
+        || intent.handId.length === 0
+      ) {
+        return null;
+      }
+      if (intent.market !== 'bankerPair' && intent.market !== 'playerPair') return null;
+      if (normalizedAmount(intent.amount) === null) return null;
+      if (typeof intent.idempotencyKey !== 'string' || intent.idempotencyKey.trim().length === 0) {
+        return null;
+      }
+      return {
+        kind: 'pair',
+        request: value,
+        intent,
+        tableId: intent.tableId,
+        shoeId: intent.shoeId,
+        handId: intent.handId,
+        market: intent.market,
+        playType: PLAY_TYPES[intent.market],
+        amount: intent.amount,
+      };
+    }
+    if (!isObject(value.wager)) return null;
+    const wager = value.wager;
     if (
-      !validTableId(intent.tableId)
-      || typeof intent.shoeId !== 'string'
-      || intent.shoeId.trim().length === 0
-      || typeof intent.handId !== 'string'
-      || intent.handId.length === 0
+      !validTableId(wager.tableId)
+      || typeof wager.shoeId !== 'string'
+      || wager.shoeId.trim().length === 0
+      || typeof wager.handId !== 'string'
+      || wager.handId.length === 0
+      || typeof wager.wagerId !== 'string'
+      || wager.wagerId.trim().length === 0
+      || (wager.market !== 'banker' && wager.market !== 'player' && wager.market !== 'bankerPair' && wager.market !== 'playerPair')
+      || (wager.source !== 'manual' && wager.source !== 'keepalive')
+      || normalizedAmount(wager.amount) === null
     ) {
       return null;
     }
-    if (intent.market !== 'bankerPair' && intent.market !== 'playerPair') return null;
-    const normalized = normalizedAmount(intent.amount);
-    if (normalized === null) return null;
-    if (typeof intent.idempotencyKey !== 'string' || intent.idempotencyKey.trim().length === 0) {
-      return null;
-    }
     return {
+      kind: 'operational',
       request: value,
-      intent,
-      tableId: intent.tableId,
-      playType: PLAY_TYPES[intent.market],
-      amount: intent.amount,
+      wager,
+      tableId: wager.tableId,
+      shoeId: wager.shoeId,
+      handId: wager.handId,
+      market: wager.market,
+      playType: PLAY_TYPES[wager.market],
+      amount: wager.amount,
     };
   }
 
   function makeReceipt(parsed, status, raw) {
+    const createdAt = new Date().toISOString();
+    if (parsed.kind === 'operational') {
+      return {
+        receiptId: `mstrom-operational-${parsed.wager.wagerId}-${Date.now()}`,
+        wagerId: parsed.wager.wagerId,
+        tableId: parsed.tableId,
+        shoeId: parsed.shoeId,
+        handId: parsed.handId,
+        market: parsed.market,
+        amount: parsed.amount,
+        source: parsed.wager.source,
+        status,
+        externalRef: `mstrom:${parsed.tableId}:${parsed.handId}:${parsed.playType}`,
+        createdAt,
+        raw,
+      };
+    }
     return {
       receiptId: `mstrom-${String(parsed.intent.intentId || 'intent')}-${Date.now()}`,
       intentId: String(parsed.intent.intentId || ''),
       reservationId: String(parsed.request.reservationId || ''),
       status,
       amount: parsed.amount,
-      market: parsed.intent.market,
+      market: parsed.market,
       mode: 'live',
-      externalRef: `mstrom:${parsed.tableId}:${parsed.intent.handId}:${parsed.playType}`,
-      createdAt: new Date().toISOString(),
+      externalRef: `mstrom:${parsed.tableId}:${parsed.handId}:${parsed.playType}`,
+      createdAt,
       raw,
     };
   }
@@ -351,7 +402,7 @@ async function executeMstromBetOneShot(request) {
     if (!store) return null;
     const vid = readStoreValue(store, 'vid');
     if (vid !== undefined && vid !== null && vid !== parsed.tableId) return rejected(parsed, 'store-vid-mismatch');
-    if (readStoreValue(store, 'gmcode') !== parsed.intent.handId) return rejected(parsed, 'hand-mismatch');
+    if (readStoreValue(store, 'gmcode') !== parsed.handId) return rejected(parsed, 'hand-mismatch');
     if (readStoreValue(store, 'betEnabled') !== true) return rejected(parsed, 'betting-disabled');
 
     const stakePool = readStoreValue(store, 'stakePool');
@@ -421,7 +472,7 @@ async function executeMstromBetOneShot(request) {
     if (
       readStoreValue(store, 'betEnabled') !== true
       || diffPending(diffPool)
-      || readStoreValue(store, 'gmcode') !== parsed.intent.handId
+      || readStoreValue(store, 'gmcode') !== parsed.handId
     ) {
       restoreStake(store, stakePool, parsed.playType, beforeStake);
       return rejected(parsed, 'pre-confirm-state-changed');

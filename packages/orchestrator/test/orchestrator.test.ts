@@ -469,6 +469,82 @@ describe('orchestrator table actor', () => {
     ledger.close();
   });
 
+  it('derives event watermarks without counting persisted events', async () => {
+    // Given: the actor receives a normal new-shoe and betting-window event sequence.
+    const { ledger, riskLimits } = makeContext();
+    const profile = simProfile();
+    const orchestrator = new Orchestrator({ ledger, riskLimits });
+    const actor = orchestrator.registerTable(profile, 'shadow', 10);
+    const countEvents = vi.spyOn(ledger, 'countEvents').mockImplementation(() => {
+      throw new Error('high-frequency event handling must not count persisted events');
+    });
+    const events = new FixtureBuilder('t1')
+      .newShoe('s1', profile)
+      .openWindow('s1', 'h1', 'bankerPair')
+      .build();
+
+    try {
+      // When: the actor serializes the sequence.
+      await Promise.all(events.map(event => orchestrator.enqueue('t1', event)));
+      await actor.flush();
+
+      // Then: it advances the local watermark and never issues the count query.
+      expect(actor.getProjection().eventWatermark).toBe(2);
+      expect(countEvents).not.toHaveBeenCalled();
+    } finally {
+      ledger.close();
+    }
+  });
+
+  it('records an unobservable window as ineligible without executing while auto betting is armed', async () => {
+    // Given: a physical shoe with automatic betting armed in live execution mode.
+    const { ledger, riskLimits } = makeContext();
+    const profile = simProfile();
+    const requests: BetExecutionRequest[] = [];
+    const executor = {
+      requestBet: async (request: BetExecutionRequest) => {
+        requests.push(request);
+        return liveReceipt(request, 'ACCEPTED', 'should-not-execute');
+      },
+    };
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor });
+    const actor = orchestrator.registerTable(profile, 'live', 10);
+    const setup = new FixtureBuilder('t1').newShoe('s1', profile).build();
+    await Promise.all(setup.map(event => orchestrator.enqueue('t1', event)));
+    await actor.flush();
+    expect(actor.getProjection().autoBetStatus).toBe('ARMED');
+    const missedWindow: NormalizedEvent = {
+      type: 'bettingWindowClosed',
+      eventId: newId('evt'),
+      tableId: 't1',
+      timestamp: '2025-01-01T00:00:02.000Z',
+      sourceSeq: ledger.nextSourceSeq('t1'),
+      source: 'mstrom-runtime',
+      schemaVersion: 1,
+      shoeId: 's1',
+      handId: 'h1',
+      market: 'bankerPair',
+      openingObserved: false,
+    };
+
+    // When: the only observed state is a close after the actual wagering window passed.
+    await orchestrator.enqueue('t1', missedWindow);
+    await actor.flush();
+
+    // Then: the decision is audited as forbidden, with no live request, receipt, or reservation.
+    expect(ledger.listDecisions('t1')).toEqual([
+      expect.objectContaining({
+        eventId: missedWindow.eventId,
+        eligible: false,
+        reason: expect.stringContaining('betting-window-not-observable; execution-forbidden'),
+      }),
+    ]);
+    expect(requests).toEqual([]);
+    expect(ledger.listReceipts('t1')).toEqual([]);
+    expect(orchestrator.getReservations('t1')).toEqual([]);
+    ledger.close();
+  });
+
   it('simulated mode calls executor, persists receipt and keeps reservation until settlement', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile = simProfile();

@@ -1,4 +1,5 @@
 export * from './normalizer.js';
+export * from './operational-wager.js';
 import type {
   BetIntent,
   BetReceipt,

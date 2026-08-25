@@ -17,11 +17,22 @@ interface PostedMessage {
   readonly data?: unknown;
 }
 
+interface HookOptions {
+  readonly bankerCards?: readonly number[];
+  readonly hostname?: string;
+}
+
 function runHook(
   gmstatus: number,
   playerCards: readonly number[] = [0x38, 0x12, 0x03],
-  hostname = 'gci.agad.mstrom-uno.com',
+  options: string | HookOptions = {},
 ): readonly PostedMessage[] {
+  const hostname = typeof options === 'string'
+    ? options
+    : options.hostname ?? 'gci.agad.mstrom-uno.com';
+  const bankerCards = typeof options === 'string'
+    ? [0x39, 0x05]
+    : options.bankerCards ?? [0x39, 0x05];
   const messages: PostedMessage[] = [];
   const postMessage = vi.fn((message: PostedMessage) => {
     messages.push(message);
@@ -46,7 +57,7 @@ function runHook(
             pval: 3,
             bval: 4,
             pcard: playerCards,
-            bcard: [0x39, 0x05],
+            bcard: bankerCards,
           },
         }],
       },
@@ -511,6 +522,24 @@ describe('mstrom runtime-state hook', () => {
       bankerScore: 4,
       playerCards: [0x38, 0x12, 0x03],
       bankerCards: [0x39, 0x05],
+    }));
+  });
+
+  it('forwards the cardless runtime state that marks an open betting window', () => {
+    // Given: mstrom exposes a known round in gmstatus=1 before any card is dealt.
+    const messages = runHook(1, [], { bankerCards: [] });
+
+    // When: the MAIN-world hook samples the GameStore.
+    const raw = messages[0]?.data;
+
+    // Then: the bridge receives a usable opening-phase snapshot instead of silence.
+    expect(messages).toHaveLength(1);
+    expect(typeof raw).toBe('string');
+    if (typeof raw !== 'string') return;
+    expect(JSON.parse(raw)).toEqual(expect.objectContaining({
+      gmstatus: 1,
+      playerCards: [],
+      bankerCards: [],
     }));
   });
 

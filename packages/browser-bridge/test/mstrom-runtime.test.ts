@@ -26,6 +26,62 @@ describe('mstrom runtime parser', () => {
     expect(decodeMstromCardByte(0x1e)).toBeNull();
   });
 
+  it('emits deduplicated pair windows from cardless runtime phase changes', () => {
+    // Given: the runtime exposes an opening phase before either side has visible cards.
+    const parser = new MstromRuntimeParser();
+    const opening = snapshot({
+      gmstatus: 1,
+      playerScore: null,
+      bankerScore: null,
+      playerCards: [],
+      bankerCards: [],
+    });
+
+    // When: the opening phase repeats and later advances to the closed phase.
+    const firstOpen = parser.parse(opening);
+    const duplicateOpen = parser.parse(opening);
+    const closed = parser.parse(snapshot({
+      gmstatus: 2,
+      playerScore: null,
+      bankerScore: null,
+      playerCards: [],
+      bankerCards: [],
+      capturedAt: '2026-08-22T15:30:19.000Z',
+    }));
+
+    // Then: both pair markets receive exactly one open and one close event.
+    expect(firstOpen.map(event => event.type)).toEqual([
+      'newShoeSignal',
+      'bettingWindowOpened',
+      'bettingWindowOpened',
+    ]);
+    expect(firstOpen.filter(event => event.type === 'bettingWindowOpened').map(event => event.market))
+      .toEqual(['bankerPair', 'playerPair']);
+    expect(duplicateOpen).toEqual([]);
+    expect(closed.map(event => event.type)).toEqual([
+      'bettingWindowClosed',
+      'bettingWindowClosed',
+    ]);
+    expect(closed.filter(event => event.type === 'bettingWindowClosed').map(event => event.market))
+      .toEqual(['bankerPair', 'playerPair']);
+  });
+
+  it('marks a window unobservable when the first live snapshot arrives after cards appear', () => {
+    // Given: the first observable state for a round is already the post-window deal phase.
+    const parser = new MstromRuntimeParser();
+
+    // When: the runtime reports gmstatus=2 before any gmstatus=1 snapshot was observed.
+    const events = parser.parse(snapshot({ gmstatus: 2 }));
+    const closes = events.filter(event => event.type === 'bettingWindowClosed');
+
+    // Then: each pair market receives a close event explicitly marked as unobservable.
+    expect(closes).toEqual([
+      expect.objectContaining({ market: 'bankerPair', openingObserved: false }),
+      expect.objectContaining({ market: 'playerPair', openingObserved: false }),
+    ]);
+    expect(events.some(event => event.type === 'bettingWindowOpened')).toBe(false);
+  });
+
   it('emits cards incrementally and waits for a complete baccarat hand before settlement', () => {
     const parser = new MstromRuntimeParser();
     const first = parser.parse(snapshot());

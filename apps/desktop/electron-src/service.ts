@@ -22,6 +22,11 @@ import { BrowserBridgeServer } from '@baccarat/browser-bridge';
 import { ShadowRoomMonitor, type RoomDescriptor, type TableExport } from '@baccarat/room-monitor';
 import { buildRandomDemo } from '../src/core-demo.js';
 import {
+  OperationalWagerCoordinator,
+  type KeepaliveSettings,
+  type OperationalWagerResult,
+} from './operational-wager-coordinator.js';
+import {
   isExactOneShotLiveBetConfirmation,
   type DesktopConsoleSnapshot as ApiDesktopConsoleSnapshot,
   type DesktopRecordCounts,
@@ -101,6 +106,8 @@ function defaultMonitorTableIds(): string[] {
 
 export interface DesktopSnapshotOptions extends MonitorSummaryOptions {
   includeHistory?: boolean;
+  includeRecordCounts?: boolean;
+  includeSummary?: boolean;
 }
 
 export interface DesktopConsoleSnapshot extends Omit<ApiDesktopConsoleSnapshot, 'snapshot' | 'summary' | 'demoError'> {
@@ -136,6 +143,7 @@ function defaultConsoleLimits(): RiskLimits {
 export class DesktopConsoleService {
   private readonly ledger: SqliteLedger;
   private readonly orchestrator: Orchestrator;
+  private readonly operationalWagers: OperationalWagerCoordinator;
   private currentExecutor: Pick<BrowserAdapter, 'requestBet'> | null;
   private lastSeed?: number;
   private demoRunning = false;
@@ -153,6 +161,8 @@ export class DesktopConsoleService {
   private liveMonitorActivated = false;
   private oneShotLiveBetInFlight: Promise<OneShotLiveBetResult> | null = null;
   private executionStateOperation: Promise<void> = Promise.resolve();
+  private cachedRecordCounts?: DesktopRecordCounts;
+  private cachedSummary?: MonitorSummary;
   /** The transient allowlist used only while a serialized live transition is being validated. */
   private pendingMonitorTableIds?: readonly string[];
   /** Operator-managed, persisted ordered selection; mutation is the configuration operation. */
@@ -168,6 +178,13 @@ export class DesktopConsoleService {
       executor: defaultExecutor,
     });
     this.monitorTableIds = this.loadMonitorTableIds();
+    this.operationalWagers = new OperationalWagerCoordinator({
+      ledger: this.ledger,
+      bridge: () => this.browserBridge,
+      monitorTableIds: () => this.monitorTableIds,
+      tableState: tableId => this.orchestrator.getActor(tableId)?.snapshot(),
+      serialize: async operation => await this.enqueueExecutionStateOperation(operation),
+    });
     this.normalizeEvFloor();
   }
 
@@ -566,10 +583,15 @@ export class DesktopConsoleService {
     const receipts = includeHistory ? this.ledger.listReceipts() : this.ledger.listReceiptsTail();
     const reservations = includeHistory ? this.orchestrator.getReservations() : this.orchestrator.getReservations().slice(-200);
     const monitorCandidates = this.monitorCandidates();
-    const recordCounts = this.recordCounts(usingLiveMonitor ? displayedTableIds : undefined);
-    const summary = this.ledger.getMonitorSummary(
-      usingLiveMonitor ? { ...options, tableIds: displayedTableIds } : options,
-    );
+    const scopedTableIds = usingLiveMonitor ? displayedTableIds : undefined;
+    const recordCounts = options.includeRecordCounts === false && this.cachedRecordCounts !== undefined
+      ? this.cachedRecordCounts
+      : this.recordCounts(scopedTableIds);
+    if (options.includeRecordCounts !== false) this.cachedRecordCounts = recordCounts;
+    const summary = options.includeSummary === false && this.cachedSummary !== undefined
+      ? this.cachedSummary
+      : this.ledger.getMonitorSummary(usingLiveMonitor ? { ...options, tableIds: displayedTableIds } : options);
+    if (options.includeSummary !== false) this.cachedSummary = summary;
     return {
       dbPath: this.dbPath,
       isOpen: this.ledger.isOpen(),
@@ -578,6 +600,8 @@ export class DesktopConsoleService {
       monitorTableIds: [...this.monitorTableIds],
       monitorCandidates,
       recordCounts,
+      keepalive: this.operationalWagers.getKeepaliveState(),
+      operationalWagers: this.ledger.listOperationalWagersTail(),
       events: filterToDisplayedTables(events),
       decisions: filterToDisplayedTables(decisions),
       receipts: filterToDisplayedTables(receipts),
@@ -908,6 +932,22 @@ export class DesktopConsoleService {
     });
   }
 
+  async executeOperationalWager(input: {
+    readonly tableId: string;
+    readonly market: 'banker' | 'player' | 'bankerPair' | 'playerPair';
+    readonly amount: number;
+  }): Promise<OperationalWagerResult & { readonly snapshot: DesktopConsoleSnapshot }> {
+    const result = await this.operationalWagers.executeManual(input);
+    return { ...result, snapshot: this.snapshot() };
+  }
+
+  async updateKeepaliveSettings(settings: KeepaliveSettings): Promise<DesktopConsoleSnapshot> {
+    return await this.enqueueExecutionStateOperation(async () => {
+      await this.operationalWagers.updateKeepalive(settings);
+      return this.snapshot();
+    });
+  }
+
   async executeOneShotLiveBet(input: OneShotLiveBetCommand): Promise<OneShotLiveBetResult> {
     if (!isExactOneShotLiveBetConfirmation(input)) {
       throw new TypeError('one-shot confirmation must match exactly');
@@ -1023,6 +1063,7 @@ export class DesktopConsoleService {
 
   async close(): Promise<void> {
     await this.enqueueExecutionStateOperation(async () => {
+      this.operationalWagers.close();
       await this.stopDemo();
       await this.stopLiveRoomMonitorInner();
       await this.stopBrowserBridgeInner();

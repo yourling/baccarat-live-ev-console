@@ -1,0 +1,50 @@
+.operational-wager-controls {
+  display: grid;
+  grid-template-columns: minmax(96px, 120px) minmax(0, 1fr);
+  gap: var(--space-2, 8px);
+  align-items: end;
+  padding-top: var(--space-3, 12px);
+  border-top: 1px solid var(--border-default);
+}
+
+.operational-wager-controls__amount {
+  display: grid;
+  gap: var(--space-1, 4px);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.operational-wager-controls__amount input {
+  min-width: 0;
+}
+
+.operational-wager-controls__buttons {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-1, 4px);
+}
+
+.operational-wager-controls__buttons .button {
+  min-width: 0;
+}
+
+.operational-wager-controls__result {
+  grid-column: 1 / -1;
+  min-height: 18px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2, 8px);
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.operational-wager-controls__result span {
+  color: var(--status-warning);
+}
+
+@media (max-width: 680px) {
+  .operational-wager-controls {
+    grid-template-columns: 1fr;
+  }
+}

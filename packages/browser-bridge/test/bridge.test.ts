@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
-import type { BetExecutionRequest } from '@baccarat/adapter-contract';
+import type { BetExecutionRequest, OperationalWagerExecutionRequest } from '@baccarat/adapter-contract';
 import type { BetReceipt } from '@baccarat/contracts';
 import { BrowserBridgeServer } from '../src/index.js';
 import type { NormalizedEvent } from '@baccarat/contracts';
@@ -51,17 +51,47 @@ function betRequest(mode: BetExecutionRequest['mode'] = 'simulated'): BetExecuti
   };
 }
 
+function operationalWagerRequest(): OperationalWagerExecutionRequest {
+  return {
+    mode: 'live',
+    wager: {
+      wagerId: 'operational-1',
+      tableId: 'D055',
+      shoeId: 'shoe-1',
+      handId: 'GD055-1',
+      market: 'banker',
+      amount: 20,
+      source: 'keepalive',
+      createdAt: '2026-08-25T00:00:00.000Z',
+    },
+  };
+}
+
 type TestSocket = {
   send(data: string): void;
+};
+
+type TestObserverSocket = TestSocket & {
+  readonly readyState: number;
 };
 
 function isTestSocketSet(value: unknown): value is Set<TestSocket> {
   return value instanceof Set;
 }
 
+function isTestObserverSocketSet(value: unknown): value is Set<TestObserverSocket> {
+  return value instanceof Set;
+}
+
 function bridgeSockets(server: BrowserBridgeServer): Set<TestSocket> {
   const value: unknown = Reflect.get(server, 'sockets');
   if (!isTestSocketSet(value)) throw new Error('bridge socket set unavailable');
+  return value;
+}
+
+function bridgeObservers(server: BrowserBridgeServer): Set<TestObserverSocket> {
+  const value: unknown = Reflect.get(server, 'observers');
+  if (!isTestObserverSocketSet(value)) throw new Error('bridge observer set unavailable');
   return value;
 }
 
@@ -202,6 +232,51 @@ describe('browser bridge server', () => {
     expect(receipt).not.toBeNull();
     expect(receipt?.receiptId).toBe('r1');
     expect(receipt?.status).toBe('SIMULATED');
+
+    client.close();
+    await server.close();
+  });
+
+  it('round-trips a live operational wager through its matching receipt', async () => {
+    // Given: exactly one extension client is connected to the local bridge.
+    const server = new BrowserBridgeServer({ port: 0 });
+    const port = await server.start();
+    const client = extensionClient(port);
+    await new Promise<void>((resolve, reject) => {
+      client.once('open', resolve);
+      client.once('error', reject);
+    });
+
+    // When: the desktop requests a banker keepalive wager.
+    const resultPromise = server.requestOperationalWager(operationalWagerRequest());
+    client.on('message', data => {
+      const message = JSON.parse(data.toString()) as { readonly kind?: string; readonly requestId?: string };
+      if (message.kind !== 'betRequest' || message.requestId === undefined) return;
+      client.send(JSON.stringify({
+        kind: 'betResult',
+        requestId: message.requestId,
+        receipt: {
+          receiptId: 'operational-receipt-1',
+          wagerId: 'operational-1',
+          tableId: 'D055',
+          shoeId: 'shoe-1',
+          handId: 'GD055-1',
+          market: 'banker',
+          amount: 20,
+          source: 'keepalive',
+          status: 'ACCEPTED',
+          createdAt: '2026-08-25T00:00:01.000Z',
+        },
+      }));
+    });
+
+    // Then: the bridge preserves the operational receipt without coercing it into a pair-bet receipt.
+    await expect(resultPromise).resolves.toEqual(expect.objectContaining({
+      receiptId: 'operational-receipt-1',
+      wagerId: 'operational-1',
+      market: 'banker',
+      status: 'ACCEPTED',
+    }));
 
     client.close();
     await server.close();
@@ -1448,6 +1523,53 @@ describe('dynamic configured live-table selection', () => {
 
     expect(await server.discoverRooms()).toEqual([]);
     expect(() => server.openTable('dafabet-live', 'D065')).toThrow(/not selected/);
+  });
+
+  it('reveals runtime lifecycle metadata to observers without exposing card bytes or URL parameters', () => {
+    const server = new BrowserBridgeServer();
+    const messages: string[] = [];
+    bridgeObservers(server).add({
+      readyState: WebSocket.OPEN,
+      send: data => { messages.push(data); },
+    });
+
+    server.ingestClientMessage({
+      kind: 'networkCapture',
+      source: 'baccarat-bridge-runtime-state',
+      url: 'https://gci.agad.mstrom-uno.com/pc/pcv1/index.jsp?session=secret',
+      direction: 'recv',
+      encoding: 'text',
+      data: JSON.stringify({
+        tableId: 'D056',
+        roundId: 'GD0562682518P',
+        gmstatus: 4,
+        playerCards: [0x04, 0x13],
+        bankerCards: [0x3b, 0x06, 0x0d],
+        capturedAt: '2026-08-25T15:04:00.000Z',
+      }),
+    });
+
+    expect(messages).toHaveLength(1);
+    const observed: unknown = JSON.parse(messages[0] ?? '');
+    expect(observed).toMatchObject({
+      kind: 'observe',
+      message: {
+        kind: 'networkCapture',
+        source: 'baccarat-bridge-runtime-state',
+        url: 'https://gci.agad.mstrom-uno.com/pc/pcv1/index.jsp',
+        data: JSON.stringify({
+          tableId: 'D056',
+          roundId: 'GD0562682518P',
+          gmstatus: 4,
+          playerCardCount: 2,
+          bankerCardCount: 3,
+          capturedAt: '2026-08-25T15:04:00.000Z',
+        }),
+      },
+    });
+    expect(messages[0]).not.toContain('secret');
+    expect(messages[0]).not.toContain('playerCards');
+    expect(messages[0]).not.toContain('bankerCards');
   });
 });
 

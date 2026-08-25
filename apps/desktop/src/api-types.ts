@@ -1,4 +1,5 @@
-import type { DecisionHandRecord, MonitorSummary } from '@baccarat/ledger-state';
+import type { OperationalWagerMarket } from '@baccarat/adapter-contract';
+import type { DecisionHandRecord, MonitorSummary, OperationalWagerRecord } from '@baccarat/ledger-state';
 import type {
   BetReceipt,
   BettingMarket,
@@ -113,9 +114,79 @@ function readOneShotString(value: object, field: 'tableId' | 'shoeId' | 'handId'
 
 export interface DesktopSnapshotOptions {
   includeHistory?: boolean;
+  includeRecordCounts?: boolean;
+  includeSummary?: boolean;
   tableId?: string;
   fromTime?: string;
   toTime?: string;
+}
+
+export interface DesktopOperationalWagerCommand {
+  readonly tableId: string;
+  readonly market: OperationalWagerMarket;
+  readonly amount: number;
+}
+
+export type DesktopOperationalWagerResult = {
+  readonly status: 'ACCEPTED' | 'REJECTED' | 'UNKNOWN';
+  readonly tableId: string;
+  readonly reason?: string;
+  readonly wager?: OperationalWagerRecord['wager'];
+  readonly receipt?: OperationalWagerRecord['receipt'];
+  readonly snapshot: DesktopConsoleSnapshot;
+};
+
+export interface DesktopKeepaliveSettings {
+  readonly enabled: boolean;
+  readonly intervalMinutes: number;
+  readonly market: 'banker' | 'player';
+  readonly amount: number;
+}
+
+export interface DesktopKeepaliveState extends DesktopKeepaliveSettings {
+  readonly lastAttemptAt?: string;
+  readonly lastSuccessAt?: string;
+  readonly lastStatus?: 'ACCEPTED' | 'REJECTED' | 'UNKNOWN';
+  readonly lastTableId?: string;
+  readonly lastReason?: string;
+  readonly running: boolean;
+}
+
+export function parseDesktopOperationalWagerCommand(value: unknown): DesktopOperationalWagerCommand {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('operational wager command must be an object');
+  }
+  const tableId = readOneShotString(value, 'tableId');
+  const market = Reflect.get(value, 'market');
+  const amount = Reflect.get(value, 'amount');
+  if (market !== 'banker' && market !== 'player' && market !== 'bankerPair' && market !== 'playerPair') {
+    throw new TypeError(`unsupported operational wager market: ${String(market)}`);
+  }
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+    throw new TypeError('operational wager amount must be a positive finite number');
+  }
+  return { tableId, market, amount };
+}
+
+export function parseDesktopKeepaliveSettings(value: unknown): DesktopKeepaliveSettings {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('keepalive settings must be an object');
+  }
+  const enabled = Reflect.get(value, 'enabled');
+  const intervalMinutes = Reflect.get(value, 'intervalMinutes');
+  const market = Reflect.get(value, 'market');
+  const amount = Reflect.get(value, 'amount');
+  if (typeof enabled !== 'boolean') throw new TypeError('keepalive enabled must be a boolean');
+  if (!Number.isInteger(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 1_440) {
+    throw new RangeError('keepalive interval must be an integer from 1 to 1440 minutes');
+  }
+  if (market !== 'banker' && market !== 'player') {
+    throw new TypeError(`unsupported keepalive market: ${String(market)}`);
+  }
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+    throw new TypeError('keepalive amount must be a positive finite number');
+  }
+  return { enabled, intervalMinutes, market, amount };
 }
 
 export type DesktopRecordKind = 'events' | 'decisions' | 'ledger';
@@ -167,6 +238,8 @@ export interface DesktopConsoleSnapshot {
   monitorTableIds: readonly string[];
   monitorCandidates: readonly MonitorTableCandidate[];
   recordCounts: DesktopRecordCounts;
+  keepalive: DesktopKeepaliveState;
+  operationalWagers: readonly OperationalWagerRecord[];
   events: NormalizedEvent[];
   decisions: DecisionSnapshot[];
   receipts: ReceiptRow[];

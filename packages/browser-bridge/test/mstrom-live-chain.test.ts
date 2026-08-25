@@ -4,6 +4,7 @@ import { replayEvents } from '../../ledger-state/src/projection.js';
 import { MstromProtocolEventParser } from '../src/mstrom-protocol-events.js';
 import { parseMstromFrame } from '../src/mstrom-protocol.js';
 import { MstromRuntimeParser } from '../src/mstrom-runtime.js';
+import { MstromShoeSessionRegistry } from '../src/mstrom-shoe-session.js';
 import protocolFixtures from '../../../.tmp-mstrom/card-research/15-fixtures.json';
 
 type LiveSnapshot = {
@@ -28,6 +29,44 @@ function readLiveSnapshots(): readonly LiveSnapshot[] {
 }
 
 describe('captured mstrom runtime snapshots', () => {
+  it('uses the same event ids when protocol and runtime both report a betting window', () => {
+    const parsed = parseMstromFrame(protocolFixture('bcst-phase1-betting-01'));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok || parsed.frame.kind !== 'type2' || parsed.frame.roundId === undefined) return;
+
+    const tableId = 'D056';
+    const roundId = 'GD056268221DEDUP';
+    const shoeSessions = new MstromShoeSessionRegistry('runtime-protocol-dedup');
+    const protocol = new MstromProtocolEventParser(shoeSessions);
+    const runtime = new MstromRuntimeParser(shoeSessions);
+    const protocolEvents = protocol.ingest({
+      ...parsed.frame,
+      tableId,
+      roundId,
+      gameStatus: 1,
+      phase: 1,
+    }, '2026-08-25T12:00:00.000Z');
+    const runtimeEvents = runtime.parse({
+      tableId,
+      roundId,
+      gameType: 'BAC',
+      gmstatus: 1,
+      playerScore: null,
+      bankerScore: null,
+      playerCards: [],
+      bankerCards: [],
+      capturedAt: '2026-08-25T12:00:00.000Z',
+    });
+
+    const protocolWindowIds = protocolEvents
+      .filter(event => event.type === 'bettingWindowOpened')
+      .map(event => event.eventId);
+    const runtimeWindowIds = runtimeEvents
+      .filter(event => event.type === 'bettingWindowOpened')
+      .map(event => event.eventId);
+    expect(runtimeWindowIds).toEqual(protocolWindowIds);
+  });
+
   it('replays real runtime snapshots into cards and settlements', () => {
     const parser = new MstromRuntimeParser();
     for (const snapshot of readLiveSnapshots()) {

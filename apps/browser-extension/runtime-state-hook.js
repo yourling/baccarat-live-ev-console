@@ -83,7 +83,8 @@
     const playerCards = hiddenForShuffle ? [] : normalizedCardBytes(snapshot.pcard);
     const bankerCards = hiddenForShuffle ? [] : normalizedCardBytes(snapshot.bcard);
     if (playerCards === null || bankerCards === null) return;
-    if (!hiddenForShuffle && playerCards.length === 0 && bankerCards.length === 0) return;
+    const isWindowLifecycleState = gmstatus === 0 || gmstatus === 1 || gmstatus === 2;
+    if (!hiddenForShuffle && !isWindowLifecycleState && playerCards.length === 0 && bankerCards.length === 0) return;
 
     const payload = {
       tableId,

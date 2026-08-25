@@ -3,7 +3,11 @@ import path from 'node:path';
 import { DesktopConsoleService } from './service.js';
 import { MainWindowRetainer } from './main-window-retainer.js';
 import { acquireSingleInstance } from './single-instance.js';
-import { parseOneShotLiveBetCommand } from '../src/api-types.js';
+import {
+  parseDesktopKeepaliveSettings,
+  parseDesktopOperationalWagerCommand,
+  parseOneShotLiveBetCommand,
+} from '../src/api-types.js';
 
 const devUrl = process.env.VITE_DEV_SERVER_URL;
 let service: DesktopConsoleService | null = null;
@@ -61,6 +65,10 @@ function registerIpc(): void {
   });
   ipcMain.handle('console:execute-one-shot-live-bet', (_event, command: unknown) =>
     getService().executeOneShotLiveBet(parseOneShotLiveBetCommand(command)));
+  ipcMain.handle('console:execute-operational-wager', (_event, command: unknown) =>
+    getService().executeOperationalWager(parseDesktopOperationalWagerCommand(command)));
+  ipcMain.handle('console:update-keepalive-settings', (_event, settings: unknown) =>
+    getService().updateKeepaliveSettings(parseDesktopKeepaliveSettings(settings)));
   ipcMain.handle('console:confirm-physical-shoe', (_event, tableId: string) =>
     getService().confirmPhysicalShoe(tableId));
   ipcMain.handle('console:manual-correction', (_event, tableId: string, correction, shoeId?: string) =>

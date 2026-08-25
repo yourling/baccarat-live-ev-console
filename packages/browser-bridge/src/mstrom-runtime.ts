@@ -1,5 +1,6 @@
 import { EVENT_SCHEMA_VERSION, defaultProfile } from '@baccarat/contracts';
 import type {
+  BettingMarket,
   Card,
   CardObservedEvent,
   CardRank,
@@ -25,6 +26,8 @@ interface RoundState {
   readonly roundId: string;
   readonly playerBytes: Array<number | undefined>;
   readonly bankerBytes: Array<number | undefined>;
+  readonly openedMarkets: Set<BettingMarket>;
+  readonly closedMarkets: Set<BettingMarket>;
   settlementScores: { readonly player: number; readonly banker: number } | undefined;
   settled: boolean;
 }
@@ -38,6 +41,7 @@ interface TableState {
 const RANKS: readonly CardRank[] = [
   'A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K',
 ];
+const PAIR_MARKETS: readonly BettingMarket[] = ['bankerPair', 'playerPair'];
 
 export function decodeMstromCardByte(value: number): Card | null {
   if (!Number.isInteger(value) || value < 0 || value > 0xff || (value & 0xc0) !== 0) return null;
@@ -162,6 +166,12 @@ function isCompleteBaccaratHand(playerCards: readonly Card[], bankerCards: reado
   return bankerCards.length === 3 ? bankerShouldDraw : !bankerShouldDraw;
 }
 
+function windowEventType(gmstatus: number | null): 'bettingWindowOpened' | 'bettingWindowClosed' | undefined {
+  if (gmstatus === 1) return 'bettingWindowOpened';
+  if (gmstatus === 0 || gmstatus === 2) return 'bettingWindowClosed';
+  return undefined;
+}
+
 export class MstromRuntimeParser {
   private readonly tables = new Map<string, TableState>();
 
@@ -189,6 +199,8 @@ export class MstromRuntimeParser {
         roundId: snapshot.roundId,
         playerBytes: [],
         bankerBytes: [],
+        openedMarkets: new Set(),
+        closedMarkets: new Set(),
         settlementScores: undefined,
         settled: false,
       };
@@ -200,6 +212,7 @@ export class MstromRuntimeParser {
       || !slotsCompatible(snapshot.bankerCards, round.bankerBytes)
     ) return events;
 
+    this.emitWindowEvents(snapshot, table, events);
     this.observe(snapshot, table, round, 'player', snapshot.playerCards, round.playerBytes, events);
     this.observe(snapshot, table, round, 'banker', snapshot.bankerCards, round.bankerBytes, events);
 
@@ -221,6 +234,52 @@ export class MstromRuntimeParser {
       }
     }
     return events;
+  }
+
+  private emitWindowEvents(
+    snapshot: MstromRuntimeSnapshot,
+    table: TableState,
+    events: NormalizedEvent[],
+  ): void {
+    const type = windowEventType(snapshot.gmstatus);
+    const round = table.currentRound;
+    if (type === undefined || round === undefined) return;
+    for (const market of PAIR_MARKETS) {
+      if (type === 'bettingWindowOpened') {
+        if (round.openedMarkets.has(market) || round.closedMarkets.has(market)) continue;
+        round.openedMarkets.add(market);
+        events.push({
+          type,
+          eventId: `mstrom-window:${table.shoeId}:${type}:${round.roundId}:${market}`,
+          tableId: snapshot.tableId,
+          timestamp: snapshot.capturedAt,
+          sourceSeq: this.nextSourceSeq(table),
+          source: 'mstrom-runtime',
+          schemaVersion: EVENT_SCHEMA_VERSION,
+          shoeId: table.shoeId,
+          handId: round.roundId,
+          market,
+        });
+        continue;
+      }
+      const openingObserved = round.openedMarkets.has(market);
+      if (!openingObserved && snapshot.gmstatus !== 2) continue;
+      if (round.closedMarkets.has(market)) continue;
+      round.closedMarkets.add(market);
+      events.push({
+        type,
+        eventId: `mstrom-window:${table.shoeId}:${type}:${round.roundId}:${market}`,
+        tableId: snapshot.tableId,
+        timestamp: snapshot.capturedAt,
+        sourceSeq: this.nextSourceSeq(table),
+        source: 'mstrom-runtime',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        shoeId: table.shoeId,
+        handId: round.roundId,
+        market,
+        openingObserved,
+      });
+    }
   }
 
   ingest(input: unknown): NormalizedEvent[] {

@@ -164,6 +164,7 @@ export interface BettingWindowClosedEvent extends BaseEvent {
   shoeId: string;
   handId: string;
   market: BettingMarket;
+  openingObserved?: boolean;
 }
 
 /**

@@ -157,7 +157,7 @@ export class MstromProtocolEventParser {
     const shoe = this.shoeSessions.current(frame.tableId);
     return {
       type,
-      eventId: `mstrom-protocol:${shoe.shoeId}:${type}:${state.handId}:${market}`,
+      eventId: `mstrom-window:${shoe.shoeId}:${type}:${state.handId}:${market}`,
       tableId: frame.tableId,
       timestamp: capturedAt,
       sourceSeq: this.nextSeq(state),

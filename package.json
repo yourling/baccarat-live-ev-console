@@ -4,7 +4,8 @@
   "private": true,
   "workspaces": [
     "packages/*",
-    "apps/desktop"
+    "apps/desktop",
+    "apps/lord-god-space"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json --noEmit",
@@ -17,6 +18,9 @@
     "bridge:observe": "tsx scripts/bridge-observe.ts",
     "bridge:reload-extension": "tsx scripts/bridge-command.ts reloadExtension",
     "smoke": "tsx scripts/smoke-console.ts",
+    "dev:god": "npm run dev -w @lord-space/game",
+    "build:god": "npm run build -w @lord-space/game",
+    "typecheck:god": "npm run typecheck -w @lord-space/game",
     "package:desktop:win": "npm run package:win -w @baccarat/desktop",
     "package:desktop:win:installer": "npm run package:win:installer -w @baccarat/desktop"
   },

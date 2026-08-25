@@ -14,26 +14,26 @@ import type {
   TableStatus,
 } from '@baccarat/contracts';
 import type { DecisionHandRecord } from '@baccarat/ledger-state';
-import { oneShotConfirmationText } from '../api-types';
 import type {
   DesktopConsoleSnapshot,
+  DesktopKeepaliveState,
   DesktopRecordPage,
   DesktopRecordQuery,
   LedgerPageRow,
-  OneShotLiveBetCommand,
-  OneShotLiveBetResult,
   ReceiptRow,
   TableActorSnapshot,
 } from '../api-types';
 import { resolveVisibleHandCards } from './hand-cards';
 import {
-  getOneShotLiveBetModeGate,
   planExecutionModeChange,
   type ExecutionMode,
 } from './execution-mode';
+import { OperationalWagerControls } from './operational-wager-controls';
+import { KeepaliveSettings } from './keepalive-settings';
+import { decisionHandExplanation, planRecordViewChange, recordKindForView, recordTabCount, type ConsoleView } from './record-view';
 import './styles.css';
 
-type View = 'overview' | 'monitor' | 'decisions' | 'events' | 'ledger' | 'settings';
+type View = ConsoleView;
 type FilterValue = 'all';
 type MarketFilter = FilterValue | BettingMarket;
 type DecisionFilter = FilterValue | 'eligible' | 'ineligible';
@@ -48,10 +48,6 @@ type SnapshotRequestToken = {
 };
 type Counts = Record<CardRank, number>;
 type MarketEvaluation = { pMean: number; pLower: number; evMean: number; evLower: number };
-type OneShotReceiptStatus = OneShotLiveBetResult['status'];
-type OneShotLiveBetDesktop = NonNullable<Window['desktop']> & {
-  readonly executeOneShotLiveBet: (command: OneShotLiveBetCommand) => Promise<OneShotLiveBetResult>;
-};
 
 interface OverviewTableRow {
   tableId: string;
@@ -252,6 +248,8 @@ export function App() {
     try {
       const nextSnapshot = await window.desktop.snapshot({
         includeHistory: false,
+        includeRecordCounts: view !== 'monitor' && view !== 'settings',
+        includeSummary: view === 'overview',
         tableId: tableFilter === 'all' ? undefined : tableFilter,
         fromTime: startTime || undefined,
         toTime: endTime || undefined,
@@ -263,7 +261,7 @@ export function App() {
       if (!canApplySnapshot(request)) return;
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [beginSnapshotRequest, canApplySnapshot, tableFilter, startTime, endTime]);
+  }, [beginSnapshotRequest, canApplySnapshot, view, tableFilter, startTime, endTime]);
 
   const toggleDemo = useCallback(async () => {
     if (!window.desktop) return;
@@ -391,7 +389,6 @@ export function App() {
   const monitoredTableIds = new Set(snapshot?.monitorTableIds ?? []);
   const monitorCandidates = (snapshot?.monitorCandidates ?? []).filter(candidate => !monitoredTableIds.has(candidate.tableId));
   const selectedMonitorTable = selectedMonitorTableId === null ? undefined : tableMap.get(selectedMonitorTableId);
-  const hasPersistentLiveExecution = tables.some(table => table.executionMode === 'live');
   const visibleTables = useMemo(() => {
     if (view === 'monitor') return tables;
     return tables.filter(table => {
@@ -567,6 +564,15 @@ export function App() {
     setRecordQueryRevision(previous => previous + 1);
   }
 
+  function changeView(nextView: View) {
+    const next = planRecordViewChange(view, nextView);
+    setView(next.view);
+    if (!next.shouldLoadRecords) return;
+    setActiveRecordFilters(recordFilters);
+    setPage(1);
+    setRecordQueryRevision(previous => previous + 1);
+  }
+
   async function setAutoBet(tableId: string, armed: boolean, shoeId?: string) {
     if (!window.desktop) return;
     setError(null);
@@ -677,12 +683,12 @@ export function App() {
       </section>
 
       <nav className="view-tabs" aria-label="数据视图">
-        <TabButton active={view === 'overview'} onClick={() => setView('overview')} label="总览" count={overview.rows.length} />
-        <TabButton active={view === 'monitor'} onClick={() => setView('monitor')} label="监控" count={visibleTables.length} />
-        <TabButton active={view === 'decisions'} onClick={() => setView('decisions')} label="决策" count={snapshot?.recordCounts.decisions ?? 0} />
-        <TabButton active={view === 'events'} onClick={() => setView('events')} label="事件" count={snapshot?.recordCounts.events ?? 0} />
-        <TabButton active={view === 'ledger'} onClick={() => setView('ledger')} label="账本" count={snapshot?.recordCounts.ledger ?? 0} />
-        <TabButton active={view === 'settings'} onClick={() => setView('settings')} label="设置" />
+        <TabButton active={view === 'overview'} onClick={() => changeView('overview')} label="总览" count={overview.rows.length} />
+        <TabButton active={view === 'monitor'} onClick={() => changeView('monitor')} label="监控" count={visibleTables.length} />
+        <TabButton active={view === 'decisions'} onClick={() => changeView('decisions')} label="决策" count={recordTabCount({ currentView: view, targetKind: 'decisions', snapshotCount: snapshot?.recordCounts.decisions ?? 0, recordPage })} />
+        <TabButton active={view === 'events'} onClick={() => changeView('events')} label="事件" count={recordTabCount({ currentView: view, targetKind: 'events', snapshotCount: snapshot?.recordCounts.events ?? 0, recordPage })} />
+        <TabButton active={view === 'ledger'} onClick={() => changeView('ledger')} label="账本" count={recordTabCount({ currentView: view, targetKind: 'ledger', snapshotCount: snapshot?.recordCounts.ledger ?? 0, recordPage })} />
+        <TabButton active={view === 'settings'} onClick={() => changeView('settings')} label="设置" />
       </nav>
 
       {view !== 'monitor' && view !== 'settings' && (
@@ -746,6 +752,7 @@ export function App() {
                   key={table.tableId}
                   actor={table}
                   events={snapshot?.events ?? []}
+                  onSnapshot={setSnapshot}
                   onOpenSettings={() => setSelectedMonitorTableId(table.tableId)}
                   dragging={draggedTableId === table.tableId}
                   dropPlacement={monitorDropTarget?.tableId === table.tableId ? monitorDropTarget.placement : undefined}
@@ -783,7 +790,6 @@ export function App() {
         <MonitorTableSettingsDialog
           actor={selectedMonitorTable}
           riskLimits={snapshot?.snapshot.riskLimits}
-          hasPersistentLiveExecution={hasPersistentLiveExecution}
           liveModeConfirmationOpen={pendingLiveExecutionTableId === selectedMonitorTable.tableId}
           onClose={() => {
             setPendingLiveExecutionTableId(null);
@@ -802,8 +808,6 @@ export function App() {
           onDeckInputChange={value => setDeckInputs(previous => ({ ...previous, [selectedMonitorTable.tableId]: value }))}
           onCorrectDecks={() => void correctDecks(selectedMonitorTable.tableId)}
           onRemove={() => void removeMonitorTable(selectedMonitorTable.tableId)}
-          onSnapshot={setSnapshot}
-          onError={setError}
         />
       )}
 
@@ -821,6 +825,7 @@ export function App() {
           onSpeedChange={changeDemoSpeed}
           tables={tables}
           monitorTableIds={snapshot?.monitorTableIds ?? []}
+          keepalive={snapshot?.keepalive}
           riskLimits={snapshot?.snapshot.riskLimits}
           onSnapshot={setSnapshot}
           onSaveMonitorTables={persistMonitorTableIds}
@@ -834,6 +839,7 @@ export function App() {
 function TableMonitorRow(props: {
   actor: TableActorSnapshot;
   events: NormalizedEvent[];
+  onSnapshot: (snapshot: DesktopConsoleSnapshot) => void;
   onOpenSettings: () => void;
   dragging: boolean;
   dropPlacement?: MonitorDropTarget['placement'];
@@ -914,7 +920,7 @@ function TableMonitorRow(props: {
           <div><span>连接</span><strong>{CONNECTION_LABELS[projection.connectionStatus]}</strong></div>
         </div>
       </div>
-
+      <OperationalWagerControls actor={actor} onSnapshot={props.onSnapshot} />
     </article>
   );
 }
@@ -922,7 +928,6 @@ function TableMonitorRow(props: {
 function MonitorTableSettingsDialog(props: {
   actor: TableActorSnapshot;
   riskLimits?: RiskLimits;
-  hasPersistentLiveExecution: boolean;
   liveModeConfirmationOpen: boolean;
   onClose: () => void;
   onArm: () => void;
@@ -935,99 +940,9 @@ function MonitorTableSettingsDialog(props: {
   onDeckInputChange: (value: string) => void;
   onCorrectDecks: () => void;
   onRemove: () => void;
-  onSnapshot: (snapshot: DesktopConsoleSnapshot) => void;
-  onError: (error: string | null) => void;
 }) {
   const { actor } = props;
   const physicalShoeKnown = actor.projection.shoeId.length > 0 && actor.projection.shoeBaseline === 'physical-shoe';
-  const [oneShotMarket, setOneShotMarket] = useState<BettingMarket>('bankerPair');
-  const [oneShotAmount, setOneShotAmount] = useState('20');
-  const [oneShotSubmitting, setOneShotSubmitting] = useState(false);
-  const [oneShotReceiptStatus, setOneShotReceiptStatus] = useState<OneShotReceiptStatus | null>(null);
-  const [oneShotError, setOneShotError] = useState<string | null>(null);
-  const desktopApi = typeof window === 'undefined' ? undefined : window.desktop;
-  const oneShotApiAvailable = desktopApi !== undefined && hasOneShotLiveBetApi(desktopApi);
-  const parsedOneShotAmount = Number(oneShotAmount);
-  const oneShotMinimumAmount = Math.max(20, actor.projection.profileSnapshot.limits.minBet);
-  const oneShotMaximumAmount = Math.min(12_500, actor.projection.profileSnapshot.limits.maxBet);
-  const oneShotAmountValid = Number.isFinite(parsedOneShotAmount)
-    && parsedOneShotAmount >= oneShotMinimumAmount
-    && parsedOneShotAmount <= oneShotMaximumAmount;
-  const oneShotAmountError = `下注金额必须在 ${formatAmount(oneShotMinimumAmount)} 到 ${formatAmount(oneShotMaximumAmount)} 之间。`;
-  const oneShotModeGate = getOneShotLiveBetModeGate(props.hasPersistentLiveExecution);
-  const oneShotModeGateReason = oneShotModeGate === 'persistent-live-execution'
-    ? '持续实盘执行已启用；单次实盘验证只能在模拟执行状态下进行。'
-    : null;
-  const oneShotGateReason = !physicalShoeKnown
-    ? '当前不是已确认的 physical-shoe，不能进行单次实盘验证。'
-    : actor.projection.connectionStatus !== 'CONNECTED'
-      ? `当前连接状态为 ${CONNECTION_LABELS[actor.projection.connectionStatus]}，不能进行单次实盘验证。`
-      : actor.projection.status !== 'BETTING_WINDOW'
-        ? `当前牌桌状态为 ${STATUS_LABELS[actor.projection.status]}，只有下注窗口开放时才能提交。`
-        : actor.projection.currentHandId === null || actor.projection.currentHandId.length === 0
-          ? '当前没有可确认的游戏平台局号，不能进行单次实盘验证。'
-          : null;
-  const oneShotBlockedReason = !oneShotApiAvailable
-    ? '当前桌面桥未提供单次实盘执行能力，未发起任何请求。'
-    : oneShotModeGateReason
-      ?? oneShotGateReason
-        ?? (!oneShotAmountValid ? oneShotAmountError : null);
-
-  async function submitOneShotLiveBet() {
-    setOneShotError(null);
-    setOneShotReceiptStatus(null);
-    if (oneShotModeGateReason !== null) {
-      setOneShotError(oneShotModeGateReason);
-      return;
-    }
-    if (oneShotGateReason !== null) {
-      setOneShotError(oneShotGateReason);
-      return;
-    }
-    if (!oneShotAmountValid) {
-      setOneShotError(oneShotAmountError);
-      return;
-    }
-    const handId = actor.projection.currentHandId;
-    const desktop = window.desktop;
-    if (handId === null || handId.length === 0 || desktop === undefined || !hasOneShotLiveBetApi(desktop)) {
-      setOneShotError('单次实盘执行能力当前不可用，未发起任何请求。');
-      return;
-    }
-    const commandBase: Omit<OneShotLiveBetCommand, 'confirmation'> = {
-      tableId: actor.tableId,
-      shoeId: actor.projection.shoeId,
-      handId,
-      market: oneShotMarket,
-      amount: parsedOneShotAmount,
-    };
-    const confirmationText = oneShotConfirmationText(commandBase);
-    const confirmation = window.prompt(
-      `这是一笔真实资金下注，会扣除真实余额。\n牌桌：${commandBase.tableId}\n牌靴：${commandBase.shoeId}\n局号：${commandBase.handId}\n玩法：${MARKET_LABELS[commandBase.market]}\n金额：${formatAmount(commandBase.amount)}\n\n请逐字输入以下确认文本：\n${confirmationText}`,
-    );
-    if (confirmation === null) {
-      setOneShotError('已取消单次实盘验证，未发起任何请求。');
-      return;
-    }
-    if (confirmation !== confirmationText) {
-      setOneShotError('确认文本不匹配，未发起任何请求。');
-      return;
-    }
-    setOneShotSubmitting(true);
-    try {
-      const response = await desktop.executeOneShotLiveBet({
-        ...commandBase,
-        confirmation,
-      });
-      props.onSnapshot(response.snapshot);
-      setOneShotReceiptStatus(response.status);
-      if (response.status !== 'ACCEPTED' && response.reason) setOneShotError(response.reason);
-    } catch (error) {
-      setOneShotError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setOneShotSubmitting(false);
-    }
-  }
 
   return (
     <div className="monitor-settings-overlay" role="presentation" onClick={props.onClose}>
@@ -1087,68 +1002,6 @@ function MonitorTableSettingsDialog(props: {
             </label>
             <button className="button button--small button--ghost settings-save" onClick={props.onCorrectDecks}>保存修正</button>
           </div>
-        </section>
-        <section className="risk-settings" aria-labelledby="one-shot-live-bet-title">
-          <div className="record-heading">
-            <h2 id="one-shot-live-bet-title">单次实盘验证</h2>
-          </div>
-          <div className="notice notice--warning" id="one-shot-live-bet-warning" role="note">
-            提交后会调用 Dafabet 实盘下注并扣除真实资金。请先核对桌号、牌靴、当前局号、玩法和金额。
-          </div>
-          <form
-            className="settings-fields"
-            aria-describedby="one-shot-live-bet-warning one-shot-live-bet-help"
-            onSubmit={event => {
-              event.preventDefault();
-              void submitOneShotLiveBet();
-            }}
-          >
-            <label htmlFor="one-shot-market">
-              <span>下注市场</span>
-              <select
-                id="one-shot-market"
-                value={oneShotMarket}
-                onChange={event => setOneShotMarket(event.target.value === 'playerPair' ? 'playerPair' : 'bankerPair')}
-                disabled={oneShotSubmitting}
-              >
-                <option value="bankerPair">bankerPair（庄对）</option>
-                <option value="playerPair">playerPair（闲对）</option>
-              </select>
-            </label>
-            <label htmlFor="one-shot-amount">
-              <span>下注金额</span>
-              <input
-                id="one-shot-amount"
-                type="number"
-                min={String(oneShotMinimumAmount)}
-                max={String(oneShotMaximumAmount)}
-                step="1"
-                value={oneShotAmount}
-                onChange={event => setOneShotAmount(event.target.value)}
-                disabled={oneShotSubmitting}
-                aria-describedby="one-shot-live-bet-help"
-              />
-            </label>
-            <button
-              className="button button--small button--primary settings-save"
-              type="submit"
-              disabled={oneShotSubmitting || oneShotBlockedReason !== null}
-              title={oneShotBlockedReason ?? undefined}
-            >
-              {oneShotSubmitting ? '提交中' : '执行单次实盘下注'}
-            </button>
-          </form>
-          {oneShotBlockedReason && <p className="muted" role="status">{oneShotBlockedReason}</p>}
-          {oneShotError && <div className="notice notice--danger" role="alert">{oneShotError}</div>}
-          {oneShotReceiptStatus && (
-            <div className="badge-line" role="status" aria-live="polite" aria-atomic="true">
-              <span>最近回执</span>
-              <Badge
-                label={oneShotReceiptStatus}
-                tone={oneShotReceiptStatus === 'ACCEPTED' ? 'good' : oneShotReceiptStatus === 'REJECTED' ? 'danger' : 'warning'}
-              />
-            </div>
-          )}
         </section>
       </section>
     </div>
@@ -1471,6 +1324,7 @@ function SystemSettingsView(props: {
   onSpeedChange: (speed: number) => Promise<void>;
   tables: TableActorSnapshot[];
   monitorTableIds: readonly string[];
+  keepalive?: DesktopKeepaliveState;
   riskLimits?: RiskLimits;
   onSnapshot: (snapshot: DesktopConsoleSnapshot) => void;
   onSaveMonitorTables: (tableIds: readonly string[]) => Promise<DesktopConsoleSnapshot | null>;
@@ -1489,6 +1343,7 @@ function SystemSettingsView(props: {
         </div>
       </div>
       <MonitorTableSettings tableIds={props.monitorTableIds} onSave={props.onSaveMonitorTables} onError={props.onError} />
+      {props.keepalive && <KeepaliveSettings state={props.keepalive} onSnapshot={props.onSnapshot} onError={props.onError} />}
       <UnifiedBetSettings tableIds={props.monitorTableIds} tables={props.tables} riskLimits={props.riskLimits} onSnapshot={props.onSnapshot} onError={props.onError} />
     </section>
   );
@@ -1816,11 +1671,6 @@ function reservationStatusLabel(status: string): string {
 }
 
 
-function recordKindForView(view: View): DesktopRecordQuery['kind'] | null {
-  if (view === 'decisions' || view === 'events' || view === 'ledger') return view;
-  return null;
-}
-
 function timeInRange(value: string, startTime: string, endTime: string): boolean {
   const timestamp = new Date(value).getTime();
   if (!Number.isFinite(timestamp)) return false;
@@ -1986,13 +1836,6 @@ function DecisionActualResult({ result }: { result: DecisionHandRecord['actualRe
   );
 }
 
-function decisionHandExplanation(decision: DecisionHandRecord): string {
-  const parts = [decision.eligible ? '达到下注阈值' : '未达到下注阈值'];
-  if (decision.reasons.some(reason => reason.includes('auto-not-armed'))) parts.push('自动下注当前已暂停');
-  if (decision.eligible && decision.selectedMarkets.length === 0 && !parts.includes('自动下注当前已暂停')) parts.push('策略未选择市场');
-  return parts.join(' · ');
-}
-
 function eventDescription(event: NormalizedEvent): string {
   switch (event.type) {
     case 'cardObserved': return (event.position ? positionLabel(event.position) + '：' : '') + cardLabel(event.card);
@@ -2120,8 +1963,4 @@ function formatTime(value: string): string {
 
 function cx(...values: Array<string | false | null | undefined>): string {
   return values.filter(Boolean).join(' ');
-}
-
-function hasOneShotLiveBetApi(value: NonNullable<Window['desktop']>): value is OneShotLiveBetDesktop {
-  return typeof Reflect.get(value, 'executeOneShotLiveBet') === 'function';
 }

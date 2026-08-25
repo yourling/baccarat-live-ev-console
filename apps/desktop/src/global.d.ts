@@ -1,5 +1,8 @@
 import type {
   DesktopConsoleSnapshot,
+  DesktopKeepaliveSettings,
+  DesktopOperationalWagerCommand,
+  DesktopOperationalWagerResult,
   DesktopRecordPage,
   DesktopRecordQuery,
   DesktopSnapshotOptions,
@@ -32,6 +35,8 @@ declare global {
       setAutoBet: (tableId: string, armed: boolean, shoeId?: string) => Promise<DesktopConsoleSnapshot>;
       setExecutionMode: (tableId: string, mode: 'shadow' | 'live') => Promise<DesktopConsoleSnapshot>;
       executeOneShotLiveBet: (command: OneShotLiveBetCommand) => Promise<OneShotLiveBetResult>;
+      executeOperationalWager: (command: DesktopOperationalWagerCommand) => Promise<DesktopOperationalWagerResult>;
+      updateKeepaliveSettings: (settings: DesktopKeepaliveSettings) => Promise<DesktopConsoleSnapshot>;
       confirmPhysicalShoe: (tableId: string) => Promise<DesktopConsoleSnapshot>;
       applyManualCorrection: (tableId: string, correction: ManualCorrection, shoeId?: string) => Promise<DesktopConsoleSnapshot>;
       updateRiskLimits: (limits: RiskLimits) => Promise<DesktopConsoleSnapshot>;

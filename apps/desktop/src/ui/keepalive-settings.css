@@ -1,0 +1,28 @@
+.keepalive-settings__fields {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.keepalive-settings__toggle {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+}
+
+.keepalive-settings__toggle input {
+  inline-size: 18px;
+  block-size: 18px;
+}
+
+.keepalive-settings__history {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3, 12px);
+  margin-top: var(--space-3, 12px);
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+@media (max-width: 960px) {
+  .keepalive-settings__fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

@@ -5,18 +5,16 @@
  *   1. use BetExecutionRequest.mode = "live";
  *   2. set chrome.storage.local.liveBetEnabled = true;
  *
- * Pair play types are taken from the site's public runtime constants:
- *   bankerPair = 4, playerPair = 5.
+ * Play types are taken from the site's public runtime constants:
+ *   banker = 1, player = 2, bankerPair = 4, playerPair = 5.
  */
 (function () {
-  const PLAY_TYPES = Object.freeze({ bankerPair: 4, playerPair: 5 });
+  const PLAY_TYPES = Object.freeze({ banker: 1, player: 2, bankerPair: 4, playerPair: 5 });
   const POLL_INTERVAL_MS = 100;
   const REQUEST_TIMEOUT_MS = 5000;
 
   function playTypeForMarket(market) {
-    return market === 'bankerPair' ? PLAY_TYPES.bankerPair
-      : market === 'playerPair' ? PLAY_TYPES.playerPair
-      : null;
+    return Object.prototype.hasOwnProperty.call(PLAY_TYPES, market) ? PLAY_TYPES[market] : null;
   }
 
   function getAmount(pool, playType) {

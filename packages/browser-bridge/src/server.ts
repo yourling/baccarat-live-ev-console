@@ -1,5 +1,9 @@
 import { EVENT_SCHEMA_VERSION, sha256, stableStringify, defaultProfile, newId, type BetReceipt, type NormalizedEvent } from '@baccarat/contracts';
-import type { BetExecutionRequest } from '@baccarat/adapter-contract';
+import type {
+  BetExecutionRequest,
+  OperationalWagerExecutionRequest,
+  OperationalWagerReceipt,
+} from '@baccarat/adapter-contract';
 import type { IncomingMessage } from 'node:http';
 import type {
   MonitorConnectionState,
@@ -13,7 +17,13 @@ import type {
   TableExportSink,
 } from '@baccarat/room-monitor';
 import { WebSocketServer, WebSocket } from 'ws';
-import type { BridgeClientMessage, BridgeRoomDescriptor, BridgeServerMessage } from './protocol.js';
+import type {
+  BridgeClientMessage,
+  BridgeExecutionReceipt,
+  BridgeExecutionRequest,
+  BridgeRoomDescriptor,
+  BridgeServerMessage,
+} from './protocol.js';
 import { EvolutionBaccaratParser } from './evolution.js';
 import { MstromProtocolEventParser } from './mstrom-protocol-events.js';
 import { parseMstromFrame } from './mstrom-protocol.js';
@@ -30,7 +40,7 @@ export interface BrowserBridgeServerOptions {
 }
 
 type PendingBet = {
-  resolve: (receipt: BetReceipt | null) => void;
+  resolve: (receipt: BridgeExecutionReceipt | null) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
   ownerSocket: WebSocket | undefined;
@@ -108,13 +118,58 @@ function redactedNetworkUrl(raw: string): string {
   }
 }
 
+type RuntimeStateObservation = {
+  readonly tableId: string;
+  readonly roundId: string;
+  readonly gmstatus: number | null;
+  readonly playerCardCount: number;
+  readonly bankerCardCount: number;
+  readonly capturedAt: string;
+};
+
+function runtimeStateObservation(raw: string): RuntimeStateObservation | undefined {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+    const tableId = Reflect.get(parsed, 'tableId');
+    const roundId = Reflect.get(parsed, 'roundId');
+    const gmstatus = Reflect.get(parsed, 'gmstatus');
+    const playerCards = Reflect.get(parsed, 'playerCards');
+    const bankerCards = Reflect.get(parsed, 'bankerCards');
+    const capturedAt = Reflect.get(parsed, 'capturedAt');
+    if (
+      typeof tableId !== 'string'
+      || typeof roundId !== 'string'
+      || (gmstatus !== null && (typeof gmstatus !== 'number' || !Number.isFinite(gmstatus)))
+      || !Array.isArray(playerCards)
+      || !Array.isArray(bankerCards)
+      || typeof capturedAt !== 'string'
+    ) return undefined;
+    return {
+      tableId,
+      roundId,
+      gmstatus,
+      playerCardCount: playerCards.length,
+      bankerCardCount: bankerCards.length,
+      capturedAt,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 function observableNetworkCapture(
   message: Extract<BridgeClientMessage, { kind: 'networkCapture' }>,
 ): Extract<BridgeClientMessage, { kind: 'networkCapture' }> {
+  const runtimeState = message.source === 'baccarat-bridge-runtime-state'
+    ? runtimeStateObservation(message.data)
+    : undefined;
   return {
     ...message,
     url: redactedNetworkUrl(message.url),
-    data: `[redacted ${message.data.length} bytes]`,
+    data: runtimeState === undefined
+      ? `[redacted ${message.data.length} bytes]`
+      : JSON.stringify(runtimeState),
   };
 }
 
@@ -490,6 +545,18 @@ export class BrowserBridgeServer implements RoomMonitor {
     }]);
   }
   async requestBet(request: BetExecutionRequest): Promise<BetReceipt | null> {
+    const receipt = await this.requestExecution(request);
+    if (receipt === null || isBetReceipt(receipt)) return receipt;
+    throw new Error('browser extension returned an operational wager receipt for a pair-bet request');
+  }
+
+  async requestOperationalWager(request: OperationalWagerExecutionRequest): Promise<OperationalWagerReceipt | null> {
+    const receipt = await this.requestExecution(request);
+    if (receipt === null || isOperationalWagerReceipt(receipt)) return receipt;
+    throw new Error('browser extension returned a pair-bet receipt for an operational wager request');
+  }
+
+  private async requestExecution(request: BridgeExecutionRequest): Promise<BridgeExecutionReceipt | null> {
     const sockets = [...this.sockets];
     if (request.mode === 'live' && sockets.length !== 1) {
       throw new Error(LIVE_EXTENSION_CONNECTION_ERROR);
@@ -500,7 +567,7 @@ export class BrowserBridgeServer implements RoomMonitor {
     const requestId = newId('bet');
     const message: BridgeServerMessage = { kind: 'betRequest', requestId, request };
     const raw = JSON.stringify(message);
-    const resultPromise = new Promise<BetReceipt | null>((resolve, reject) => {
+    const resultPromise = new Promise<BridgeExecutionReceipt | null>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingBets.delete(requestId);
         reject(new Error(`bet request timed out: ${requestId}`));
@@ -949,6 +1016,15 @@ function runtimeStateTableId(raw: string): string | null {
     return null;
   }
 }
+
+function isBetReceipt(value: BridgeExecutionReceipt): value is BetReceipt {
+  return 'intentId' in value;
+}
+
+function isOperationalWagerReceipt(value: BridgeExecutionReceipt): value is OperationalWagerReceipt {
+  return 'wagerId' in value;
+}
+
 function exportKey(roomId: string, tableId: string): string {
   return `${roomId}::${tableId}`;
 }

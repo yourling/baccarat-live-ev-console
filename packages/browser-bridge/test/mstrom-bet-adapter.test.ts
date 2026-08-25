@@ -116,6 +116,8 @@ describe('Dafabet mstrom MAIN-world bet runtime', () => {
       balance: 100,
       disabledPlayTypes: [],
       limits: {
+        banker: { min: 1, max: 1000, invalid: false },
+        player: { min: 1, max: 1000, invalid: false },
         bankerPair: { min: 1, max: 1000, invalid: false },
         playerPair: { min: 1, max: 1000, invalid: false },
       },

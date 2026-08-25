@@ -13,6 +13,7 @@ import {
   sha256,
   stableStringify,
 } from '@baccarat/contracts';
+import type { OperationalWagerRecord } from './operational-wager.js';
 import { replayEvents } from './projection.js';
 
 type EventRow = {
@@ -44,6 +45,12 @@ type ReservationRow = {
   status: string;
   payload: string;
   created_at: string;
+};
+
+type OperationalWagerRow = {
+  id: number;
+  wager_id: string;
+  payload: string;
 };
 
 
@@ -337,8 +344,9 @@ export class LedgerConflictError extends Error {
 
 export type AppendEventResult = 'appended' | 'duplicate';
 
-const SCHEMA_VERSION = '2';
+const SCHEMA_VERSION = '3';
 
+// allow: SIZE_OK — SQLite schema, atomic persistence, and read projections share one transaction boundary.
 export class SqliteLedger {
   private db: Database.Database;
 
@@ -424,14 +432,27 @@ export class SqliteLedger {
         payload TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS operational_wagers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        wager_id TEXT NOT NULL UNIQUE,
+        table_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_operational_wagers_table_created
+        ON operational_wagers(table_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_operational_wagers_created
+        ON operational_wagers(created_at);
     `);
     const row = this.db.prepare('SELECT value FROM ledger_meta WHERE key = ?').get('schema_version') as { value: string } | undefined;
     if (!row) {
       this.db.prepare('INSERT INTO ledger_meta (key, value) VALUES (?, ?)').run('schema_version', SCHEMA_VERSION);
     } else if (row.value === SCHEMA_VERSION) {
       // 当前版本,无需迁移
-    } else if (row.value === '1' && SCHEMA_VERSION === '2') {
-      this.rebuildReservationsTable();
+    } else if (row.value === '1' || row.value === '2') {
+      if (row.value === '1') this.rebuildReservationsTable();
       this.db.prepare('UPDATE ledger_meta SET value = ? WHERE key = ?').run(SCHEMA_VERSION, 'schema_version');
     } else {
       throw new Error(`ledger schema version mismatch: db=${row.value}, code=${SCHEMA_VERSION}; refusing to open`);
@@ -495,6 +516,7 @@ export class SqliteLedger {
       this.db.prepare('DELETE FROM decisions').run();
       this.db.prepare('DELETE FROM receipts').run();
       this.db.prepare('DELETE FROM reservations').run();
+      this.db.prepare('DELETE FROM operational_wagers').run();
       this.db.prepare('DELETE FROM risk_state').run();
     });
     this.db.exec('VACUUM');
@@ -521,6 +543,40 @@ export class SqliteLedger {
       handId: row.hand_id,
       market: row.market,
     }));
+  }
+
+  saveOperationalWager(record: OperationalWagerRecord): boolean {
+    const payload = stableStringify(record);
+    const existing = this.db.prepare('SELECT payload FROM operational_wagers WHERE wager_id = ?')
+      .get(record.wager.wagerId) as { payload: string } | undefined;
+    if (existing) {
+      if (existing.payload !== payload) {
+        throw new LedgerConflictError(`operational wager ${record.wager.wagerId} already exists with a different payload`);
+      }
+      return false;
+    }
+    this.db.prepare(`
+      INSERT INTO operational_wagers (wager_id, table_id, source, status, payload, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      record.wager.wagerId,
+      record.wager.tableId,
+      record.wager.source,
+      record.status,
+      payload,
+      record.wager.createdAt,
+    );
+    return true;
+  }
+
+  listOperationalWagersTail(limit = 100): OperationalWagerRecord[] {
+    const rows = this.db.prepare(`
+      SELECT id, wager_id, payload
+      FROM operational_wagers
+      ORDER BY id DESC
+      LIMIT ?
+    `).all(limit) as OperationalWagerRow[];
+    return rows.reverse().map(row => JSON.parse(row.payload) as OperationalWagerRecord);
   }
 
   getMonitorSummary(options: MonitorSummaryOptions = {}): MonitorSummary {

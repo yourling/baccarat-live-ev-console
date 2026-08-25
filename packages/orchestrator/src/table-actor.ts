@@ -231,7 +231,7 @@ export class TableActor {
 
   private async handleEvent(event: NormalizedEvent): Promise<void> {
     const previousProjection = this.projection;
-    const watermark = this.ledger.countEvents(this.tableId) + 1;
+    const watermark = previousProjection.eventWatermark + 1;
     const tentativeState = applyEvent(new Map([[this.tableId, previousProjection]]), event, watermark);
     const tentativeProjection = tentativeState.get(this.tableId) ?? emptyProjection(this.tableId);
     const appended = this.ledger.appendEvent(event);
@@ -249,6 +249,10 @@ export class TableActor {
     }
     if (event.type === 'bettingWindowOpened') {
       await this.evaluateWindow(event, this.projection);
+      return;
+    }
+    if (event.type === 'bettingWindowClosed' && event.openingObserved === false) {
+      this.recordUnobservableWindow(event, this.projection);
       return;
     }
     if (event.type === 'handSettled') {
@@ -282,6 +286,10 @@ export class TableActor {
     }
     if (event.type === 'bettingWindowOpened') {
       await this.evaluateWindow(event, this.projection);
+      return;
+    }
+    if (event.type === 'bettingWindowClosed' && event.openingObserved === false) {
+      this.recordUnobservableWindow(event, this.projection);
       return;
     }
     if (event.type === 'handSettled') {
@@ -413,8 +421,21 @@ export class TableActor {
     }
   }
 
+  private recordUnobservableWindow(
+    event: Extract<NormalizedEvent, { type: 'bettingWindowClosed' }>,
+    projection: ShoeStateProjection,
+  ): void {
+    if (event.shoeId !== projection.shoeId || projection.sealed) return;
+    this.recordDecision(
+      event,
+      projection,
+      false,
+      'betting-window-not-observable; execution-forbidden',
+    );
+  }
+
   private recordDecision(
-    event: Extract<NormalizedEvent, { type: 'bettingWindowOpened' }>,
+    event: Extract<NormalizedEvent, { type: 'bettingWindowOpened' | 'bettingWindowClosed' }>,
     projection: ShoeStateProjection,
     eligible: boolean,
     reason: string,
