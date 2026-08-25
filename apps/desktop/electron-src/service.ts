@@ -535,18 +535,22 @@ export class DesktopConsoleService {
       ledger: this.ledger.listReservationsPage(scope).total,
     };
   }
-  snapshot(options: DesktopSnapshotOptions = {}): DesktopConsoleSnapshot {
-    const includeHistory = options.includeHistory !== false;
-    const fullSnapshot = this.orchestrator.snapshot();
-    const usingLiveMonitor = this.liveMonitorActivated;
+
+  private displayedTableIds(fullSnapshot: OrchestratorSnapshot): string[] {
+    if (!this.liveMonitorActivated) return Object.keys(fullSnapshot.tables);
     const simulatedTableIds = this.demoRunning
       ? Object.values(fullSnapshot.tables)
         .filter(table => table.executionMode === 'simulated')
         .map(table => table.tableId)
       : [];
-    const displayedTableIds = usingLiveMonitor
-      ? [...this.monitorTableIds, ...simulatedTableIds.filter(tableId => !this.monitorTableIds.includes(tableId))]
-      : Object.keys(fullSnapshot.tables);
+    return [...this.monitorTableIds, ...simulatedTableIds.filter(tableId => !this.monitorTableIds.includes(tableId))];
+  }
+
+  snapshot(options: DesktopSnapshotOptions = {}): DesktopConsoleSnapshot {
+    const includeHistory = options.includeHistory !== false;
+    const fullSnapshot = this.orchestrator.snapshot();
+    const usingLiveMonitor = this.liveMonitorActivated;
+    const displayedTableIds = this.displayedTableIds(fullSnapshot);
     const activeTableIds = new Set(displayedTableIds);
     const tables = Object.fromEntries(
       displayedTableIds.flatMap(tableId => {
@@ -747,7 +751,7 @@ export class DesktopConsoleService {
     // Record pages are part of the live dashboard surface. Apply the same monitor-table
     // scope before pagination so unrelated historical tables cannot inflate totals or rows.
     const scopedQuery = this.liveMonitorActivated
-      ? { ...query, tableIds: this.monitorTableIds }
+      ? { ...query, tableIds: this.displayedTableIds(this.orchestrator.snapshot()) }
       : query;
     if (query.kind === 'events') {
       const page = this.ledger.listEventsPage(scopedQuery);

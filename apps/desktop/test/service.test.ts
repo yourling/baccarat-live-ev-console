@@ -1777,4 +1777,30 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('includes simulated record pages only while a live-monitor demo is running', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      // Given: live monitoring and a simulated demo table with persisted data.
+      await service.updateMonitorTableIds(['D055']);
+      await service.startLiveRoomMonitor(0);
+      await service.registerTable(defaultProfile('P001'), 'simulated', 100);
+      await service.injectEvent(monitorShoeEvent('P001', 'p001-demo-record'));
+
+      // When: the continuous demo is active.
+      service['demoRunning'] = true;
+      const running = service.queryRecords({ kind: 'events', page: 1, pageSize: 20 });
+
+      // Then: its simulated records appear in the paginated live-console view.
+      expect(running.total).toBe(1);
+      expect(running.events?.map(event => event.tableId)).toEqual(['P001']);
+
+      // When / Then: stopping the demo restores the real-monitor-only scope.
+      service['demoRunning'] = false;
+      const stopped = service.queryRecords({ kind: 'events', page: 1, pageSize: 20 });
+      expect(stopped.total).toBe(0);
+    } finally {
+      await service.close();
+    }
+  });
+
 });
