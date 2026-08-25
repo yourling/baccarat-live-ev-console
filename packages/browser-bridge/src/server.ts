@@ -1,5 +1,6 @@
 import { EVENT_SCHEMA_VERSION, sha256, stableStringify, defaultProfile, newId, type BetReceipt, type NormalizedEvent } from '@baccarat/contracts';
 import type { BetExecutionRequest } from '@baccarat/adapter-contract';
+import type { IncomingMessage } from 'node:http';
 import type {
   MonitorConnectionState,
   MonitorHealth,
@@ -45,16 +46,96 @@ const OBSERVABLE_KINDS = new Set(['sessionExpired', 'sessionAction', 'keepalive'
 /** 观察广播允许透传的网络捕获域名(游戏/聊天/会话通道,不含视频流)。 */
 const OBSERVABLE_NETWORK_PATTERN = /df888evo|evolution|evo|mstrom-uno|673ing|mdvuz|e9p1/i;
 
-/** 观察广播中 networkCapture 的 data 截断长度(视频流等大帧只传头部)。 */
-const OBSERVABLE_NETWORK_DATA_LIMIT = 800;
 const LIVE_EXTENSION_CONNECTION_ERROR = 'live bet execution requires exactly one browser extension connection';
 const LIVE_BET_CONNECTION_LOST_ERROR = 'browser extension disconnected before live bet result';
+const OBSERVER_PATH = '/observe';
+const COMMAND_PATH = '/command';
+const BRIDGE_DEBUG_ENABLED = process.env.BACCARAT_BRIDGE_DEBUG === '1';
 
 /** 已配置多桌在单桌回退时请求页面恢复的最短间隔。 */
 const MULTIVIEW_RECOVERY_COOLDOWN_MS = 10_000;
 
 /** 页面确认已打开多台后，留给真实页面完成加载的宽限时间。 */
 const MULTIVIEW_OPENED_GRACE_MS = 60_000;
+
+type BridgeSocketRole = 'extension' | 'observer' | 'command';
+
+function bridgeSocketRole(origin: string, requestUrl: string | undefined): BridgeSocketRole | null {
+  const path = bridgeRequestPath(requestUrl);
+  if (isExtensionOrigin(origin)) return path === '/' ? 'extension' : null;
+  if (!isLoopbackObserverOrigin(origin)) return null;
+  if (path === OBSERVER_PATH) return 'observer';
+  if (path === COMMAND_PATH) return 'command';
+  return null;
+}
+
+function bridgeRequestPath(requestUrl: string | undefined): string {
+  try {
+    return new URL(requestUrl ?? '/', 'ws://localhost').pathname;
+  } catch {
+    return '';
+  }
+}
+
+function isExtensionOrigin(origin: string): boolean {
+  try {
+    const url = new URL(origin);
+    return url.protocol === 'chrome-extension:' && /^[a-p]{32}$/.test(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isLoopbackObserverOrigin(origin: string): boolean {
+  try {
+    const url = new URL(origin);
+    const isLoopbackHost = url.hostname === 'localhost'
+      || url.hostname === '127.0.0.1'
+      || url.hostname === '[::1]'
+      || url.hostname === '::1';
+    return isLoopbackHost && (url.protocol === 'http:' || url.protocol === 'https:');
+  } catch {
+    return false;
+  }
+}
+
+function redactedNetworkUrl(raw: string): string {
+  try {
+    const url = new URL(raw);
+    return `${url.protocol}//${url.host}${url.pathname}`;
+  } catch {
+    return '';
+  }
+}
+
+function observableNetworkCapture(
+  message: Extract<BridgeClientMessage, { kind: 'networkCapture' }>,
+): Extract<BridgeClientMessage, { kind: 'networkCapture' }> {
+  return {
+    ...message,
+    url: redactedNetworkUrl(message.url),
+    data: `[redacted ${message.data.length} bytes]`,
+  };
+}
+
+function logNetworkCapture(message: Extract<BridgeClientMessage, { kind: 'networkCapture' }>): void {
+  if (!BRIDGE_DEBUG_ENABLED) return;
+  console.log('[bridge-network]', JSON.stringify({
+    source: message.source,
+    url: redactedNetworkUrl(message.url),
+    direction: message.direction,
+    encoding: message.encoding,
+    dataLength: message.data.length,
+  }));
+}
+
+function isBridgeCommand(value: unknown): value is Extract<BridgeClientMessage, { kind: 'command' }> {
+  return typeof value === 'object'
+    && value !== null
+    && !Array.isArray(value)
+    && Reflect.get(value, 'kind') === 'command'
+    && typeof Reflect.get(value, 'name') === 'string';
+}
 
 class BridgeTableExport implements TableExport {
   readonly tableId: string;
@@ -229,6 +310,8 @@ export class BrowserBridgeServer implements RoomMonitor {
   private readonly betTimeoutMs: number;
   private wss?: WebSocketServer;
   private sockets = new Set<WebSocket>();
+  private observers = new Set<WebSocket>();
+  private commandClients = new Set<WebSocket>();
   private rooms = new Map<string, BridgeRoomDescriptor>();
   private discoveredRooms = new Map<string, BridgeRoomDescriptor>();
   private exports = new Map<string, BridgeTableExport>();
@@ -275,6 +358,8 @@ export class BrowserBridgeServer implements RoomMonitor {
     const wss = new WebSocketServer({
       port: this.options.port ?? 0,
       host: this.options.host ?? '127.0.0.1',
+      verifyClient: (info: { origin: string; secure: boolean; req: IncomingMessage }) =>
+        bridgeSocketRole(info.origin, info.req.url) !== null,
     });
     await new Promise<void>((resolve, reject) => {
       wss.once('listening', resolve);
@@ -283,23 +368,46 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.wss = wss;
     const address = wss.address();
     this.port = typeof address === 'object' && address ? address.port : 0;
-    wss.on('connection', socket => {
-      this.sockets.add(socket);
-      if (!this.extensionConnected) {
-        this.extensionConnected = true;
-        this.handleBridgeRestored('browser-extension-connected');
+    wss.on('connection', (socket, request) => {
+      const role = bridgeSocketRole(String(request.headers.origin ?? ''), request.url);
+      if (role === null) {
+        socket.close(1008, 'unauthorized bridge client');
+        return;
+      }
+      if (role === 'observer') {
+        this.observers.add(socket);
+      } else if (role === 'command') {
+        this.commandClients.add(socket);
+      } else {
+        this.sockets.add(socket);
+        if (!this.extensionConnected) {
+          this.extensionConnected = true;
+          this.handleBridgeRestored('browser-extension-connected');
+        }
       }
       socket.on('message', data => {
+        if (role === 'observer') return;
         try {
-          this.ingestClientMessage(JSON.parse(data.toString()), socket);
+          const message: unknown = JSON.parse(data.toString());
+          if (role === 'command' && !isBridgeCommand(message)) return;
+          this.ingestClientMessage(message, socket);
         } catch {
           // ignore malformed messages from untrusted extensions
         }
       });
       socket.on('error', () => {
+        if (role !== 'extension') return;
         this.rejectPendingBets(new Error(LIVE_BET_CONNECTION_LOST_ERROR), socket);
       });
       socket.on('close', () => {
+        if (role === 'observer') {
+          this.observers.delete(socket);
+          return;
+        }
+        if (role === 'command') {
+          this.commandClients.delete(socket);
+          return;
+        }
         this.rejectPendingBets(new Error(LIVE_BET_CONNECTION_LOST_ERROR), socket);
         this.sockets.delete(socket);
         if (this.sockets.size === 0 && this.extensionConnected) {
@@ -318,8 +426,10 @@ export class BrowserBridgeServer implements RoomMonitor {
 
   async close(): Promise<void> {
     this.clearMultiviewRecoveryTimer();
-    for (const socket of this.sockets) socket.close();
+    for (const socket of [...this.sockets, ...this.observers, ...this.commandClients]) socket.close();
     this.sockets.clear();
+    this.observers.clear();
+    this.commandClients.clear();
     if (this.wss) {
       const wss = this.wss;
       this.wss = undefined;
@@ -562,7 +672,7 @@ export class BrowserBridgeServer implements RoomMonitor {
         console.log('[bridge-diagnostic]', JSON.stringify(message));
         break;
       case 'networkCapture':
-        console.log('[bridge-network]', JSON.stringify(message));
+        logNetworkCapture(message);
         if (message.source === 'baccarat-bridge-jsonparse') {
           this.ingestParsedEvents(this.evolutionParser.parse(message.data));
         } else if (message.source === 'baccarat-bridge-runtime-selection') {
@@ -611,13 +721,9 @@ export class BrowserBridgeServer implements RoomMonitor {
         break;
     }
     if (OBSERVABLE_KINDS.has(message.kind)) {
-      this.broadcastToSockets({ kind: 'observe', message });
+      this.broadcastToObservers({ kind: 'observe', message });
     } else if (message.kind === 'networkCapture' && OBSERVABLE_NETWORK_PATTERN.test(message.url)) {
-      const observable: BridgeClientMessage = {
-        ...message,
-        data: message.data.slice(0, OBSERVABLE_NETWORK_DATA_LIMIT),
-      };
-      this.broadcastToSockets({ kind: 'observe', message: observable });
+      this.broadcastToObservers({ kind: 'observe', message: observableNetworkCapture(message) });
     }
   }
 
@@ -761,6 +867,18 @@ export class BrowserBridgeServer implements RoomMonitor {
         } catch {
           // 单个连接发送失败不影响其他客户端。
         }
+      }
+    }
+  }
+
+  private broadcastToObservers(payload: BridgeServerMessage): void {
+    const raw = JSON.stringify(payload);
+    for (const socket of this.observers) {
+      if (socket.readyState !== WebSocket.OPEN) continue;
+      try {
+        socket.send(raw);
+      } catch {
+        continue;
       }
     }
   }

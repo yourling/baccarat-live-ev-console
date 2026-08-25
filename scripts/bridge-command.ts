@@ -6,7 +6,7 @@ if (!name) {
   process.exit(1);
 }
 const port = Number(process.env.BRIDGE_PORT ?? 17890);
-const ws = new WebSocket('ws://127.0.0.1:' + port);
+const ws = new WebSocket('ws://127.0.0.1:' + port + '/command', { origin: 'http://localhost' });
 ws.on('open', () => {
   ws.send(JSON.stringify({ kind: 'command', name }));
   console.log('[bridge-command] 已发送: ' + name);

@@ -8,7 +8,7 @@ const DEFAULT_BRIDGE_URL = 'ws://127.0.0.1:17890';
 const CDP_MIN_INTERVAL_MS = 60 * 1000;
 const EXTENSION_RELOAD_DELAY_MS = 1000;
 const DAFABET_BACCARAT_POPUP_URL = 'https://www.dafabet.net/sc/live-dealer/popup-launch/live-baccarat-pa';
-const GAME_TAB_URL_PATTERN = /dafabet\.(?:net|com)|df888evo\.com|egcvi\.com|evolution|mstrom-uno|673ing\.com/i;
+const GAME_TAB_URL_PATTERN = /^https?:\/\/(?:[a-z0-9-]+\.)*(?:dafabet\.(?:net|com)|df888evo\.com|egcvi\.com|mstrom-uno\.com|673ing\.com)(?::\d+)?(?:[/?#]|$)/i;
 const MSTROM_FRAME_HOST_PATTERN = /(^|\.)(?:mstrom-uno|673ing)\.com$/i;
 const betRequests = new Map();
 let liveBetSessionEnabled = false;
@@ -19,6 +19,12 @@ if (typeof importScripts === 'function') {
 
 function isGameTabUrl(url) {
   return GAME_TAB_URL_PATTERN.test(String(url || ''));
+}
+
+function isTrustedGameSender(sender) {
+  return !!sender
+    && !!sender.tab
+    && isGameTabUrl(sender.url || sender.tab.url);
 }
 let socket = null;
 let socketGeneration = 0;
@@ -954,7 +960,7 @@ async function ensureKeeperTab(url) {
 let lastTabReloadAt = 0;
 
 chrome.runtime.onMessage.addListener((message, sender, _sendResponse) => {
-  if (!message || typeof message.kind !== 'string') return;
+  if (!message || typeof message.kind !== 'string' || !isTrustedGameSender(sender)) return;
   send(message);
   const senderTabId = sender && sender.tab ? sender.tab.id : null;
   if (message.kind === 'keepalive') {

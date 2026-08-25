@@ -10,7 +10,12 @@
     "scripting"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "https://*.dafabet.net/*",
+    "https://*.dafabet.com/*",
+    "https://*.df888evo.com/*",
+    "https://*.egcvi.com/*",
+    "https://*.mstrom-uno.com/*",
+    "https://*.673ing.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -18,7 +23,12 @@
   "content_scripts": [
     {
       "matches": [
-        "<all_urls>"
+        "https://*.dafabet.net/*",
+        "https://*.dafabet.com/*",
+        "https://*.df888evo.com/*",
+        "https://*.egcvi.com/*",
+        "https://*.mstrom-uno.com/*",
+        "https://*.673ing.com/*"
       ],
       "js": [
         "network-hook.js",
@@ -30,7 +40,12 @@
     },
     {
       "matches": [
-        "<all_urls>"
+        "https://*.dafabet.net/*",
+        "https://*.dafabet.com/*",
+        "https://*.df888evo.com/*",
+        "https://*.egcvi.com/*",
+        "https://*.mstrom-uno.com/*",
+        "https://*.673ing.com/*"
       ],
       "js": [
         "dom-probe.js"
@@ -40,7 +55,12 @@
     },
     {
       "matches": [
-        "<all_urls>"
+        "https://*.dafabet.net/*",
+        "https://*.dafabet.com/*",
+        "https://*.df888evo.com/*",
+        "https://*.egcvi.com/*",
+        "https://*.mstrom-uno.com/*",
+        "https://*.673ing.com/*"
       ],
       "js": [
         "content.js"

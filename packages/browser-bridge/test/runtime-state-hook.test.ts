@@ -532,6 +532,23 @@ describe('mstrom runtime-state hook', () => {
     expect(allowed).toBe(true);
   });
 
+  it('does not enable the content relay on a lookalike evolution host', () => {
+    const gamePageExpression = contentRelaySource.match(/const GAME_PAGE = (.+);/)?.[1];
+    if (gamePageExpression === undefined) {
+      throw new Error('content relay GAME_PAGE expression was not found');
+    }
+
+    // Given: an attacker-controlled hostname that only contains the old broad keyword.
+    const allowed = vm.runInNewContext(`Boolean(${gamePageExpression})`, {
+      location: { hostname: 'evolution.attacker.invalid' },
+    });
+
+    // When: the content relay decides whether to forward game data.
+    expect(allowed).toBe(false);
+
+    // Then: no lookalike host can activate the real-room relay.
+  });
+
   it('reads decoded cards from the LinkStoreFactory multi-table map', () => {
     const messages = runLinkStoreHook();
     expect(messages).toHaveLength(1);

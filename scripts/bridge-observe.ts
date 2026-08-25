@@ -26,12 +26,12 @@ async function runServer(): Promise<void> {
 
 /** 端口被占（桌面控制台正在运行桥接服务）：作为观察者客户端接入。 */
 function runObserver(): void {
-  const url = 'ws://127.0.0.1:' + PORT;
+  const url = 'ws://127.0.0.1:' + PORT + '/observe';
   let delay = 1000;
   let hintPrinted = false;
 
   const connect = () => {
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, { origin: 'http://localhost' });
     ws.on('open', () => {
       delay = 1000;
       console.log('[bridge-observe] 已作为观察者接入 ' + url + ' —— 等待扩展事件…');

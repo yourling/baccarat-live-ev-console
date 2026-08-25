@@ -23,7 +23,7 @@
   const CLICK_REPORT_INTERVAL_MS = 5 * 60 * 1000;
 
   // 只在游戏相关页面上工作:其他页面(控制台/搜索引擎/追踪器)不采集、不保活、不发心跳。
-  const GAME_PAGE = /dafabet\.net|df888evo\.com|egcvi\.com|evolution|mstrom-uno|673ing\.com/i.test(location.hostname);
+  const GAME_PAGE = /(?:^|\.)(?:dafabet\.(?:net|com)|df888evo\.com|egcvi\.com|mstrom-uno\.com|673ing\.com)$/i.test(location.hostname);
 
   const knownRooms = new Map();
   let diagnosticSent = false;
@@ -528,7 +528,7 @@
   // 接收 MAIN world network-hook 发来的网络数据。
   // WebSocket/SSE/运行时牌面全部转发；普通 fetch/XHR 仍按游戏域名过滤。
   window.addEventListener('message', event => {
-    if (!GAME_PAGE || event.source !== window) return;
+    if (!GAME_PAGE || event.source !== window || event.origin !== location.origin) return;
     const data = event.data;
     if (!data || typeof data.source !== 'string' || !data.source.startsWith('baccarat-bridge-')) return;
     const url = String(data.url || '');
@@ -556,6 +556,7 @@
 
   // MAIN world 上报的 WebSocket 断开:静默掉线的可观测信号。
   window.addEventListener('message', event => {
+    if (!GAME_PAGE || event.source !== window || event.origin !== location.origin) return;
     const data = event.data;
     if (!data || data.source !== 'baccarat-bridge-ws-closed') return;
     sendSessionAction('socket-closed', String(data.url || '').split('?')[0].slice(0, 100));

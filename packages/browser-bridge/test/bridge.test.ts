@@ -88,6 +88,20 @@ const acceptedLiveReceipt: BetReceipt = {
   createdAt: '2026-08-24T00:00:00.000Z',
 };
 
+const EXTENSION_ORIGIN = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
+
+function extensionClient(port: number): WebSocket {
+  return new WebSocket(`ws://127.0.0.1:${port}`, { origin: EXTENSION_ORIGIN });
+}
+
+function observerClient(port: number): WebSocket {
+  return new WebSocket(`ws://127.0.0.1:${port}/observe`, { origin: 'http://localhost' });
+}
+
+function commandClient(port: number): WebSocket {
+  return new WebSocket(`ws://127.0.0.1:${port}/command`, { origin: 'http://localhost' });
+}
+
 describe('browser bridge server', () => {
   it('discovers rooms from extension messages and merges default table profile', async () => {
     const server = new BrowserBridgeServer();
@@ -157,7 +171,7 @@ describe('browser bridge server', () => {
   it('round-trips real bet execution requests through a WebSocket extension client', async () => {
     const server = new BrowserBridgeServer({ port: 0 });
     const port = await server.start();
-    const client = new WebSocket(`ws://127.0.0.1:${port}`);
+    const client = extensionClient(port);
     await new Promise<void>((resolve, reject) => {
       client.once('open', resolve);
       client.once('error', reject);
@@ -193,6 +207,70 @@ describe('browser bridge server', () => {
     await server.close();
   });
 
+  it('rejects a web-page origin before it becomes an extension socket', async () => {
+    const server = new BrowserBridgeServer({ port: 0 });
+    const port = await server.start();
+    const attacker = new WebSocket(`ws://127.0.0.1:${port}`, { origin: 'https://attacker.invalid' });
+    try {
+      // Given: a browser page outside the installed extension.
+      const outcome = await new Promise<'opened' | 'rejected'>(resolve => {
+        attacker.once('open', () => resolve('opened'));
+        attacker.once('unexpected-response', (_request, response) => {
+          response.resume();
+          resolve('rejected');
+        });
+        attacker.once('error', () => resolve('rejected'));
+      });
+
+      // When: it attempts to connect to the loopback bridge.
+      expect(outcome).toBe('rejected');
+
+      // Then: it cannot become the socket that controls extension commands.
+    } finally {
+      attacker.close();
+      await server.close();
+    }
+  });
+
+  it('keeps observer clients read-only while allowing local command clients', async () => {
+    const server = new BrowserBridgeServer({ port: 0 });
+    const port = await server.start();
+    const extension = extensionClient(port);
+    const observer = observerClient(port);
+    const command = commandClient(port);
+    try {
+      await Promise.all([extension, observer, command].map(client => new Promise<void>((resolve, reject) => {
+        client.once('open', resolve);
+        client.once('error', reject);
+      })));
+
+      // Given: an extension, a read-only observer, and a local command client.
+      const commands: string[] = [];
+      const receivedCommand = new Promise<void>(resolve => {
+        extension.on('message', data => {
+          const message = JSON.parse(data.toString()) as { readonly kind?: string; readonly name?: string };
+          if (message.kind !== 'command' || message.name === undefined) return;
+          commands.push(message.name);
+          if (message.name === 'openMultiView') resolve();
+        });
+      });
+
+      // When: both the observer and the command client send a bridge command.
+      observer.send(JSON.stringify({ kind: 'command', name: 'liveOn' }));
+      command.send(JSON.stringify({ kind: 'command', name: 'openMultiView' }));
+      await receivedCommand;
+      await new Promise<void>(resolve => setImmediate(resolve));
+
+      // Then: only the dedicated command client reaches the extension.
+      expect(commands).toEqual(['openMultiView']);
+    } finally {
+      extension.close();
+      observer.close();
+      command.close();
+      await server.close();
+    }
+  });
+
   it('fails closed for live bets when no extension socket is connected', async () => {
     const server = new BrowserBridgeServer({ betTimeoutMs: 5 });
 
@@ -203,8 +281,8 @@ describe('browser bridge server', () => {
     const server = new BrowserBridgeServer({ port: 0, betTimeoutMs: 5 });
     const port = await server.start();
     const clients = [
-      new WebSocket(`ws://127.0.0.1:${port}`),
-      new WebSocket(`ws://127.0.0.1:${port}`),
+      extensionClient(port),
+      extensionClient(port),
     ];
     const betRequestCount = { value: 0 };
     try {
@@ -230,7 +308,7 @@ describe('browser bridge server', () => {
   it('registers the pending live bet before a synchronous socket result can arrive', async () => {
     const server = new BrowserBridgeServer({ port: 0, betTimeoutMs: 5 });
     const port = await server.start();
-    const client = new WebSocket(`ws://127.0.0.1:${port}`);
+    const client = extensionClient(port);
     try {
       await new Promise<void>((resolve, reject) => {
         client.once('open', resolve);
@@ -258,7 +336,7 @@ describe('browser bridge server', () => {
   it('rejects a dispatched live bet immediately when its extension socket closes and clears pending state', async () => {
     const server = new BrowserBridgeServer({ port: 0, betTimeoutMs: 1_000 });
     const port = await server.start();
-    const client = new WebSocket(`ws://127.0.0.1:${port}`);
+    const client = extensionClient(port);
     let requestId: string | undefined;
     try {
       await new Promise<void>((resolve, reject) => {
@@ -302,7 +380,7 @@ describe('browser bridge server', () => {
   it('ignores a live bet result received on a different extension socket', async () => {
     const server = new BrowserBridgeServer({ port: 0, betTimeoutMs: 1_000 });
     const port = await server.start();
-    const originalClient = new WebSocket(`ws://127.0.0.1:${port}`);
+    const originalClient = extensionClient(port);
     let newClient: WebSocket | undefined;
     let requestId: string | undefined;
     try {
@@ -326,7 +404,7 @@ describe('browser bridge server', () => {
       await dispatched;
       if (requestId === undefined) throw new Error('live bet request id missing');
 
-      const replacementClient = new WebSocket(`ws://127.0.0.1:${port}`);
+      const replacementClient = extensionClient(port);
       newClient = replacementClient;
       await new Promise<void>((resolve, reject) => {
         replacementClient.once('open', resolve);
@@ -360,7 +438,7 @@ describe('browser bridge server', () => {
     const server = new BrowserBridgeServer({ port: 0 });
     expect(() => server.setLiveBetEnabled(true)).toThrow(/exactly one browser extension connection/i);
     const port = await server.start();
-    const client = new WebSocket(`ws://127.0.0.1:${port}`);
+    const client = extensionClient(port);
     await new Promise<void>((resolve, reject) => {
       client.once('open', resolve);
       client.once('error', reject);
@@ -385,8 +463,8 @@ describe('browser bridge server', () => {
     const server = new BrowserBridgeServer({ port: 0 });
     const port = await server.start();
     const clients = [
-      new WebSocket(`ws://127.0.0.1:${port}`),
-      new WebSocket(`ws://127.0.0.1:${port}`),
+      extensionClient(port),
+      extensionClient(port),
     ];
     const liveOnCount = { value: 0 };
     const liveOffCount = { value: 0 };
@@ -527,7 +605,7 @@ describe('browser bridge server', () => {
   it('broadcasts observable session events to connected observer clients', async () => {
     const server = new BrowserBridgeServer({ port: 0 });
     const port = await server.start();
-    const client = new WebSocket(`ws://127.0.0.1:${port}`);
+    const client = observerClient(port);
     await new Promise<void>((resolve, reject) => {
       client.once('open', resolve);
       client.once('error', reject);
@@ -558,10 +636,10 @@ describe('browser bridge server', () => {
     await server.close();
   });
 
-  it('broadcasts truncated game-channel network captures to observers only', async () => {
+  it('broadcasts redacted game-channel network captures to observers only', async () => {
     const server = new BrowserBridgeServer({ port: 0 });
     const port = await server.start();
-    const client = new WebSocket(`ws://127.0.0.1:${port}`);
+    const client = observerClient(port);
     await new Promise<void>((resolve, reject) => {
       client.once('open', resolve);
       client.once('error', reject);
@@ -599,7 +677,7 @@ describe('browser bridge server', () => {
     const seen = await observed;
     expect(seen.message.kind).toBe('networkCapture');
     expect(seen.message.url).toContain('df888evo');
-    expect(seen.message.data.length).toBeLessThan(longData.length);
+    expect(seen.message.data).toBe('[redacted 8000 bytes]');
 
     client.close();
     await server.close();
@@ -880,7 +958,7 @@ describe('browser bridge server', () => {
     const configuredTableIds = ['D055', 'D056', 'D057', 'D065'] as const;
     const server = new BrowserBridgeServer({ port: 0, selectedTableIds: configuredTableIds });
     const port = await server.start();
-    const client = new WebSocket(`ws://127.0.0.1:${port}`);
+    const client = extensionClient(port);
     try {
       await new Promise<void>((resolve, reject) => {
         client.once('open', resolve);
@@ -927,7 +1005,7 @@ describe('browser bridge server', () => {
       selectedTableIds: configuredTableIds,
     });
     const port = await server.start();
-    const client = new WebSocket(`ws://127.0.0.1:${port}`);
+    const client = extensionClient(port);
     try {
       await new Promise<void>((resolve, reject) => {
         client.once('open', resolve);
@@ -968,7 +1046,7 @@ describe('browser bridge server', () => {
       multiviewRecoveryCooldownMs: 25,
     });
     const port = await server.start();
-    const client = new WebSocket(`ws://127.0.0.1:${port}`);
+    const client = extensionClient(port);
     try {
       await new Promise<void>((resolve, reject) => {
         client.once('open', resolve);
@@ -1010,7 +1088,7 @@ describe('browser bridge server', () => {
       multiviewOpenedGraceMs: openedGraceMs,
     });
     const port = await server.start();
-    const client = new WebSocket(`ws://127.0.0.1:${port}`);
+    const client = extensionClient(port);
     try {
       await new Promise<void>((resolve, reject) => {
         client.once('open', resolve);
@@ -1446,7 +1524,7 @@ describe('runtime-selection recovery after configuration changes', () => {
   it('requests multiview recovery when the new whitelist has no runtime-selection overlap', async () => {
     const server = new BrowserBridgeServer({ port: 0, selectedTableIds: ['D055', 'D065'] });
     const port = await server.start();
-    const client = new WebSocket(`ws://127.0.0.1:${port}`);
+    const client = extensionClient(port);
     try {
       await new Promise<void>((resolve, reject) => {
         client.once('open', resolve);

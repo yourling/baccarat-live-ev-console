@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   createHarness,
+  extensionManifest,
   flushAsyncWork,
   installedContentScripts,
   liveRequest,
@@ -166,5 +167,16 @@ describe('extension background live bet routing', () => {
 
     expect(installedScripts).not.toContain('site-adapter.js');
     expect(installedScripts).not.toContain('bet-executor.js');
+  });
+
+  it('limits extension injection to known game hosts', () => {
+    // Given: the packaged extension manifest.
+    const serializedManifest = JSON.stringify(extensionManifest);
+
+    // When: its host permissions and content-script matches are inspected.
+    expect(serializedManifest).not.toContain('<all_urls>');
+
+    // Then: the current mstrom game host remains explicitly covered.
+    expect(serializedManifest).toContain('https://*.mstrom-uno.com/*');
   });
 });
