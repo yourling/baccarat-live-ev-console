@@ -441,6 +441,8 @@ export class SqliteLedger {
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS uq_reservations_active
         ON reservations(table_id, shoe_id, hand_id, market) WHERE status = 'RESERVED';
+      CREATE INDEX IF NOT EXISTS idx_reservations_window
+        ON reservations(table_id, shoe_id, hand_id, market);
       CREATE INDEX IF NOT EXISTS idx_reservations_status ON reservations(table_id, status);
       CREATE INDEX IF NOT EXISTS idx_reservations_table_created ON reservations(table_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_reservations_created ON reservations(created_at);

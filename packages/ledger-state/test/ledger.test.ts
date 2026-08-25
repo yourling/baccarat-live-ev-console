@@ -433,6 +433,29 @@ describe('reservations active-key semantics (tombstone regression)', () => {
     ledger.close();
     rmSync(dir, { recursive: true, force: true });
   });
+
+  it('creates a hand-window index for reservation summary joins', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-index-'));
+    const dbPath = join(dir, 'ledger.sqlite');
+    try {
+      // Given: a newly initialized ledger database.
+      const ledger = new SqliteLedger(dbPath);
+      ledger.close();
+
+      // When: the reservation indexes are inspected outside the ledger connection.
+      const raw = new Database(dbPath, { readonly: true });
+      try {
+        const indexNames = raw.prepare("SELECT name FROM pragma_index_list('reservations')").pluck().all();
+
+        // Then: income-summary joins can look up one reservation by its full hand key.
+        expect(indexNames).toContain('idx_reservations_window');
+      } finally {
+        raw.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 
