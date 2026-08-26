@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { OperationalWagerMarket } from '@baccarat/adapter-contract';
 import type { TableActorSnapshot } from '../api-types';
+import { useConfirmationDialog } from './confirmation-dialog';
 import './operational-wager-controls.css';
 
 const MARKET_LABELS: Record<OperationalWagerMarket, string> = {
@@ -22,6 +23,7 @@ export function OperationalWagerControls(props: {
   const [submitting, setSubmitting] = useState<OperationalWagerMarket | null>(null);
   const [status, setStatus] = useState<OperationalWagerStatus | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const { confirm, dialog } = useConfirmationDialog();
   const parsedAmount = Number(amount);
   const amountIsValid = Number.isFinite(parsedAmount) && parsedAmount > 0;
   const gateReason = operationalWagerGateReason(props.actor);
@@ -33,10 +35,26 @@ export function OperationalWagerControls(props: {
       setMessage(blockedReason ?? '桌面下注通道当前不可用');
       return;
     }
-    const confirmed = window.confirm(props.actor.executionMode === 'live'
-      ? `确认使用真实资金下注？\n牌桌：${props.actor.tableId}\n玩法：${MARKET_LABELS[market]}\n金额：${formatAmount(parsedAmount)}`
-      : `确认记录${props.actor.executionMode === 'shadow' ? '影子' : '模拟'}下注测试？\n牌桌：${props.actor.tableId}\n玩法：${MARKET_LABELS[market]}\n金额：${formatAmount(parsedAmount)}\n本次不会向浏览器发送下注。`,
-    );
+    const isLive = props.actor.executionMode === 'live';
+    const executionModeLabel = isLive
+      ? '真实资金'
+      : props.actor.executionMode === 'shadow'
+        ? '影子'
+        : '模拟';
+    const confirmed = await confirm({
+      title: isLive ? '确认真实下注' : `确认${executionModeLabel}下注测试`,
+      description: isLive
+        ? '此操作会通过浏览器扩展尝试使用真实资金提交下注，请再次核对下注信息。'
+        : `本次只记录${executionModeLabel}测试，不会向浏览器发送下注。`,
+      details: [
+        { label: '牌桌', value: props.actor.tableId },
+        { label: '执行模式', value: executionModeLabel },
+        { label: '玩法', value: MARKET_LABELS[market] },
+        { label: '金额', value: formatAmount(parsedAmount) },
+      ],
+      confirmLabel: isLive ? '确认真实下注' : '确认记录',
+      tone: isLive ? 'danger' : 'primary',
+    });
     if (!confirmed) return;
 
     setSubmitting(market);
@@ -98,6 +116,7 @@ export function OperationalWagerControls(props: {
         {status === null ? (blockedReason ?? '准备就绪') : statusLabel(status)}
         {message === null ? null : <span>{message}</span>}
       </div>
+      {dialog}
     </section>
   );
 }

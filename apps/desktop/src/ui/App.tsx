@@ -28,6 +28,7 @@ import {
   planExecutionModeChange,
   type ExecutionMode,
 } from './execution-mode';
+import { useConfirmationDialog } from './confirmation-dialog';
 import { OperationalWagerControls } from './operational-wager-controls';
 import { KeepaliveSettings } from './keepalive-settings';
 import { decisionHandExplanation, planRecordViewChange, recordKindForView, recordTabCount, type ConsoleView } from './record-view';
@@ -169,6 +170,7 @@ const DEFAULT_PAIR_PROBABILITY = exactPairProbabilityLocal(initialCounts(8));
 const DEFAULT_PAIR_EV = evForPairLocal({ netWin: 11, loss: 1 }, DEFAULT_PAIR_PROBABILITY);
 
 export function App() {
+  const { confirm, dialog } = useConfirmationDialog();
   const [snapshot, setSnapshot] = useState<DesktopConsoleSnapshot | null>(null);
   const [recordPage, setRecordPage] = useState<DesktopRecordPage | null>(null);
   const [recordLoading, setRecordLoading] = useState(false);
@@ -291,8 +293,25 @@ export function App() {
   }, []);
 
   const clearRecords = useCallback(async () => {
-    if (!window.desktop || !window.confirm('确认清除全部事件、决策和下注账本记录吗？当前监控将重置，牌桌和下注设置会保留。')) return;
-    if (!window.confirm('此操作不可恢复，并会回收本地记录占用的空间。再次确认清除记录吗？')) return;
+    if (!window.desktop) return;
+    const initialConfirmed = await confirm({
+      title: '清除监控记录',
+      description: '将清除全部事件、决策和下注账本记录，并重置当前监控状态。',
+      details: [
+        { label: '将被清除', value: '事件、决策、下注账本' },
+        { label: '仍会保留', value: '牌桌与下注设置' },
+      ],
+      confirmLabel: '继续',
+      tone: 'danger',
+    });
+    if (!initialConfirmed) return;
+    const finalConfirmed = await confirm({
+      title: '再次确认永久清除',
+      description: '此操作不可恢复，并会回收本地记录占用的空间。',
+      confirmLabel: '永久清除',
+      tone: 'danger',
+    });
+    if (!finalConfirmed) return;
     setBusy(true);
     setError(null);
     try {
@@ -303,7 +322,7 @@ export function App() {
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [confirm]);
 
   useEffect(() => {
     void refresh();
@@ -588,9 +607,20 @@ export function App() {
   async function toggleAutomation() {
     if (!window.desktop) return;
     const enabled = !(snapshot?.automation.enabled ?? false);
-    const hasLiveTable = tables.some(table => table.executionMode === 'live');
-    if (enabled && hasLiveTable && !window.confirm('确认开启全局自动投注？当前存在实盘牌桌，保活和对子策略会按已保存设置执行。')) {
-      return;
+    const liveTableIds = tables
+      .filter(table => table.executionMode === 'live')
+      .map(table => table.tableId);
+    if (enabled && liveTableIds.length > 0) {
+      const confirmed = await confirm({
+        title: '开启实盘自动投注',
+        description: '当前存在实盘牌桌。开启后，保活和对子策略会按已保存设置自动执行。',
+        details: [
+          { label: '实盘牌桌', value: liveTableIds.join('、') },
+        ],
+        confirmLabel: '开启自动投注',
+        tone: 'danger',
+      });
+      if (!confirmed) return;
     }
     setAutomationSaving(true);
     setError(null);
@@ -637,7 +667,17 @@ export function App() {
   }
 
   async function confirmPhysicalShoe(tableId: string) {
-    if (!window.desktop || !window.confirm('确认人工重置该桌牌靴？仅在平台未自动识别新牌靴时使用。')) return;
+    if (!window.desktop) return;
+    const confirmed = await confirm({
+      title: '人工重置牌靴',
+      description: '仅在平台未自动识别新牌靴时使用。正常监控流程无需人工确认。',
+      details: [
+        { label: '牌桌', value: tableId },
+      ],
+      confirmLabel: '确认重置',
+      tone: 'danger',
+    });
+    if (!confirmed) return;
     setError(null);
     try {
       setSnapshot(await window.desktop.confirmPhysicalShoe(tableId));
@@ -859,6 +899,7 @@ export function App() {
           onError={setError}
         />
       )}
+      {dialog}
     </div>
   );
 }

@@ -34,6 +34,7 @@
     "@vitejs/plugin-react": "^4.3.0",
     "electron": "^43.4.0",
     "electron-builder": "^26.15.3",
+    "jsdom": "^30.0.1",
     "react-doctor": "^0.9.12",
     "react-grab": "^0.1.37",
     "react-scan": "^0.5.7",

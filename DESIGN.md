@@ -14,6 +14,7 @@
 | Panel | `--surface-panel` | `#101923` | 摘要、筛选器、卡片 |
 | Raised panel | `--surface-raised` | `#111c26` | 设置区与强调面板 |
 | Field | `--surface-field` | `#0c141d` | 输入与选择器 |
+| Overlay | `--surface-overlay` | `rgb(3 8 12 / 82%)` | 全屏模态遮罩 |
 | Text primary | `--text-primary` | `#e6edf3` | 正文与数据 |
 | Text strong | `--text-strong` | `#f4f7fa` | 标题与关键数值 |
 | Text muted | `--text-muted` | `#8ea3b3` | 说明与元数据 |
@@ -21,6 +22,8 @@
 | Border strong | `--border-strong` | `#334657` | 输入与可交互边框 |
 | Accent | `--accent-primary` | `#14856b` | 主操作 |
 | Accent hover | `--accent-hover` | `#1a9c7c` | 主操作悬停 |
+| Confirmation accent | `--confirmation-primary` | `#11745f` | 确认弹窗普通确认操作 |
+| Confirmation accent hover | `--confirmation-primary-hover` | `#147d66` | 确认弹窗普通确认悬停 |
 | Focus | `--focus-ring` | `#51b99d` | 输入与拖拽目标 |
 | Success | `--status-success` | `#3bc49b` | 连接、健康状态 |
 | Warning | `--status-warning` | `#d9a441` | 风险、同步与注意项 |
@@ -81,6 +84,14 @@
 - **Structure**: 筛选器、查询、分页和危险性清除记录操作。
 - **Interaction**: 首次切换到决策、事件或账本视图时自动加载当前页；筛选项变更不自动查库，点击查询或切换分页后才加载对应记录页。
 - **Safety**: 清除记录必须二次确认，并通过 SQLite `VACUUM` 回收已删除记录占用的空间；牌桌和下注配置保留。
+
+### Confirmation dialog
+- **Structure**: 通过 `document.body` Portal 渲染的全屏遮罩与单一确认面板，包含标题、说明、可选详情、取消和确认操作。
+- **States**: 普通确认、危险确认、实盘资金确认。
+- **Layering**: 使用独立顶层 stacking context，不受牌桌卡片 `overflow`、页面滚动区或设置弹窗层级影响。
+- **Interaction**: 打开后锁定背景滚动和焦点；`Escape`、遮罩与取消按钮返回取消；关闭后恢复触发控件焦点。
+- **Accessibility**: `role="dialog"`、`aria-modal="true"`、明确标题与说明；默认焦点落在取消按钮，避免误触实盘或破坏性操作。
+- **Motion**: 仅使用 120ms 不透明度反馈；减少动态偏好下无位移动画。
 
 ### Global automated wagering
 - **Structure**: 页头的全局开启/停止按钮，以及间隔分钟数、庄/闲分段选择、金额输入和上次尝试/成功状态。

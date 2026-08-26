@@ -3,6 +3,7 @@
   --surface-panel: #101923;
   --surface-raised: #111c26;
   --surface-field: #0c141d;
+  --surface-overlay: rgb(3 8 12 / 82%);
   --text-primary: #e6edf3;
   --text-strong: #f4f7fa;
   --text-muted: #8ea3b3;
@@ -10,6 +11,8 @@
   --border-strong: #334657;
   --accent-primary: #14856b;
   --accent-hover: #1a9c7c;
+  --confirmation-primary: #11745f;
+  --confirmation-primary-hover: #147d66;
   --focus-ring: #51b99d;
   --status-success: #3bc49b;
   --status-warning: #d9a441;
