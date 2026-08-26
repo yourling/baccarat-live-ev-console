@@ -56,6 +56,6 @@ describe('tryKeepaliveInOrder', () => {
 
     // Then: the scheduler stops after the ordered fallback pass.
     expect(requestWager).toHaveBeenCalledTimes(2);
-    expect(result).toEqual({ status: 'REJECTED', tableId: null });
+    expect(result).toEqual({ status: 'REJECTED', tableId: null, attempted: false });
   });
 });

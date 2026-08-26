@@ -54,7 +54,6 @@ function registerIpc(): void {
   ipcMain.handle('console:set-demo-speed', (_event, speed: number) => getService().setDemoSpeed(speed));
   ipcMain.handle('console:register-table', (_event, profile, mode, amount) =>
     getService().registerTable(profile, mode, amount));
-  ipcMain.handle('console:inject-event', (_event, event) => getService().injectEvent(event));
   ipcMain.handle('console:set-auto-bet', (_event, tableId: string, armed: boolean, shoeId?: string) =>
     getService().setAutoBet(tableId, armed, shoeId));
   ipcMain.handle('console:set-execution-mode', async (_event, tableId: string, mode: unknown) => {
@@ -69,6 +68,10 @@ function registerIpc(): void {
     getService().executeOperationalWager(parseDesktopOperationalWagerCommand(command)));
   ipcMain.handle('console:update-keepalive-settings', (_event, settings: unknown) =>
     getService().updateKeepaliveSettings(parseDesktopKeepaliveSettings(settings)));
+  ipcMain.handle('console:set-automation-enabled', (_event, enabled: unknown) => {
+    if (typeof enabled !== 'boolean') throw new TypeError('automation enabled must be boolean');
+    return getService().setAutomationEnabled(enabled);
+  });
   ipcMain.handle('console:confirm-physical-shoe', (_event, tableId: string) =>
     getService().confirmPhysicalShoe(tableId));
   ipcMain.handle('console:manual-correction', (_event, tableId: string, correction, shoeId?: string) =>

@@ -17,6 +17,18 @@
 
 .operational-wager-controls__amount input {
   min-width: 0;
+  height: 32px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  outline: none;
+  background: var(--surface-field);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.operational-wager-controls__amount input:focus {
+  border-color: var(--focus-ring);
 }
 
 .operational-wager-controls__buttons {

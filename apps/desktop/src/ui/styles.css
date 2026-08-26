@@ -1,7 +1,28 @@
 :root {
+  --surface-canvas: #0b1118;
+  --surface-panel: #101923;
+  --surface-raised: #111c26;
+  --surface-field: #0c141d;
+  --text-primary: #e6edf3;
+  --text-strong: #f4f7fa;
+  --text-muted: #8ea3b3;
+  --border-default: #263846;
+  --border-strong: #334657;
+  --accent-primary: #14856b;
+  --accent-hover: #1a9c7c;
+  --focus-ring: #51b99d;
+  --status-success: #3bc49b;
+  --status-warning: #d9a441;
+  --status-danger: #df6262;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
   font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
-  color: #e6edf3;
-  background: #0b1118;
+  color: var(--text-primary);
+  background: var(--surface-canvas);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
@@ -11,8 +32,8 @@
 body {
   margin: 0;
   min-width: 320px;
-  background: #0b1118;
-  color: #e6edf3;
+  background: var(--surface-canvas);
+  color: var(--text-primary);
 }
 
 button, input, select { font: inherit; }
@@ -87,8 +108,8 @@ h2 { color: #f4f7fa; font-size: 18px; }
   transition: background 120ms ease, border-color 120ms ease;
 }
 .button span { margin-right: 6px; }
-.button--primary { background: #14856b; color: #f5fffb; }
-.button--primary:hover { background: #1a9c7c; }
+.button--primary { background: var(--accent-primary); color: var(--text-strong); }
+.button--primary:hover { background: var(--accent-hover); }
 .button--secondary { background: #1b2835; border-color: #304253; color: #dce8f2; }
 .button--secondary:hover, .button--ghost:hover { border-color: #5b758d; background: #223342; }
 .button--ghost { background: transparent; border-color: #304253; color: #b7c7d5; }

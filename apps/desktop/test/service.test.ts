@@ -266,6 +266,243 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('starts global automation immediately and arms pair EV after a verified shoe or restore', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      await service.updateMonitorTableIds(['D055']);
+      await service.injectEvent(monitorShoeEvent('D055', 'd055-attached', 'unknown-monitor-session'));
+
+      const started = await service.setAutomationEnabled(true);
+
+      expect(started.automation).toEqual({ enabled: true });
+      expect(started.keepalive.enabled).toBe(true);
+      expect(started.snapshot.tables.D055?.projection.autoBetStatus).toBe('DISARMED');
+
+      await service.injectEvent({
+        ...monitorShoeEvent('D055', 'd055-verified', 'physical-shoe'),
+        shoeId: 'd055-verified-shoe',
+        sourceSeq: 2,
+      });
+
+      expect(service.snapshot().snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
+
+      await service.injectEvent({
+        type: 'connectionLost',
+        eventId: 'd055-lost',
+        tableId: 'D055',
+        timestamp: '2026-08-23T11:00:02.000Z',
+        sourceSeq: 3,
+        source: 'room-monitor',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+      });
+      await service.injectEvent({
+        type: 'connectionRestored',
+        eventId: 'd055-restored',
+        tableId: 'D055',
+        timestamp: '2026-08-23T11:00:03.000Z',
+        sourceSeq: 4,
+        source: 'room-monitor',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        continuityProof: 'd055-restored-proof',
+      });
+
+      expect(service.snapshot().snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
+
+      const stopped = await service.setAutomationEnabled(false);
+
+      expect(stopped.automation).toEqual({ enabled: false });
+      expect(stopped.keepalive.enabled).toBe(false);
+      expect(stopped.snapshot.tables.D055?.projection.autoBetStatus).toBe('DISARMED');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('arms pair EV after an approved physical shoe confirmation', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      // Given: automation is active while a verified physical shoe awaits confirmation.
+      await service.updateMonitorTableIds(['D055']);
+      await service.setAutomationEnabled(true);
+      await service.injectEvent({
+        ...monitorShoeEvent('D055', 'd055-awaiting-confirmation', 'physical-shoe'),
+        profile: { ...defaultProfile('D055'), autoConfirmNewShoe: false },
+      });
+      expect(service.snapshot().snapshot.tables.D055?.projection).toMatchObject({
+        status: 'WAITING_CONFIRMATION',
+        autoBetStatus: 'DISARMED',
+      });
+
+      // When: the physical shoe confirmation is approved.
+      await service.injectEvent({
+        type: 'shoeConfirmation',
+        eventId: 'd055-confirmed',
+        tableId: 'D055',
+        timestamp: '2026-08-23T11:00:01.000Z',
+        sourceSeq: 2,
+        source: 'operator',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        shoeId: 'monitor-session-D055',
+        approved: true,
+      });
+
+      // Then: the newly confirmed shoe is tracked and pair EV is armed.
+      expect(service.snapshot().snapshot.tables.D055?.projection).toMatchObject({
+        status: 'TRACKING',
+        autoBetStatus: 'ARMED',
+      });
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('keeps automation stopped when strategy settings are saved after a global stop', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      await service.setAutomationEnabled(true);
+      await service.setAutomationEnabled(false);
+
+      const updated = await service.updateKeepaliveSettings({
+        intervalMinutes: 5,
+        market: 'player',
+        amount: 30,
+      });
+
+      expect(updated.automation).toEqual({ enabled: false });
+      expect(updated.keepalive).toMatchObject({
+        enabled: false,
+        intervalMinutes: 5,
+        market: 'player',
+        amount: 30,
+      });
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('does not allow manual pair recovery to bypass a global stop', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      await service.updateMonitorTableIds(['D055']);
+      await service.injectEvent(monitorShoeEvent('D055', 'd055-global-stop-shoe', 'physical-shoe'));
+      await service.setAutomationEnabled(true);
+      await service.setAutomationEnabled(false);
+
+      await expect(service.setAutoBet('D055', true, 'monitor-session-D055'))
+        .rejects.toThrow('global automation is disabled');
+      expect(service.snapshot().snapshot.tables.D055?.projection.autoBetStatus).toBe('DISARMED');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('blocks automatic pair execution after global stop even when a later event rearms the table', async () => {
+    // Given: a live, eligible physical shoe has been globally stopped.
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const requestBet = vi.spyOn(bridge, 'requestBet').mockResolvedValue(null);
+    vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    service['browserBridge'] = bridge;
+
+    try {
+      await service.updateMonitorTableIds(['D055']);
+      service['orchestrator'].registerTable(defaultProfile('D055'), 'shadow', 20);
+      await service.setExecutionMode('D055', 'live');
+      await service.injectEvent(monitorShoeEvent('D055', 'd055-global-stop-execution-shoe', 'physical-shoe'));
+      const actor = service['orchestrator'].getActor('D055');
+      if (!actor) throw new Error('global-stop execution test actor was not registered');
+      actor.updateConfiguration({ ...actor.getProfile(), minEV: -10 }, 20);
+      await service.setAutomationEnabled(true);
+      await service.setAutomationEnabled(false);
+
+      // When: an event re-arms the table after the global stop and a live window opens.
+      await service.injectEvent({
+        type: 'autoArmChanged',
+        eventId: 'd055-rearmed-after-global-stop',
+        tableId: 'D055',
+        timestamp: '2026-08-23T11:00:01.000Z',
+        sourceSeq: 2,
+        source: 'operator',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        shoeId: 'monitor-session-D055',
+        armed: true,
+      });
+      await service.injectEvent({
+        ...openedPlatformRound('D055', 'd055-window-after-global-stop', 'GD055-global-stop'),
+        sourceSeq: 3,
+      });
+
+      // Then: the automatic event is audited but cannot reach the live browser bridge.
+      expect(requestBet).not.toHaveBeenCalled();
+      expect(service.snapshot().decisions).toContainEqual(expect.objectContaining({
+        tableId: 'D055',
+        reason: expect.stringContaining('global-automation-disabled'),
+      }));
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('starts keepalive before a blocked live pair execution completes', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    let releasePair: () => void = () => undefined;
+    let signalPairStarted: () => void = () => undefined;
+    const pairBlocked = new Promise<void>(resolve => {
+      releasePair = resolve;
+    });
+    const pairStarted = new Promise<void>(resolve => {
+      signalPairStarted = resolve;
+    });
+    const requestBet = vi.spyOn(bridge, 'requestBet').mockImplementation(async () => {
+      signalPairStarted();
+      await pairBlocked;
+      return null;
+    });
+    const requestOperationalWager = vi.spyOn(bridge, 'requestOperationalWager')
+      .mockImplementation(async request => ({
+        receiptId: `keepalive-${request.wager.wagerId}`,
+        wagerId: request.wager.wagerId,
+        tableId: request.wager.tableId,
+        shoeId: request.wager.shoeId,
+        handId: request.wager.handId,
+        market: request.wager.market,
+        amount: request.wager.amount,
+        source: request.wager.source,
+        status: 'ACCEPTED',
+        createdAt: '2026-08-23T11:00:02.000Z',
+      }));
+    vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    service['browserBridge'] = bridge;
+
+    try {
+      await service.updateMonitorTableIds(['D055']);
+      service['orchestrator'].registerTable(defaultProfile('D055'), 'shadow', 20);
+      await service.setExecutionMode('D055', 'live');
+      await service.injectEvent(monitorShoeEvent('D055', 'd055-overlap-shoe', 'physical-shoe'));
+      const actor = service['orchestrator'].getActor('D055');
+      if (!actor) throw new Error('overlap test actor was not registered');
+      actor.updateConfiguration({ ...actor.getProfile(), minEV: -10 }, 20);
+      await service.setAutomationEnabled(true);
+
+      const opening = service.injectEvent({
+        ...openedPlatformRound('D055', 'd055-overlap-window', 'GD055-overlap'),
+        sourceSeq: 2,
+      });
+      await pairStarted;
+
+      expect(requestOperationalWager).toHaveBeenCalledWith(expect.objectContaining({
+        wager: expect.objectContaining({ source: 'keepalive', market: 'banker' }),
+      }));
+      expect(requestBet).toHaveBeenCalledTimes(1);
+
+      releasePair();
+      await opening;
+    } finally {
+      await service.close();
+    }
+  });
+
   it('keeps simulated demo records visible while live monitoring is active', async () => {
     const service = new DesktopConsoleService(':memory:');
     try {
@@ -467,6 +704,7 @@ describe('desktop console demo sessions', () => {
         ...monitorShoeEvent('D055', 'd055-fail-closed-shoe', 'physical-shoe'),
         sourceSeq: 2,
       });
+      await service.setAutomationEnabled(true);
       await service.setAutoBet('D055', true, 'monitor-session-D055');
 
       expect(actor.snapshot().executionMode).toBe('live');
@@ -538,6 +776,7 @@ describe('desktop console demo sessions', () => {
         ...monitorShoeEvent('D055', 'd055-hanging-feed-shoe', 'physical-shoe'),
         sourceSeq: 2,
       });
+      await service.setAutomationEnabled(true);
       await service.setAutoBet('D055', true, 'monitor-session-D055');
 
       const transition = service.updateMonitorTableIds([]);
@@ -609,6 +848,7 @@ describe('desktop console demo sessions', () => {
         ...monitorShoeEvent('D055', 'd055-stop-monitor-shoe', 'physical-shoe'),
         sourceSeq: 2,
       });
+      await service.setAutomationEnabled(true);
       await service.setAutoBet('D055', true, 'monitor-session-D055');
 
       const stopping = service.stopLiveRoomMonitor();
@@ -1136,6 +1376,7 @@ describe('desktop console demo sessions', () => {
     const updateExecutionMode = vi.spyOn(service['orchestrator'], 'updateTableExecutionMode');
 
     try {
+      await service.setAutomationEnabled(true);
       const oneShot = service.executeOneShotLiveBet(command);
       await started;
 

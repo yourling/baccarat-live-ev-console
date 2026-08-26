@@ -3,7 +3,6 @@ import type { DesktopConsoleSnapshot, DesktopKeepaliveState } from '../api-types
 import './keepalive-settings.css';
 
 type KeepaliveDraft = {
-  readonly enabled: boolean;
   readonly intervalMinutes: string;
   readonly market: 'banker' | 'player';
   readonly amount: string;
@@ -27,11 +26,11 @@ export function KeepaliveSettings(props: {
     const intervalMinutes = Number(draft.intervalMinutes);
     const amount = Number(draft.amount);
     if (!Number.isInteger(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 1_440) {
-      props.onError('自动保活间隔必须是 1 到 1440 分钟的整数');
+      props.onError('自动投注保活间隔必须是 1 到 1440 分钟的整数');
       return;
     }
     if (!Number.isFinite(amount) || amount <= 0) {
-      props.onError('自动保活金额必须大于 0');
+      props.onError('自动投注保活金额必须大于 0');
       return;
     }
     const desktop = window.desktop;
@@ -43,7 +42,6 @@ export function KeepaliveSettings(props: {
     props.onError(null);
     try {
       props.onSnapshot(await desktop.updateKeepaliveSettings({
-        enabled: draft.enabled,
         intervalMinutes,
         market: draft.market,
         amount,
@@ -59,22 +57,10 @@ export function KeepaliveSettings(props: {
   return (
     <section className="ledger-settings keepalive-settings">
       <div className="record-heading">
-        <h2>自动保活下注</h2>
+        <h2>自动投注保活策略</h2>
         <span className="record-count">{keepaliveStatus(props.state)}</span>
       </div>
       <div className="settings-fields keepalive-settings__fields">
-        <label className="keepalive-settings__toggle">
-          <span>开启自动保活</span>
-          <input
-            type="checkbox"
-            checked={draft.enabled}
-            disabled={saving}
-            onChange={event => {
-              setDraft(current => ({ ...current, enabled: event.target.checked }));
-              setDirty(true);
-            }}
-          />
-        </label>
         <label>
           <span>间隔（分钟）</span>
           <input
@@ -119,7 +105,7 @@ export function KeepaliveSettings(props: {
           />
         </label>
         <button className="button button--small button--primary settings-save" type="button" disabled={saving || !dirty} onClick={() => void save()}>
-          {saving ? '保存中' : '保存保活'}
+          {saving ? '保存中' : '保存保活策略'}
         </button>
       </div>
       <div className="keepalive-settings__history" role="status">
@@ -134,7 +120,6 @@ export function KeepaliveSettings(props: {
 
 function draftFor(state: DesktopKeepaliveState): KeepaliveDraft {
   return {
-    enabled: state.enabled,
     intervalMinutes: String(state.intervalMinutes),
     market: state.market,
     amount: String(state.amount),

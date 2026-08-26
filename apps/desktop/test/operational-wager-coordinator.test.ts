@@ -91,7 +91,123 @@ describe('OperationalWagerCoordinator', () => {
     }
   });
 
-  it('allows manual wagers from an unconfirmed monitor session while keepalive remains gated', async () => {
+  it('does not report a keepalive result before any wager attempt', async () => {
+    // Given: automation starts before its browser bridge is available.
+    const ledger = new SqliteLedger(':memory:');
+    const coordinator = new OperationalWagerCoordinator({
+      ledger,
+      bridge: () => undefined,
+      monitorTableIds: () => ['D001'],
+      tableState: tableId => tableId === 'D001' ? liveTable(tableId) : undefined,
+      serialize: async operation => await operation(),
+    });
+
+    try {
+      // When: global automation enables the keepalive strategy.
+      const state = await coordinator.updateKeepalive({
+        enabled: true,
+        intervalMinutes: 1,
+        market: 'banker',
+        amount: 20,
+      }, BASE_TIME);
+
+      // Then: the UI retains a neutral preflight state until a wager is actually attempted.
+      expect(state.lastAttemptAt).toBeUndefined();
+      expect(state.lastStatus).toBeUndefined();
+      expect(state.lastReason).toBeUndefined();
+      expect(ledger.listOperationalWagersTail()).toEqual([]);
+    } finally {
+      coordinator.close();
+      ledger.close();
+    }
+  });
+
+  it('clears the previous keepalive result when a new cycle has not attempted a wager', async () => {
+    // Given: the previous cycle completed successfully, then its browser bridge becomes unavailable.
+    const ledger = new SqliteLedger(':memory:');
+    let bridgeAvailable = true;
+    const bridge = {
+      requestOperationalWager: vi.fn(async (request: OperationalWagerExecutionRequest) => receipt(request, 'ACCEPTED')),
+    };
+    const coordinator = new OperationalWagerCoordinator({
+      ledger,
+      bridge: () => bridgeAvailable ? bridge : undefined,
+      monitorTableIds: () => ['D001'],
+      tableState: tableId => tableId === 'D001' ? liveTable(tableId) : undefined,
+      serialize: async operation => await operation(),
+    });
+
+    try {
+      await coordinator.updateKeepalive({
+        enabled: true,
+        intervalMinutes: 1,
+        market: 'banker',
+        amount: 20,
+      }, BASE_TIME);
+      await coordinator.updateKeepalive({
+        enabled: false,
+        intervalMinutes: 1,
+        market: 'banker',
+        amount: 20,
+      }, new Date(BASE_TIME.valueOf() + 1_000));
+      bridgeAvailable = false;
+
+      // When: the operator starts a fresh cycle before any new wager can be attempted.
+      const state = await coordinator.updateKeepalive({
+        enabled: true,
+        intervalMinutes: 1,
+        market: 'banker',
+        amount: 20,
+      }, new Date(BASE_TIME.valueOf() + 2_000));
+
+      // Then: no result from the prior cycle is displayed as this cycle's preflight state.
+      expect(state.lastAttemptAt).toBeUndefined();
+      expect(state.lastSuccessAt).toBeUndefined();
+      expect(state.lastStatus).toBeUndefined();
+      expect(state.lastTableId).toBeUndefined();
+      expect(state.lastReason).toBeUndefined();
+      expect(bridge.requestOperationalWager).toHaveBeenCalledTimes(1);
+    } finally {
+      coordinator.close();
+      ledger.close();
+    }
+  });
+
+  it('reports a periodic keepalive failure through its error handler', async () => {
+    vi.useFakeTimers();
+    const ledger = new SqliteLedger(':memory:');
+    const expectedError = new Error('synthetic scheduler failure');
+    const onError = vi.fn();
+    const coordinator = new OperationalWagerCoordinator({
+      ledger,
+      bridge: () => undefined,
+      monitorTableIds: () => ['D001'],
+      tableState: tableId => tableId === 'D001' ? liveTable(tableId) : undefined,
+      serialize: async () => {
+        throw expectedError;
+      },
+      onError,
+    });
+
+    try {
+      await coordinator.updateKeepalive({
+        enabled: true,
+        intervalMinutes: 1,
+        market: 'banker',
+        amount: 20,
+      }, BASE_TIME);
+
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      expect(onError).toHaveBeenCalledWith(expectedError);
+    } finally {
+      coordinator.close();
+      ledger.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it('allows manual wagers and keepalive from an unconfirmed monitor session', async () => {
     // Given: a live, connected betting window attached mid-shoe without a physical-shoe baseline.
     const ledger = new SqliteLedger(':memory:');
     const bridge = {
@@ -108,7 +224,7 @@ describe('OperationalWagerCoordinator', () => {
     });
 
     try {
-      // When: the operator places one manual wager and the automatic keepalive interval elapses.
+      // When: the operator places one manual wager and enables automatic keepalive.
       const manual = await coordinator.executeManual({
         tableId: 'D001',
         market: 'banker',
@@ -120,15 +236,58 @@ describe('OperationalWagerCoordinator', () => {
         market: 'banker',
         amount: 20,
       }, BASE_TIME);
-      await coordinator.tick(new Date(BASE_TIME.valueOf() + 60_000));
 
-      // Then: the manual wager reaches the bridge, while keepalive remains blocked by the physical-shoe rule.
+      // Then: both paths reach the bridge; keepalive starts without a physical-shoe baseline.
       expect(manual).toMatchObject({ status: 'ACCEPTED', tableId: 'D001' });
-      expect(bridge.requestOperationalWager).toHaveBeenCalledTimes(1);
+      expect(bridge.requestOperationalWager).toHaveBeenCalledTimes(2);
       expect(coordinator.getKeepaliveState()).toMatchObject({
-        lastStatus: 'REJECTED',
+        lastStatus: 'ACCEPTED',
+        lastTableId: 'D001',
       });
-      expect(ledger.listOperationalWagersTail()).toHaveLength(1);
+      expect(ledger.listOperationalWagersTail()).toHaveLength(2);
+    } finally {
+      coordinator.close();
+      ledger.close();
+    }
+  });
+
+  it('keeps a table alive while pair automation is armed', async () => {
+    // Given: a live table in a valid window with the pair-EV strategy armed.
+    const ledger = new SqliteLedger(':memory:');
+    const bridge = {
+      requestOperationalWager: vi.fn(async (request: OperationalWagerExecutionRequest) => receipt(request, 'ACCEPTED')),
+    };
+    const coordinator = new OperationalWagerCoordinator({
+      ledger,
+      bridge: () => bridge,
+      monitorTableIds: () => ['D001'],
+      tableState: tableId => tableId === 'D001'
+        ? liveTable(tableId, { autoBetStatus: 'ARMED' })
+        : undefined,
+      serialize: async operation => await operation(),
+    });
+
+    try {
+      // When: automatic keepalive is enabled.
+      await coordinator.updateKeepalive({
+        enabled: true,
+        intervalMinutes: 1,
+        market: 'player',
+        amount: 20,
+      }, BASE_TIME);
+
+      // Then: the independent banker/player keepalive path remains available.
+      expect(bridge.requestOperationalWager).toHaveBeenCalledWith(expect.objectContaining({
+        wager: expect.objectContaining({
+          tableId: 'D001',
+          market: 'player',
+          source: 'keepalive',
+        }),
+      }));
+      expect(coordinator.getKeepaliveState()).toMatchObject({
+        lastStatus: 'ACCEPTED',
+        lastTableId: 'D001',
+      });
     } finally {
       coordinator.close();
       ledger.close();
@@ -220,7 +379,6 @@ describe('OperationalWagerCoordinator', () => {
         market: 'player',
         amount: 20,
       }, BASE_TIME);
-      await coordinator.tick(new Date(BASE_TIME.valueOf() + 5 * 60_000));
 
       expect(bridge.requestOperationalWager.mock.calls.map(([request]) => request.wager.tableId))
         .toEqual(['D001', 'D002']);

@@ -136,11 +136,14 @@ export type DesktopOperationalWagerResult = {
   readonly snapshot: DesktopConsoleSnapshot;
 };
 
-export interface DesktopKeepaliveSettings {
-  readonly enabled: boolean;
+export interface DesktopKeepaliveStrategySettings {
   readonly intervalMinutes: number;
   readonly market: 'banker' | 'player';
   readonly amount: number;
+}
+
+export interface DesktopKeepaliveSettings extends DesktopKeepaliveStrategySettings {
+  readonly enabled: boolean;
 }
 
 export interface DesktopKeepaliveState extends DesktopKeepaliveSettings {
@@ -150,6 +153,10 @@ export interface DesktopKeepaliveState extends DesktopKeepaliveSettings {
   readonly lastTableId?: string;
   readonly lastReason?: string;
   readonly running: boolean;
+}
+
+export interface DesktopAutomationState {
+  readonly enabled: boolean;
 }
 
 export function parseDesktopOperationalWagerCommand(value: unknown): DesktopOperationalWagerCommand {
@@ -168,15 +175,13 @@ export function parseDesktopOperationalWagerCommand(value: unknown): DesktopOper
   return { tableId, market, amount };
 }
 
-export function parseDesktopKeepaliveSettings(value: unknown): DesktopKeepaliveSettings {
+export function parseDesktopKeepaliveSettings(value: unknown): DesktopKeepaliveStrategySettings {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new TypeError('keepalive settings must be an object');
   }
-  const enabled = Reflect.get(value, 'enabled');
   const intervalMinutes = Reflect.get(value, 'intervalMinutes');
   const market = Reflect.get(value, 'market');
   const amount = Reflect.get(value, 'amount');
-  if (typeof enabled !== 'boolean') throw new TypeError('keepalive enabled must be a boolean');
   if (!Number.isInteger(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 1_440) {
     throw new RangeError('keepalive interval must be an integer from 1 to 1440 minutes');
   }
@@ -186,7 +191,7 @@ export function parseDesktopKeepaliveSettings(value: unknown): DesktopKeepaliveS
   if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
     throw new TypeError('keepalive amount must be a positive finite number');
   }
-  return { enabled, intervalMinutes, market, amount };
+  return { intervalMinutes, market, amount };
 }
 
 export type DesktopRecordKind = 'events' | 'decisions' | 'ledger';
@@ -239,6 +244,7 @@ export interface DesktopConsoleSnapshot {
   monitorCandidates: readonly MonitorTableCandidate[];
   recordCounts: DesktopRecordCounts;
   keepalive: DesktopKeepaliveState;
+  automation: DesktopAutomationState;
   operationalWagers: readonly OperationalWagerRecord[];
   events: NormalizedEvent[];
   decisions: DecisionSnapshot[];

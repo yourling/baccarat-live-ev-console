@@ -173,6 +173,7 @@ export function App() {
   const [recordPage, setRecordPage] = useState<DesktopRecordPage | null>(null);
   const [recordLoading, setRecordLoading] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [automationSaving, setAutomationSaving] = useState(false);
   const [demoSpeed, setDemoSpeed] = useState(1);
   const [error, setError] = useState<string | null>(null);
   const [deckInputs, setDeckInputs] = useState<Record<string, string>>({});
@@ -389,6 +390,7 @@ export function App() {
   const monitoredTableIds = new Set(snapshot?.monitorTableIds ?? []);
   const monitorCandidates = (snapshot?.monitorCandidates ?? []).filter(candidate => !monitoredTableIds.has(candidate.tableId));
   const selectedMonitorTable = selectedMonitorTableId === null ? undefined : tableMap.get(selectedMonitorTableId);
+  const automationEnabled = snapshot?.automation.enabled ?? false;
   const visibleTables = useMemo(() => {
     if (view === 'monitor') return tables;
     return tables.filter(table => {
@@ -583,6 +585,24 @@ export function App() {
     }
   }
 
+  async function toggleAutomation() {
+    if (!window.desktop) return;
+    const enabled = !(snapshot?.automation.enabled ?? false);
+    const hasLiveTable = tables.some(table => table.executionMode === 'live');
+    if (enabled && hasLiveTable && !window.confirm('确认开启全局自动投注？当前存在实盘牌桌，保活和对子策略会按已保存设置执行。')) {
+      return;
+    }
+    setAutomationSaving(true);
+    setError(null);
+    try {
+      setSnapshot(await window.desktop.setAutomationEnabled(enabled));
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAutomationSaving(false);
+    }
+  }
+
   async function setExecutionMode(tableId: string, mode: ExecutionMode) {
     if (!window.desktop) return;
     setError(null);
@@ -617,7 +637,7 @@ export function App() {
   }
 
   async function confirmPhysicalShoe(tableId: string) {
-    if (!window.desktop || !window.confirm('确认该桌当前已经开始新牌靴？确认后会重置该桌物理库存并允许计算对子 EV。')) return;
+    if (!window.desktop || !window.confirm('确认人工重置该桌牌靴？仅在平台未自动识别新牌靴时使用。')) return;
     setError(null);
     try {
       setSnapshot(await window.desktop.confirmPhysicalShoe(tableId));
@@ -653,6 +673,13 @@ export function App() {
           <h1>百家乐实时监控</h1>
         </div>
         <div className="header-actions">
+          <button
+            className={cx('button', automationEnabled ? 'button--danger-ghost' : 'button--primary')}
+            onClick={() => void toggleAutomation()}
+            disabled={!desktopReady || automationSaving}
+          >
+            {automationSaving ? (automationEnabled ? '正在停止自动投注' : '正在开启自动投注') : (automationEnabled ? '停止自动投注' : '开启自动投注')}
+          </button>
           <button className="button button--primary" onClick={() => void toggleDemo()} disabled={busy || !desktopReady}>
             <span aria-hidden="true">{snapshot?.demoRunning ? '■' : '▶'}</span>
             {busy ? (snapshot?.demoRunning ? '正在停止模拟' : '正在启动模拟') : (snapshot?.demoRunning ? '停止持续模拟' : '开始持续模拟')}
@@ -954,9 +981,9 @@ function MonitorTableSettingsDialog(props: {
         <section className="monitor-settings-dialog__autobet">
           <div><span>自动下注</span><strong>{AUTO_BET_LABELS[actor.projection.autoBetStatus]}</strong></div>
           <div className="monitor-settings-dialog__actions">
-            {!physicalShoeKnown && <button className="button button--small button--primary" onClick={props.onConfirmShoe}>确认新牌靴</button>}
-            <button className="button button--small button--primary" onClick={props.onArm} disabled={!physicalShoeKnown} title={physicalShoeKnown ? undefined : '物理牌靴基线未知，先确认新牌靴'}>开始自动下注</button>
-            <button className="button button--small button--secondary" onClick={props.onDisarm}>停止自动下注</button>
+            {!physicalShoeKnown && <button className="button button--small button--secondary" onClick={props.onConfirmShoe}>人工重置牌靴</button>}
+            <button className="button button--small button--secondary" onClick={props.onArm} disabled={!physicalShoeKnown} title={physicalShoeKnown ? undefined : '物理牌靴基线未知，无法人工恢复对子策略'}>人工恢复对子策略</button>
+            <button className="button button--small button--secondary" onClick={props.onDisarm}>暂停本桌对子策略</button>
             <button className="button button--small button--danger-ghost" onClick={props.onRemove}>删除监控</button>
           </div>
         </section>

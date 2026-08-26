@@ -24,6 +24,7 @@ import { buildRandomDemo } from '../src/core-demo.js';
 import {
   OperationalWagerCoordinator,
   type KeepaliveSettings,
+  type KeepaliveStrategySettings,
   type OperationalWagerResult,
 } from './operational-wager-coordinator.js';
 import {
@@ -176,6 +177,10 @@ export class DesktopConsoleService {
       ledger: this.ledger,
       riskLimits: defaultConsoleLimits(),
       executor: defaultExecutor,
+      canExecuteAutomaticBets: () => this.operationalWagers.getKeepaliveState().enabled,
+      onBettingWindowOpened: () => {
+        void this.operationalWagers.tick().catch(error => this.recordLiveMonitorError(error));
+      },
     });
     this.monitorTableIds = this.loadMonitorTableIds();
     this.operationalWagers = new OperationalWagerCoordinator({
@@ -184,6 +189,7 @@ export class DesktopConsoleService {
       monitorTableIds: () => this.monitorTableIds,
       tableState: tableId => this.orchestrator.getActor(tableId)?.snapshot(),
       serialize: async operation => await this.enqueueExecutionStateOperation(operation),
+      onError: error => this.recordLiveMonitorError(error),
     });
     this.normalizeEvFloor();
   }
@@ -252,6 +258,52 @@ export class DesktopConsoleService {
 
   private isCurrentLiveFeed(tableId: string, feed: TableExport): boolean {
     return this.isMonitorTableSelected(tableId) && this.liveFeeds.get(tableId) === feed;
+  }
+
+  private async enqueueMonitorEvent(event: NormalizedEvent): Promise<void> {
+    await this.orchestrator.enqueue(event.tableId, event);
+    if (
+      event.type === 'newShoeSignal'
+      || event.type === 'connectionRestored'
+      || (event.type === 'shoeConfirmation' && event.approved)
+    ) {
+      await this.rearmPairAutomation(event.tableId);
+    }
+  }
+
+  private async reconcilePairAutomation(enabled: boolean): Promise<void> {
+    for (const tableId of this.monitorTableIds) {
+      const actor = this.orchestrator.getActor(tableId);
+      if (!actor) continue;
+      const projection = actor.getProjection();
+      if (!enabled) {
+        if (projection.autoBetStatus !== 'DISARMED') {
+          await actor.setAutoBet(false, projection.shoeId || undefined);
+        }
+        continue;
+      }
+      await this.rearmPairAutomation(tableId);
+    }
+  }
+
+  private async rearmPairAutomation(tableId: string): Promise<void> {
+    if (!this.operationalWagers.getKeepaliveState().enabled || !this.monitorTableIds.includes(tableId)) return;
+    const actor = this.orchestrator.getActor(tableId);
+    if (!actor) return;
+    const projection = actor.getProjection();
+    const canArm = projection.autoBetStatus === 'DISARMED'
+      && projection.shoeBaseline === 'physical-shoe'
+      && projection.connectionStatus === 'CONNECTED'
+      && !projection.sealed
+      && (projection.status === 'TRACKING'
+        || projection.status === 'BETTING_WINDOW'
+        || projection.status === 'PENDING_SETTLEMENT');
+    if (canArm) await actor.setAutoBet(true, projection.shoeId || undefined);
+  }
+
+  private async applyKeepaliveSettings(settings: KeepaliveSettings): Promise<void> {
+    await this.operationalWagers.updateKeepalive(settings);
+    await this.reconcilePairAutomation(settings.enabled);
   }
 
   private recordLiveMonitorError(error: unknown): void {
@@ -459,7 +511,7 @@ export class DesktopConsoleService {
                 if (event.tableId !== table.tableId || !this.isCurrentLiveFeed(table.tableId, feed)) continue;
                 const sourceSeq = this.nextMonitorSourceSeq(event.tableId);
                 if (!this.isCurrentLiveFeed(table.tableId, feed)) continue;
-                await this.orchestrator.enqueue(event.tableId, { ...event, sourceSeq });
+                await this.enqueueMonitorEvent({ ...event, sourceSeq });
               }
             },
             onDisconnect: (tableId, reason) => {
@@ -468,7 +520,7 @@ export class DesktopConsoleService {
               // registered while it is disconnected: deleting it would make the
               // periodic attach call start() on the same already-started export.
               const sourceSeq = this.nextMonitorSourceSeq(tableId);
-              void this.orchestrator.enqueue(tableId, {
+              void this.enqueueMonitorEvent({
                 type: 'connectionLost',
                 eventId: newId('evt'),
                 tableId,
@@ -477,12 +529,12 @@ export class DesktopConsoleService {
                 source: 'room-monitor',
                 schemaVersion: EVENT_SCHEMA_VERSION,
                 ...(reason ? { reason } : {}),
-              });
+              }).catch(error => this.recordLiveMonitorError(error));
             },
             onRestored: (tableId, proof) => {
               if (!this.isCurrentLiveFeed(tableId, feed)) return;
               const sourceSeq = this.nextMonitorSourceSeq(tableId);
-              void this.orchestrator.enqueue(tableId, {
+              void this.enqueueMonitorEvent({
                 type: 'connectionRestored',
                 eventId: newId('evt'),
                 tableId,
@@ -491,7 +543,7 @@ export class DesktopConsoleService {
                 source: 'room-monitor',
                 schemaVersion: EVENT_SCHEMA_VERSION,
                 continuityProof: proof,
-              });
+              }).catch(error => this.recordLiveMonitorError(error));
             },
           });
           if (!this.isCurrentLiveFeed(table.tableId, feed)) {
@@ -500,7 +552,7 @@ export class DesktopConsoleService {
           }
           // 实时桥刚附加到牌桌时，主动写一条恢复事件，让之前 RESYNCING 的投影回到 TRACKING。
           const restoreSeq = this.nextMonitorSourceSeq(table.tableId);
-          await this.orchestrator.enqueue(table.tableId, {
+          await this.enqueueMonitorEvent({
             type: 'connectionRestored',
             eventId: newId('evt'),
             tableId: table.tableId,
@@ -578,6 +630,7 @@ export class DesktopConsoleService {
     const snapshot: OrchestratorSnapshot = { ...fullSnapshot, tables };
     const filterToDisplayedTables = <T extends { tableId: string }>(rows: readonly T[]): T[] =>
       usingLiveMonitor ? rows.filter(row => activeTableIds.has(row.tableId)) : [...rows];
+    const keepalive = this.operationalWagers.getKeepaliveState();
     const events = includeHistory ? this.ledger.listEvents() : this.ledger.listEventsTail();
     const decisions = includeHistory ? this.ledger.listDecisions() : this.ledger.listDecisionsTail();
     const receipts = includeHistory ? this.ledger.listReceipts() : this.ledger.listReceiptsTail();
@@ -600,7 +653,8 @@ export class DesktopConsoleService {
       monitorTableIds: [...this.monitorTableIds],
       monitorCandidates,
       recordCounts,
-      keepalive: this.operationalWagers.getKeepaliveState(),
+      keepalive,
+      automation: { enabled: keepalive.enabled },
       operationalWagers: this.ledger.listOperationalWagersTail(),
       events: filterToDisplayedTables(events),
       decisions: filterToDisplayedTables(decisions),
@@ -880,7 +934,7 @@ export class DesktopConsoleService {
   }
 
   async injectEvent(event: NormalizedEvent): Promise<DesktopConsoleSnapshot> {
-    await this.orchestrator.enqueue(event.tableId, event);
+    await this.enqueueMonitorEvent(event);
     return this.snapshot();
   }
 
@@ -895,6 +949,9 @@ export class DesktopConsoleService {
     return this.enqueueExecutionStateOperation(async () => {
       const actor = this.orchestrator.getActor(tableId);
       if (!actor) throw new Error(`unknown table ${tableId}`);
+      if (armed && !this.operationalWagers.getKeepaliveState().enabled) {
+        throw new Error('global automation is disabled');
+      }
       await actor.setAutoBet(armed, shoeId);
       return this.snapshot();
     });
@@ -941,9 +998,28 @@ export class DesktopConsoleService {
     return { ...result, snapshot: this.snapshot() };
   }
 
-  async updateKeepaliveSettings(settings: KeepaliveSettings): Promise<DesktopConsoleSnapshot> {
+  async updateKeepaliveSettings(settings: KeepaliveStrategySettings): Promise<DesktopConsoleSnapshot> {
     return await this.enqueueExecutionStateOperation(async () => {
-      await this.operationalWagers.updateKeepalive(settings);
+      const current = this.operationalWagers.getKeepaliveState();
+      await this.applyKeepaliveSettings({
+        enabled: current.enabled,
+        intervalMinutes: settings.intervalMinutes,
+        market: settings.market,
+        amount: settings.amount,
+      });
+      return this.snapshot();
+    });
+  }
+
+  async setAutomationEnabled(enabled: boolean): Promise<DesktopConsoleSnapshot> {
+    return await this.enqueueExecutionStateOperation(async () => {
+      const current = this.operationalWagers.getKeepaliveState();
+      await this.applyKeepaliveSettings({
+        enabled,
+        intervalMinutes: current.intervalMinutes,
+        market: current.market,
+        amount: current.amount,
+      });
       return this.snapshot();
     });
   }

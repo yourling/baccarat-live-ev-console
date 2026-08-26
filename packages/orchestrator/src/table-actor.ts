@@ -42,6 +42,8 @@ export interface TableActorOptions {
   ledger: SqliteLedger;
   riskManager: RiskManager;
   executor?: Pick<BrowserAdapter, 'requestBet'> | null;
+  canExecuteAutomaticBets?: () => boolean;
+  onBettingWindowOpened?: () => void;
   executionMode: 'shadow' | 'simulated' | 'live';
   defaultBetAmount: number;
   riskLimits: RiskLimits;
@@ -68,6 +70,8 @@ export class TableActor {
   private readonly ledger: SqliteLedger;
   private readonly riskManager: RiskManager;
   private executor: Pick<BrowserAdapter, 'requestBet'> | null;
+  private readonly canExecuteAutomaticBets: () => boolean;
+  private readonly onBettingWindowOpened?: () => void;
   private profile: TableProfile;
   private executionMode: 'shadow' | 'simulated' | 'live';
   private defaultBetAmount: number;
@@ -89,6 +93,8 @@ export class TableActor {
     this.ledger = options.ledger;
     this.riskManager = options.riskManager;
     this.executor = options.executor ?? null;
+    this.canExecuteAutomaticBets = options.canExecuteAutomaticBets ?? (() => true);
+    this.onBettingWindowOpened = options.onBettingWindowOpened;
     this.profile = structuredClone(options.profile);
     this.executionMode = options.executionMode;
     this.defaultBetAmount = options.defaultBetAmount;
@@ -248,6 +254,7 @@ export class TableActor {
       return;
     }
     if (event.type === 'bettingWindowOpened') {
+      this.onBettingWindowOpened?.();
       await this.evaluateWindow(event, this.projection);
       return;
     }
@@ -285,6 +292,7 @@ export class TableActor {
       return;
     }
     if (event.type === 'bettingWindowOpened') {
+      this.onBettingWindowOpened?.();
       await this.evaluateWindow(event, this.projection);
       return;
     }
@@ -327,6 +335,10 @@ export class TableActor {
 
     if (projection.autoBetStatus !== 'ARMED') {
       this.recordDecision(event, projection, eligible, reason, 'auto-not-armed');
+      return;
+    }
+    if (this.executionMode === 'live' && !this.canExecuteAutomaticBets()) {
+      this.recordDecision(event, projection, eligible, reason, 'global-automation-disabled');
       return;
     }
 
@@ -602,6 +614,8 @@ export interface OrchestratorOptions {
   ledger: SqliteLedger;
   riskLimits: RiskLimits;
   executor?: Pick<BrowserAdapter, 'requestBet'> | null;
+  canExecuteAutomaticBets?: () => boolean;
+  onBettingWindowOpened?: () => void;
 }
 
 export interface RegisteredTableConfig {
@@ -626,6 +640,8 @@ export class Orchestrator {
   private readonly actors = new Map<string, TableActor>();
   private riskLimits: RiskLimits;
   private executor: Pick<BrowserAdapter, 'requestBet'> | null;
+  private readonly canExecuteAutomaticBets: () => boolean;
+  private readonly onBettingWindowOpened?: () => void;
 
   constructor(options: OrchestratorOptions) {
     this.ledger = options.ledger;
@@ -635,6 +651,8 @@ export class Orchestrator {
     if (persistedLimits) this.riskLimits = persistedLimits;
     this.ledger.setConfig(RISK_LIMITS_KEY, this.riskLimits);
     this.executor = options.executor ?? null;
+    this.canExecuteAutomaticBets = options.canExecuteAutomaticBets ?? (() => true);
+    this.onBettingWindowOpened = options.onBettingWindowOpened;
     this.riskManager = new RiskManager(
       this.ledger,
       this.ledger.getRiskState() ?? emptyRiskState(todayUtc()),
@@ -807,6 +825,8 @@ export class Orchestrator {
       ledger: this.ledger,
       riskManager: this.riskManager,
       executor: this.executor,
+      canExecuteAutomaticBets: this.canExecuteAutomaticBets,
+      onBettingWindowOpened: this.onBettingWindowOpened,
       executionMode: config.executionMode,
       defaultBetAmount: config.defaultBetAmount,
       riskLimits: this.riskLimits,

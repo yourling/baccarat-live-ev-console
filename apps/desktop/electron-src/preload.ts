@@ -1,9 +1,9 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { BetTier, ManualCorrection, NormalizedEvent, RiskLimits, TableProfile } from '@baccarat/contracts';
+import type { BetTier, ManualCorrection, RiskLimits, TableProfile } from '@baccarat/contracts';
 import type {
   DesktopRecordPage,
   DesktopRecordQuery,
-  DesktopKeepaliveSettings,
+  DesktopKeepaliveStrategySettings,
   DesktopOperationalWagerCommand,
   DesktopOperationalWagerResult,
   DesktopSnapshotOptions,
@@ -21,7 +21,6 @@ const api = {
   setDemoSpeed: (speed: number) => ipcRenderer.invoke('console:set-demo-speed', speed),
   registerTable: (profile: TableProfile, mode: 'shadow' | 'simulated' | 'live', amount: number) =>
     ipcRenderer.invoke('console:register-table', profile, mode, amount),
-  injectEvent: (event: NormalizedEvent) => ipcRenderer.invoke('console:inject-event', event),
   setAutoBet: (tableId: string, armed: boolean, shoeId?: string) =>
     ipcRenderer.invoke('console:set-auto-bet', tableId, armed, shoeId),
   setExecutionMode: (tableId: string, mode: 'shadow' | 'live') =>
@@ -30,8 +29,9 @@ const api = {
     ipcRenderer.invoke('console:execute-one-shot-live-bet', command),
   executeOperationalWager: (command: DesktopOperationalWagerCommand): Promise<DesktopOperationalWagerResult> =>
     ipcRenderer.invoke('console:execute-operational-wager', command),
-  updateKeepaliveSettings: (settings: DesktopKeepaliveSettings) =>
+  updateKeepaliveSettings: (settings: DesktopKeepaliveStrategySettings) =>
     ipcRenderer.invoke('console:update-keepalive-settings', settings),
+  setAutomationEnabled: (enabled: boolean) => ipcRenderer.invoke('console:set-automation-enabled', enabled),
   confirmPhysicalShoe: (tableId: string) => ipcRenderer.invoke('console:confirm-physical-shoe', tableId),
   applyManualCorrection: (tableId: string, correction: ManualCorrection, shoeId?: string) =>
     ipcRenderer.invoke('console:manual-correction', tableId, correction, shoeId),

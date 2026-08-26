@@ -36,11 +36,14 @@ export type OperationalWagerTableState = {
   };
 };
 
-export interface KeepaliveSettings {
-  readonly enabled: boolean;
+export interface KeepaliveStrategySettings {
   readonly intervalMinutes: number;
   readonly market: KeepaliveWagerMarket;
   readonly amount: number;
+}
+
+export interface KeepaliveSettings extends KeepaliveStrategySettings {
+  readonly enabled: boolean;
 }
 
 export interface KeepaliveState extends KeepaliveSettings {
@@ -68,6 +71,7 @@ export interface OperationalWagerCoordinatorOptions {
   readonly monitorTableIds: () => readonly string[];
   readonly tableState: (tableId: string) => OperationalWagerTableState | undefined;
   readonly serialize: <T>(operation: () => Promise<T>) => Promise<T>;
+  readonly onError?: (error: unknown) => void;
 }
 
 export class OperationalWagerCoordinator {
@@ -80,7 +84,9 @@ export class OperationalWagerCoordinator {
     this.options = options;
     this.state = readKeepaliveState(options.ledger.getConfig<unknown>(KEEPALIVE_CONFIG_KEY)) ?? defaultKeepaliveState();
     options.ledger.setConfig(KEEPALIVE_CONFIG_KEY, this.state);
-    this.timer = setInterval(() => void this.tick(), KEEPALIVE_TICK_MS);
+    this.timer = setInterval(() => {
+      void this.tick().catch(options.onError ?? (error => console.error('operational keepalive tick failed', error)));
+    }, KEEPALIVE_TICK_MS);
     this.timer.unref?.();
   }
 
@@ -94,16 +100,10 @@ export class OperationalWagerCoordinator {
 
   async updateKeepalive(settings: KeepaliveSettings, now = new Date()): Promise<KeepaliveState> {
     assertKeepaliveSettings(settings);
-    const changed = this.state.enabled !== settings.enabled
-      || this.state.intervalMinutes !== settings.intervalMinutes
-      || this.state.market !== settings.market
-      || this.state.amount !== settings.amount;
-    this.state = {
-      ...this.state,
-      ...settings,
-      ...(settings.enabled && changed ? { lastAttemptAt: now.toISOString() } : {}),
-    };
+    const newlyEnabled = settings.enabled && !this.state.enabled;
+    this.state = newlyEnabled ? { ...settings } : { ...this.state, ...settings };
     this.persist();
+    if (newlyEnabled) await this.tickInner(now);
     return this.getKeepaliveState();
   }
 
@@ -119,7 +119,7 @@ export class OperationalWagerCoordinator {
     try {
       const bridge = this.options.bridge();
       const result = bridge === undefined
-        ? { status: 'REJECTED' as const, tableId: null, reason: 'browser-bridge-unavailable' }
+        ? { status: 'REJECTED' as const, tableId: null, attempted: false, reason: 'browser-bridge-unavailable' }
         : await tryKeepaliveInOrder({
           tableIds: this.options.monitorTableIds(),
           market: this.state.market,
@@ -131,18 +131,25 @@ export class OperationalWagerCoordinator {
               amount,
               source: 'keepalive',
             }, bridge, now);
-            return { status: response.status, ...(response.reason === undefined ? {} : { reason: response.reason }) };
+            return {
+              status: response.status,
+              attempted: response.wager !== undefined,
+              ...(response.reason === undefined ? {} : { reason: response.reason }),
+            };
           },
         });
-      this.state = {
-        ...this.state,
-        lastAttemptAt: now.toISOString(),
-        lastStatus: result.status,
-        ...(result.tableId === null ? {} : { lastTableId: result.tableId }),
-        ...(result.reason === undefined ? {} : { lastReason: result.reason }),
-        ...(result.status === 'ACCEPTED' ? { lastSuccessAt: now.toISOString() } : {}),
-      };
-      this.persist();
+      const shouldRecordAttempt = result.status !== 'REJECTED' || result.attempted;
+      if (shouldRecordAttempt) {
+        this.state = {
+          ...this.state,
+          lastAttemptAt: now.toISOString(),
+          lastStatus: result.status,
+          ...(result.tableId === null ? {} : { lastTableId: result.tableId }),
+          ...(result.reason === undefined ? {} : { lastReason: result.reason }),
+          ...(result.status === 'ACCEPTED' ? { lastSuccessAt: now.toISOString() } : {}),
+        };
+        this.persist();
+      }
     } finally {
       this.running = false;
     }
@@ -335,13 +342,10 @@ function operationalWagerGateReason(
 ): string | null {
   if (source === 'manual' && table.executionMode !== 'live') return null;
   if (source === 'keepalive' && table.executionMode !== 'live') return 'live-execution-required';
-  if (source === 'keepalive' && table.projection.shoeBaseline !== 'physical-shoe') {
-    return 'physical-shoe-required';
-  }
   if (table.projection.connectionStatus !== 'CONNECTED') return 'connected-required';
   if (table.projection.status !== 'BETTING_WINDOW') return 'betting-window-required';
   if (table.projection.sealed) return 'shoe-sealed';
-  if (table.projection.autoBetStatus === 'ARMED') return 'auto-bet-armed';
+  if (source !== 'keepalive' && table.projection.autoBetStatus === 'ARMED') return 'auto-bet-armed';
   return null;
 }
 

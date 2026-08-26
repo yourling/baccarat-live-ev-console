@@ -5,11 +5,12 @@ export type KeepaliveWagerMarket = Extract<OperationalWagerMarket, 'banker' | 'p
 export type KeepaliveWagerResponse = {
   readonly status: OperationalWagerStatus;
   readonly reason?: string;
+  readonly attempted?: boolean;
 };
 
 export type KeepaliveAttemptResult =
   | { readonly status: 'ACCEPTED'; readonly tableId: string; readonly reason?: string }
-  | { readonly status: 'REJECTED'; readonly tableId: string | null; readonly reason?: string }
+  | { readonly status: 'REJECTED'; readonly tableId: null; readonly attempted: boolean; readonly reason?: string }
   | { readonly status: 'UNKNOWN'; readonly tableId: string; readonly reason?: string };
 
 export interface KeepaliveAttemptInput {
@@ -24,6 +25,8 @@ export interface KeepaliveAttemptInput {
 }
 
 export async function tryKeepaliveInOrder(input: KeepaliveAttemptInput): Promise<KeepaliveAttemptResult> {
+  let attempted = false;
+  let lastReason: string | undefined;
   for (const tableId of input.tableIds) {
     const response = await input.requestWager(tableId, input.market, input.amount);
     switch (response.status) {
@@ -32,12 +35,19 @@ export async function tryKeepaliveInOrder(input: KeepaliveAttemptInput): Promise
       case 'UNKNOWN':
         return { status: 'UNKNOWN', tableId, ...(response.reason === undefined ? {} : { reason: response.reason }) };
       case 'REJECTED':
+        attempted ||= response.attempted === true;
+        lastReason = response.reason;
         break;
       default:
         return assertNeverOperationalWagerStatus(response.status);
     }
   }
-  return { status: 'REJECTED', tableId: null };
+  return {
+    status: 'REJECTED',
+    tableId: null,
+    attempted,
+    ...(lastReason === undefined ? {} : { reason: lastReason }),
+  };
 }
 
 function assertNeverOperationalWagerStatus(value: never): never {
