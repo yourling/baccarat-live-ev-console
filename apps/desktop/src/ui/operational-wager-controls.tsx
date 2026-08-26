@@ -33,8 +33,9 @@ export function OperationalWagerControls(props: {
       setMessage(blockedReason ?? '桌面下注通道当前不可用');
       return;
     }
-    const confirmed = window.confirm(
-      `确认使用真实资金下注？\n牌桌：${props.actor.tableId}\n玩法：${MARKET_LABELS[market]}\n金额：${formatAmount(parsedAmount)}`,
+    const confirmed = window.confirm(props.actor.executionMode === 'live'
+      ? `确认使用真实资金下注？\n牌桌：${props.actor.tableId}\n玩法：${MARKET_LABELS[market]}\n金额：${formatAmount(parsedAmount)}`
+      : `确认记录${props.actor.executionMode === 'shadow' ? '影子' : '模拟'}下注测试？\n牌桌：${props.actor.tableId}\n玩法：${MARKET_LABELS[market]}\n金额：${formatAmount(parsedAmount)}\n本次不会向浏览器发送下注。`,
     );
     if (!confirmed) return;
 
@@ -49,7 +50,11 @@ export function OperationalWagerControls(props: {
       });
       props.onSnapshot(result.snapshot);
       setStatus(result.status);
-      setMessage(result.reason ?? null);
+      setMessage(result.reason === 'shadow-simulated'
+        ? '影子测试已记录，未向浏览器发送下注'
+        : result.reason === 'simulated-simulated'
+          ? '模拟测试已记录，未向浏览器发送下注'
+          : result.reason ?? null);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
     } finally {
@@ -98,9 +103,8 @@ export function OperationalWagerControls(props: {
 }
 
 function operationalWagerGateReason(actor: TableActorSnapshot): string | null {
+  if (actor.executionMode !== 'live') return null;
   const projection = actor.projection;
-  if (actor.executionMode !== 'live') return '请先在牌桌设置中启用真实下注';
-  if (projection.shoeBaseline !== 'physical-shoe') return '请先确认当前物理牌靴';
   if (projection.connectionStatus !== 'CONNECTED') return '牌桌连接未就绪';
   if (projection.status !== 'BETTING_WINDOW') return '当前不在下注窗口';
   if (projection.currentHandId === null || projection.currentHandId.length === 0) return '当前没有可下注局号';

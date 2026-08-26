@@ -246,8 +246,9 @@ export class MstromRuntimeParser {
     if (type === undefined || round === undefined) return;
     for (const market of PAIR_MARKETS) {
       if (type === 'bettingWindowOpened') {
-        if (round.openedMarkets.has(market) || round.closedMarkets.has(market)) continue;
+        if (round.openedMarkets.has(market)) continue;
         round.openedMarkets.add(market);
+        round.closedMarkets.delete(market);
         events.push({
           type,
           eventId: `mstrom-window:${table.shoeId}:${type}:${round.roundId}:${market}`,

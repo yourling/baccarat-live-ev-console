@@ -32,6 +32,11 @@
     return cards;
   }
 
+  function normalizedOpeningCardBytes(value, gmstatus) {
+    if (gmstatus === 1 && (value === null || value === undefined)) return [];
+    return normalizedCardBytes(value);
+  }
+
   function postSelection(tableIds) {
     const uniqueTableIds = Array.from(new Set(tableIds.filter(Boolean))).sort();
     const signature = uniqueTableIds.join('|');
@@ -80,8 +85,8 @@
 
     // 站点明确把 gmstatus=11 定义为洗牌。该状态可上报，但绝不携带隐藏牌面。
     const hiddenForShuffle = gmstatus === 11;
-    const playerCards = hiddenForShuffle ? [] : normalizedCardBytes(snapshot.pcard);
-    const bankerCards = hiddenForShuffle ? [] : normalizedCardBytes(snapshot.bcard);
+    const playerCards = hiddenForShuffle ? [] : normalizedOpeningCardBytes(snapshot.pcard, gmstatus);
+    const bankerCards = hiddenForShuffle ? [] : normalizedOpeningCardBytes(snapshot.bcard, gmstatus);
     if (playerCards === null || bankerCards === null) return;
     const isWindowLifecycleState = gmstatus === 0 || gmstatus === 1 || gmstatus === 2;
     if (!hiddenForShuffle && !isWindowLifecycleState && playerCards.length === 0 && bankerCards.length === 0) return;

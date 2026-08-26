@@ -154,11 +154,7 @@ export class OperationalWagerCoordinator {
     readonly amount: number;
   }): Promise<OperationalWagerResult> {
     return await this.options.serialize(async () => {
-      const bridge = this.options.bridge();
-      if (bridge === undefined) {
-        return { status: 'REJECTED', tableId: input.tableId, reason: 'browser-bridge-unavailable' };
-      }
-      return await this.execute({ ...input, source: 'manual' }, bridge, new Date());
+      return await this.execute({ ...input, source: 'manual' }, this.options.bridge(), new Date());
     });
   }
 
@@ -169,7 +165,7 @@ export class OperationalWagerCoordinator {
       readonly amount: number;
       readonly source: OperationalWagerSource;
     },
-    bridge: OperationalWagerBridge,
+    bridge: OperationalWagerBridge | undefined,
     now: Date,
   ): Promise<OperationalWagerResult> {
     if (!isOperationalWagerMarket(input.market)) {
@@ -185,7 +181,7 @@ export class OperationalWagerCoordinator {
     if (table === undefined) {
       return { status: 'REJECTED', tableId: input.tableId, reason: 'table-unavailable' };
     }
-    const gateReason = operationalWagerGateReason(table);
+    const gateReason = operationalWagerGateReason(table, input.source);
     if (gateReason !== null) {
       return { status: 'REJECTED', tableId: input.tableId, reason: gateReason };
     }
@@ -203,6 +199,12 @@ export class OperationalWagerCoordinator {
       source: input.source,
       createdAt: now.toISOString(),
     };
+    if (table.executionMode !== 'live') {
+      return this.saveResult(wager, 'ACCEPTED', `${table.executionMode}-simulated`);
+    }
+    if (bridge === undefined) {
+      return { status: 'REJECTED', tableId: input.tableId, reason: 'browser-bridge-unavailable' };
+    }
     const request: OperationalWagerExecutionRequest = { mode: 'live', wager };
     let receipt: OperationalWagerReceipt | null;
     try {
@@ -325,9 +327,15 @@ function keepaliveDue(state: PersistedKeepaliveState, now: Date): boolean {
   return now.valueOf() - lastAttemptAt >= state.intervalMinutes * 60_000;
 }
 
-function operationalWagerGateReason(table: OperationalWagerTableState): string | null {
-  if (table.executionMode !== 'live') return 'live-execution-required';
-  if (table.projection.shoeBaseline !== 'physical-shoe') return 'physical-shoe-required';
+function operationalWagerGateReason(
+  table: OperationalWagerTableState,
+  source: OperationalWagerSource,
+): string | null {
+  if (source === 'manual' && table.executionMode !== 'live') return null;
+  if (source === 'keepalive' && table.executionMode !== 'live') return 'live-execution-required';
+  if (source === 'keepalive' && table.projection.shoeBaseline !== 'physical-shoe') {
+    return 'physical-shoe-required';
+  }
   if (table.projection.connectionStatus !== 'CONNECTED') return 'connected-required';
   if (table.projection.status !== 'BETTING_WINDOW') return 'betting-window-required';
   if (table.projection.sealed) return 'shoe-sealed';

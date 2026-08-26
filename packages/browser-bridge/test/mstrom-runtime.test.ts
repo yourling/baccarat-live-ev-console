@@ -82,6 +82,34 @@ describe('mstrom runtime parser', () => {
     expect(events.some(event => event.type === 'bettingWindowOpened')).toBe(false);
   });
 
+  it('emits a later observed opening after an unobservable close for the same round', () => {
+    // Given: monitor attachment begins after the window, then receives a late opening snapshot for that same round.
+    const parser = new MstromRuntimeParser();
+    parser.parse(snapshot({
+      gmstatus: 2,
+      playerScore: null,
+      bankerScore: null,
+      playerCards: [],
+      bankerCards: [],
+    }));
+
+    // When: the runtime reports the actual opening lifecycle state.
+    const events = parser.parse(snapshot({
+      gmstatus: 1,
+      playerScore: null,
+      bankerScore: null,
+      playerCards: [],
+      bankerCards: [],
+      capturedAt: '2026-08-22T15:30:19.000Z',
+    }));
+
+    // Then: the table receives a new opening event for both pair markets.
+    expect(events).toEqual([
+      expect.objectContaining({ type: 'bettingWindowOpened', market: 'bankerPair' }),
+      expect.objectContaining({ type: 'bettingWindowOpened', market: 'playerPair' }),
+    ]);
+  });
+
   it('emits cards incrementally and waits for a complete baccarat hand before settlement', () => {
     const parser = new MstromRuntimeParser();
     const first = parser.parse(snapshot());

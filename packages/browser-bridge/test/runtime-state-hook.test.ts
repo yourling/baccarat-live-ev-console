@@ -18,21 +18,30 @@ interface PostedMessage {
 }
 
 interface HookOptions {
-  readonly bankerCards?: readonly number[];
+  readonly bankerCards?: readonly number[] | null | undefined;
   readonly hostname?: string;
+  readonly playerCards?: readonly number[] | null | undefined;
+}
+
+function isCardList(value: readonly number[] | string | HookOptions): value is readonly number[] {
+  return Array.isArray(value);
 }
 
 function runHook(
   gmstatus: number,
-  playerCards: readonly number[] = [0x38, 0x12, 0x03],
+  playerCardsOrOptions: readonly number[] | string | HookOptions = [0x38, 0x12, 0x03],
   options: string | HookOptions = {},
 ): readonly PostedMessage[] {
-  const hostname = typeof options === 'string'
+  const resolvedOptions = isCardList(playerCardsOrOptions) || typeof playerCardsOrOptions === 'string'
     ? options
-    : options.hostname ?? 'gci.agad.mstrom-uno.com';
-  const bankerCards = typeof options === 'string'
-    ? [0x39, 0x05]
-    : options.bankerCards ?? [0x39, 0x05];
+    : playerCardsOrOptions;
+  const hostname = typeof resolvedOptions === 'string'
+    ? resolvedOptions
+    : resolvedOptions.hostname ?? 'gci.agad.mstrom-uno.com';
+  const playerCards = isCardList(playerCardsOrOptions)
+    ? playerCardsOrOptions
+    : cardsFromOptions(resolvedOptions, 'playerCards', [0x38, 0x12, 0x03]);
+  const bankerCards = cardsFromOptions(resolvedOptions, 'bankerCards', [0x39, 0x05]);
   const messages: PostedMessage[] = [];
   const postMessage = vi.fn((message: PostedMessage) => {
     messages.push(message);
@@ -66,6 +75,15 @@ function runHook(
   });
   vm.runInContext(hookSource, context);
   return messages;
+}
+
+function cardsFromOptions(
+  options: string | HookOptions,
+  field: 'playerCards' | 'bankerCards',
+  fallback: readonly number[],
+): readonly number[] | null | undefined {
+  if (typeof options === 'string' || !Object.hasOwn(options, field)) return fallback;
+  return options[field];
 }
 
 function runLobbyRoadStoreHook(): readonly PostedMessage[] {
@@ -715,7 +733,18 @@ describe('mstrom runtime-state hook', () => {
   });
 
   it('rejects an entire snapshot instead of shifting invalid card slots', () => {
-    expect(runHook(0, [0x38, 0x00, 0x03])).toHaveLength(0);
+    expect(runHook(0, { playerCards: [0x38, 0x00, 0x03] })).toHaveLength(0);
+  });
+
+  it('reports an open window when lifecycle snapshots omit empty card arrays', () => {
+    const messages = runHook(1, { playerCards: undefined, bankerCards: null });
+
+    expect(messages).toHaveLength(1);
+    expect(JSON.parse(String(messages[0]?.data))).toMatchObject({
+      gmstatus: 1,
+      playerCards: [],
+      bankerCards: [],
+    });
   });
 });
 
