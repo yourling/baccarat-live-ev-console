@@ -753,7 +753,6 @@ export class BrowserBridgeServer implements RoomMonitor {
           message.source === 'baccarat-bridge-ws'
           && message.encoding === 'base64'
           && message.direction !== 'send'
-          && /mstrom-uno|673ing|mdvuz|e9p1/i.test(message.url)
         ) {
           const bytes = Uint8Array.from(Buffer.from(message.data, 'base64'));
           const parsed = parseMstromFrame(bytes);

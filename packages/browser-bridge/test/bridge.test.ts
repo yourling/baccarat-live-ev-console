@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import type { BetExecutionRequest, OperationalWagerExecutionRequest } from '@baccarat/adapter-contract';
 import type { BetReceipt } from '@baccarat/contracts';
+import { replayEvents } from '../../ledger-state/src/projection.js';
 import { BrowserBridgeServer } from '../src/index.js';
 import type { NormalizedEvent } from '@baccarat/contracts';
 import fixtures from '../../../.tmp-mstrom/card-research/15-fixtures.json';
@@ -972,6 +973,48 @@ describe('browser bridge server', () => {
     });
     await feed.flush();
     expect(events).toHaveLength(3);
+  });
+
+  it('imports verified mstrom frames from rotated websocket hostnames', async () => {
+    // Given: a real phase-1 baccarat frame arrives from the provider's current rotating socket host.
+    const sample = fixtures.find(fixture => fixture.id === 'bcst-phase1-betting-01');
+    if (!sample) throw new Error('betting fixture missing');
+    const server = new BrowserBridgeServer();
+    server.ingestClientMessage({
+      kind: 'networkCapture',
+      source: 'baccarat-bridge-runtime-selection',
+      url: 'https://gci.agad.mstrom-uno.com/pc/pcv1/index.jsp?',
+      direction: 'recv',
+      encoding: 'text',
+      data: JSON.stringify({ tableIds: ['P020'] }),
+    });
+
+    // When: the bridge receives the frame from a hostname that is not in its historical alias list.
+    server.ingestClientMessage({
+      kind: 'networkCapture',
+      source: 'baccarat-bridge-ws',
+      url: 'wss://ty242c.mmxxpp.com.cn:5000',
+      direction: 'recv',
+      encoding: 'base64',
+      data: sample.base64,
+    });
+    const feed = server.openTable('dafabet-live', 'P020');
+    const events: NormalizedEvent[] = [];
+    await feed.start({ onBatch: batch => { events.push(...batch.events); } });
+    await feed.flush();
+
+    // Then: strict frame parsing, not the volatile hostname, identifies the betting window.
+    expect(events.map(event => event.type)).toEqual([
+      'newShoeSignal',
+      'bettingWindowOpened',
+      'bettingWindowOpened',
+    ]);
+    expect(replayEvents(events).get('P020')).toMatchObject({
+      tableId: 'P020',
+      currentHandId: 'GP020268211JD',
+      status: 'BETTING_WINDOW',
+      connectionStatus: 'CONNECTED',
+    });
   });
 
   it('promotes an explicit raw shuffle snapshot exactly once across protocol and runtime channels', async () => {
