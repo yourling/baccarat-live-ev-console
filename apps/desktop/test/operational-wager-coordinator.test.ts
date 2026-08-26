@@ -136,7 +136,7 @@ describe('OperationalWagerCoordinator', () => {
   });
 
   it.each(['shadow', 'simulated'] as const)(
-    'records a %s manual test while the live table gate is closed',
+    'records a %s manual test without a current hand or an open live table gate',
     async executionMode => {
       const ledger = new SqliteLedger(':memory:');
       const bridge = {
@@ -153,6 +153,7 @@ describe('OperationalWagerCoordinator', () => {
               status: 'TRACKING',
               autoBetStatus: 'ARMED',
               connectionStatus: 'DISCONNECTED',
+              currentHandId: null,
               sealed: true,
             }),
             executionMode,
@@ -175,7 +176,12 @@ describe('OperationalWagerCoordinator', () => {
         });
         expect(bridge.requestOperationalWager).not.toHaveBeenCalled();
         expect(ledger.listOperationalWagersTail()).toMatchObject([{
-          wager: expect.objectContaining({ tableId: 'D001', market: 'banker', source: 'manual' }),
+          wager: expect.objectContaining({
+            tableId: 'D001',
+            handId: expect.stringMatching(/^manual-test-/),
+            market: 'banker',
+            source: 'manual',
+          }),
           status: 'ACCEPTED',
           reason: `${executionMode}-simulated`,
         }]);

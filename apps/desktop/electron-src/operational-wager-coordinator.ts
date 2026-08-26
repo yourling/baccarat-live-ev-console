@@ -185,15 +185,17 @@ export class OperationalWagerCoordinator {
     if (gateReason !== null) {
       return { status: 'REJECTED', tableId: input.tableId, reason: gateReason };
     }
-    const handId = table.projection.currentHandId;
-    if (handId === null || handId.length === 0) {
+    const isManualTest = input.source === 'manual' && table.executionMode !== 'live';
+    const currentHandId = table.projection.currentHandId;
+    if (!isManualTest && (currentHandId === null || currentHandId.length === 0)) {
       return { status: 'REJECTED', tableId: input.tableId, reason: 'current-hand-required' };
     }
+    const wagerId = newId('opw');
     const wager: OperationalWagerRecord['wager'] = {
-      wagerId: newId('opw'),
+      wagerId,
       tableId: input.tableId,
       shoeId: table.projection.shoeId,
-      handId,
+      handId: currentHandId ?? `manual-test-${wagerId}`,
       market: input.market,
       amount: input.amount,
       source: input.source,
