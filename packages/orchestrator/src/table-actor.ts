@@ -30,6 +30,13 @@ import {
 import { evaluatePairMarket } from '@baccarat/probability';
 import { RiskManager, emptyRiskState } from '@baccarat/risk-execution';
 import {
+  executeControlledOperationalWager,
+  type ControlledOperationalWagerCommand,
+  type ControlledOperationalWagerResult,
+  type OperationalWagerExecutor,
+  type OperationalWagerTerms,
+} from './controlled-wager.js';
+import {
   executeOneShotBet,
   type OneShotBetCommand,
   type OneShotBetResult,
@@ -42,7 +49,9 @@ export interface TableActorOptions {
   ledger: SqliteLedger;
   riskManager: RiskManager;
   executor?: Pick<BrowserAdapter, 'requestBet'> | null;
-  canExecuteAutomaticBets?: () => boolean;
+  operationalExecutor?: OperationalWagerExecutor | null;
+  operationalWagerTerms?: OperationalWagerTerms;
+  canExecuteAutomaticBets?: (tableId: string) => boolean;
   onBettingWindowOpened?: () => void;
   executionMode: 'shadow' | 'simulated' | 'live';
   defaultBetAmount: number;
@@ -70,7 +79,9 @@ export class TableActor {
   private readonly ledger: SqliteLedger;
   private readonly riskManager: RiskManager;
   private executor: Pick<BrowserAdapter, 'requestBet'> | null;
-  private readonly canExecuteAutomaticBets: () => boolean;
+  private operationalExecutor: OperationalWagerExecutor | null;
+  private readonly operationalWagerTerms?: OperationalWagerTerms;
+  private readonly canExecuteAutomaticBets: (tableId: string) => boolean;
   private readonly onBettingWindowOpened?: () => void;
   private profile: TableProfile;
   private executionMode: 'shadow' | 'simulated' | 'live';
@@ -93,6 +104,8 @@ export class TableActor {
     this.ledger = options.ledger;
     this.riskManager = options.riskManager;
     this.executor = options.executor ?? null;
+    this.operationalExecutor = options.operationalExecutor ?? null;
+    this.operationalWagerTerms = options.operationalWagerTerms;
     this.canExecuteAutomaticBets = options.canExecuteAutomaticBets ?? (() => true);
     this.onBettingWindowOpened = options.onBettingWindowOpened;
     this.profile = structuredClone(options.profile);
@@ -148,6 +161,25 @@ export class TableActor {
     }));
   }
 
+  placeOperationalWager(
+    command: ControlledOperationalWagerCommand,
+  ): Promise<ControlledOperationalWagerResult> {
+    return this.enqueueTask(() => executeControlledOperationalWager(command, {
+      tableId: this.tableId,
+      projection: this.projection,
+      profile: this.profile,
+      ledger: this.ledger,
+      riskManager: this.riskManager,
+      riskLimits: this.riskLimits,
+      executionMode: this.executionMode,
+      executor: this.operationalExecutor,
+      terms: this.operationalWagerTerms,
+      canExecuteAutomaticBets: () => this.canExecuteAutomaticBets(this.tableId),
+      requestTimeoutMs: Math.max(this.requestTimeoutMs, 12_000),
+      disarmOnUnknown: reason => this.disarmForUnknown(reason),
+    }));
+  }
+
   async flush(): Promise<void> {
     while (this.processing || this.queue.length > 0) {
       await new Promise(resolve => setTimeout(resolve, 1));
@@ -160,6 +192,10 @@ export class TableActor {
 
   setExecutor(executor: Pick<BrowserAdapter, 'requestBet'> | null): void {
     this.executor = executor;
+  }
+
+  setOperationalExecutor(executor: OperationalWagerExecutor | null): void {
+    this.operationalExecutor = executor;
   }
 
   getProfile(): TableProfile {
@@ -254,7 +290,6 @@ export class TableActor {
       return;
     }
     if (event.type === 'bettingWindowOpened') {
-      this.onBettingWindowOpened?.();
       await this.evaluateWindow(event, this.projection);
       return;
     }
@@ -267,8 +302,11 @@ export class TableActor {
         this.tableId,
         event.shoeId,
         event.handId,
-        event.outcomes,
-        this.projection.profileSnapshot,
+        {
+          outcomes: event.outcomes,
+          playerCards: event.playerCards,
+          bankerCards: event.bankerCards,
+        },
       );
       return;
     }
@@ -292,7 +330,6 @@ export class TableActor {
       return;
     }
     if (event.type === 'bettingWindowOpened') {
-      this.onBettingWindowOpened?.();
       await this.evaluateWindow(event, this.projection);
       return;
     }
@@ -301,7 +338,11 @@ export class TableActor {
       return;
     }
     if (event.type === 'handSettled') {
-      this.riskManager.settleHand(this.tableId, event.shoeId, event.handId, event.outcomes, this.projection.profileSnapshot);
+      this.riskManager.settleHand(this.tableId, event.shoeId, event.handId, {
+        outcomes: event.outcomes,
+        playerCards: event.playerCards,
+        bankerCards: event.bankerCards,
+      });
       return;
     }
     if (event.type === 'betReceipt') {
@@ -324,6 +365,7 @@ export class TableActor {
     if (projection.status !== 'BETTING_WINDOW') return;
     if (projection.shoeBaseline === 'unknown-monitor-session') {
       this.recordDecision(event, projection, false, 'physical-shoe-baseline-unknown', 'monitor-session-baseline-unknown');
+      this.requestKeepalive();
       return;
     }
 
@@ -335,9 +377,15 @@ export class TableActor {
 
     if (projection.autoBetStatus !== 'ARMED') {
       this.recordDecision(event, projection, eligible, reason, 'auto-not-armed');
+      this.requestKeepalive();
       return;
     }
-    if (this.executionMode === 'live' && !this.canExecuteAutomaticBets()) {
+    if (this.riskManager.hasUnknownReservations()) {
+      this.recordDecision(event, projection, eligible, reason, 'unknown-execution-pending');
+      await this.disarmForUnknown('unknown-execution-pending');
+      return;
+    }
+    if (!this.canExecuteAutomaticBets(this.tableId)) {
       this.recordDecision(event, projection, eligible, reason, 'global-automation-disabled');
       return;
     }
@@ -358,9 +406,15 @@ export class TableActor {
     );
     if (!snapshot) return;
 
-    if (!eligible) return;
+    if (!eligible) {
+      this.requestKeepalive();
+      return;
+    }
     // 策略门控:策略未选中当前市场时,只记录决策审计,绝不创建 intent/下注。
-    if (!strategyResult.selected) return;
+    if (!strategyResult.selected) {
+      this.requestKeepalive();
+      return;
+    }
     const reminder = reminderKey(event.shoeId, event.handId, projection.modelRevision, event.market);
     if (this.reminderKeys.has(reminder)) return;
     this.reminderKeys.add(reminder);
@@ -386,6 +440,7 @@ export class TableActor {
 
     const reserve = this.riskManager.tryReserve(intent, this.profile, this.riskLimits);
     if (!reserve.ok) {
+      this.requestKeepalive();
       return;
     }
     const reservation = reserve.reservation!;
@@ -400,6 +455,7 @@ export class TableActor {
 
     if (!this.executor) {
       this.riskManager.release(reservation.reservationId, false, 'no-executor-configured');
+      this.requestKeepalive();
       return;
     }
 
@@ -431,6 +487,10 @@ export class TableActor {
       };
       await this.handleEvent(receiptEvent);
     }
+  }
+
+  private requestKeepalive(): void {
+    this.onBettingWindowOpened?.();
   }
 
   private recordUnobservableWindow(
@@ -514,6 +574,21 @@ export class TableActor {
         reason: 'platform-acknowledgement-unknown',
       });
     }
+  }
+
+  private async disarmForUnknown(reason: string): Promise<void> {
+    if (this.projection.autoBetStatus !== 'ARMED') return;
+    await this.handleEvent({
+      type: 'autoDisarmChanged',
+      eventId: newId('evt'),
+      tableId: this.tableId,
+      timestamp: new Date().toISOString(),
+      sourceSeq: this.nextSyntheticSeq(),
+      source: 'orchestrator',
+      schemaVersion: EVENT_SCHEMA_VERSION,
+      shoeId: this.projection.shoeId || undefined,
+      reason,
+    });
   }
 
   private async recordOneShotReceipt(
@@ -614,7 +689,9 @@ export interface OrchestratorOptions {
   ledger: SqliteLedger;
   riskLimits: RiskLimits;
   executor?: Pick<BrowserAdapter, 'requestBet'> | null;
-  canExecuteAutomaticBets?: () => boolean;
+  operationalExecutor?: OperationalWagerExecutor | null;
+  operationalWagerTerms?: OperationalWagerTerms;
+  canExecuteAutomaticBets?: (tableId: string) => boolean;
   onBettingWindowOpened?: () => void;
 }
 
@@ -640,7 +717,9 @@ export class Orchestrator {
   private readonly actors = new Map<string, TableActor>();
   private riskLimits: RiskLimits;
   private executor: Pick<BrowserAdapter, 'requestBet'> | null;
-  private readonly canExecuteAutomaticBets: () => boolean;
+  private operationalExecutor: OperationalWagerExecutor | null;
+  private readonly operationalWagerTerms?: OperationalWagerTerms;
+  private readonly canExecuteAutomaticBets: (tableId: string) => boolean;
   private readonly onBettingWindowOpened?: () => void;
 
   constructor(options: OrchestratorOptions) {
@@ -651,6 +730,8 @@ export class Orchestrator {
     if (persistedLimits) this.riskLimits = persistedLimits;
     this.ledger.setConfig(RISK_LIMITS_KEY, this.riskLimits);
     this.executor = options.executor ?? null;
+    this.operationalExecutor = options.operationalExecutor ?? null;
+    this.operationalWagerTerms = options.operationalWagerTerms;
     this.canExecuteAutomaticBets = options.canExecuteAutomaticBets ?? (() => true);
     this.onBettingWindowOpened = options.onBettingWindowOpened;
     this.riskManager = new RiskManager(
@@ -686,6 +767,11 @@ export class Orchestrator {
     this.updateTableSettingsForTables([tableId], settings);
   }
 
+  setOperationalExecutor(executor: OperationalWagerExecutor | null): void {
+    this.operationalExecutor = executor;
+    for (const actor of this.actors.values()) actor.setOperationalExecutor(executor);
+  }
+
   updateTableSettingsForTables(tableIds: readonly string[], settings: TableSettingsUpdate): void {
     if (!Number.isFinite(settings.defaultBetAmount) || settings.defaultBetAmount <= 0) {
       throw new RangeError('defaultBetAmount must be a positive finite number');
@@ -709,9 +795,10 @@ export class Orchestrator {
     });
     const configs = this.listTableConfigs();
     for (const update of updates) {
+      const persistedExecutionMode = configs[update.tableId]?.executionMode ?? update.executionMode;
       configs[update.tableId] = {
         profile: structuredClone(update.profile),
-        executionMode: update.executionMode,
+        executionMode: persistedExecutionMode,
         defaultBetAmount: settings.defaultBetAmount,
       };
     }
@@ -825,6 +912,8 @@ export class Orchestrator {
       ledger: this.ledger,
       riskManager: this.riskManager,
       executor: this.executor,
+      operationalExecutor: this.operationalExecutor,
+      operationalWagerTerms: this.operationalWagerTerms,
       canExecuteAutomaticBets: this.canExecuteAutomaticBets,
       onBettingWindowOpened: this.onBettingWindowOpened,
       executionMode: config.executionMode,

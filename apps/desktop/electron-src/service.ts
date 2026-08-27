@@ -13,13 +13,24 @@ import {
 import { SqliteLedger, type MonitorSummary, type MonitorSummaryOptions } from '@baccarat/ledger-state';
 import {
   Orchestrator,
+  STANDARD_COMMISSION_BACCARAT_TERMS,
   type OneShotBetCommand,
   type OneShotBetResult,
   type OrchestratorSnapshot,
   type TableSettingsUpdate,
 } from '@baccarat/orchestrator';
-import { BrowserBridgeServer } from '@baccarat/browser-bridge';
-import { ShadowRoomMonitor, type RoomDescriptor, type TableExport } from '@baccarat/room-monitor';
+import {
+  BUNDLED_BROWSER_EXTENSION_ID,
+  BUNDLED_BROWSER_EXTENSION_TOKEN,
+  BrowserBridgeServer,
+  type BrowserBridgeRuntimeEvent,
+} from '@baccarat/browser-bridge';
+import {
+  ShadowRoomMonitor,
+  type MonitorHealth,
+  type RoomDescriptor,
+  type TableExport,
+} from '@baccarat/room-monitor';
 import { buildRandomDemo } from '../src/core-demo.js';
 import {
   OperationalWagerCoordinator,
@@ -33,14 +44,25 @@ import {
   type DesktopRecordCounts,
   type DesktopRecordPage,
   type DesktopRecordQuery,
+  type DesktopRuntimeState,
   type MonitorTableCandidate,
   type OneShotLiveBetCommand,
   type OneShotLiveBetResult,
 } from '../src/api-types.js';
+import {
+  LiveApprovalStore,
+  RuntimeIncidentStore,
+  evaluateLiveExecutionReadiness,
+  type LiveExecutionBlockReason,
+  type RuntimeIncidentCode,
+  type RuntimeIncidentSeverity,
+} from './runtime-supervisor.js';
 
 const DEFAULT_APPROVED_LIVE_TABLE_IDS = ['D066', 'D067', 'D056', 'D057'] as const;
 const MONITOR_TABLE_CONFIG_KEY = 'desktop:monitor-tables:v1';
 const MONITOR_TABLE_ID_PATTERN = /^[A-Z]{1,4}\d{2,6}$/;
+const MAX_LIVE_FEED_STALENESS_MS = 45_000;
+const LIVE_MONITOR_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000] as const;
 
 type MonitorTableConfig = {
   readonly tableIds: readonly string[];
@@ -125,6 +147,7 @@ export interface DesktopConsoleSnapshot extends Omit<ApiDesktopConsoleSnapshot, 
   reservations: ReturnType<Orchestrator['getReservations']>;
   demoRunning: boolean;
   demoSpeed: number;
+  runtime: DesktopRuntimeState;
   summary: MonitorSummary;
   demoError?: string;
 }
@@ -145,6 +168,9 @@ export class DesktopConsoleService {
   private readonly ledger: SqliteLedger;
   private readonly orchestrator: Orchestrator;
   private readonly operationalWagers: OperationalWagerCoordinator;
+  private readonly liveApprovals: LiveApprovalStore;
+  private readonly runtimeIncidents: RuntimeIncidentStore;
+  private readonly startupFailCloseTask: Promise<void>;
   private currentExecutor: Pick<BrowserAdapter, 'requestBet'> | null;
   private lastSeed?: number;
   private demoRunning = false;
@@ -157,13 +183,18 @@ export class DesktopConsoleService {
   private browserBridgePort = 0;
   private liveExecutionMode: ExecutionMode = 'shadow';
   private readonly liveFeeds = new Map<string, TableExport>();
+  private readonly runtimeObservedTableIds = new Set<string>();
+  private readonly liveAuthorizationSources = new Map<string, 'manual' | 'unattended'>();
+  private persistentLiveGateEnabled = false;
   private liveRoomTimer?: NodeJS.Timeout;
+  private liveMonitorRetryAttempt = 0;
   private liveMonitorOperation: Promise<void> = Promise.resolve();
   private liveMonitorActivated = false;
   private oneShotLiveBetInFlight: Promise<OneShotLiveBetResult> | null = null;
   private executionStateOperation: Promise<void> = Promise.resolve();
   private cachedRecordCounts?: DesktopRecordCounts;
   private cachedSummary?: MonitorSummary;
+  private closing = false;
   /** The transient allowlist used only while a serialized live transition is being validated. */
   private pendingMonitorTableIds?: readonly string[];
   /** Operator-managed, persisted ordered selection; mutation is the configuration operation. */
@@ -177,21 +208,32 @@ export class DesktopConsoleService {
       ledger: this.ledger,
       riskLimits: defaultConsoleLimits(),
       executor: defaultExecutor,
-      canExecuteAutomaticBets: () => this.operationalWagers.getKeepaliveState().enabled,
+      operationalWagerTerms: STANDARD_COMMISSION_BACCARAT_TERMS,
+      canExecuteAutomaticBets: tableId => this.canExecuteAutomaticBets(tableId),
       onBettingWindowOpened: () => {
-        void this.operationalWagers.tick().catch(error => this.recordLiveMonitorError(error));
+        void this.operationalWagers.tick().catch(error => {
+          this.recordLiveMonitorError(error, 'scheduler-failure', 'degraded');
+        });
       },
     });
+    const persistedLiveTableIds = Object.values(this.orchestrator.listTableConfigs())
+      .filter(config => config.executionMode === 'live')
+      .map(config => config.profile.tableId);
+    this.liveApprovals = new LiveApprovalStore(this.ledger, persistedLiveTableIds);
+    this.runtimeIncidents = new RuntimeIncidentStore(this.ledger);
     this.monitorTableIds = this.loadMonitorTableIds();
+    this.liveApprovals.retain(this.monitorTableIds);
     this.operationalWagers = new OperationalWagerCoordinator({
       ledger: this.ledger,
-      bridge: () => this.browserBridge,
+      actor: tableId => this.orchestrator.getActor(tableId),
       monitorTableIds: () => this.monitorTableIds,
-      tableState: tableId => this.orchestrator.getActor(tableId)?.snapshot(),
       serialize: async operation => await this.enqueueExecutionStateOperation(operation),
-      onError: error => this.recordLiveMonitorError(error),
+      runtimeBlockReason: tableId => this.operationalWagerRuntimeBlockReason(tableId),
+      onError: error => this.recordLiveMonitorError(error, 'scheduler-failure', 'degraded'),
     });
     this.normalizeEvFloor();
+    this.startupFailCloseTask = this.initializeFailClosedRuntime();
+    this.refreshAccountingIncidents();
   }
 
   private loadMonitorTableIds(): string[] {
@@ -222,6 +264,353 @@ export class DesktopConsoleService {
     }
   }
 
+  private async initializeFailClosedRuntime(): Promise<void> {
+    for (const actor of this.orchestrator.listActors()) {
+      const approved = this.liveApprovals.has(actor.tableId);
+      if (actor.snapshot().executionMode === 'live' || approved) {
+        actor.setExecutionMode('shadow');
+      }
+      const projection = actor.getProjection();
+      if (projection.autoBetStatus === 'ARMED' && approved) {
+        await actor.setAutoBet(false, projection.shoeId || undefined);
+      }
+      if (approved && projection.shoeId && projection.connectionStatus !== 'DISCONNECTED') {
+        await this.orchestrator.enqueue(actor.tableId, {
+          type: 'connectionLost',
+          eventId: newId('evt'),
+          tableId: actor.tableId,
+          timestamp: new Date().toISOString(),
+          sourceSeq: this.nextMonitorSourceSeq(actor.tableId),
+          source: 'console',
+          schemaVersion: EVENT_SCHEMA_VERSION,
+          reason: 'process-restarted',
+        });
+      }
+    }
+    this.liveAuthorizationSources.clear();
+    this.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
+    this.setOperationalWagerExecutor(false);
+  }
+
+  private canExecuteAutomaticBets(tableId: string): boolean {
+    if (!this.operationalWagers.getKeepaliveState().enabled) return false;
+    if (this.liveApprovals.has(tableId) && !this.liveAuthorizationSources.has(tableId)) return false;
+    const actor = this.orchestrator.getActor(tableId);
+    if (actor?.snapshot().executionMode !== 'live') return true;
+    return this.liveAuthorizationSources.has(tableId)
+      && !this.hasUnknownExecution()
+      && !this.hasSettlementGap(tableId);
+  }
+
+  private hasUnknownExecution(tableId?: string): boolean {
+    return this.orchestrator.getReservations(tableId)
+      .some(reservation => reservation.status === 'UNKNOWN');
+  }
+
+  private hasSettlementGap(tableId: string): boolean {
+    return this.runtimeIncidents.hasActive('settlement-gap', tableId);
+  }
+
+  private ensureRuntimeIncident(input: {
+    readonly code: RuntimeIncidentCode;
+    readonly severity: RuntimeIncidentSeverity;
+    readonly message: string;
+    readonly tableId?: string;
+  }): void {
+    if (this.runtimeIncidents.hasActive(input.code, input.tableId)) return;
+    this.runtimeIncidents.record(input);
+  }
+
+  private refreshAccountingIncidents(): void {
+    const unknownTableIds = new Set(
+      this.orchestrator.getReservations()
+        .filter(reservation => reservation.status === 'UNKNOWN')
+        .map(reservation => reservation.tableId),
+    );
+    if (unknownTableIds.size > 0) this.operationalWagers.disableKeepaliveImmediately();
+    const knownTableIds = new Set([
+      ...this.monitorTableIds,
+      ...this.liveApprovals.list(),
+      ...this.orchestrator.listActors().map(actor => actor.tableId),
+    ]);
+    for (const tableId of knownTableIds) {
+      if (unknownTableIds.has(tableId)) {
+        this.ensureRuntimeIncident({
+          code: 'unknown-execution',
+          severity: 'blocked',
+          tableId,
+          message: `Unresolved execution result retains exposure for ${tableId}`,
+        });
+      } else {
+        this.runtimeIncidents.resolve('unknown-execution', tableId);
+      }
+    }
+  }
+
+  private detectSettlementGap(
+    event: Extract<NormalizedEvent, { type: 'bettingWindowOpened' }>,
+  ): boolean {
+    const unresolved = this.orchestrator.getReservations(event.tableId).filter(reservation =>
+      reservation.status === 'RESERVED'
+      && reservation.shoeId === event.shoeId
+      && reservation.handId !== event.handId);
+    if (unresolved.length === 0) return false;
+    this.ensureRuntimeIncident({
+      code: 'settlement-gap',
+      severity: 'blocked',
+      tableId: event.tableId,
+      message: `New hand ${event.handId} opened with ${unresolved.length} unsettled reservation(s) from a prior hand`,
+    });
+    return true;
+  }
+
+  private resolveSettlementGapIfCleared(tableId: string): void {
+    const actor = this.orchestrator.getActor(tableId);
+    if (!actor) return;
+    const currentHandId = actor.getProjection().currentHandId;
+    const stillMissing = this.orchestrator.getReservations(tableId).some(reservation =>
+      reservation.status === 'RESERVED'
+      && currentHandId !== null
+      && reservation.handId !== currentHandId);
+    if (!stillMissing) this.runtimeIncidents.resolve('settlement-gap', tableId);
+  }
+
+  private bridgeRuntimeStatus(): DesktopRuntimeState['bridge'] {
+    if (!this.browserBridge) {
+      return {
+        running: false,
+        connectionCount: 0,
+        authenticated: false,
+      };
+    }
+    const status = this.browserBridge.getExtensionStatus();
+    return {
+      running: true,
+      connectionCount: status.connectionCount,
+      authenticated: status.authenticated,
+      ...(status.lastSeenAt === undefined ? {} : { lastSeenAt: status.lastSeenAt }),
+    };
+  }
+
+  private liveTableReasons(
+    tableId: string,
+    approved = this.liveApprovals.has(tableId),
+  ): LiveExecutionBlockReason[] {
+    const actor = this.orchestrator.getActor(tableId);
+    if (!actor) return ['table-feed-missing', 'physical-shoe-baseline-unknown', 'table-connection-not-restored'];
+    let health: MonitorHealth | undefined;
+    try {
+      health = this.liveFeeds.get(tableId)?.health();
+    } catch {
+      health = undefined;
+    }
+    return evaluateLiveExecutionReadiness({
+      approved,
+      bridge: this.bridgeRuntimeStatus(),
+      ...(health === undefined ? {} : {
+        feed: {
+          state: health.state,
+          stalenessMs: this.runtimeObservedTableIds.has(tableId)
+            ? health.stalenessMs
+            : undefined,
+        },
+      }),
+      maxFeedStalenessMs: MAX_LIVE_FEED_STALENESS_MS,
+      projection: actor.getProjection(),
+      hasUnknownExecution: this.hasUnknownExecution(),
+      hasSettlementGap: this.hasSettlementGap(tableId),
+    });
+  }
+
+  private operationalWagerRuntimeBlockReason(tableId: string): string | undefined {
+    const actor = this.orchestrator.getActor(tableId);
+    if (actor?.snapshot().executionMode !== 'live') return undefined;
+    if (!this.liveApprovals.has(tableId) || !this.liveAuthorizationSources.has(tableId)) {
+      return 'unattended-runtime-blocked:live-authorization-missing';
+    }
+    const reasons = this.liveTableReasons(tableId);
+    return reasons.length === 0
+      ? undefined
+      : `unattended-runtime-blocked:${reasons.join(',')}`;
+  }
+
+  private runtimeSnapshot(): DesktopRuntimeState {
+    this.refreshAccountingIncidents();
+    const bridge = this.bridgeRuntimeStatus();
+    const approvedLiveTableIds = this.liveApprovals.list();
+    const tables: DesktopRuntimeState['tables'] = Object.fromEntries(
+      this.monitorTableIds.map(tableId => {
+        const feedHealth = this.liveFeeds.get(tableId)?.health();
+        const actor = this.orchestrator.getActor(tableId);
+        return [tableId, {
+          approved: this.liveApprovals.has(tableId),
+          active: actor?.snapshot().executionMode === 'live'
+            && this.liveAuthorizationSources.has(tableId),
+          reasons: this.liveApprovals.has(tableId) ? this.liveTableReasons(tableId) : [],
+          ...(feedHealth === undefined ? {} : {
+            feedState: feedHealth.state,
+            ...(feedHealth.stalenessMs === undefined ? {} : { feedStalenessMs: feedHealth.stalenessMs }),
+          }),
+        }];
+      }),
+    );
+    const activeLiveTableIds = approvedLiveTableIds.filter(tableId =>
+      tables[tableId]?.active === true);
+    const reasons = [...new Set(
+      approvedLiveTableIds.flatMap(tableId => tables[tableId]?.reasons ?? []),
+    )];
+    const incidents = this.runtimeIncidents.list();
+    const activeIncidents = incidents.filter(incident => incident.active);
+    const blocked = reasons.length > 0
+      || activeIncidents.some(incident => incident.severity === 'blocked');
+    const degraded = activeIncidents.some(incident => incident.severity === 'degraded');
+    return {
+      status: blocked ? 'blocked' : degraded ? 'degraded' : 'healthy',
+      executionReady: approvedLiveTableIds.length > 0
+        && activeLiveTableIds.length === approvedLiveTableIds.length
+        && reasons.length === 0,
+      monitorActive: this.liveMonitorActivated,
+      approvedLiveTableIds,
+      activeLiveTableIds,
+      bridge,
+      reasons,
+      tables,
+      incidents,
+    };
+  }
+
+  private async setPersistentLiveGate(enabled: boolean): Promise<void> {
+    if (this.persistentLiveGateEnabled === enabled) return;
+    if (enabled && !this.browserBridge) throw new Error('browser bridge is not running');
+    this.browserBridge?.setLiveBetEnabled(enabled);
+    this.persistentLiveGateEnabled = enabled;
+  }
+
+  private async reconcileUnattendedExecution(): Promise<void> {
+    await this.startupFailCloseTask;
+    this.refreshAccountingIncidents();
+    const selectedTableIds = this.currentMonitorTableIds();
+    const approvedTableIds = this.liveApprovals.list()
+      .filter(tableId => selectedTableIds.includes(tableId));
+    for (const tableId of approvedTableIds) {
+      const actor = this.orchestrator.getActor(tableId);
+      if (!actor) continue;
+      const reasons = this.liveTableReasons(tableId);
+      const authorization = this.liveAuthorizationSources.get(tableId);
+      const accountingBlocked = reasons.includes('unknown-execution-pending')
+        || reasons.includes('settlement-gap');
+      if (reasons.length > 0) {
+        if (authorization === 'unattended' || accountingBlocked) {
+          await this.resetMonitorExecutionState(tableId);
+        }
+        continue;
+      }
+
+      this.runtimeIncidents.resolve('table-feed-stale', tableId);
+      if (authorization === undefined) {
+        await this.setPersistentLiveGate(true);
+        const bridge = this.browserBridge!;
+        this.setOrchestratorExecutor({ requestBet: request => bridge.requestBet(request) });
+        this.setOperationalWagerExecutor(true);
+        actor.setExecutionMode('live');
+        this.liveAuthorizationSources.set(tableId, 'unattended');
+      }
+      await this.rearmPairAutomation(tableId);
+    }
+
+    const hasActiveLiveTable = this.orchestrator.listActors().some(actor =>
+      actor.snapshot().executionMode === 'live'
+      && this.liveAuthorizationSources.has(actor.tableId));
+    if (!hasActiveLiveTable) {
+      this.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
+      this.setOperationalWagerExecutor(false);
+      try {
+        await this.setPersistentLiveGate(false);
+      } catch (error) {
+        this.recordLiveMonitorError(error, 'bridge-disconnected', 'blocked');
+      }
+    }
+
+    const bridge = this.bridgeRuntimeStatus();
+    if (bridge.authenticated) {
+      this.runtimeIncidents.resolveAll('bridge-auth-failed');
+      this.runtimeIncidents.resolveAll('bridge-disconnected');
+    }
+    const continuityReady = approvedTableIds.every(tableId => {
+      const reasons = this.liveTableReasons(tableId);
+      return !reasons.includes('table-feed-missing')
+        && !reasons.includes('table-feed-disconnected')
+        && !reasons.includes('table-feed-stale')
+        && !reasons.includes('table-connection-not-restored');
+    });
+    if (continuityReady) this.runtimeIncidents.resolveAll('continuity-invalidated');
+  }
+
+  private handleBridgeRuntimeEvent(event: BrowserBridgeRuntimeEvent): void {
+    if (this.closing) return;
+    void this.enqueueExecutionStateOperation(async () => {
+      switch (event.kind) {
+        case 'extension-auth-failed':
+          this.ensureRuntimeIncident({
+            code: 'bridge-auth-failed',
+            severity: 'blocked',
+            message: event.reason,
+          });
+          return;
+        case 'extension-connected':
+          return;
+        case 'extension-authenticated':
+          this.runtimeIncidents.resolveAll('bridge-auth-failed');
+          this.runtimeIncidents.resolveAll('bridge-disconnected');
+          await this.reconcileUnattendedExecution();
+          return;
+        case 'extension-disconnected':
+          this.runtimeObservedTableIds.clear();
+          this.ensureRuntimeIncident({
+            code: 'bridge-disconnected',
+            severity: 'blocked',
+            message: event.reason,
+          });
+          await this.failCloseLiveExecution(this.liveApprovals.list());
+          return;
+        case 'continuity-invalidated':
+          this.runtimeObservedTableIds.clear();
+          this.ensureRuntimeIncident({
+            code: 'continuity-invalidated',
+            severity: 'blocked',
+            message: event.reason,
+          });
+          await this.failCloseLiveExecution(this.liveApprovals.list());
+          return;
+        case 'table-disconnected':
+          this.runtimeObservedTableIds.delete(event.tableId);
+          this.ensureRuntimeIncident({
+            code: event.reason === 'table-feed-stale' ? 'table-feed-stale' : 'bridge-disconnected',
+            severity: 'blocked',
+            tableId: event.tableId,
+            message: event.reason,
+          });
+          await this.failCloseLiveExecution([event.tableId]);
+          return;
+        case 'session-recovery-exhausted':
+          this.runtimeObservedTableIds.clear();
+          this.ensureRuntimeIncident({
+            code: 'session-recovery-exhausted',
+            severity: 'blocked',
+            message: event.detail ?? 'browser session recovery attempts exhausted',
+          });
+          await this.failCloseLiveExecution(this.liveApprovals.list());
+          return;
+        case 'session-recovered':
+          this.runtimeIncidents.resolveAll('session-recovery-exhausted');
+          await this.reconcileUnattendedExecution();
+          return;
+        default:
+          return assertNeverBridgeRuntimeEvent(event);
+      }
+    }).catch(error => this.recordLiveMonitorError(error, 'scheduler-failure', 'degraded'));
+  }
+
   /** 为监控层导出的源事件与连接事件分配不冲突的账本 sourceSeq。 */
   private nextMonitorSourceSeq(tableId: string): number {
     const base = this.ledger.nextSourceSeq(tableId);
@@ -248,6 +637,13 @@ export class DesktopConsoleService {
     this.orchestrator.setExecutor(executor);
   }
 
+  private setOperationalWagerExecutor(enabled: boolean): void {
+    this.orchestrator.setOperationalExecutor(enabled ? {
+      requestOperationalWager: request =>
+        this.browserBridge?.requestOperationalWager(request) ?? Promise.resolve(null),
+    } : null);
+  }
+
   private currentMonitorTableIds(): readonly string[] {
     return this.pendingMonitorTableIds ?? this.monitorTableIds;
   }
@@ -261,7 +657,23 @@ export class DesktopConsoleService {
   }
 
   private async enqueueMonitorEvent(event: NormalizedEvent): Promise<void> {
+    if (
+      event.type === 'newShoeSignal'
+      || event.type === 'cardObserved'
+      || event.type === 'bettingWindowOpened'
+      || event.type === 'bettingWindowClosed'
+      || event.type === 'handSettled'
+      || event.type === 'redCardSeen'
+      || event.type === 'shoeInvalidated'
+    ) {
+      this.runtimeObservedTableIds.add(event.tableId);
+    }
+    if (event.type === 'bettingWindowOpened' && this.detectSettlementGap(event)) {
+      await this.failCloseLiveExecution([event.tableId]);
+    }
     await this.orchestrator.enqueue(event.tableId, event);
+    this.refreshAccountingIncidents();
+    if (event.type === 'handSettled') this.resolveSettlementGapIfCleared(event.tableId);
     if (
       event.type === 'newShoeSignal'
       || event.type === 'connectionRestored'
@@ -269,6 +681,7 @@ export class DesktopConsoleService {
     ) {
       await this.rearmPairAutomation(event.tableId);
     }
+    await this.reconcileUnattendedExecution();
   }
 
   private async reconcilePairAutomation(enabled: boolean): Promise<void> {
@@ -288,6 +701,7 @@ export class DesktopConsoleService {
 
   private async rearmPairAutomation(tableId: string): Promise<void> {
     if (!this.operationalWagers.getKeepaliveState().enabled || !this.monitorTableIds.includes(tableId)) return;
+    if (this.liveApprovals.has(tableId) && !this.liveAuthorizationSources.has(tableId)) return;
     const actor = this.orchestrator.getActor(tableId);
     if (!actor) return;
     const projection = actor.getProjection();
@@ -306,8 +720,19 @@ export class DesktopConsoleService {
     await this.reconcilePairAutomation(settings.enabled);
   }
 
-  private recordLiveMonitorError(error: unknown): void {
+  private recordLiveMonitorError(
+    error: unknown,
+    code: RuntimeIncidentCode = 'monitor-failure',
+    severity: RuntimeIncidentSeverity = 'degraded',
+    tableId?: string,
+  ): void {
     this.demoError = error instanceof Error ? error.message : String(error);
+    this.ensureRuntimeIncident({
+      code,
+      severity,
+      message: this.demoError,
+      ...(tableId === undefined ? {} : { tableId }),
+    });
   }
 
   private async resetMonitorExecutionState(tableId: string): Promise<void> {
@@ -316,41 +741,42 @@ export class DesktopConsoleService {
 
     const state = actor.snapshot();
     if (state.executionMode !== 'shadow') {
-      this.orchestrator.updateTableExecutionMode(tableId, 'shadow');
+      actor.setExecutionMode('shadow');
     }
+    this.liveAuthorizationSources.delete(tableId);
     if (state.projection.autoBetStatus === 'ARMED') {
       await actor.setAutoBet(false, state.projection.shoeId || undefined);
     }
   }
 
   private async failCloseLiveExecution(tableIds: readonly string[]): Promise<void> {
-    const hadLiveTable = this.orchestrator.listActors()
-      .some(actor => actor.snapshot().executionMode === 'live');
     for (const tableId of tableIds) {
       await this.resetMonitorExecutionState(tableId);
     }
 
-    if (!hadLiveTable) return;
     const hasLiveTable = this.orchestrator.listActors()
-      .some(actor => actor.snapshot().executionMode === 'live');
+      .some(actor => actor.snapshot().executionMode === 'live'
+        && this.liveAuthorizationSources.has(actor.tableId));
     if (hasLiveTable) return;
 
     this.liveExecutionMode = 'shadow';
     this.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
+    this.setOperationalWagerExecutor(false);
     try {
-      this.browserBridge?.setLiveBetEnabled(false);
+      await this.setPersistentLiveGate(false);
     } catch (error) {
-      this.recordLiveMonitorError(error);
+      this.recordLiveMonitorError(error, 'bridge-disconnected', 'blocked');
     }
   }
 
   private async stopLiveFeed(tableId: string, feed: TableExport): Promise<void> {
     if (this.liveFeeds.get(tableId) === feed) this.liveFeeds.delete(tableId);
+    this.runtimeObservedTableIds.delete(tableId);
     await this.failCloseLiveExecution([tableId]);
     try {
       await feed.stop();
     } catch (error) {
-      this.recordLiveMonitorError(error);
+      this.recordLiveMonitorError(error, 'monitor-failure', 'degraded', tableId);
     }
     await this.resetMonitorExecutionState(tableId);
   }
@@ -376,6 +802,7 @@ export class DesktopConsoleService {
       return { kind: 'failed', error };
     }
     if (this.liveFeeds.get(tableId) === feed) this.liveFeeds.delete(tableId);
+    this.runtimeObservedTableIds.delete(tableId);
     return { kind: 'stopped' };
   }
 
@@ -384,6 +811,10 @@ export class DesktopConsoleService {
       const bridge = new BrowserBridgeServer({
         port,
         selectedTableIds: this.monitorTableIds,
+        requireExtensionSequence: true,
+        allowedExtensionId: BUNDLED_BROWSER_EXTENSION_ID,
+        extensionToken: BUNDLED_BROWSER_EXTENSION_TOKEN,
+        onRuntimeEvent: event => this.handleBridgeRuntimeEvent(event),
       });
       this.browserBridgePort = await bridge.start();
       this.browserBridge = bridge;
@@ -400,12 +831,15 @@ export class DesktopConsoleService {
     if (!bridge) return;
     try {
       bridge.setLiveBetEnabled(false);
+      this.persistentLiveGateEnabled = false;
     } catch (error) {
-      this.recordLiveMonitorError(error);
+      this.recordLiveMonitorError(error, 'bridge-disconnected', 'blocked');
     }
     await bridge.close();
     this.browserBridge = undefined;
     this.browserBridgePort = 0;
+    this.liveAuthorizationSources.clear();
+    this.setOperationalWagerExecutor(false);
   }
 
   browserBridgeStatus(): { running: boolean; port: number; rooms: RoomDescriptor[] } {
@@ -424,31 +858,64 @@ export class DesktopConsoleService {
   }
 
   private async startLiveRoomMonitorInner(port: number, executionMode: ExecutionMode): Promise<{ port: number }> {
+    if (executionMode === 'live') {
+      throw new Error('live monitor startup requires persisted per-table approval');
+    }
+    await this.startupFailCloseTask;
+    const startsNewMonitorSession = !this.liveMonitorActivated;
     this.liveMonitorActivated = true;
-    this.liveExecutionMode = executionMode;
+    this.liveExecutionMode = executionMode === 'simulated' ? 'simulated' : 'shadow';
     this.ensureMonitorActors(this.monitorTableIds);
-    this.setOrchestratorExecutor(executionMode === 'live'
-      ? { requestBet: request => this.browserBridge?.requestBet(request) ?? Promise.resolve(null) }
-      : new SimulatedAdapter({ events: [] }));
-    const startsNewMonitorSession = !this.liveRoomTimer;
+    this.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
+    this.setOperationalWagerExecutor(false);
     const started = await this.startBrowserBridge(port);
-    if (startsNewMonitorSession) this.browserBridge?.beginMonitorSession();
+    if (startsNewMonitorSession) {
+      this.runtimeObservedTableIds.clear();
+      this.browserBridge?.beginMonitorSession();
+    }
     this.ensureLiveMonitorTimer();
     try {
       await this.attachLiveTables();
     } catch (error) {
       // Initial discovery is transient while the browser page/extension is reconnecting.
       // Keep the live monitor active and let the established retry timer attach selected tables.
-      this.recordLiveMonitorError(error);
+      this.recordLiveMonitorError(error, 'monitor-failure', 'degraded');
     }
+    await this.reconcileUnattendedExecution();
     return started;
   }
 
   private ensureLiveMonitorTimer(): void {
     if (this.liveRoomTimer) return;
-    this.liveRoomTimer = setInterval(() => {
-      void this.attachLiveTables().catch(error => this.recordLiveMonitorError(error));
-    }, 2000);
+    this.scheduleLiveMonitorRetry(LIVE_MONITOR_RETRY_DELAYS_MS[0]);
+  }
+
+  private scheduleLiveMonitorRetry(delayMs: number): void {
+    if (this.liveRoomTimer || !this.liveMonitorActivated) return;
+    this.liveRoomTimer = setTimeout(() => {
+      this.liveRoomTimer = undefined;
+      void this.runLiveMonitorRetry();
+    }, delayMs);
+    this.liveRoomTimer.unref?.();
+  }
+
+  private async runLiveMonitorRetry(): Promise<void> {
+    if (!this.liveMonitorActivated) return;
+    try {
+      await this.attachLiveTables();
+      await this.enqueueExecutionStateOperation(() => this.reconcileUnattendedExecution());
+      this.liveMonitorRetryAttempt = 0;
+      this.runtimeIncidents.resolveAll('scheduler-failure');
+      this.runtimeIncidents.resolveAll('monitor-failure');
+    } catch (error) {
+      this.liveMonitorRetryAttempt += 1;
+      this.recordLiveMonitorError(error, 'scheduler-failure', 'degraded');
+    } finally {
+      const delay = LIVE_MONITOR_RETRY_DELAYS_MS[
+        Math.min(this.liveMonitorRetryAttempt, LIVE_MONITOR_RETRY_DELAYS_MS.length - 1)
+      ];
+      this.scheduleLiveMonitorRetry(delay);
+    }
   }
 
   async stopLiveRoomMonitor(): Promise<void> {
@@ -457,9 +924,12 @@ export class DesktopConsoleService {
 
   private async stopLiveRoomMonitorInner(): Promise<void> {
     if (this.liveRoomTimer) {
-      clearInterval(this.liveRoomTimer);
+      clearTimeout(this.liveRoomTimer);
       this.liveRoomTimer = undefined;
     }
+    this.liveMonitorActivated = false;
+    this.liveMonitorRetryAttempt = 0;
+    this.runtimeObservedTableIds.clear();
     await this.enqueueLiveMonitorOperation(async () => {
       const feedEntries = [...this.liveFeeds];
       const failClosedTableIds = new Set(feedEntries.map(([tableId]) => tableId));
@@ -472,6 +942,7 @@ export class DesktopConsoleService {
       }
       this.liveExecutionMode = 'shadow';
       this.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
+      this.setOperationalWagerExecutor(false);
     });
   }
 
@@ -516,25 +987,37 @@ export class DesktopConsoleService {
             },
             onDisconnect: (tableId, reason) => {
               if (!this.isCurrentLiveFeed(tableId, feed)) return;
+              this.runtimeObservedTableIds.delete(tableId);
               // BridgeTableExport performs its own reconnect. Keep the identity
               // registered while it is disconnected: deleting it would make the
               // periodic attach call start() on the same already-started export.
               const sourceSeq = this.nextMonitorSourceSeq(tableId);
-              void this.enqueueMonitorEvent({
-                type: 'connectionLost',
-                eventId: newId('evt'),
-                tableId,
-                timestamp: new Date().toISOString(),
-                sourceSeq,
-                source: 'room-monitor',
-                schemaVersion: EVENT_SCHEMA_VERSION,
-                ...(reason ? { reason } : {}),
-              }).catch(error => this.recordLiveMonitorError(error));
+              void this.enqueueExecutionStateOperation(async () => {
+                if (reason === 'table-feed-stale') {
+                  this.ensureRuntimeIncident({
+                    code: 'table-feed-stale',
+                    severity: 'blocked',
+                    tableId,
+                    message: reason,
+                  });
+                }
+                await this.failCloseLiveExecution([tableId]);
+                await this.enqueueMonitorEvent({
+                  type: 'connectionLost',
+                  eventId: newId('evt'),
+                  tableId,
+                  timestamp: new Date().toISOString(),
+                  sourceSeq,
+                  source: 'room-monitor',
+                  schemaVersion: EVENT_SCHEMA_VERSION,
+                  ...(reason ? { reason } : {}),
+                });
+              }).catch(error => this.recordLiveMonitorError(error, 'monitor-failure', 'degraded', tableId));
             },
-            onRestored: (tableId, proof) => {
+            onRestored: async (tableId, proof) => {
               if (!this.isCurrentLiveFeed(tableId, feed)) return;
               const sourceSeq = this.nextMonitorSourceSeq(tableId);
-              void this.enqueueMonitorEvent({
+              await this.enqueueMonitorEvent({
                 type: 'connectionRestored',
                 eventId: newId('evt'),
                 tableId,
@@ -543,31 +1026,20 @@ export class DesktopConsoleService {
                 source: 'room-monitor',
                 schemaVersion: EVENT_SCHEMA_VERSION,
                 continuityProof: proof,
-              }).catch(error => this.recordLiveMonitorError(error));
+              }).catch(error => this.recordLiveMonitorError(error, 'monitor-failure', 'degraded', tableId));
             },
           });
           if (!this.isCurrentLiveFeed(table.tableId, feed)) {
             await this.stopLiveFeed(table.tableId, feed);
             continue;
           }
-          // 实时桥刚附加到牌桌时，主动写一条恢复事件，让之前 RESYNCING 的投影回到 TRACKING。
-          const restoreSeq = this.nextMonitorSourceSeq(table.tableId);
-          await this.enqueueMonitorEvent({
-            type: 'connectionRestored',
-            eventId: newId('evt'),
-            tableId: table.tableId,
-            timestamp: new Date().toISOString(),
-            sourceSeq: restoreSeq,
-            source: 'room-monitor',
-            schemaVersion: EVENT_SCHEMA_VERSION,
-            continuityProof: `live-attach:${Date.now()}`,
-          });
         } catch (error) {
           if (this.liveFeeds.get(table.tableId) === feed) this.liveFeeds.delete(table.tableId);
+          this.runtimeObservedTableIds.delete(table.tableId);
           try {
             await feed.stop();
           } catch (stopError) {
-            this.recordLiveMonitorError(stopError);
+            this.recordLiveMonitorError(stopError, 'monitor-failure', 'degraded', table.tableId);
           }
           throw error;
         }
@@ -655,6 +1127,7 @@ export class DesktopConsoleService {
       recordCounts,
       keepalive,
       automation: { enabled: keepalive.enabled },
+      runtime: this.runtimeSnapshot(),
       operationalWagers: this.ledger.listOperationalWagersTail(),
       events: filterToDisplayedTables(events),
       decisions: filterToDisplayedTables(decisions),
@@ -801,9 +1274,9 @@ export class DesktopConsoleService {
                 ...(reason ? { reason } : {}),
               });
             },
-            onRestored: (tableId, proof) => {
+            onRestored: async (tableId, proof) => {
               const sourceSeq = this.nextMonitorSourceSeq(tableId);
-              void this.orchestrator.enqueue(tableId, {
+              await this.orchestrator.enqueue(tableId, {
                 type: 'connectionRestored',
                 eventId: newId('evt'),
                 tableId,
@@ -880,28 +1353,30 @@ export class DesktopConsoleService {
   private async updateMonitorTableIdsInner(nextTableIds: readonly string[]): Promise<DesktopConsoleSnapshot> {
     const previousTableIds = [...this.monitorTableIds];
     const nextTableIdSet = new Set(nextTableIds);
-    this.ensureMonitorActors(nextTableIds);
-    const outgoingFeeds = [...this.liveFeeds].filter(([tableId]) => !nextTableIdSet.has(tableId));
-    await this.failCloseLiveExecution(outgoingFeeds.map(([tableId]) => tableId));
-
-    // Stop outgoing tables before mutating the Bridge allowlist. The Bridge
-    // prunes exports as a side effect of selection changes, so doing this in
-    // reverse order would make a failed stop ambiguous and could duplicate a
-    // still-active export during rollback.
-    for (const [tableId, feed] of outgoingFeeds) {
-      const stopped = await this.stopLiveFeedForTransition(tableId, feed);
-      if (stopped.kind === 'failed') {
-        this.recordLiveMonitorError(stopped.error);
-        return this.snapshot();
-      }
-    }
-
     this.pendingMonitorTableIds = [...nextTableIds];
     try {
+      this.ensureMonitorActors(nextTableIds);
+      const outgoingFeeds = [...this.liveFeeds].filter(([tableId]) => !nextTableIdSet.has(tableId));
+      await this.failCloseLiveExecution(outgoingFeeds.map(([tableId]) => tableId));
+
+      // Stop outgoing tables before mutating the Bridge allowlist. The Bridge
+      // prunes exports as a side effect of selection changes, so doing this in
+      // reverse order would make a failed stop ambiguous and could duplicate a
+      // still-active export during rollback.
+      for (const [tableId, feed] of outgoingFeeds) {
+        const stopped = await this.stopLiveFeedForTransition(tableId, feed);
+        if (stopped.kind === 'failed') {
+          this.recordLiveMonitorError(stopped.error);
+          this.pendingMonitorTableIds = undefined;
+          return this.snapshot();
+        }
+      }
+
       this.browserBridge?.setSelectedTableIds(nextTableIds);
       await this.attachLiveTablesInner();
       this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
       this.monitorTableIds = [...nextTableIds];
+      this.liveApprovals.retain(nextTableIds);
       this.pendingMonitorTableIds = undefined;
       return this.snapshot();
     } catch (error) {
@@ -947,10 +1422,20 @@ export class DesktopConsoleService {
   }
   async setAutoBet(tableId: string, armed: boolean, shoeId?: string): Promise<DesktopConsoleSnapshot> {
     return this.enqueueExecutionStateOperation(async () => {
+      await this.startupFailCloseTask;
       const actor = this.orchestrator.getActor(tableId);
       if (!actor) throw new Error(`unknown table ${tableId}`);
       if (armed && !this.operationalWagers.getKeepaliveState().enabled) {
         throw new Error('global automation is disabled');
+      }
+      if (armed && this.liveApprovals.has(tableId) && !this.liveAuthorizationSources.has(tableId)) {
+        throw new Error(`live execution is blocked for ${tableId}: ${this.liveTableReasons(tableId).join(', ')}`);
+      }
+      if (armed && this.hasUnknownExecution()) {
+        throw new Error('unresolved UNKNOWN execution blocks automatic betting');
+      }
+      if (armed && this.hasSettlementGap(tableId)) {
+        throw new Error(`unresolved settlement gap blocks automatic betting for ${tableId}`);
       }
       await actor.setAutoBet(armed, shoeId);
       return this.snapshot();
@@ -959,31 +1444,45 @@ export class DesktopConsoleService {
 
   async setExecutionMode(tableId: string, mode: 'shadow' | 'live'): Promise<DesktopConsoleSnapshot> {
     return this.enqueueExecutionStateOperation(async () => {
+      await this.startupFailCloseTask;
       const actor = this.orchestrator.getActor(tableId);
       if (!actor) throw new Error(`unknown table ${tableId}`);
       const bridge = this.browserBridge;
       if (mode === 'live' && !bridge) {
         throw new Error('browser bridge is not running');
       }
+      if (mode === 'live') {
+        const reasons = this.liveTableReasons(tableId, true);
+        if (reasons.length > 0) {
+          throw new Error(`live execution is blocked for ${tableId}: ${reasons.join(', ')}`);
+        }
+      }
 
       const shoeId = actor.getProjection().shoeId || undefined;
       await actor.setAutoBet(false, shoeId);
 
       if (mode === 'live') {
-        bridge!.setLiveBetEnabled(true);
+        await this.setPersistentLiveGate(true);
         this.setOrchestratorExecutor({
           requestBet: request => bridge!.requestBet(request),
         });
+        this.setOperationalWagerExecutor(true);
         this.orchestrator.updateTableExecutionMode(tableId, 'live');
+        this.liveApprovals.approve(tableId);
+        this.liveAuthorizationSources.set(tableId, 'manual');
         return this.snapshot();
       }
 
+      this.liveApprovals.revoke(tableId);
+      this.liveAuthorizationSources.delete(tableId);
       this.orchestrator.updateTableExecutionMode(tableId, 'shadow');
       const hasLiveTable = this.orchestrator.listActors()
-        .some(candidate => candidate.snapshot().executionMode === 'live');
+        .some(candidate => candidate.snapshot().executionMode === 'live'
+          && this.liveAuthorizationSources.has(candidate.tableId));
       if (!hasLiveTable) {
-        bridge?.setLiveBetEnabled(false);
+        await this.setPersistentLiveGate(false);
         this.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
+        this.setOperationalWagerExecutor(false);
       }
       return this.snapshot();
     });
@@ -995,6 +1494,10 @@ export class DesktopConsoleService {
     readonly amount: number;
   }): Promise<OperationalWagerResult & { readonly snapshot: DesktopConsoleSnapshot }> {
     const result = await this.operationalWagers.executeManual(input);
+    if (result.status === 'UNKNOWN') {
+      this.refreshAccountingIncidents();
+      await this.enqueueExecutionStateOperation(() => this.failCloseLiveExecution(this.liveApprovals.list()));
+    }
     return { ...result, snapshot: this.snapshot() };
   }
 
@@ -1012,7 +1515,16 @@ export class DesktopConsoleService {
   }
 
   async setAutomationEnabled(enabled: boolean): Promise<DesktopConsoleSnapshot> {
+    if (!enabled) this.operationalWagers.disableKeepaliveImmediately();
     return await this.enqueueExecutionStateOperation(async () => {
+      await this.startupFailCloseTask;
+      if (enabled && this.hasUnknownExecution()) {
+        throw new Error('unresolved UNKNOWN execution blocks automation');
+      }
+      const settlementGapTable = this.monitorTableIds.find(tableId => this.hasSettlementGap(tableId));
+      if (enabled && settlementGapTable !== undefined) {
+        throw new Error(`unresolved settlement gap blocks automation for ${settlementGapTable}`);
+      }
       const current = this.operationalWagers.getKeepaliveState();
       await this.applyKeepaliveSettings({
         enabled,
@@ -1020,6 +1532,7 @@ export class DesktopConsoleService {
         market: current.market,
         amount: current.amount,
       });
+      await this.reconcileUnattendedExecution();
       return this.snapshot();
     });
   }
@@ -1042,7 +1555,8 @@ export class DesktopConsoleService {
   }
 
   private async executeOneShotLiveBetInner(command: OneShotLiveBetCommand): Promise<OneShotLiveBetResult> {
-    if (!this.monitorTableIds.includes(command.tableId)) {
+    await this.startupFailCloseTask;
+    if (!this.isMonitorTableSelected(command.tableId)) {
       throw new Error(`table ${command.tableId} is not monitored`);
     }
 
@@ -1054,11 +1568,16 @@ export class DesktopConsoleService {
 
     const bridge = this.browserBridge;
     if (!bridge) throw new Error('browser bridge is not running');
+    const readinessReasons = this.liveTableReasons(command.tableId, true);
+    if (readinessReasons.length > 0) {
+      throw new Error(`one-shot live bet is blocked for ${command.tableId}: ${readinessReasons.join(', ')}`);
+    }
 
-    const persistentLiveTable = this.orchestrator.listActors()
-      .find(candidate => candidate.snapshot().executionMode === 'live');
-    if (persistentLiveTable) {
-      throw new Error(`persistent live execution mode is active for table ${persistentLiveTable.tableId}`);
+    const persistentLiveTableId = this.liveApprovals.list()[0]
+      ?? this.orchestrator.listActors()
+        .find(candidate => candidate.snapshot().executionMode === 'live')?.tableId;
+    if (persistentLiveTableId) {
+      throw new Error(`persistent live execution mode is active for table ${persistentLiveTableId}`);
     }
 
     const armedTable = this.orchestrator.listActors()
@@ -1089,6 +1608,11 @@ export class DesktopConsoleService {
       })();
     } finally {
       actor.setExecutor(previousExecutor);
+    }
+
+    if (result.status === 'UNKNOWN') {
+      this.refreshAccountingIncidents();
+      await this.failCloseLiveExecution(this.liveApprovals.list());
     }
 
     const snapshot = this.snapshot();
@@ -1138,7 +1662,9 @@ export class DesktopConsoleService {
   }
 
   async close(): Promise<void> {
+    this.closing = true;
     await this.enqueueExecutionStateOperation(async () => {
+      await this.startupFailCloseTask;
       this.operationalWagers.close();
       await this.stopDemo();
       await this.stopLiveRoomMonitorInner();
@@ -1150,6 +1676,10 @@ export class DesktopConsoleService {
 
 function assertNeverOneShotBetResult(value: never): never {
   throw new Error(`unexpected one-shot bet result: ${String(value)}`);
+}
+
+function assertNeverBridgeRuntimeEvent(value: never): never {
+  throw new Error(`unexpected browser bridge runtime event: ${String(value)}`);
 }
 
 function buildShoeIdMap(

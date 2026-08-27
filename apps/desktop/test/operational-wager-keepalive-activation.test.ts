@@ -1,112 +1,75 @@
 import { describe, expect, it, vi } from 'vitest';
-import type {
-  OperationalWagerExecutionRequest,
-  OperationalWagerReceipt,
-} from '@baccarat/adapter-contract';
 import { SqliteLedger } from '@baccarat/ledger-state';
-import {
-  OperationalWagerCoordinator,
-  type OperationalWagerTableState,
-} from '../electron-src/operational-wager-coordinator.js';
+import type { ControlledOperationalWagerCommand } from '@baccarat/orchestrator';
+import { OperationalWagerCoordinator } from '../electron-src/operational-wager-coordinator.js';
 
-const BASE_TIME = new Date('2026-08-26T00:00:00.000Z');
+const BASE_TIME = new Date('2026-08-27T00:00:00.000Z');
 
-function liveTable(
-  tableId: string,
-  projectionOverrides: Partial<OperationalWagerTableState['projection']> = {},
-): OperationalWagerTableState {
+function accepted(command: ControlledOperationalWagerCommand) {
   return {
-    tableId,
-    executionMode: 'live',
-    projection: {
-      shoeId: `shoe-${tableId}`,
-      shoeBaseline: 'unknown-monitor-session',
-      status: 'BETTING_WINDOW',
-      currentHandId: `hand-${tableId}`,
-      autoBetStatus: 'DISARMED',
-      connectionStatus: 'CONNECTED',
-      sealed: false,
-      ...projectionOverrides,
+    status: 'ACCEPTED' as const,
+    tableId: 'D001',
+    wager: {
+      wagerId: 'wager-D001',
+      tableId: 'D001',
+      shoeId: 'shoe-D001',
+      handId: 'hand-D001',
+      market: command.market,
+      amount: command.amount,
+      source: command.source,
+      createdAt: command.createdAt ?? BASE_TIME.toISOString(),
     },
   };
 }
 
-function receipt(request: OperationalWagerExecutionRequest): OperationalWagerReceipt {
-  return {
-    receiptId: `receipt-${request.wager.wagerId}`,
-    wagerId: request.wager.wagerId,
-    tableId: request.wager.tableId,
-    shoeId: request.wager.shoeId,
-    handId: request.wager.handId,
-    market: request.wager.market,
-    amount: request.wager.amount,
-    source: request.wager.source,
-    status: 'ACCEPTED',
-    createdAt: BASE_TIME.toISOString(),
-  };
-}
-
 describe('OperationalWagerCoordinator keepalive activation', () => {
-  it('checks immediately and retries on the next scheduler tick when a monitored table opens', async () => {
-    // Given: a live monitor session begins between betting windows without a confirmed physical shoe.
+  it('checks immediately and retries when the next betting window becomes eligible', async () => {
     const ledger = new SqliteLedger(':memory:');
-    let table = liveTable('D001', {
-      status: 'TRACKING',
-      currentHandId: null,
-    });
-    const bridge = {
-      requestOperationalWager: vi.fn(async (request: OperationalWagerExecutionRequest) => receipt(request)),
-    };
+    let open = false;
+    const placeOperationalWager = vi.fn(async (command: ControlledOperationalWagerCommand) =>
+      open
+        ? accepted(command)
+        : { status: 'REJECTED' as const, tableId: 'D001', reason: 'betting-window-required' });
     const coordinator = new OperationalWagerCoordinator({
       ledger,
-      bridge: () => bridge,
+      actor: () => ({ placeOperationalWager }),
       monitorTableIds: () => ['D001'],
-      tableState: tableId => tableId === 'D001' ? table : undefined,
       serialize: async operation => await operation(),
     });
 
     try {
-      // When: global automation is enabled and the table opens before the configured interval has elapsed.
       await coordinator.updateKeepalive({
         enabled: true,
         intervalMinutes: 10,
         market: 'banker',
         amount: 20,
       }, BASE_TIME);
-      table = liveTable('D001');
+      expect(placeOperationalWager).toHaveBeenCalledTimes(1);
+      expect(coordinator.getKeepaliveState().lastAttemptAt).toBeUndefined();
+
+      open = true;
       await coordinator.tick(new Date(BASE_TIME.valueOf() + 15_000));
 
-      // Then: activation checks immediately, and the first eligible window submits the banker keepalive wager.
+      expect(placeOperationalWager).toHaveBeenCalledTimes(2);
       expect(coordinator.getKeepaliveState()).toMatchObject({
         enabled: true,
         lastStatus: 'ACCEPTED',
         lastTableId: 'D001',
       });
-      expect(bridge.requestOperationalWager).toHaveBeenCalledWith(expect.objectContaining({
-        wager: expect.objectContaining({
-          tableId: 'D001',
-          market: 'banker',
-          source: 'keepalive',
-        }),
-      }));
-      expect(bridge.requestOperationalWager).toHaveBeenCalledTimes(1);
     } finally {
       coordinator.close();
       ledger.close();
     }
   });
 
-  it('starts a fresh keepalive cycle immediately when automation is re-enabled', async () => {
-    // Given: a successful keepalive remains inside its configured interval.
+  it('starts a fresh cycle immediately after automation is re-enabled', async () => {
     const ledger = new SqliteLedger(':memory:');
-    const bridge = {
-      requestOperationalWager: vi.fn(async (request: OperationalWagerExecutionRequest) => receipt(request)),
-    };
+    const placeOperationalWager = vi.fn(async (command: ControlledOperationalWagerCommand) =>
+      accepted(command));
     const coordinator = new OperationalWagerCoordinator({
       ledger,
-      bridge: () => bridge,
+      actor: () => ({ placeOperationalWager }),
       monitorTableIds: () => ['D001'],
-      tableState: tableId => tableId === 'D001' ? liveTable('D001') : undefined,
       serialize: async operation => await operation(),
     });
 
@@ -123,8 +86,6 @@ describe('OperationalWagerCoordinator keepalive activation', () => {
         market: 'banker',
         amount: 20,
       }, new Date(BASE_TIME.valueOf() + 1_000));
-
-      // When: the operator starts automatic betting again before the old interval expires.
       await coordinator.updateKeepalive({
         enabled: true,
         intervalMinutes: 10,
@@ -132,8 +93,7 @@ describe('OperationalWagerCoordinator keepalive activation', () => {
         amount: 20,
       }, new Date(BASE_TIME.valueOf() + 2_000));
 
-      // Then: the newly enabled cycle immediately submits another keeper wager.
-      expect(bridge.requestOperationalWager).toHaveBeenCalledTimes(2);
+      expect(placeOperationalWager).toHaveBeenCalledTimes(2);
     } finally {
       coordinator.close();
       ledger.close();

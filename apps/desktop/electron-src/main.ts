@@ -4,6 +4,10 @@ import { DesktopConsoleService } from './service.js';
 import { MainWindowRetainer } from './main-window-retainer.js';
 import { acquireSingleInstance } from './single-instance.js';
 import {
+  restoreOrCreateMainWindow,
+  shouldHideMainWindowOnClose,
+} from './background-lifecycle.js';
+import {
   parseDesktopKeepaliveSettings,
   parseDesktopOperationalWagerCommand,
   parseOneShotLiveBetCommand,
@@ -13,6 +17,7 @@ const devUrl = process.env.VITE_DEV_SERVER_URL;
 let service: DesktopConsoleService | null = null;
 const mainWindowRetainer = new MainWindowRetainer<BrowserWindow>();
 type DesktopExecutionMode = 'shadow' | 'live';
+let appQuitting = false;
 
 function isDesktopExecutionMode(value: unknown): value is DesktopExecutionMode {
   return value === 'shadow' || value === 'live';
@@ -36,6 +41,11 @@ async function createWindow(): Promise<void> {
       nodeIntegration: false,
       sandbox: false,
     },
+  });
+  win.on('close', event => {
+    if (!shouldHideMainWindowOnClose(appQuitting)) return;
+    event.preventDefault();
+    win.hide();
   });
   mainWindowRetainer.retain(win);
   if (devUrl) {
@@ -91,18 +101,15 @@ function registerIpc(): void {
   ipcMain.handle('console:browser-bridge-status', () => getService().browserBridgeStatus());
 }
 
-function focusExistingMainWindow(): void {
-  const window = mainWindowRetainer.current();
-  if (!window) return;
-  if (window.isMinimized()) window.restore();
-  window.focus();
+async function focusExistingMainWindow(): Promise<void> {
+  await restoreOrCreateMainWindow(mainWindowRetainer.current(), createWindow);
 }
 
 if (acquireSingleInstance(app)) {
   registerIpc();
 
   app.on('second-instance', () => {
-    focusExistingMainWindow();
+    void focusExistingMainWindow();
   });
 
   app.whenReady().then(async () => {
@@ -118,6 +125,7 @@ if (acquireSingleInstance(app)) {
 
   let closing = false;
   app.on('before-quit', (event) => {
+    appQuitting = true;
     if (closing || !service) return;
     event.preventDefault();
     closing = true;
@@ -128,6 +136,7 @@ if (acquireSingleInstance(app)) {
   });
 
   app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') app.quit();
+    // The monitor, bridge, keepalive scheduler, and ledger remain active in the
+    // background. Launching the app again restores the retained hidden window.
   });
 }

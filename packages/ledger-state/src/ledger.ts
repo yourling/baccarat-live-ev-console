@@ -344,7 +344,7 @@ export class LedgerConflictError extends Error {
 
 export type AppendEventResult = 'appended' | 'duplicate';
 
-const SCHEMA_VERSION = '3';
+const SCHEMA_VERSION = '4';
 
 // allow: SIZE_OK — SQLite schema, atomic persistence, and read projections share one transaction boundary.
 export class SqliteLedger {
@@ -451,7 +451,7 @@ export class SqliteLedger {
       this.db.prepare('INSERT INTO ledger_meta (key, value) VALUES (?, ?)').run('schema_version', SCHEMA_VERSION);
     } else if (row.value === SCHEMA_VERSION) {
       // 当前版本,无需迁移
-    } else if (row.value === '1' || row.value === '2') {
+    } else if (row.value === '1' || row.value === '2' || row.value === '3') {
       if (row.value === '1') this.rebuildReservationsTable();
       this.db.prepare('UPDATE ledger_meta SET value = ? WHERE key = ?').run(SCHEMA_VERSION, 'schema_version');
     } else {
@@ -460,8 +460,15 @@ export class SqliteLedger {
     // 兜底:极早期未写版本号的库也可能带旧的全局唯一约束;该函数幂等,非旧形态时为空操作。
     this.rebuildReservationsTable();
     this.db.exec(`
+      DROP INDEX IF EXISTS uq_reservations_active;
       CREATE UNIQUE INDEX IF NOT EXISTS uq_reservations_active
-        ON reservations(table_id, shoe_id, hand_id, market) WHERE status = 'RESERVED';
+        ON reservations(
+          table_id,
+          shoe_id,
+          hand_id,
+          market,
+          COALESCE(json_extract(payload, '$.executionSource'), 'strategy')
+        ) WHERE status IN ('RESERVED', 'UNKNOWN');
       CREATE INDEX IF NOT EXISTS idx_reservations_window
         ON reservations(table_id, shoe_id, hand_id, market);
       CREATE INDEX IF NOT EXISTS idx_reservations_status ON reservations(table_id, status);
@@ -579,9 +586,29 @@ export class SqliteLedger {
     return rows.reverse().map(row => JSON.parse(row.payload) as OperationalWagerRecord);
   }
 
+  hasOperationalWager(
+    tableId: string,
+    shoeId: string,
+    handId: string,
+    market: string,
+    source: string,
+  ): boolean {
+    return Boolean(this.db.prepare(`
+      SELECT 1
+      FROM operational_wagers
+      WHERE table_id = ?
+        AND json_extract(payload, '$.wager.shoeId') = ?
+        AND json_extract(payload, '$.wager.handId') = ?
+        AND json_extract(payload, '$.wager.market') = ?
+        AND json_extract(payload, '$.wager.source') = ?
+      LIMIT 1
+    `).get(tableId, shoeId, handId, market, source));
+  }
+
   getMonitorSummary(options: MonitorSummaryOptions = {}): MonitorSummary {
     const eventScope = summaryScope('e', options);
     const receiptScope = summaryScope('r', options);
+    const operationalScope = summaryScope('o', options);
     const reservationScope = summaryScope('r', options);
     const rowsByTable = new Map<string, MonitorSummaryRow>();
     const ensureRow = (tableId: string): MonitorSummaryRow => {
@@ -598,7 +625,7 @@ export class SqliteLedger {
     for (const row of handRows) ensureRow(row.tableId).hands = Number(row.hands);
 
     const receiptRows = this.db.prepare(
-      'SELECT r.table_id AS tableId, COUNT(*) AS bets, COALESCE(SUM(CAST(json_extract(r.payload, \'$.amount\') AS REAL)), 0) AS amount FROM receipts r WHERE json_extract(r.payload, \'$.status\') <> \'REJECTED\' AND ' + receiptScope.where + ' GROUP BY r.table_id'
+      'SELECT r.table_id AS tableId, COUNT(*) AS bets, COALESCE(SUM(CAST(json_extract(r.payload, \'$.amount\') AS REAL)), 0) AS amount FROM receipts r WHERE json_extract(r.payload, \'$.status\') IN (\'ACCEPTED\', \'SIMULATED\') AND ' + receiptScope.where + ' GROUP BY r.table_id'
     ).all(...receiptScope.params) as { tableId: string; bets: number; amount: number }[];
     for (const row of receiptRows) {
       const target = ensureRow(row.tableId);
@@ -606,8 +633,17 @@ export class SqliteLedger {
       target.amount = Number(row.amount);
     }
 
+    const operationalRows = this.db.prepare(
+      'SELECT o.table_id AS tableId, COUNT(*) AS bets, COALESCE(SUM(CAST(json_extract(o.payload, \'$.wager.amount\') AS REAL)), 0) AS amount FROM operational_wagers o WHERE json_extract(o.payload, \'$.status\') = \'ACCEPTED\' AND json_type(o.payload, \'$.receipt\') IS NOT NULL AND ' + operationalScope.where + ' GROUP BY o.table_id'
+    ).all(...operationalScope.params) as { tableId: string; bets: number; amount: number }[];
+    for (const row of operationalRows) {
+      const target = ensureRow(row.tableId);
+      target.bets += Number(row.bets);
+      target.amount += Number(row.amount);
+    }
+
     const expectedRows = this.db.prepare(
-      'SELECT r.table_id AS tableId, COALESCE(SUM(CAST(json_extract(r.payload, \'$.amount\') AS REAL) * COALESCE(CAST(json_extract(d.payload, \'$.evMean\') AS REAL), 0)), 0) AS expectedPnl FROM receipts r LEFT JOIN decisions d ON d.table_id = r.table_id AND d.shoe_id = r.shoe_id AND d.hand_id = r.hand_id AND d.market = r.market WHERE json_extract(r.payload, \'$.status\') <> \'REJECTED\' AND ' + receiptScope.where + ' GROUP BY r.table_id'
+      'SELECT r.table_id AS tableId, COALESCE(SUM(CAST(json_extract(r.payload, \'$.amount\') AS REAL) * COALESCE(CAST(json_extract(d.payload, \'$.evMean\') AS REAL), 0)), 0) AS expectedPnl FROM receipts r LEFT JOIN decisions d ON d.table_id = r.table_id AND d.shoe_id = r.shoe_id AND d.hand_id = r.hand_id AND d.market = r.market WHERE json_extract(r.payload, \'$.status\') IN (\'ACCEPTED\', \'SIMULATED\') AND ' + receiptScope.where + ' GROUP BY r.table_id'
     ).all(...receiptScope.params) as { tableId: string; expectedPnl: number }[];
     for (const row of expectedRows) ensureRow(row.tableId).expectedPnl = Number(row.expectedPnl);
 
@@ -616,9 +652,42 @@ export class SqliteLedger {
     ).all(...reservationScope.params) as { tableId: string; actualPnl: number }[];
     for (const row of actualRows) ensureRow(row.tableId).actualPnl = Number(row.actualPnl);
 
-    const pointRows = this.db.prepare(
-      'SELECT r.created_at AS createdAt, CAST(json_extract(r.payload, \'$.amount\') AS REAL) * COALESCE(CAST(json_extract(d.payload, \'$.evMean\') AS REAL), 0) AS expectedPnl, COALESCE(CAST(json_extract(res.payload, \'$.realizedPnl\') AS REAL), 0) AS actualPnl FROM receipts r LEFT JOIN decisions d ON d.table_id = r.table_id AND d.shoe_id = r.shoe_id AND d.hand_id = r.hand_id AND d.market = r.market LEFT JOIN reservations res ON res.table_id = r.table_id AND res.shoe_id = r.shoe_id AND res.hand_id = r.hand_id AND res.market = r.market WHERE json_extract(r.payload, \'$.status\') <> \'REJECTED\' AND ' + receiptScope.where + ' ORDER BY r.created_at ASC, r.receipt_id ASC'
-    ).all(...receiptScope.params) as { createdAt: string; expectedPnl: number; actualPnl: number }[];
+    const pointRows = this.db.prepare(`
+      SELECT createdAt, expectedPnl, actualPnl
+      FROM (
+        SELECT
+          r.created_at AS createdAt,
+          CAST(json_extract(r.payload, '$.amount') AS REAL)
+            * COALESCE(CAST(json_extract(d.payload, '$.evMean') AS REAL), 0) AS expectedPnl,
+          COALESCE(CAST(json_extract(res.payload, '$.realizedPnl') AS REAL), 0) AS actualPnl,
+          r.receipt_id AS stableId
+        FROM receipts r
+        LEFT JOIN decisions d
+          ON d.table_id = r.table_id
+          AND d.shoe_id = r.shoe_id
+          AND d.hand_id = r.hand_id
+          AND d.market = r.market
+        LEFT JOIN reservations res ON res.intent_id = r.intent_id
+        WHERE json_extract(r.payload, '$.status') IN ('ACCEPTED', 'SIMULATED')
+          AND ${receiptScope.where}
+        UNION ALL
+        SELECT
+          o.created_at AS createdAt,
+          0 AS expectedPnl,
+          COALESCE(CAST(json_extract(res.payload, '$.realizedPnl') AS REAL), 0) AS actualPnl,
+          o.wager_id AS stableId
+        FROM operational_wagers o
+        LEFT JOIN reservations res
+          ON res.reservation_id = json_extract(o.payload, '$.reservationId')
+        WHERE json_extract(o.payload, '$.status') = 'ACCEPTED'
+          AND json_type(o.payload, '$.receipt') IS NOT NULL
+          AND ${operationalScope.where}
+      )
+      ORDER BY createdAt ASC, stableId ASC
+    `).all(
+      ...receiptScope.params,
+      ...operationalScope.params,
+    ) as { createdAt: string; expectedPnl: number; actualPnl: number }[];
     let expected = 0;
     let actual = 0;
     const allPoints = pointRows.map(row => {
@@ -971,13 +1040,27 @@ export class SqliteLedger {
   }
 
   /**
-   * 仅当同键已存在「活跃」(status='RESERVED')预留时才冲突;
-   * 终态行(RELEASED/SETTLED/EXPIRED/UNKNOWN)是审计历史,不再占用键位。
+   * RESERVED and UNKNOWN both hold exposure. The execution source is part of
+   * the key so strategy/manual/keepalive attempts remain independently auditable.
    */
   saveReservation(reservation: RiskReservation): boolean {
     const active = this.db.prepare(
-      "SELECT reservation_id FROM reservations WHERE table_id = ? AND shoe_id = ? AND hand_id = ? AND market = ? AND status = 'RESERVED' LIMIT 1"
-    ).get(reservation.tableId, reservation.shoeId, reservation.handId, reservation.market) as { reservation_id: string } | undefined;
+      `SELECT reservation_id
+       FROM reservations
+       WHERE table_id = ?
+         AND shoe_id = ?
+         AND hand_id = ?
+         AND market = ?
+         AND COALESCE(json_extract(payload, '$.executionSource'), 'strategy') = ?
+         AND status IN ('RESERVED', 'UNKNOWN')
+       LIMIT 1`
+    ).get(
+      reservation.tableId,
+      reservation.shoeId,
+      reservation.handId,
+      reservation.market,
+      reservation.executionSource ?? 'strategy',
+    ) as { reservation_id: string } | undefined;
     if (active) {
       if (active.reservation_id === reservation.reservationId) return false;
       throw new LedgerConflictError(`active reservation already exists for ${reservation.tableId}/${reservation.shoeId}/${reservation.handId}/${reservation.market}`);

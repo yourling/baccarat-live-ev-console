@@ -11,6 +11,13 @@ export interface Card {
 export type BettingMarket = 'bankerPair' | 'playerPair';
 export const BETTING_MARKETS: BettingMarket[] = ['bankerPair', 'playerPair'];
 
+/**
+ * Execution markets are broader than EV decision markets. Probability and
+ * strategy code must continue to use BettingMarket.
+ */
+export type ExecutionMarket = BettingMarket | 'banker' | 'player';
+export type ExecutionSource = 'strategy' | 'one-shot' | 'manual' | 'keepalive';
+
 export interface OddsConfig {
   netWin: number;
   loss: number;
@@ -201,7 +208,15 @@ export interface ConnectionLostEvent extends BaseEvent {
 
 export interface ConnectionRestoredEvent extends BaseEvent {
   type: 'connectionRestored';
+  /** Trusted monitor cursor proof in the form cursor-v1:<64 lowercase hex>. */
   continuityProof?: string;
+}
+
+export const CONTINUITY_PROOF_PREFIX = 'cursor-v1:';
+
+export function isValidContinuityProof(value: unknown): value is string {
+  return typeof value === 'string'
+    && /^cursor-v1:[a-f0-9]{64}$/.test(value);
 }
 
 export interface BetReceiptEvent extends BaseEvent {
@@ -286,7 +301,9 @@ export interface RiskReservation {
   tableId: string;
   shoeId: string;
   handId: string;
-  market: BettingMarket;
+  market: ExecutionMarket;
+  /** Missing on legacy rows and interpreted as "strategy". */
+  executionSource?: ExecutionSource;
   amount: number;
   maxLoss: number;
   /** 命中的最大盈利，用于结算审计。 */

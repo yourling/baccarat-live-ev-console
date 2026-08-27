@@ -193,7 +193,7 @@ describe('orchestrator table actor', () => {
       tableId: 't1',
       timestamp: '2025-01-01T00:00:04.000Z',
       sourceSeq: 4,
-      continuityProof: 'test-proof',
+      continuityProof: `cursor-v1:${'b'.repeat(64)}`,
     };
     const secondHandWindow: NormalizedEvent = {
       type: 'bettingWindowOpened',
@@ -717,11 +717,12 @@ describe('orchestrator table actor', () => {
     await actor.flush();
 
     expect(orchestrator.getReservations('t1')[0]).toEqual(expect.objectContaining({
-      status: 'SETTLED',
+      status: 'UNKNOWN',
       receiptId: 'unknown-receipt',
     }));
-    expect(orchestrator.getRiskState().reservedExposure).toBe(0);
-    expect(orchestrator.getRiskState().pendingExecutions).toBe(0);
+    expect(orchestrator.getReservations('t1')[0]?.realizedPnl).toBeUndefined();
+    expect(orchestrator.getRiskState().reservedExposure).toBe(10);
+    expect(orchestrator.getRiskState().pendingExecutions).toBe(1);
     ledger.close();
   });
 

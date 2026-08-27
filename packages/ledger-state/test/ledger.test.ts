@@ -338,7 +338,7 @@ describe('projection state machine hardening', () => {
 
     const withProof = replayEvents([
       ...events.slice(0, 2),
-      ev({ type: 'connectionRestored', continuityProof: 'verified-continuity-token' }, 3),
+      ev({ type: 'connectionRestored', continuityProof: `cursor-v1:${'a'.repeat(64)}` }, 3),
     ]).get('t1')!;
     expect(withProof.status).toBe('TRACKING');
     expect(withProof.connectionStatus).toBe('CONNECTED');
@@ -455,6 +455,96 @@ describe('reservations active-key semantics (tombstone regression)', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('keeps UNKNOWN active per execution source across restart-safe persistence', () => {
+    const ledger = new SqliteLedger();
+    const unknown: RiskReservation = {
+      ...rsv('unknown-keepalive'),
+      market: 'banker',
+      executionSource: 'keepalive',
+      status: 'UNKNOWN',
+    };
+    expect(ledger.saveReservation(unknown)).toBe(true);
+    expect(() => ledger.saveReservation({
+      ...unknown,
+      reservationId: 'unknown-keepalive-duplicate',
+      intentId: 'intent-duplicate',
+    })).toThrow(LedgerConflictError);
+    expect(ledger.saveReservation({
+      ...unknown,
+      reservationId: 'manual-same-window',
+      intentId: 'intent-manual',
+      executionSource: 'manual',
+    })).toBe(true);
+    ledger.close();
+  });
+});
+
+describe('operational wager income summary', () => {
+  it('includes accepted live operational wagers and their realized pnl', () => {
+    const ledger = new SqliteLedger();
+    const createdAt = '2026-08-27T01:00:00.000Z';
+    const reservation: RiskReservation = {
+      reservationId: 'rsv-operational-banker',
+      intentId: 'opw-banker',
+      tableId: 'D001',
+      shoeId: 'shoe-D001',
+      handId: 'hand-D001',
+      market: 'banker',
+      executionSource: 'keepalive',
+      amount: 20,
+      maxLoss: 20,
+      maxProfit: 19,
+      status: 'SETTLED',
+      createdAt,
+      settledAt: '2026-08-27T01:00:30.000Z',
+      realizedPnl: 19,
+      receiptId: 'receipt-opw-banker',
+    };
+    ledger.saveReservation(reservation);
+    ledger.saveOperationalWager({
+      reservationId: reservation.reservationId,
+      status: 'ACCEPTED',
+      wager: {
+        wagerId: reservation.intentId,
+        tableId: reservation.tableId,
+        shoeId: reservation.shoeId,
+        handId: reservation.handId,
+        market: 'banker',
+        amount: reservation.amount,
+        source: 'keepalive',
+        createdAt,
+      },
+      receipt: {
+        receiptId: 'receipt-opw-banker',
+        wagerId: reservation.intentId,
+        tableId: reservation.tableId,
+        shoeId: reservation.shoeId,
+        handId: reservation.handId,
+        market: 'banker',
+        amount: reservation.amount,
+        source: 'keepalive',
+        status: 'ACCEPTED',
+        createdAt: '2026-08-27T01:00:02.000Z',
+      },
+    });
+
+    const summary = ledger.getMonitorSummary();
+    expect(summary.rows).toEqual([{
+      tableId: 'D001',
+      hands: 0,
+      bets: 1,
+      amount: 20,
+      expectedPnl: 0,
+      actualPnl: 19,
+    }]);
+    expect(summary.incomePoints).toEqual([{
+      createdAt,
+      expectedPnl: 0,
+      actualPnl: 19,
+    }]);
+    ledger.close();
   });
 });
 

@@ -1,6 +1,7 @@
 import {
   BETTING_MARKETS,
   CARD_RANKS,
+  isValidContinuityProof,
   type BettingMarket,
   type BurnModel,
   type Card,
@@ -199,5 +200,12 @@ export function assertValidEventEnvelope(event: NormalizedEvent): void {
     && event.baseline !== 'unknown-monitor-session'
   ) {
     throw new ContractValidationError(`unsupported shoe baseline: ${String(event.baseline)}`, 'baseline');
+  }
+  if (
+    event.type === 'connectionRestored'
+    && event.continuityProof !== undefined
+    && !isValidContinuityProof(event.continuityProof)
+  ) {
+    throw new ContractValidationError('invalid continuity proof', 'continuityProof');
   }
 }

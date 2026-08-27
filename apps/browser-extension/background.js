@@ -4,7 +4,8 @@
  * （chrome.debugger / CDP，由 storage.trustedKeepalive 控制）。
  */
 
-const DEFAULT_BRIDGE_URL = 'ws://127.0.0.1:17890';
+const DEFAULT_BRIDGE_TOKEN = 'd63a1a9d927e268d5b3d0ac2450836c0fa90de2e55398ccb73ae888ecf35d97b';
+const DEFAULT_BRIDGE_URL = `ws://127.0.0.1:17890/?token=${DEFAULT_BRIDGE_TOKEN}`;
 const CDP_MIN_INTERVAL_MS = 60 * 1000;
 const EXTENSION_RELOAD_DELAY_MS = 1000;
 const DAFABET_BACCARAT_POPUP_URL = 'https://www.dafabet.net/sc/live-dealer/popup-launch/live-baccarat-pa';
@@ -12,6 +13,12 @@ const GAME_TAB_URL_PATTERN = /^https?:\/\/(?:[a-z0-9-]+\.)*(?:dafabet\.(?:net|co
 const MSTROM_FRAME_HOST_PATTERN = /(^|\.)(?:mstrom-uno|673ing)\.com$/i;
 const betRequests = new Map();
 let liveBetSessionEnabled = false;
+const BRIDGE_SESSION_ID = [
+  'bridge',
+  Date.now().toString(36),
+  Math.random().toString(36).slice(2, 12),
+].join('-');
+let bridgeMessageSeq = 0;
 
 if (typeof importScripts === 'function') {
   importScripts('mstrom-bet-runtime.js');
@@ -65,7 +72,14 @@ chrome.storage.onChanged.addListener((_changes, _area) => {
 
 async function getBridgeUrl() {
   const stored = await chrome.storage.local.get({ bridgeUrl: DEFAULT_BRIDGE_URL });
-  return stored.bridgeUrl || DEFAULT_BRIDGE_URL;
+  const raw = stored.bridgeUrl || DEFAULT_BRIDGE_URL;
+  try {
+    const url = new URL(raw);
+    if (!url.searchParams.has('token')) url.searchParams.set('token', DEFAULT_BRIDGE_TOKEN);
+    return url.toString();
+  } catch (_) {
+    return DEFAULT_BRIDGE_URL;
+  }
 }
 
 async function connect() {
@@ -312,6 +326,88 @@ async function executeUniqueMstromBet(message, generation) {
   return receipt;
 }
 
+async function probeMstromBetReadiness(tableIds, generation) {
+  const requestedTableIds = Array.from(new Set(
+    (Array.isArray(tableIds) ? tableIds : [])
+      .filter(tableId => typeof tableId === 'string' && /^[A-Z]\d{3}$/.test(tableId)),
+  ));
+  if (requestedTableIds.length === 0) {
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: 'allFrames',
+      detail: 'probeBetReadiness:no-valid-table',
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+
+  const tabs = await chrome.tabs.query({
+    url: [`${DAFABET_BACCARAT_POPUP_URL}*`],
+  });
+  if (generation !== activeSocketGeneration) return;
+  const targets = tabs.filter(tab => tab.id && exactDafabetBaccaratPopup(tab.url));
+  if (targets.length !== 1) {
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: 'allFrames',
+      detail: `probeBetReadiness:popup-count=${targets.length}`,
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+
+  for (const tableId of requestedTableIds) {
+    let probes;
+    try {
+      probes = await chrome.scripting.executeScript({
+        target: { tabId: targets[0].id, allFrames: true },
+        world: 'MAIN',
+        args: [tableId],
+        func: globalThis.probeMstromBetStore,
+      });
+    } catch (error) {
+      send({
+        kind: 'sessionAction',
+        action: 'command-executed',
+        url: '',
+        frame: 'allFrames',
+        detail: `probeBetReadiness:${tableId}:probe-failed=${betErrorMessage(error)}`,
+        timestamp: new Date().toISOString(),
+      });
+      continue;
+    }
+    if (generation !== activeSocketGeneration) return;
+    const candidates = probes.filter(entry => {
+      const result = entry && entry.result;
+      return result
+        && (result.status === 'ready' || result.ownsTargetStore === true)
+        && result.tableId === tableId
+        && MSTROM_FRAME_HOST_PATTERN.test(String(result.host || ''));
+    });
+    const result = candidates.length === 1 ? candidates[0].result : null;
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: 'allFrames',
+      detail: [
+        `probeBetReadiness:${tableId}`,
+        `candidates=${candidates.length}`,
+        `betEnabled=${result && result.betEnabled === true}`,
+        `gmcode=${result && typeof result.gmcode === 'string' ? result.gmcode : ''}`,
+        `addChip=${result && result.hasAddChip === true}`,
+        `confirm=${result && result.hasConfirm === true}`,
+        `calculateDiff=${result && result.hasCalculateDiff === true}`,
+      ].join(':'),
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+
 function handleBetRequest(message, generation) {
   const requestId = message && typeof message.requestId === 'string'
     ? message.requestId
@@ -373,7 +469,7 @@ function sendBetResult(message, generation) {
     return false;
   }
   try {
-    socket.send(JSON.stringify(message));
+    socket.send(JSON.stringify(withBridgeSequence(message)));
     return true;
   } catch (_) {
     return false;
@@ -382,13 +478,22 @@ function sendBetResult(message, generation) {
 
 function send(message) {
   if (message && message.kind === 'betResult') return;
+  const sequenced = withBridgeSequence(message);
   if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(message));
+    socket.send(JSON.stringify(sequenced));
     return;
   }
   // 断线/重连窗口内排队,重连后按序补发,避免牌局消息被静默丢弃。
   if (outbox.length >= OUTBOX_LIMIT) outbox.shift();
-  outbox.push(message);
+  outbox.push(sequenced);
+}
+
+function withBridgeSequence(message) {
+  return {
+    ...message,
+    bridgeSessionId: BRIDGE_SESSION_ID,
+    bridgeSeq: ++bridgeMessageSeq,
+  };
 }
 
 function flushOutbox() {
@@ -545,6 +650,10 @@ async function handleRemoteCommand(name, tableIds = [], generation) {
   }
   if (name === 'openMultiView') {
     await openActiveGameTabInMultiplay(tableIds);
+    return;
+  }
+  if (name === 'probeBetReadiness') {
+    await probeMstromBetReadiness(tableIds, generation);
     return;
   }
   if (name === 'replayRuntimeState') {

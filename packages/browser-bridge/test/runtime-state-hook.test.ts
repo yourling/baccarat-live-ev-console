@@ -485,6 +485,13 @@ describe('mstrom runtime-state hook', () => {
     expect(() => new vm.Script(contentRelaySource, { filename: 'content.js' })).not.toThrow();
   });
 
+  it('continues session recovery with a capped supervisory backoff after the first retry cycle is exhausted', () => {
+    expect(contentRelaySource).toContain('SUPERVISORY_RECOVERY_DELAYS_MS');
+    expect(contentRelaySource).toContain('scheduleSupervisoryRecovery');
+    expect(contentRelaySource).toContain("sendSessionAction('recovery-failed'");
+    expect(contentRelaySource).toContain('Math.min(supervisoryRecoveryAttempts');
+  });
+
   it('exposes read-only runtime diagnostics to a replay probe', () => {
     const context = vm.createContext({
       location: { hostname: 'gci.agad.mstrom-uno.com', href: 'https://gci.agad.mstrom-uno.com/pc/pcv1/index.jsp?' },

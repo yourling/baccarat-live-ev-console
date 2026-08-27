@@ -446,6 +446,32 @@ describe('extension background multitable command', () => {
     expect(executeScript.mock.calls.some(([options]) => String(options.func).includes('__baccaratRuntimeStateHookReplay'))).toBe(true);
   });
 
+  it('reports live-bet readiness without executing a wager', async () => {
+    const harness = await createHarness();
+
+    harness.socket.emit('message', {
+      data: JSON.stringify({
+        kind: 'command',
+        name: 'probeBetReadiness',
+        tableIds: ['D067'],
+      }),
+    });
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => isMstromProbeInjection(injection.func),
+    )).toBe(true);
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => isMstromFinalInjection(injection.func),
+    )).toBe(false);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      detail: expect.stringContaining('probeBetReadiness:D067:candidates=1'),
+    }));
+  });
+
 });
 describe('extension background live bet gate', () => {
   it.each(['close', 'error'] as const)(

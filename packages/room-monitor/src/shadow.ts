@@ -1,14 +1,15 @@
 import { sha256, stableStringify, type NormalizedEvent, type TableProfile } from '@baccarat/contracts';
-import type {
-  MonitorConnectionState,
-  MonitorHealth,
-  MonitorKeepAliveResult,
-  RoomDescriptor,
-  RoomMonitor,
-  TableCursor,
-  TableEventBatch,
-  TableExport,
-  TableExportSink,
+import {
+  cursorContinuityProof,
+  type MonitorConnectionState,
+  type MonitorHealth,
+  type MonitorKeepAliveResult,
+  type RoomDescriptor,
+  type RoomMonitor,
+  type TableCursor,
+  type TableEventBatch,
+  type TableExport,
+  type TableExportSink,
 } from './types.js';
 
 export interface ShadowFaultPlan {
@@ -229,18 +230,19 @@ class ShadowTableExport implements TableExport {
     if (this.stopped) return;
 
     const proof = faults.continuityProof ?? this.buildContinuityProof();
+    const restored = this.sink?.onRestored?.(this.tableId, proof);
+    if (restored !== undefined) await restored;
     this.state = 'CONNECTED';
     this.reconnectCount += 1;
-    this.sink?.onRestored?.(this.tableId, proof);
   }
 
   private buildContinuityProof(): string {
-    return sha256(stableStringify({
+    return cursorContinuityProof({
       tableId: this.tableId,
       sourceSeq: this.cursor.sourceSeq,
       eventId: this.cursor.eventId,
       payloadHash: this.cursor.payloadHash,
-    }));
+    });
   }
 
   private assertNoGaps(batchEvents: NormalizedEvent[]): void {

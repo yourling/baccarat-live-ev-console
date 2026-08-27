@@ -209,7 +209,7 @@ describe('room monitor', () => {
           faults: {
             disconnectAfterEvent: 1,
             restoreAfterMs: 0,
-            continuityProof: 'proof-1',
+            continuityProof: `cursor-v1:${'e'.repeat(64)}`,
           },
         }],
       }],
@@ -226,7 +226,7 @@ describe('room monitor', () => {
     await feed.flush();
 
     expect(disconnects).toEqual(['t1:simulated-disconnect']);
-    expect(restores).toEqual([{ tableId: 't1', proof: 'proof-1' }]);
+    expect(restores).toEqual([{ tableId: 't1', proof: `cursor-v1:${'e'.repeat(64)}` }]);
     expect(feed.health().state).toBe('CONNECTED');
     expect(feed.health().reconnectCount).toBe(1);
     expect(feed.health().lastAckedSeq).toBe(events[events.length - 1].sourceSeq);

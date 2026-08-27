@@ -1,15 +1,14 @@
 import {
   isOperationalWagerMarket,
-  type OperationalWagerExecutionRequest,
   type OperationalWagerMarket,
-  type OperationalWagerReceipt,
   type OperationalWagerSource,
 } from '@baccarat/adapter-contract';
-import { newId, type AutoBetStatus, type ConnectionStatus, type ShoeBaseline, type TableStatus } from '@baccarat/contracts';
-import {
-  SqliteLedger,
-  type OperationalWagerRecord,
-} from '@baccarat/ledger-state';
+import type { AutoBetStatus, ConnectionStatus, ShoeBaseline, TableStatus } from '@baccarat/contracts';
+import { SqliteLedger } from '@baccarat/ledger-state';
+import type {
+  ControlledOperationalWagerCommand,
+  ControlledOperationalWagerResult,
+} from '@baccarat/orchestrator';
 import {
   tryKeepaliveInOrder,
   type KeepaliveWagerMarket,
@@ -18,8 +17,10 @@ import {
 const KEEPALIVE_CONFIG_KEY = 'desktop:operational-keepalive:v1';
 const KEEPALIVE_TICK_MS = 15_000;
 
-type OperationalWagerBridge = {
-  requestOperationalWager(request: OperationalWagerExecutionRequest): Promise<OperationalWagerReceipt | null>;
+type OperationalWagerActor = {
+  placeOperationalWager(
+    command: ControlledOperationalWagerCommand,
+  ): Promise<ControlledOperationalWagerResult>;
 };
 
 export type OperationalWagerTableState = {
@@ -57,20 +58,17 @@ export interface KeepaliveState extends KeepaliveSettings {
 
 type PersistedKeepaliveState = Omit<KeepaliveState, 'running'>;
 
-export type OperationalWagerResult = {
-  readonly status: 'ACCEPTED' | 'REJECTED' | 'UNKNOWN';
-  readonly tableId: string;
-  readonly reason?: string;
-  readonly wager?: OperationalWagerRecord['wager'];
-  readonly receipt?: OperationalWagerReceipt;
-};
+export type OperationalWagerResult = ControlledOperationalWagerResult;
 
 export interface OperationalWagerCoordinatorOptions {
   readonly ledger: SqliteLedger;
-  readonly bridge: () => OperationalWagerBridge | undefined;
+  readonly actor: (tableId: string) => OperationalWagerActor | undefined;
   readonly monitorTableIds: () => readonly string[];
-  readonly tableState: (tableId: string) => OperationalWagerTableState | undefined;
   readonly serialize: <T>(operation: () => Promise<T>) => Promise<T>;
+  readonly runtimeBlockReason?: (
+    tableId: string,
+    source: OperationalWagerSource,
+  ) => string | undefined;
   readonly onError?: (error: unknown) => void;
 }
 
@@ -85,7 +83,7 @@ export class OperationalWagerCoordinator {
     this.state = readKeepaliveState(options.ledger.getConfig<unknown>(KEEPALIVE_CONFIG_KEY)) ?? defaultKeepaliveState();
     options.ledger.setConfig(KEEPALIVE_CONFIG_KEY, this.state);
     this.timer = setInterval(() => {
-      void this.tick().catch(options.onError ?? (error => console.error('operational keepalive tick failed', error)));
+      void this.tick().catch(error => this.reportTickError(error));
     }, KEEPALIVE_TICK_MS);
     this.timer.unref?.();
   }
@@ -96,6 +94,12 @@ export class OperationalWagerCoordinator {
 
   getKeepaliveState(): KeepaliveState {
     return { ...this.state, running: this.running };
+  }
+
+  disableKeepaliveImmediately(): void {
+    if (!this.state.enabled) return;
+    this.state = { ...this.state, enabled: false };
+    this.persist();
   }
 
   async updateKeepalive(settings: KeepaliveSettings, now = new Date()): Promise<KeepaliveState> {
@@ -117,31 +121,29 @@ export class OperationalWagerCoordinator {
     if (!this.state.enabled || this.running || !keepaliveDue(this.state, now)) return;
     this.running = true;
     try {
-      const bridge = this.options.bridge();
-      const result = bridge === undefined
-        ? { status: 'REJECTED' as const, tableId: null, attempted: false, reason: 'browser-bridge-unavailable' }
-        : await tryKeepaliveInOrder({
-          tableIds: this.options.monitorTableIds(),
-          market: this.state.market,
-          amount: this.state.amount,
-          requestWager: async (tableId, market, amount) => {
-            const response = await this.execute({
-              tableId,
-              market,
-              amount,
-              source: 'keepalive',
-            }, bridge, now);
-            return {
-              status: response.status,
-              attempted: response.wager !== undefined,
-              ...(response.reason === undefined ? {} : { reason: response.reason }),
-            };
-          },
-        });
+      const result = await tryKeepaliveInOrder({
+        tableIds: this.options.monitorTableIds(),
+        market: this.state.market,
+        amount: this.state.amount,
+        requestWager: async (tableId, market, amount) => {
+          const response = await this.execute({
+            tableId,
+            market,
+            amount,
+            source: 'keepalive',
+          }, now);
+          return {
+            status: response.status,
+            attempted: response.wager !== undefined,
+            ...(response.reason === undefined ? {} : { reason: response.reason }),
+          };
+        },
+      });
       const shouldRecordAttempt = result.status !== 'REJECTED' || result.attempted;
       if (shouldRecordAttempt) {
         this.state = {
           ...this.state,
+          ...(result.status === 'UNKNOWN' ? { enabled: false } : {}),
           lastAttemptAt: now.toISOString(),
           lastStatus: result.status,
           ...(result.tableId === null ? {} : { lastTableId: result.tableId }),
@@ -161,7 +163,7 @@ export class OperationalWagerCoordinator {
     readonly amount: number;
   }): Promise<OperationalWagerResult> {
     return await this.options.serialize(async () => {
-      return await this.execute({ ...input, source: 'manual' }, this.options.bridge(), new Date());
+      return await this.execute({ ...input, source: 'manual' }, new Date());
     });
   }
 
@@ -172,9 +174,11 @@ export class OperationalWagerCoordinator {
       readonly amount: number;
       readonly source: OperationalWagerSource;
     },
-    bridge: OperationalWagerBridge | undefined,
     now: Date,
   ): Promise<OperationalWagerResult> {
+    if (input.source === 'keepalive' && !this.state.enabled) {
+      return { status: 'REJECTED', tableId: input.tableId, reason: 'global-automation-disabled' };
+    }
     if (!isOperationalWagerMarket(input.market)) {
       return { status: 'REJECTED', tableId: input.tableId, reason: 'unsupported-market' };
     }
@@ -184,80 +188,38 @@ export class OperationalWagerCoordinator {
     if (!this.options.monitorTableIds().includes(input.tableId)) {
       return { status: 'REJECTED', tableId: input.tableId, reason: 'table-not-monitored' };
     }
-    const table = this.options.tableState(input.tableId);
-    if (table === undefined) {
+    const runtimeBlockReason = this.options.runtimeBlockReason?.(input.tableId, input.source);
+    if (runtimeBlockReason !== undefined) {
+      return { status: 'REJECTED', tableId: input.tableId, reason: runtimeBlockReason };
+    }
+    const actor = this.options.actor(input.tableId);
+    if (actor === undefined) {
       return { status: 'REJECTED', tableId: input.tableId, reason: 'table-unavailable' };
     }
-    const gateReason = operationalWagerGateReason(table, input.source);
-    if (gateReason !== null) {
-      return { status: 'REJECTED', tableId: input.tableId, reason: gateReason };
-    }
-    const isManualTest = input.source === 'manual' && table.executionMode !== 'live';
-    const currentHandId = table.projection.currentHandId;
-    if (!isManualTest && (currentHandId === null || currentHandId.length === 0)) {
-      return { status: 'REJECTED', tableId: input.tableId, reason: 'current-hand-required' };
-    }
-    const wagerId = newId('opw');
-    const wager: OperationalWagerRecord['wager'] = {
-      wagerId,
-      tableId: input.tableId,
-      shoeId: table.projection.shoeId,
-      handId: currentHandId ?? `manual-test-${wagerId}`,
+    const result = await actor.placeOperationalWager({
       market: input.market,
       amount: input.amount,
       source: input.source,
       createdAt: now.toISOString(),
-    };
-    if (table.executionMode !== 'live') {
-      return this.saveResult(wager, 'ACCEPTED', `${table.executionMode}-simulated`);
-    }
-    if (bridge === undefined) {
-      return { status: 'REJECTED', tableId: input.tableId, reason: 'browser-bridge-unavailable' };
-    }
-    const request: OperationalWagerExecutionRequest = { mode: 'live', wager };
-    let receipt: OperationalWagerReceipt | null;
-    try {
-      receipt = await bridge.requestOperationalWager(request);
-    } catch (error) {
-      return this.saveResult(wager, 'UNKNOWN', 'bridge-request-error');
-    }
-    if (receipt === null) {
-      return this.saveResult(wager, 'UNKNOWN', 'bridge-no-receipt');
-    }
-    if (!receiptMatchesWager(receipt, wager)) {
-      return this.saveResult(wager, 'UNKNOWN', 'bridge-receipt-mismatch');
-    }
-    return this.saveResult(
-      wager,
-      receipt.status,
-      undefined,
-      receipt,
-    );
-  }
-
-  private saveResult(
-    wager: OperationalWagerRecord['wager'],
-    status: OperationalWagerResult['status'],
-    reason?: string,
-    receipt?: OperationalWagerReceipt,
-  ): OperationalWagerResult {
-    this.options.ledger.saveOperationalWager({
-      wager,
-      status,
-      ...(reason === undefined ? {} : { reason }),
-      ...(receipt === undefined ? {} : { receipt }),
     });
-    return {
-      status,
-      tableId: wager.tableId,
-      wager,
-      ...(reason === undefined ? {} : { reason }),
-      ...(receipt === undefined ? {} : { receipt }),
-    };
+    if (result.status === 'UNKNOWN') this.disableKeepaliveImmediately();
+    return result;
   }
 
   private persist(): void {
     this.options.ledger.setConfig(KEEPALIVE_CONFIG_KEY, this.state);
+  }
+
+  private reportTickError(error: unknown): void {
+    try {
+      if (this.options.onError) {
+        this.options.onError(error);
+        return;
+      }
+      console.error('operational keepalive tick failed', error);
+    } catch (reportingError) {
+      console.error('operational keepalive error reporter failed', reportingError);
+    }
   }
 }
 
@@ -334,30 +296,4 @@ function keepaliveDue(state: PersistedKeepaliveState, now: Date): boolean {
   const lastAttemptAt = Date.parse(state.lastAttemptAt);
   if (Number.isNaN(lastAttemptAt)) return true;
   return now.valueOf() - lastAttemptAt >= state.intervalMinutes * 60_000;
-}
-
-function operationalWagerGateReason(
-  table: OperationalWagerTableState,
-  source: OperationalWagerSource,
-): string | null {
-  if (source === 'manual' && table.executionMode !== 'live') return null;
-  if (source === 'keepalive' && table.executionMode !== 'live') return 'live-execution-required';
-  if (table.projection.connectionStatus !== 'CONNECTED') return 'connected-required';
-  if (table.projection.status !== 'BETTING_WINDOW') return 'betting-window-required';
-  if (table.projection.sealed) return 'shoe-sealed';
-  if (source !== 'keepalive' && table.projection.autoBetStatus === 'ARMED') return 'auto-bet-armed';
-  return null;
-}
-
-function receiptMatchesWager(
-  receipt: OperationalWagerReceipt,
-  wager: OperationalWagerRecord['wager'],
-): boolean {
-  return receipt.wagerId === wager.wagerId
-    && receipt.tableId === wager.tableId
-    && receipt.shoeId === wager.shoeId
-    && receipt.handId === wager.handId
-    && receipt.market === wager.market
-    && receipt.amount === wager.amount
-    && receipt.source === wager.source;
 }

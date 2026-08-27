@@ -3,7 +3,14 @@ import { WebSocket } from 'ws';
 import type { BetExecutionRequest, OperationalWagerExecutionRequest } from '@baccarat/adapter-contract';
 import type { BetReceipt } from '@baccarat/contracts';
 import { replayEvents } from '../../ledger-state/src/projection.js';
-import { BrowserBridgeServer } from '../src/index.js';
+import { cursorContinuityProof } from '@baccarat/room-monitor';
+import {
+  BUNDLED_BROWSER_EXTENSION_ID,
+  BUNDLED_BROWSER_EXTENSION_TOKEN,
+  BrowserBridgeServer,
+  redactBridgeDiagnostic,
+  type BrowserBridgeRuntimeEvent,
+} from '../src/index.js';
 import type { NormalizedEvent } from '@baccarat/contracts';
 import fixtures from '../../../.tmp-mstrom/card-research/15-fixtures.json';
 
@@ -120,9 +127,17 @@ const acceptedLiveReceipt: BetReceipt = {
 };
 
 const EXTENSION_ORIGIN = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
+const VALID_CONTINUITY_PROOF = cursorContinuityProof({ test: 'bridge-restore' });
 
 function extensionClient(port: number): WebSocket {
   return new WebSocket(`ws://127.0.0.1:${port}`, { origin: EXTENSION_ORIGIN });
+}
+
+function authenticatedExtensionClient(port: number): WebSocket {
+  return new WebSocket(
+    `ws://127.0.0.1:${port}/?token=${BUNDLED_BROWSER_EXTENSION_TOKEN}`,
+    { origin: `chrome-extension://${BUNDLED_BROWSER_EXTENSION_ID}` },
+  );
 }
 
 function observerClient(port: number): WebSocket {
@@ -179,7 +194,7 @@ describe('browser bridge server', () => {
     expect(feed.health().bufferDepth).toBe(0);
   });
 
-  it('forwards disconnect and restore lifecycle to the sink', async () => {
+  it('ignores client-supplied restore proofs and restores only from the next continuous event', async () => {
     const server = new BrowserBridgeServer();
     const feed = server.openTable('r1', 't1');
     const disconnects: string[] = [];
@@ -190,13 +205,94 @@ describe('browser bridge server', () => {
       onDisconnect: (_tableId, reason) => { disconnects.push(reason ?? ''); },
       onRestored: (_tableId, proof) => { restores.push(proof); },
     });
+    server.ingestClientMessage({
+      kind: 'tableEvent',
+      roomId: 'r1',
+      tableId: 't1',
+      event: bridgeEvent(),
+    });
+    await feed.flush();
     server.ingestClientMessage({ kind: 'tableDisconnected', roomId: 'r1', tableId: 't1', reason: 'page hidden' });
-    server.ingestClientMessage({ kind: 'tableRestored', roomId: 'r1', tableId: 't1', proof: 'proof-1' });
+    server.ingestClientMessage({
+      kind: 'tableRestored',
+      roomId: 'r1',
+      tableId: 't1',
+      proof: VALID_CONTINUITY_PROOF,
+    });
 
     expect(disconnects).toEqual(['page hidden']);
-    expect(restores).toEqual(['proof-1']);
+    expect(restores).toEqual([]);
+    expect(feed.health().state).toBe('DISCONNECTED');
+
+    server.ingestClientMessage({
+      kind: 'tableEvent',
+      roomId: 'r1',
+      tableId: 't1',
+      event: { ...bridgeEvent('t1', 'e2'), sourceSeq: 2 },
+    });
+    await feed.flush();
+
+    expect(restores).toHaveLength(1);
+    expect(restores[0]).toMatch(/^cursor-v1:[a-f0-9]{64}$/);
+    expect(restores[0]).not.toBe(VALID_CONTINUITY_PROOF);
     expect(feed.health().reconnectCount).toBe(1);
     expect(feed.health().state).toBe('CONNECTED');
+  });
+
+  it('fails closed on a table source sequence gap and recovers only from a physical-shoe reset', async () => {
+    const server = new BrowserBridgeServer();
+    const feed = server.openTable('r1', 't1');
+    const batches: NormalizedEvent[] = [];
+    const disconnects: string[] = [];
+    const restores: string[] = [];
+
+    await feed.start({
+      onBatch: batch => { batches.push(...batch.events); },
+      onDisconnect: (_tableId, reason) => { disconnects.push(reason ?? ''); },
+      onRestored: (_tableId, proof) => { restores.push(proof); },
+    });
+    server.ingestClientMessage({
+      kind: 'tableEvent',
+      roomId: 'r1',
+      tableId: 't1',
+      event: bridgeEvent(),
+    });
+    await feed.flush();
+
+    server.ingestClientMessage({
+      kind: 'tableEvent',
+      roomId: 'r1',
+      tableId: 't1',
+      event: { ...bridgeEvent('t1', 'e3'), sourceSeq: 3 },
+    });
+
+    await expect(feed.flush()).rejects.toThrow(/continuity gap.*expected 2, got 3/i);
+    expect(feed.health()).toMatchObject({
+      state: 'DISCONNECTED',
+      lastAckedSeq: 1,
+    });
+    expect(disconnects).toContainEqual(expect.stringMatching(/continuity gap.*expected 2, got 3/i));
+    expect(batches.map(event => event.eventId)).toEqual(['e1']);
+
+    server.ingestClientMessage({
+      kind: 'tableEvent',
+      roomId: 'r1',
+      tableId: 't1',
+      event: {
+        ...bridgeEvent('t1', 'e4'),
+        sourceSeq: 4,
+        baseline: 'physical-shoe',
+      },
+    });
+    await feed.flush();
+
+    expect(feed.health()).toMatchObject({
+      state: 'CONNECTED',
+      lastAckedSeq: 4,
+    });
+    expect(restores).toHaveLength(1);
+    expect(restores[0]).toMatch(/^cursor-v1:[a-f0-9]{64}$/);
+    expect(batches.map(event => event.eventId)).toEqual(['e1', 'e4']);
   });
 
   it('round-trips real bet execution requests through a WebSocket extension client', async () => {
@@ -308,6 +404,102 @@ describe('browser bridge server', () => {
     }
   });
 
+  it('accepts only the pinned bundled extension with the shared token', async () => {
+    const server = new BrowserBridgeServer({
+      port: 0,
+      allowedExtensionId: BUNDLED_BROWSER_EXTENSION_ID,
+      extensionToken: BUNDLED_BROWSER_EXTENSION_TOKEN,
+    });
+    const port = await server.start();
+    const wrongId = new WebSocket(
+      `ws://127.0.0.1:${port}/?token=${BUNDLED_BROWSER_EXTENSION_TOKEN}`,
+      { origin: EXTENSION_ORIGIN },
+    );
+    const missingToken = new WebSocket(
+      `ws://127.0.0.1:${port}/`,
+      { origin: `chrome-extension://${BUNDLED_BROWSER_EXTENSION_ID}` },
+    );
+    const bundled = authenticatedExtensionClient(port);
+    try {
+      const outcomes = await Promise.all([wrongId, missingToken, bundled].map(client =>
+        new Promise<'opened' | 'rejected'>(resolve => {
+          client.once('open', () => resolve('opened'));
+          client.once('unexpected-response', (_request, response) => {
+            response.resume();
+            resolve('rejected');
+          });
+          client.once('error', () => resolve('rejected'));
+        })));
+      expect(outcomes).toEqual(['rejected', 'rejected', 'opened']);
+    } finally {
+      wrongId.close();
+      missingToken.close();
+      bundled.close();
+      await server.close();
+    }
+  });
+
+  it('disconnects the extension and invalidates table continuity on a message sequence gap', async () => {
+    const server = new BrowserBridgeServer({
+      port: 0,
+      requireExtensionSequence: true,
+    });
+    const port = await server.start();
+    const feed = server.openTable('r1', 't1');
+    const disconnects: string[] = [];
+    await feed.start({
+      onBatch: () => {},
+      onDisconnect: (_tableId, reason) => disconnects.push(reason ?? ''),
+    });
+    const client = extensionClient(port);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        client.once('open', resolve);
+        client.once('error', reject);
+      });
+      client.send(JSON.stringify({
+        kind: 'heartbeat',
+        timestamp: new Date().toISOString(),
+        bridgeSessionId: 'bridge-session-one',
+        bridgeSeq: 1,
+      }));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      client.send(JSON.stringify({
+        kind: 'heartbeat',
+        timestamp: new Date().toISOString(),
+        bridgeSessionId: 'bridge-session-one',
+        bridgeSeq: 3,
+      }));
+      await new Promise<void>(resolve => setImmediate(resolve));
+
+      expect(feed.health().state).toBe('DISCONNECTED');
+      expect(disconnects.some(reason => reason.startsWith('extension-message-gap:2:3'))).toBe(true);
+    } finally {
+      client.close();
+      await server.close();
+    }
+  });
+
+  it('marks a connected table stale and reports real observation age', async () => {
+    const server = new BrowserBridgeServer({ tableStaleAfterMs: 1_000 });
+    const feed = server.openTable('r1', 't1');
+    const disconnects: string[] = [];
+    await feed.start({
+      onBatch: () => {},
+      onDisconnect: (_tableId, reason) => disconnects.push(reason ?? ''),
+    });
+    const checkFreshness = Reflect.get(feed, 'checkFreshness');
+    if (typeof checkFreshness !== 'function') throw new Error('freshness watchdog unavailable');
+    Reflect.apply(checkFreshness, feed, [Date.now() + 2_000]);
+
+    expect(feed.health().state).toBe('DISCONNECTED');
+    expect(disconnects).toEqual(['table-feed-stale']);
+    await expect(feed.keepAlive()).resolves.toMatchObject({
+      ok: false,
+      latencyMs: expect.any(Number),
+    });
+  });
+
   it('keeps observer clients read-only while allowing local command clients', async () => {
     const server = new BrowserBridgeServer({ port: 0 });
     const port = await server.start();
@@ -321,24 +513,38 @@ describe('browser bridge server', () => {
       })));
 
       // Given: an extension, a read-only observer, and a local command client.
-      const commands: string[] = [];
+      const commands: Array<{ readonly name: string; readonly tableIds?: readonly string[] }> = [];
       const receivedCommand = new Promise<void>(resolve => {
         extension.on('message', data => {
-          const message = JSON.parse(data.toString()) as { readonly kind?: string; readonly name?: string };
+          const message = JSON.parse(data.toString()) as {
+            readonly kind?: string;
+            readonly name?: string;
+            readonly tableIds?: readonly string[];
+          };
           if (message.kind !== 'command' || message.name === undefined) return;
-          commands.push(message.name);
+          commands.push({
+            name: message.name,
+            ...(message.tableIds === undefined ? {} : { tableIds: message.tableIds }),
+          });
           if (message.name === 'openMultiView') resolve();
         });
       });
 
       // When: both the observer and the command client send a bridge command.
       observer.send(JSON.stringify({ kind: 'command', name: 'liveOn' }));
-      command.send(JSON.stringify({ kind: 'command', name: 'openMultiView' }));
+      command.send(JSON.stringify({
+        kind: 'command',
+        name: 'openMultiView',
+        tableIds: ['D066', 'D067'],
+      }));
       await receivedCommand;
       await new Promise<void>(resolve => setImmediate(resolve));
 
       // Then: only the dedicated command client reaches the extension.
-      expect(commands).toEqual(['openMultiView']);
+      expect(commands).toEqual([{
+        name: 'openMultiView',
+        tableIds: ['D066', 'D067'],
+      }]);
     } finally {
       extension.close();
       observer.close();
@@ -449,6 +655,71 @@ describe('browser bridge server', () => {
       expect(bridgePendingBets(server).has(requestId)).toBe(false);
     } finally {
       client.close();
+      await server.close();
+    }
+  });
+
+  it('serializes pair and keepalive requests for the same table', async () => {
+    const server = new BrowserBridgeServer({ betTimeoutMs: 1_000 });
+    const requestIds: string[] = [];
+    const socket: TestSocket = {
+      send(data: string): void {
+        const message: unknown = JSON.parse(data);
+        if (typeof message !== 'object' || message === null || Array.isArray(message)) return;
+        if (Reflect.get(message, 'kind') !== 'betRequest') return;
+        const requestId = Reflect.get(message, 'requestId');
+        if (typeof requestId === 'string') requestIds.push(requestId);
+      },
+    };
+    bridgeSockets(server).add(socket);
+    const pairRequest: BetExecutionRequest = {
+      ...betRequest('live'),
+      intent: {
+        ...betRequest('live').intent,
+        tableId: 'D055',
+      },
+    };
+    const keepaliveRequest = operationalWagerRequest();
+    const keepaliveReceipt = {
+      receiptId: 'keepalive-receipt',
+      wagerId: keepaliveRequest.wager.wagerId,
+      tableId: keepaliveRequest.wager.tableId,
+      shoeId: keepaliveRequest.wager.shoeId,
+      handId: keepaliveRequest.wager.handId,
+      market: keepaliveRequest.wager.market,
+      amount: keepaliveRequest.wager.amount,
+      source: keepaliveRequest.wager.source,
+      status: 'ACCEPTED' as const,
+      createdAt: '2026-08-25T00:00:00.000Z',
+    };
+
+    try {
+      const pair = server.requestBet(pairRequest);
+      const keepalive = server.requestOperationalWager(keepaliveRequest);
+
+      await Promise.resolve();
+      expect(requestIds).toHaveLength(1);
+      const pairRequestId = requestIds[0];
+      if (pairRequestId === undefined) throw new Error('pair request id missing');
+      ingestFromSocket(server, {
+        kind: 'betResult',
+        requestId: pairRequestId,
+        receipt: acceptedLiveReceipt,
+      }, socket);
+      await expect(pair).resolves.toEqual(acceptedLiveReceipt);
+
+      await Promise.resolve();
+      expect(requestIds).toHaveLength(2);
+      const keepaliveRequestId = requestIds[1];
+      if (keepaliveRequestId === undefined) throw new Error('keepalive request id missing');
+      ingestFromSocket(server, {
+        kind: 'betResult',
+        requestId: keepaliveRequestId,
+        receipt: keepaliveReceipt,
+      }, socket);
+      await expect(keepalive).resolves.toEqual(keepaliveReceipt);
+    } finally {
+      bridgeSockets(server).delete(socket);
       await server.close();
     }
   });
@@ -581,7 +852,7 @@ describe('browser bridge server', () => {
     }
   });
 
-  it('marks exports disconnected on game session expiry and restores on recovery action', async () => {
+  it('keeps exports disconnected when the page only claims session recovery', async () => {
     const server = new BrowserBridgeServer();
     const feed = server.openTable('r1', 't1');
     const disconnects: string[] = [];
@@ -611,12 +882,12 @@ describe('browser bridge server', () => {
       frame: 'top',
       timestamp: '2025-01-01T00:01:00.000Z',
     });
-    expect(feed.health().state).toBe('CONNECTED');
-    expect(restores).toEqual(['session-recovered']);
-    expect(feed.health().reconnectCount).toBe(1);
+    expect(feed.health().state).toBe('DISCONNECTED');
+    expect(restores).toEqual([]);
+    expect(feed.health().reconnectCount).toBe(0);
   });
 
-  it('restores an expired export and delivers the next live table event', async () => {
+  it('restores an expired export only from a physical-shoe reset', async () => {
     const server = new BrowserBridgeServer();
     server.ingestClientMessage({
       kind: 'roomDiscovered',
@@ -640,19 +911,74 @@ describe('browser bridge server', () => {
     });
     expect(feed.health().state).toBe('DISCONNECTED');
 
-    // 页面自动恢复后第一帧实时数据应当重新点亮导出并正常投递。
+    const physicalReset = {
+      ...bridgeEvent(),
+      baseline: 'physical-shoe' as const,
+    };
     server.ingestClientMessage({
       kind: 'tableEvent',
       roomId: 'r1',
       tableId: 't1',
-      event: bridgeEvent(),
+      event: physicalReset,
     });
     await feed.flush();
 
-    expect(restores).toEqual(['data-received']);
+    expect(restores).toHaveLength(1);
+    expect(restores[0]).toMatch(/^cursor-v1:[a-f0-9]{64}$/);
     expect(feed.health().state).toBe('CONNECTED');
     expect(batches).toHaveLength(1);
     expect(batches[0].events[0].eventId).toBe('e1');
+  });
+
+  it('waits for asynchronous restoration before draining the first recovered event', async () => {
+    const server = new BrowserBridgeServer();
+    server.ingestClientMessage({
+      kind: 'roomDiscovered',
+      room: { roomId: 'r1', tables: [{ tableId: 't1' }] },
+    });
+    const feed = server.openTable('r1', 't1');
+    const batches: NormalizedEvent[] = [];
+    let releaseRestoration: () => void = () => undefined;
+    const restorationBlocked = new Promise<void>(resolve => {
+      releaseRestoration = resolve;
+    });
+
+    try {
+      await feed.start({
+        onBatch: batch => { batches.push(...batch.events); },
+        onRestored: async () => await restorationBlocked,
+      });
+      server.ingestClientMessage({
+        kind: 'sessionExpired',
+        url: 'https://www.dafabet.net/room',
+        frame: 'top',
+        textPreview: '会话已过期',
+        timestamp: '2025-01-01T00:00:00.000Z',
+      });
+
+      server.ingestClientMessage({
+        kind: 'tableEvent',
+        roomId: 'r1',
+        tableId: 't1',
+        event: {
+          ...bridgeEvent(),
+          baseline: 'physical-shoe',
+        },
+      });
+      await Promise.resolve();
+
+      expect(batches).toEqual([]);
+
+      releaseRestoration();
+      await feed.flush();
+      expect(batches).toEqual([{
+        ...bridgeEvent(),
+        baseline: 'physical-shoe',
+      }]);
+    } finally {
+      releaseRestoration();
+      await server.close();
+    }
   });
 
   it('ignores keepalive and session actions that do not affect exports', () => {
@@ -1613,6 +1939,159 @@ describe('dynamic configured live-table selection', () => {
     expect(messages[0]).not.toContain('secret');
     expect(messages[0]).not.toContain('playerCards');
     expect(messages[0]).not.toContain('bankerCards');
+  });
+});
+
+describe('browser bridge runtime supervision', () => {
+  it('blocks live arming and dispatch until the extension sequence is authenticated', async () => {
+    const server = new BrowserBridgeServer({
+      port: 0,
+      betTimeoutMs: 5,
+      requireExtensionSequence: true,
+      allowedExtensionId: BUNDLED_BROWSER_EXTENSION_ID,
+      extensionToken: BUNDLED_BROWSER_EXTENSION_TOKEN,
+    });
+    const port = await server.start();
+    const client = authenticatedExtensionClient(port);
+    let betRequestCount = 0;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        client.once('open', resolve);
+        client.once('error', reject);
+      });
+      client.on('message', data => {
+        const message = JSON.parse(data.toString()) as { readonly kind?: string };
+        if (message.kind === 'betRequest') betRequestCount += 1;
+      });
+
+      expect(server.getExtensionStatus()).toMatchObject({
+        connectionCount: 1,
+        authenticated: false,
+      });
+      expect(() => server.setLiveBetEnabled(true)).toThrow(/authenticated extension sequence/i);
+      await expect(server.requestBet(betRequest('live'))).rejects.toThrow(/authenticated extension sequence/i);
+      expect(betRequestCount).toBe(0);
+    } finally {
+      client.close();
+      await server.close();
+    }
+  });
+
+  it('reports rejected extension identity and requires a sequenced authenticated session', async () => {
+    const events: BrowserBridgeRuntimeEvent[] = [];
+    const server = new BrowserBridgeServer({
+      port: 0,
+      requireExtensionSequence: true,
+      allowedExtensionId: BUNDLED_BROWSER_EXTENSION_ID,
+      extensionToken: BUNDLED_BROWSER_EXTENSION_TOKEN,
+      onRuntimeEvent: event => events.push(event),
+    });
+    const port = await server.start();
+    const rejected = new WebSocket(
+      `ws://127.0.0.1:${port}/`,
+      { origin: `chrome-extension://${BUNDLED_BROWSER_EXTENSION_ID}` },
+    );
+    const client = authenticatedExtensionClient(port);
+    try {
+      await Promise.all([
+        new Promise<void>(resolve => {
+          rejected.once('unexpected-response', (_request, response) => {
+            response.resume();
+            resolve();
+          });
+          rejected.once('error', () => resolve());
+        }),
+        new Promise<void>((resolve, reject) => {
+          client.once('open', resolve);
+          client.once('error', reject);
+        }),
+      ]);
+
+      expect(server.getExtensionStatus()).toMatchObject({
+        connectionCount: 1,
+        authenticated: false,
+      });
+      expect(events).toContainEqual(expect.objectContaining({ kind: 'extension-auth-failed' }));
+
+      client.send(JSON.stringify({
+        kind: 'hello',
+        extensionVersion: '0.1.0',
+        browser: 'Chrome',
+        timestamp: '2026-08-27T01:00:00.000Z',
+        bridgeSessionId: 'bridge-session-20260827',
+        bridgeSeq: 1,
+      }));
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if (events.some(event => event.kind === 'extension-authenticated')) break;
+        await new Promise(resolve => setTimeout(resolve, 1));
+      }
+
+      expect(server.getExtensionStatus()).toMatchObject({
+        connectionCount: 1,
+        authenticated: true,
+      });
+      expect(events).toContainEqual(expect.objectContaining({ kind: 'extension-authenticated' }));
+    } finally {
+      rejected.close();
+      client.close();
+      await server.close();
+    }
+  });
+
+  it('emits recovery exhaustion and recovery completion without claiming table continuity', () => {
+    const events: BrowserBridgeRuntimeEvent[] = [];
+    const server = new BrowserBridgeServer({
+      onRuntimeEvent: event => events.push(event),
+    });
+
+    server.ingestClientMessage({
+      kind: 'sessionAction',
+      action: 'recovery-failed',
+      url: 'https://www.dafabet.net/room?token=secret',
+      frame: 'iframe',
+      detail: 'still expired after 3 reload attempts',
+      timestamp: '2026-08-27T01:00:00.000Z',
+    });
+    server.ingestClientMessage({
+      kind: 'sessionAction',
+      action: 'recovered',
+      url: 'https://www.dafabet.net/room?token=secret',
+      frame: 'iframe',
+      timestamp: '2026-08-27T01:01:00.000Z',
+    });
+
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'session-recovery-exhausted' }),
+      expect.objectContaining({ kind: 'session-recovered' }),
+    ]));
+  });
+
+  it('redacts diagnostic URLs and never retains title, body, or HTML previews', () => {
+    expect(redactBridgeDiagnostic({
+      kind: 'diagnostic',
+      url: 'https://www.dafabet.net/room?token=secret&account=alice',
+      frame: 'iframe',
+      readyState: 'complete',
+      title: 'private title',
+      bodyTextPreview: 'private body',
+      htmlPreview: '<div>private html</div>',
+      candidateCount: 1,
+      canvasCount: 2,
+      videoCount: 3,
+      iframeCount: 4,
+    })).toEqual({
+      kind: 'diagnostic',
+      url: 'https://www.dafabet.net/room',
+      frame: 'iframe',
+      readyState: 'complete',
+      titleLength: 13,
+      bodyTextLength: 12,
+      htmlLength: 23,
+      candidateCount: 1,
+      canvasCount: 2,
+      videoCount: 3,
+      iframeCount: 4,
+    });
   });
 });
 

@@ -1,14 +1,18 @@
 import { WebSocket } from 'ws';
 
-const name = process.argv[2] || '';
+const [name = '', ...tableIds] = process.argv.slice(2);
 if (!name) {
-  console.error('用法: tsx scripts/bridge-command.ts <reloadExtension|openMultiView|replayRuntimeState|liveOn|liveOff|calibrate|trustedOn|trustedOff|calibrateClear>');
+  console.error('用法: tsx scripts/bridge-command.ts <reloadExtension|openMultiView|probeBetReadiness|replayRuntimeState|liveOn|liveOff|calibrate|trustedOn|trustedOff|calibrateClear> [tableId...]');
   process.exit(1);
 }
 const port = Number(process.env.BRIDGE_PORT ?? 17890);
 const ws = new WebSocket('ws://127.0.0.1:' + port + '/command', { origin: 'http://localhost' });
 ws.on('open', () => {
-  ws.send(JSON.stringify({ kind: 'command', name }));
+  ws.send(JSON.stringify({
+    kind: 'command',
+    name,
+    ...(tableIds.length === 0 ? {} : { tableIds }),
+  }));
   console.log('[bridge-command] 已发送: ' + name);
 });
 ws.on('message', data => {

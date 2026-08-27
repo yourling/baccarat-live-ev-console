@@ -132,7 +132,69 @@ describe('risk manager', () => {
     expect(state.shoeLosses['t1:s1']).toBeCloseTo(-100, 6);
   });
 
-  it('keeps an ambiguous reservation active until authoritative hand settlement', () => {
+  it('settles banker/player reservations from cards using explicit payout terms', () => {
+    const bankerManager = new RiskManager();
+    const banker = bankerManager.tryReserveExecution({
+      intentId: 'banker-live',
+      tableId: 't1',
+      shoeId: 's-main',
+      handId: 'h-banker',
+      market: 'banker',
+      executionSource: 'keepalive',
+      amount: 20,
+    }, profile.limits, { netWin: 0.95, loss: 1 }, limits);
+    expect(banker.ok).toBe(true);
+
+    const bankerSettled = bankerManager.settleHand('t1', 's-main', 'h-banker', {
+      playerCards: [{ rank: '2' }, { rank: '3' }],
+      bankerCards: [{ rank: '4' }, { rank: '3' }],
+    });
+    expect(bankerSettled[0]).toEqual(expect.objectContaining({
+      market: 'banker',
+      status: 'SETTLED',
+      realizedPnl: 19,
+    }));
+
+    const playerManager = new RiskManager();
+    const player = playerManager.tryReserveExecution({
+      intentId: 'player-live',
+      tableId: 't1',
+      shoeId: 's-main',
+      handId: 'h-tie',
+      market: 'player',
+      executionSource: 'manual',
+      amount: 20,
+    }, profile.limits, { netWin: 1, loss: 1 }, limits);
+    expect(player.ok).toBe(true);
+    const tieSettled = playerManager.settleHand('t1', 's-main', 'h-tie', {
+      playerCards: [{ rank: '4' }, { rank: '3' }],
+      bankerCards: [{ rank: '2' }, { rank: '5' }],
+    });
+    expect(tieSettled[0]).toEqual(expect.objectContaining({
+      market: 'player',
+      status: 'SETTLED',
+      realizedPnl: 0,
+    }));
+  });
+
+  it('uses execution source in operational reservation idempotency', () => {
+    const m = new RiskManager();
+    const reserve = (executionSource: 'manual' | 'keepalive') => m.tryReserveExecution({
+      intentId: newId('opw'),
+      tableId: 't1',
+      shoeId: 's-source',
+      handId: 'h-source',
+      market: 'banker',
+      executionSource,
+      amount: 10,
+    }, profile.limits, { netWin: 0.95, loss: 1 }, limits);
+
+    expect(reserve('manual').ok).toBe(true);
+    expect(reserve('manual').reason).toBe('duplicate:already-reserved');
+    expect(reserve('keepalive').ok).toBe(true);
+  });
+
+  it('keeps an ambiguous acknowledgement active even after the hand settles', () => {
     const m = new RiskManager();
     const r = m.tryReserve(intent(), profile, limits);
     expect(r.ok).toBe(true);
@@ -144,12 +206,15 @@ describe('risk manager', () => {
     expect(m.tryReserve(intent(), profile, limits).reason).toBe('duplicate:already-reserved');
 
     const settled = m.settleHand('t1', 's1', 'h1', { bankerPair: false, playerPair: false }, profile);
-    expect(settled[0]?.status).toBe('SETTLED');
-    expect(settled[0]?.receiptId).toBe('receipt-unknown');
-    expect(settled[0]?.realizedPnl).toBe(-10);
-    expect(m.getState().reservedExposure).toBe(0);
-    expect(m.getState().pendingExecutions).toBe(0);
-    expect(m.tryReserve(intent(), profile, limits).ok).toBe(true);
+    expect(settled).toEqual([]);
+    expect(m.snapshot()[0]).toEqual(expect.objectContaining({
+      status: 'UNKNOWN',
+      receiptId: 'receipt-unknown',
+    }));
+    expect(m.snapshot()[0]?.realizedPnl).toBeUndefined();
+    expect(m.getState().reservedExposure).toBe(10);
+    expect(m.getState().pendingExecutions).toBe(1);
+    expect(m.tryReserve(intent(), profile, limits).reason).toBe('duplicate:already-reserved');
   });
 
   it('persists an ambiguous platform acknowledgement as active exposure through restart', () => {

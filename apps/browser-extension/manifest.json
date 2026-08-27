@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "Baccarat Real Room Bridge",
   "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArNkBjljroVV19fwPaIc6BOonBwmFi7juT112K9ZyXLJKmemOzFlUAcNCfK53GlPw5wUOJJUJ/ulvtTUh9g2vwY/69Y5fwnrfb67Lb5NPrHboxnur0jFSps8wnj+Te3JEnCxl7sttoVwh5XAY4Bk1S74gQg8Eph4Oy2bsy+1it3/5YUlUPJLJUB+L1AnLKG87WuFZNiAlletenz4jhp8NxVToyrqJyd8VLD5EdWDC0jtWdpXkt6kK0qKubz964XGcQrX/XK6xKFY9hGSUi76bWr/j+xlIHmfkUTMwg54ZgorVW51oxFHj8V0or1sQas94V6RmAy5euk2r4Jv3m10ybwIDAQAB",
   "description": "把真实游戏房间/牌桌数据从浏览器桥接到本机 EV 中控台，并预留真实下注执行通道。",
   "permissions": [
     "storage",

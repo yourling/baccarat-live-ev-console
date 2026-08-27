@@ -41,6 +41,7 @@ export interface OperationalWagerAuditReceipt {
 export interface OperationalWagerRecord {
   readonly wager: OperationalWagerAuditRequest;
   readonly status: OperationalWagerAuditStatus;
+  readonly reservationId?: string;
   readonly reason?: string;
   readonly receipt?: OperationalWagerAuditReceipt;
 }

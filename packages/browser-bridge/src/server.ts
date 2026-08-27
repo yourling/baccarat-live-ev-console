@@ -1,20 +1,30 @@
-import { EVENT_SCHEMA_VERSION, sha256, stableStringify, defaultProfile, newId, type BetReceipt, type NormalizedEvent } from '@baccarat/contracts';
+import {
+  EVENT_SCHEMA_VERSION,
+  defaultProfile,
+  isValidContinuityProof,
+  newId,
+  sha256,
+  stableStringify,
+  type BetReceipt,
+  type NormalizedEvent,
+} from '@baccarat/contracts';
 import type {
   BetExecutionRequest,
   OperationalWagerExecutionRequest,
   OperationalWagerReceipt,
 } from '@baccarat/adapter-contract';
 import type { IncomingMessage } from 'node:http';
-import type {
-  MonitorConnectionState,
-  MonitorHealth,
-  MonitorKeepAliveResult,
-  RoomDescriptor,
-  RoomMonitor,
-  TableCursor,
-  TableEventBatch,
-  TableExport,
-  TableExportSink,
+import {
+  cursorContinuityProof,
+  type MonitorConnectionState,
+  type MonitorHealth,
+  type MonitorKeepAliveResult,
+  type RoomDescriptor,
+  type RoomMonitor,
+  type TableCursor,
+  type TableEventBatch,
+  type TableExport,
+  type TableExportSink,
 } from '@baccarat/room-monitor';
 import { WebSocketServer, WebSocket } from 'ws';
 import type {
@@ -37,6 +47,28 @@ export interface BrowserBridgeServerOptions {
   multiviewRecoveryCooldownMs?: number;
   multiviewOpenedGraceMs?: number;
   selectedTableIds?: readonly string[];
+  tableStaleAfterMs?: number;
+  extensionHeartbeatTimeoutMs?: number;
+  requireExtensionSequence?: boolean;
+  allowedExtensionId?: string;
+  extensionToken?: string;
+  onRuntimeEvent?: (event: BrowserBridgeRuntimeEvent) => void;
+}
+
+export type BrowserBridgeRuntimeEvent =
+  | { readonly kind: 'extension-auth-failed'; readonly reason: string; readonly timestamp: string }
+  | { readonly kind: 'extension-connected'; readonly timestamp: string }
+  | { readonly kind: 'extension-authenticated'; readonly sessionId: string; readonly timestamp: string }
+  | { readonly kind: 'extension-disconnected'; readonly reason: string; readonly timestamp: string }
+  | { readonly kind: 'continuity-invalidated'; readonly reason: string; readonly timestamp: string }
+  | { readonly kind: 'table-disconnected'; readonly tableId: string; readonly reason: string; readonly timestamp: string }
+  | { readonly kind: 'session-recovery-exhausted'; readonly detail?: string; readonly timestamp: string }
+  | { readonly kind: 'session-recovered'; readonly timestamp: string };
+
+export interface BrowserBridgeExtensionStatus {
+  readonly connectionCount: number;
+  readonly authenticated: boolean;
+  readonly lastSeenAt?: string;
 }
 
 type PendingBet = {
@@ -56,7 +88,8 @@ const OBSERVABLE_KINDS = new Set(['sessionExpired', 'sessionAction', 'keepalive'
 /** 观察广播允许透传的网络捕获域名(游戏/聊天/会话通道,不含视频流)。 */
 const OBSERVABLE_NETWORK_PATTERN = /df888evo|evolution|evo|mstrom-uno|673ing|mdvuz|e9p1/i;
 
-const LIVE_EXTENSION_CONNECTION_ERROR = 'live bet execution requires exactly one browser extension connection';
+const LIVE_EXTENSION_CONNECTION_ERROR =
+  'live bet execution requires exactly one browser extension connection with an authenticated extension sequence';
 const LIVE_BET_CONNECTION_LOST_ERROR = 'browser extension disconnected before live bet result';
 const OBSERVER_PATH = '/observe';
 const COMMAND_PATH = '/command';
@@ -67,12 +100,22 @@ const MULTIVIEW_RECOVERY_COOLDOWN_MS = 10_000;
 
 /** 页面确认已打开多台后，留给真实页面完成加载的宽限时间。 */
 const MULTIVIEW_OPENED_GRACE_MS = 60_000;
+const TABLE_STALE_AFTER_MS = 45_000;
+const EXTENSION_HEARTBEAT_TIMEOUT_MS = 15_000;
 
 type BridgeSocketRole = 'extension' | 'observer' | 'command';
 
-function bridgeSocketRole(origin: string, requestUrl: string | undefined): BridgeSocketRole | null {
+function bridgeSocketRole(
+  origin: string,
+  requestUrl: string | undefined,
+  identity: Pick<BrowserBridgeServerOptions, 'allowedExtensionId' | 'extensionToken'> = {},
+): BridgeSocketRole | null {
   const path = bridgeRequestPath(requestUrl);
-  if (isExtensionOrigin(origin)) return path === '/' ? 'extension' : null;
+  if (isExtensionOrigin(origin, identity.allowedExtensionId)) {
+    return path === '/' && hasExtensionToken(requestUrl, identity.extensionToken)
+      ? 'extension'
+      : null;
+  }
   if (!isLoopbackObserverOrigin(origin)) return null;
   if (path === OBSERVER_PATH) return 'observer';
   if (path === COMMAND_PATH) return 'command';
@@ -87,10 +130,22 @@ function bridgeRequestPath(requestUrl: string | undefined): string {
   }
 }
 
-function isExtensionOrigin(origin: string): boolean {
+function isExtensionOrigin(origin: string, allowedExtensionId?: string): boolean {
   try {
     const url = new URL(origin);
-    return url.protocol === 'chrome-extension:' && /^[a-p]{32}$/.test(url.hostname);
+    return url.protocol === 'chrome-extension:'
+      && /^[a-p]{32}$/.test(url.hostname)
+      && (allowedExtensionId === undefined || url.hostname === allowedExtensionId);
+  } catch {
+    return false;
+  }
+}
+
+function hasExtensionToken(requestUrl: string | undefined, expectedToken?: string): boolean {
+  if (expectedToken === undefined) return true;
+  try {
+    const url = new URL(requestUrl ?? '/', 'ws://localhost');
+    return url.searchParams.get('token') === expectedToken;
   } catch {
     return false;
   }
@@ -184,12 +239,54 @@ function logNetworkCapture(message: Extract<BridgeClientMessage, { kind: 'networ
   }));
 }
 
+function redactedLifecycleMessage(
+  message: Extract<BridgeClientMessage, { kind: 'sessionExpired' | 'sessionAction' | 'keepalive' }>,
+): BridgeClientMessage {
+  if (message.kind === 'sessionExpired') {
+    return {
+      ...message,
+      url: redactedNetworkUrl(message.url),
+      textLength: message.textLength ?? message.textPreview?.length ?? 0,
+      textPreview: undefined,
+    };
+  }
+  return {
+    ...message,
+    url: redactedNetworkUrl(message.url),
+  };
+}
+
+export function redactBridgeDiagnostic(
+  message: Extract<BridgeClientMessage, { kind: 'diagnostic' }>,
+): Record<string, unknown> {
+  return {
+    kind: message.kind,
+    url: redactedNetworkUrl(message.url),
+    frame: message.frame,
+    readyState: message.readyState,
+    titleLength: message.titleLength ?? message.title?.length ?? 0,
+    bodyTextLength: message.bodyTextLength ?? message.bodyTextPreview?.length ?? 0,
+    htmlLength: message.htmlLength ?? message.htmlPreview?.length ?? 0,
+    candidateCount: message.candidateCount,
+    canvasCount: message.canvasCount,
+    videoCount: message.videoCount,
+    iframeCount: message.iframeCount,
+  };
+}
+
 function isBridgeCommand(value: unknown): value is Extract<BridgeClientMessage, { kind: 'command' }> {
+  const tableIds = typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? Reflect.get(value, 'tableIds')
+    : undefined;
   return typeof value === 'object'
     && value !== null
     && !Array.isArray(value)
     && Reflect.get(value, 'kind') === 'command'
-    && typeof Reflect.get(value, 'name') === 'string';
+    && typeof Reflect.get(value, 'name') === 'string'
+    && (
+      tableIds === undefined
+      || (Array.isArray(tableIds) && tableIds.every(tableId => typeof tableId === 'string'))
+    );
 }
 
 class BridgeTableExport implements TableExport {
@@ -208,12 +305,20 @@ class BridgeTableExport implements TableExport {
   private lastEmittedSeq = 0;
   private reconnectCount = 0;
   private flushWaiters: Array<() => void> = [];
-  private autoRestoreTimer?: NodeJS.Timeout;
+  private restoreInFlight?: Promise<void>;
+  private lastObservationAt: number;
+  private transportContinuous = true;
 
-  constructor(roomId: string, tableId: string) {
+  constructor(
+    roomId: string,
+    tableId: string,
+    private readonly staleAfterMs: number,
+    private readonly onDisconnected?: (tableId: string, reason: string) => void,
+  ) {
     this.roomId = roomId;
     this.tableId = tableId;
     this.cursor = { tableId, sourceSeq: 0, eventId: '', payloadHash: '' };
+    this.lastObservationAt = Date.now();
   }
 
   async start(sink: TableExportSink, cursor?: TableCursor): Promise<void> {
@@ -240,14 +345,10 @@ class BridgeTableExport implements TableExport {
     this.stopped = true;
     this.paused = true;
     this.state = 'DISCONNECTED';
-    if (this.autoRestoreTimer) {
-      clearTimeout(this.autoRestoreTimer);
-      this.autoRestoreTimer = undefined;
-    }
   }
 
   async flush(): Promise<void> {
-    while (this.processing) {
+    while (this.processing || this.restoreInFlight !== undefined) {
       await new Promise<void>(resolve => this.flushWaiters.push(resolve));
     }
     if (this.error) {
@@ -256,11 +357,15 @@ class BridgeTableExport implements TableExport {
   }
 
   async keepAlive(): Promise<MonitorKeepAliveResult> {
-    const ok = this.started && !this.stopped && this.state === 'CONNECTED';
+    const stalenessMs = Math.max(0, Date.now() - this.lastObservationAt);
+    const ok = this.started
+      && !this.stopped
+      && this.state === 'CONNECTED'
+      && stalenessMs <= this.staleAfterMs;
     return {
       ok,
-      latencyMs: 1,
-      ...(ok ? {} : { error: this.error?.message ?? 'not connected' }),
+      latencyMs: stalenessMs,
+      ...(ok ? {} : { error: this.error?.message ?? (stalenessMs > this.staleAfterMs ? 'table-feed-stale' : 'not connected') }),
     };
   }
 
@@ -272,65 +377,102 @@ class BridgeTableExport implements TableExport {
       lastEmittedSeq: this.lastEmittedSeq,
       bufferDepth: this.pending.length,
       reconnectCount: this.reconnectCount,
+      lastObservationAt: new Date(this.lastObservationAt).toISOString(),
+      stalenessMs: Math.max(0, Date.now() - this.lastObservationAt),
       ...(this.error ? { lastError: this.error.message } : {}),
     };
   }
 
   ingestEvent(event: NormalizedEvent): void {
     if (this.stopped) return;
+    this.noteObservation();
     this.pending.push(event);
-    if (this.started && !this.paused) {
+    if (this.started) {
       void this.drain();
     }
+  }
+
+  noteObservation(): void {
+    this.lastObservationAt = Date.now();
+  }
+
+  markTransportContinuous(): void {
+    this.transportContinuous = true;
+  }
+
+  invalidateTransportContinuity(reason: string): void {
+    this.transportContinuous = false;
+    this.handleDisconnect(reason);
+  }
+
+  checkFreshness(now = Date.now()): void {
+    if (!this.started || this.stopped || this.state !== 'CONNECTED') return;
+    if (now - this.lastObservationAt <= this.staleAfterMs) return;
+    this.handleDisconnect('table-feed-stale');
   }
 
   handleDisconnect(reason?: string): void {
     if (this.stopped) return;
+    const changed = this.state !== 'DISCONNECTED' || !this.paused;
     console.error('[bridge-table-disconnect]', this.tableId, reason ?? '');
     this.paused = true;
     this.state = 'DISCONNECTED';
     this.sink?.onDisconnect?.(this.tableId, reason);
+    if (changed) this.onDisconnected?.(this.tableId, reason ?? 'table-disconnected');
   }
 
-  handleRestored(proof: string): void {
+  async handleRestored(proof: string): Promise<void> {
     if (this.stopped) return;
+    if (!isValidContinuityProof(proof)) return;
     if (this.state === 'CONNECTED' && !this.paused) return;
-    if (this.autoRestoreTimer) {
-      clearTimeout(this.autoRestoreTimer);
-      this.autoRestoreTimer = undefined;
+    if (this.restoreInFlight !== undefined) {
+      await this.restoreInFlight;
+      return;
     }
     this.error = undefined;
+    try {
+      const restored = this.sink?.onRestored?.(this.tableId, proof);
+      if (restored !== undefined) {
+        this.restoreInFlight = restored;
+        await restored;
+      }
+    } catch (error) {
+      this.error = error instanceof Error ? error : new Error(String(error));
+      this.state = 'DISCONNECTED';
+      this.paused = true;
+      this.resolveFlushWaiters();
+      return;
+    } finally {
+      this.restoreInFlight = undefined;
+    }
+    if (this.stopped) return;
     this.paused = false;
     this.state = 'CONNECTED';
     this.reconnectCount += 1;
-    this.sink?.onRestored?.(this.tableId, proof);
     void this.drain();
-  }
-
-  private scheduleAutoRestore(error: Error): void {
-    if (this.autoRestoreTimer) return;
-    console.error('[bridge-export-error]', this.tableId, error.message);
-    this.autoRestoreTimer = setTimeout(() => {
-      this.autoRestoreTimer = undefined;
-      if (this.stopped) return;
-      this.error = undefined;
-      this.paused = false;
-      this.state = 'CONNECTED';
-      this.reconnectCount += 1;
-      this.sink?.onRestored?.(this.tableId, `auto-recover:${Date.now()}`);
-      void this.drain();
-    }, 2000);
   }
 
   private async drain(): Promise<void> {
     if (this.processing) return;
     this.processing = true;
     try {
+      if (this.paused && !(await this.restoreFromPending())) return;
       while (!this.stopped && this.started && !this.paused && this.pending.length > 0) {
-        const event = this.pending.shift()!;
-        if (event.sourceSeq <= this.cursor.sourceSeq) continue;
-        // 实时桥允许源序号缺口：解析层可能漏掉个别中间消息，
-        // 后续 gameState/shoeState 会提供完整快照，不应因缺口永久停摆。
+        const event = this.pending[0]!;
+        if (event.sourceSeq <= this.cursor.sourceSeq) {
+          this.pending.shift();
+          continue;
+        }
+        const isPhysicalReset = event.type === 'newShoeSignal'
+          && event.baseline === 'physical-shoe';
+        if (!isPhysicalReset && event.sourceSeq !== this.cursor.sourceSeq + 1) {
+          const reason =
+            `continuity gap for ${this.tableId}: expected ${this.cursor.sourceSeq + 1}, got ${event.sourceSeq}`;
+          this.transportContinuous = false;
+          this.error = new Error(reason);
+          this.handleDisconnect(reason);
+          return;
+        }
         const batch: TableEventBatch = {
           tableId: this.tableId,
           events: [event],
@@ -343,6 +485,7 @@ class BridgeTableExport implements TableExport {
           kind: this.cursor.sourceSeq > 0 ? 'replay' : 'live',
         };
         await this.sink!.onBatch(batch);
+        this.pending.shift();
         this.cursor = batch.cursor;
         this.lastEmittedSeq = event.sourceSeq;
       }
@@ -351,12 +494,52 @@ class BridgeTableExport implements TableExport {
       this.state = 'DISCONNECTED';
       this.paused = true;
       this.sink?.onDisconnect?.(this.tableId, this.error.message);
-      this.scheduleAutoRestore(this.error);
     } finally {
       this.processing = false;
-      const waiters = this.flushWaiters.splice(0);
-      for (const waiter of waiters) waiter();
+      this.resolveFlushWaiters();
     }
+  }
+
+  private async restoreFromPending(): Promise<boolean> {
+    while (this.pending[0] && this.pending[0].sourceSeq <= this.cursor.sourceSeq) {
+      this.pending.shift();
+    }
+    if (!this.transportContinuous) {
+      const physicalResetIndex = this.pending.findIndex(event =>
+        event.type === 'newShoeSignal' && event.baseline === 'physical-shoe');
+      if (physicalResetIndex < 0) return false;
+      this.pending.splice(0, physicalResetIndex);
+    }
+    const nextEvent = this.pending[0];
+    if (nextEvent === undefined) return false;
+    const isPhysicalReset = nextEvent.type === 'newShoeSignal'
+      && nextEvent.baseline === 'physical-shoe';
+    if (!isPhysicalReset && !this.transportContinuous) return false;
+    if (!isPhysicalReset && nextEvent.sourceSeq !== this.cursor.sourceSeq + 1) {
+      this.transportContinuous = false;
+      this.error = new Error(
+        `continuity gap for ${this.tableId}: expected ${this.cursor.sourceSeq + 1}, got ${nextEvent.sourceSeq}`,
+      );
+      return false;
+    }
+    const proof = cursorContinuityProof({
+      tableId: this.tableId,
+      previousCursor: this.cursor,
+      nextEvent: {
+        sourceSeq: nextEvent.sourceSeq,
+        eventId: nextEvent.eventId,
+        payloadHash: sha256(stableStringify(nextEvent)),
+      },
+      physicalReset: isPhysicalReset,
+    });
+    await this.handleRestored(proof);
+    if (this.state === 'CONNECTED' && !this.paused) this.transportContinuous = true;
+    return this.state === 'CONNECTED' && !this.paused;
+  }
+
+  private resolveFlushWaiters(): void {
+    const waiters = this.flushWaiters.splice(0);
+    for (const waiter of waiters) waiter();
   }
 }
 
@@ -371,6 +554,7 @@ export class BrowserBridgeServer implements RoomMonitor {
   private discoveredRooms = new Map<string, BridgeRoomDescriptor>();
   private exports = new Map<string, BridgeTableExport>();
   private pendingBets = new Map<string, PendingBet>();
+  private readonly tableExecutionTails = new Map<string, Promise<void>>();
   private readonly evolutionParser = new EvolutionBaccaratParser();
   private readonly mstromShoeSessions = new Map<string, MstromShoeSessionRegistry>();
   private readonly mstromProtocolParsers = new Map<string, MstromProtocolEventParser>();
@@ -384,6 +568,14 @@ export class BrowserBridgeServer implements RoomMonitor {
   private multiviewRecoveryTimer?: NodeJS.Timeout;
   private readonly multiviewRecoveryCooldownMs: number;
   private readonly multiviewOpenedGraceMs: number;
+  private readonly tableStaleAfterMs: number;
+  private readonly extensionHeartbeatTimeoutMs: number;
+  private readonly requireExtensionSequence: boolean;
+  private freshnessTimer?: NodeJS.Timeout;
+  private readonly socketLastSeenAt = new Map<WebSocket, number>();
+  private readonly socketBridgeSession = new Map<WebSocket, string>();
+  private readonly lastBridgeSeqBySession = new Map<string, number>();
+  private activeBridgeSessionId?: string;
   private extensionConnected = false;
   private port = 0;
 
@@ -398,6 +590,12 @@ export class BrowserBridgeServer implements RoomMonitor {
       this.multiviewRecoveryCooldownMs,
       options.multiviewOpenedGraceMs ?? MULTIVIEW_OPENED_GRACE_MS,
     );
+    this.tableStaleAfterMs = Math.max(1_000, options.tableStaleAfterMs ?? TABLE_STALE_AFTER_MS);
+    this.extensionHeartbeatTimeoutMs = Math.max(
+      1_000,
+      options.extensionHeartbeatTimeoutMs ?? EXTENSION_HEARTBEAT_TIMEOUT_MS,
+    );
+    this.requireExtensionSequence = options.requireExtensionSequence ?? false;
     this.configuredSelectedTables = options.selectedTableIds === undefined
       ? undefined
       : new Set(
@@ -413,8 +611,17 @@ export class BrowserBridgeServer implements RoomMonitor {
     const wss = new WebSocketServer({
       port: this.options.port ?? 0,
       host: this.options.host ?? '127.0.0.1',
-      verifyClient: (info: { origin: string; secure: boolean; req: IncomingMessage }) =>
-        bridgeSocketRole(info.origin, info.req.url) !== null,
+      verifyClient: (info: { origin: string; secure: boolean; req: IncomingMessage }) => {
+        const role = bridgeSocketRole(info.origin, info.req.url, this.options);
+        if (role === null && info.origin.startsWith('chrome-extension://')) {
+          this.emitRuntimeEvent({
+            kind: 'extension-auth-failed',
+            reason: 'extension identity or token rejected',
+            timestamp: new Date().toISOString(),
+          });
+        }
+        return role !== null;
+      },
     });
     await new Promise<void>((resolve, reject) => {
       wss.once('listening', resolve);
@@ -424,7 +631,7 @@ export class BrowserBridgeServer implements RoomMonitor {
     const address = wss.address();
     this.port = typeof address === 'object' && address ? address.port : 0;
     wss.on('connection', (socket, request) => {
-      const role = bridgeSocketRole(String(request.headers.origin ?? ''), request.url);
+      const role = bridgeSocketRole(String(request.headers.origin ?? ''), request.url, this.options);
       if (role === null) {
         socket.close(1008, 'unauthorized bridge client');
         return;
@@ -435,16 +642,24 @@ export class BrowserBridgeServer implements RoomMonitor {
         this.commandClients.add(socket);
       } else {
         this.sockets.add(socket);
+        this.socketLastSeenAt.set(socket, Date.now());
         if (!this.extensionConnected) {
           this.extensionConnected = true;
-          this.handleBridgeRestored('browser-extension-connected');
         }
+        this.emitRuntimeEvent({
+          kind: 'extension-connected',
+          timestamp: new Date().toISOString(),
+        });
       }
       socket.on('message', data => {
         if (role === 'observer') return;
         try {
           const message: unknown = JSON.parse(data.toString());
           if (role === 'command' && !isBridgeCommand(message)) return;
+          if (role === 'extension') {
+            this.socketLastSeenAt.set(socket, Date.now());
+            if (!this.acceptExtensionSequence(message, socket)) return;
+          }
           this.ingestClientMessage(message, socket);
         } catch {
           // ignore malformed messages from untrusted extensions
@@ -454,7 +669,7 @@ export class BrowserBridgeServer implements RoomMonitor {
         if (role !== 'extension') return;
         this.rejectPendingBets(new Error(LIVE_BET_CONNECTION_LOST_ERROR), socket);
       });
-      socket.on('close', () => {
+      socket.on('close', (code, rawReason) => {
         if (role === 'observer') {
           this.observers.delete(socket);
           return;
@@ -465,6 +680,13 @@ export class BrowserBridgeServer implements RoomMonitor {
         }
         this.rejectPendingBets(new Error(LIVE_BET_CONNECTION_LOST_ERROR), socket);
         this.sockets.delete(socket);
+        this.socketLastSeenAt.delete(socket);
+        this.socketBridgeSession.delete(socket);
+        this.emitRuntimeEvent({
+          kind: 'extension-disconnected',
+          reason: rawReason.toString() || `websocket-close-${code}`,
+          timestamp: new Date().toISOString(),
+        });
         if (this.sockets.size === 0 && this.extensionConnected) {
           this.extensionConnected = false;
           this.handleBridgeDisconnect('browser-extension-disconnected');
@@ -476,15 +698,22 @@ export class BrowserBridgeServer implements RoomMonitor {
         timestamp: new Date().toISOString(),
       } satisfies BridgeServerMessage));
     });
+    this.ensureFreshnessTimer();
     return this.port;
   }
 
   async close(): Promise<void> {
     this.clearMultiviewRecoveryTimer();
+    if (this.freshnessTimer) {
+      clearInterval(this.freshnessTimer);
+      this.freshnessTimer = undefined;
+    }
     for (const socket of [...this.sockets, ...this.observers, ...this.commandClients]) socket.close();
     this.sockets.clear();
     this.observers.clear();
     this.commandClients.clear();
+    this.socketLastSeenAt.clear();
+    this.socketBridgeSession.clear();
     if (this.wss) {
       const wss = this.wss;
       this.wss = undefined;
@@ -495,6 +724,21 @@ export class BrowserBridgeServer implements RoomMonitor {
 
   getPort(): number {
     return this.port;
+  }
+
+  getExtensionStatus(): BrowserBridgeExtensionStatus {
+    const sockets = [...this.sockets];
+    const lastSeenAt = sockets
+      .map(socket => this.socketLastSeenAt.get(socket))
+      .filter((value): value is number => value !== undefined)
+      .sort((left, right) => right - left)[0];
+    const authenticated = sockets.length === 1
+      && (!this.requireExtensionSequence || this.socketBridgeSession.has(sockets[0]!));
+    return {
+      connectionCount: sockets.length,
+      authenticated,
+      ...(lastSeenAt === undefined ? {} : { lastSeenAt: new Date(lastSeenAt).toISOString() }),
+    };
   }
 
   /** Starts an independent logical monitor session without claiming a physical shoe reset. */
@@ -557,8 +801,24 @@ export class BrowserBridgeServer implements RoomMonitor {
   }
 
   private async requestExecution(request: BridgeExecutionRequest): Promise<BridgeExecutionReceipt | null> {
+    const tableId = 'intent' in request ? request.intent.tableId : request.wager.tableId;
+    return await this.serializeTableExecution(tableId, async () => await this.dispatchExecution(request));
+  }
+
+  private async serializeTableExecution<T>(tableId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.tableExecutionTails.get(tableId) ?? Promise.resolve();
+    const current = previous.then(operation, operation);
+    const tail = current.then(() => undefined, () => undefined);
+    this.tableExecutionTails.set(tableId, tail);
+    void tail.then(() => {
+      if (this.tableExecutionTails.get(tableId) === tail) this.tableExecutionTails.delete(tableId);
+    });
+    return await current;
+  }
+
+  private async dispatchExecution(request: BridgeExecutionRequest): Promise<BridgeExecutionReceipt | null> {
     const sockets = [...this.sockets];
-    if (request.mode === 'live' && sockets.length !== 1) {
+    if (request.mode === 'live' && !this.getExtensionStatus().authenticated) {
       throw new Error(LIVE_EXTENSION_CONNECTION_ERROR);
     }
     if (sockets.length === 0) {
@@ -584,7 +844,7 @@ export class BrowserBridgeServer implements RoomMonitor {
   }
 
   setLiveBetEnabled(enabled: boolean): void {
-    if (enabled && this.sockets.size !== 1) {
+    if (enabled && !this.getExtensionStatus().authenticated) {
       throw new Error(LIVE_EXTENSION_CONNECTION_ERROR);
     }
     if (this.sockets.size === 0) return;
@@ -708,9 +968,7 @@ export class BrowserBridgeServer implements RoomMonitor {
         break;
       case 'tableEvent': {
         if (!this.isTableSelected(message.tableId)) break;
-        // 收到实时数据即视为连接恢复：过期恢复/断线后第一帧数据会重新点亮导出。
         const exportInstance = this.getOrCreateExport(message.roomId, message.tableId);
-        exportInstance.handleRestored('data-received');
         exportInstance.ingestEvent(message.event);
         break;
       }
@@ -719,8 +977,8 @@ export class BrowserBridgeServer implements RoomMonitor {
         this.exports.get(exportKey(message.roomId, message.tableId))?.handleDisconnect(message.reason);
         break;
       case 'tableRestored':
-        if (!this.isTableSelected(message.tableId)) break;
-        this.exports.get(exportKey(message.roomId, message.tableId))?.handleRestored(message.proof);
+        // Recovery proofs are bridge-owned. A client claim cannot establish
+        // cursor continuity without the next event that the bridge can verify.
         break;
       case 'betResult': {
         const pending = this.pendingBets.get(message.requestId);
@@ -736,7 +994,9 @@ export class BrowserBridgeServer implements RoomMonitor {
         break;
       }
       case 'diagnostic':
-        console.log('[bridge-diagnostic]', JSON.stringify(message));
+        if (BRIDGE_DEBUG_ENABLED) {
+          console.log('[bridge-diagnostic]', JSON.stringify(redactBridgeDiagnostic(message)));
+        }
         break;
       case 'networkCapture':
         logNetworkCapture(message);
@@ -747,6 +1007,7 @@ export class BrowserBridgeServer implements RoomMonitor {
         } else if (message.source === 'baccarat-bridge-runtime-state') {
           const tableId = runtimeStateTableId(message.data);
           if (tableId !== null && this.isTableSelected(tableId)) {
+            this.noteTableObservation(tableId);
             this.ingestParsedEvents(this.getMstromRuntimeParser(tableId).parse(message.data));
           }
         } else if (
@@ -757,6 +1018,7 @@ export class BrowserBridgeServer implements RoomMonitor {
           const bytes = Uint8Array.from(Buffer.from(message.data, 'base64'));
           const parsed = parseMstromFrame(bytes);
           if (parsed.ok && this.isTableSelected(parsed.frame.tableId)) {
+            this.noteTableObservation(parsed.frame.tableId);
             this.ingestParsedEvents(
               this.getMstromProtocolParser(parsed.frame.tableId).ingest(parsed.frame, new Date().toISOString()),
             );
@@ -764,22 +1026,35 @@ export class BrowserBridgeServer implements RoomMonitor {
         }
         break;
       case 'sessionExpired':
-        console.error('[session-expired]', JSON.stringify(message));
-        this.handleBridgeDisconnect('game-session-expired');
+        console.error('[session-expired]', JSON.stringify(redactedLifecycleMessage(message)));
+        this.invalidateBridgeContinuity('game-session-expired');
         break;
       case 'sessionAction':
-        console.log('[session-action]', JSON.stringify(message));
+        console.log('[session-action]', JSON.stringify(redactedLifecycleMessage(message)));
+        if (message.action === 'recovery-failed') {
+          this.emitRuntimeEvent({
+            kind: 'session-recovery-exhausted',
+            ...(message.detail === undefined ? {} : { detail: message.detail }),
+            timestamp: message.timestamp,
+          });
+        } else if (message.action === 'recovered') {
+          this.emitRuntimeEvent({
+            kind: 'session-recovered',
+            timestamp: message.timestamp,
+          });
+        }
         if (message.detail?.startsWith('openMultiView:opened:') && this.isConfiguredMultiviewIncomplete()) {
           this.clearMultiviewRecoveryTimer();
           this.scheduleMultiviewRecovery(this.multiviewOpenedGraceMs);
         }
-        if (message.action === 'recovered') {
-          this.handleBridgeRestored('session-recovered');
-        }
         break;
       case 'command':
         console.log('[bridge-command]', JSON.stringify(message));
-        this.broadcastToSockets({ kind: 'command', name: message.name });
+        this.broadcastToSockets({
+          kind: 'command',
+          name: message.name,
+          ...(message.tableIds === undefined ? {} : { tableIds: message.tableIds }),
+        });
         break;
       case 'hello':
       case 'heartbeat':
@@ -787,7 +1062,13 @@ export class BrowserBridgeServer implements RoomMonitor {
         break;
     }
     if (OBSERVABLE_KINDS.has(message.kind)) {
-      this.broadcastToObservers({ kind: 'observe', message });
+      this.broadcastToObservers({
+        kind: 'observe',
+        message: redactedLifecycleMessage(message as Extract<
+          BridgeClientMessage,
+          { kind: 'sessionExpired' | 'sessionAction' | 'keepalive' }
+        >),
+      });
     } else if (message.kind === 'networkCapture' && OBSERVABLE_NETWORK_PATTERN.test(message.url)) {
       this.broadcastToObservers({ kind: 'observe', message: observableNetworkCapture(message) });
     }
@@ -919,7 +1200,6 @@ export class BrowserBridgeServer implements RoomMonitor {
       console.log('[bridge-event]', JSON.stringify(normalizedEvent));
       this.ensureRoomForTable(normalizedEvent.tableId);
       const exportInstance = this.getOrCreateExport('dafabet-live', normalizedEvent.tableId);
-      exportInstance.handleRestored('data-received');
       exportInstance.ingestEvent(normalizedEvent);
     }
   }
@@ -980,10 +1260,100 @@ export class BrowserBridgeServer implements RoomMonitor {
     }
   }
 
-  private handleBridgeRestored(proof: string): void {
+  private invalidateBridgeContinuity(reason: string): void {
+    this.emitRuntimeEvent({
+      kind: 'continuity-invalidated',
+      reason,
+      timestamp: new Date().toISOString(),
+    });
     for (const exportInstance of this.exports.values()) {
-      exportInstance.handleRestored(proof);
+      exportInstance.invalidateTransportContinuity(reason);
     }
+  }
+
+  private markBridgeTransportContinuous(): void {
+    for (const exportInstance of this.exports.values()) {
+      exportInstance.markTransportContinuous();
+    }
+  }
+
+  private noteTableObservation(tableId: string): void {
+    for (const [key, exportInstance] of this.exports) {
+      if (key.endsWith(`::${tableId}`)) exportInstance.noteObservation();
+    }
+  }
+
+  private acceptExtensionSequence(raw: unknown, socket: WebSocket): boolean {
+    if (!this.requireExtensionSequence) return true;
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      socket.close(1008, 'missing bridge sequence');
+      return false;
+    }
+    const sessionId = Reflect.get(raw, 'bridgeSessionId');
+    const sequence = Reflect.get(raw, 'bridgeSeq');
+    if (
+      typeof sessionId !== 'string'
+      || !/^[a-zA-Z0-9._-]{8,128}$/.test(sessionId)
+      || !Number.isSafeInteger(sequence)
+      || sequence < 1
+    ) {
+      socket.close(1008, 'invalid bridge sequence');
+      return false;
+    }
+    const socketSession = this.socketBridgeSession.get(socket);
+    if (socketSession !== undefined && socketSession !== sessionId) {
+      this.invalidateBridgeContinuity('extension-session-changed-on-socket');
+      socket.close(1008, 'bridge session changed on socket');
+      return false;
+    }
+
+    const previousSequence = this.lastBridgeSeqBySession.get(sessionId);
+    if (previousSequence !== undefined && sequence !== previousSequence + 1) {
+      this.invalidateBridgeContinuity(
+        `extension-message-gap:${previousSequence + 1}:${sequence}`,
+      );
+      socket.close(1008, 'bridge message sequence gap');
+      return false;
+    }
+
+    const previousActiveSession = this.activeBridgeSessionId;
+    const wasAuthenticated = this.socketBridgeSession.has(socket);
+    this.socketBridgeSession.set(socket, sessionId);
+    this.lastBridgeSeqBySession.set(sessionId, sequence);
+    this.activeBridgeSessionId = sessionId;
+    if (previousActiveSession !== undefined && previousActiveSession !== sessionId) {
+      this.invalidateBridgeContinuity('extension-session-restarted');
+    } else {
+      this.markBridgeTransportContinuous();
+    }
+    if (!wasAuthenticated) {
+      this.emitRuntimeEvent({
+        kind: 'extension-authenticated',
+        sessionId,
+        timestamp: new Date().toISOString(),
+      });
+    }
+    return true;
+  }
+
+  private ensureFreshnessTimer(): void {
+    if (this.freshnessTimer) return;
+    const intervalMs = Math.max(
+      1_000,
+      Math.min(this.tableStaleAfterMs, this.extensionHeartbeatTimeoutMs) / 3,
+    );
+    this.freshnessTimer = setInterval(() => {
+      const now = Date.now();
+      for (const socket of this.sockets) {
+        const lastSeenAt = this.socketLastSeenAt.get(socket) ?? 0;
+        if (now - lastSeenAt <= this.extensionHeartbeatTimeoutMs) continue;
+        socket.close(4001, 'extension heartbeat stale');
+      }
+      for (const exportInstance of this.exports.values()) {
+        exportInstance.checkFreshness(now);
+      }
+    }, intervalMs);
+    this.freshnessTimer.unref();
   }
 
   private rejectPendingBets(error: Error, sourceSocket?: WebSocket): void {
@@ -999,9 +1369,29 @@ export class BrowserBridgeServer implements RoomMonitor {
     const key = exportKey(roomId, tableId);
     const existing = this.exports.get(key);
     if (existing) return existing;
-    const created = new BridgeTableExport(roomId, tableId);
+    const created = new BridgeTableExport(
+      roomId,
+      tableId,
+      this.tableStaleAfterMs,
+      (disconnectedTableId, reason) => {
+        this.emitRuntimeEvent({
+          kind: 'table-disconnected',
+          tableId: disconnectedTableId,
+          reason,
+          timestamp: new Date().toISOString(),
+        });
+      },
+    );
     this.exports.set(key, created);
     return created;
+  }
+
+  private emitRuntimeEvent(event: BrowserBridgeRuntimeEvent): void {
+    try {
+      this.options.onRuntimeEvent?.(event);
+    } catch (error) {
+      console.error('browser bridge runtime observer failed', error);
+    }
   }
 }
 

@@ -1,4 +1,10 @@
-import type { NormalizedEvent, TableProfile } from '@baccarat/contracts';
+import {
+  CONTINUITY_PROOF_PREFIX,
+  sha256,
+  stableStringify,
+  type NormalizedEvent,
+  type TableProfile,
+} from '@baccarat/contracts';
 
 export interface TableDescriptor {
   tableId: string;
@@ -44,7 +50,7 @@ export interface TableExportSink {
    */
   onBatch(batch: TableEventBatch): Promise<void> | void;
   onDisconnect?(tableId: string, reason?: string): void;
-  onRestored?(tableId: string, proof: string): void;
+  onRestored?(tableId: string, proof: string): Promise<void> | void;
 }
 
 export interface MonitorHealth {
@@ -54,7 +60,13 @@ export interface MonitorHealth {
   lastEmittedSeq: number;
   bufferDepth: number;
   reconnectCount: number;
+  lastObservationAt?: string;
+  stalenessMs?: number;
   lastError?: string;
+}
+
+export function cursorContinuityProof(evidence: unknown): string {
+  return `${CONTINUITY_PROOF_PREFIX}${sha256(stableStringify(evidence))}`;
 }
 
 export interface TableExport {

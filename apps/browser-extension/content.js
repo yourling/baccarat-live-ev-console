@@ -9,17 +9,20 @@
  *  4. background 可选 CDP 可信点击（storage.trustedKeepalive=true 时）。
  *
  * 过期恢复：检测到“会话已过期”文案后，先上报并标记牌桌断开，
- * 然后按 5s/15s/45s 退避自动 reload（最多 3 次，sessionStorage 标记跨刷新计数），
- * 恢复后上报 sessionAction:recovered + tableRestored；仍失败则上报 recovery-failed 并停止。
+ * 然后按 5s/15s/45s 退避自动 reload（每轮最多 3 次，sessionStorage 标记跨刷新计数）。
+ * 一轮耗尽后上报 recovery-failed，并按 1m/5m/15m/30m（封顶）持续监督重试；
+ * 恢复只上报 sessionAction:recovered，绝不伪造 tableRestored 或连续性证明。
  */
 (function () {
   const SCAN_INTERVAL_MS = 2000;
   const KEEPALIVE_INTERVAL_MS = 30 * 1000;
   const MAX_RECOVERY_ATTEMPTS = 3;
   const RECOVERY_DELAYS_MS = [5 * 1000, 15 * 1000, 45 * 1000];
+  const SUPERVISORY_RECOVERY_DELAYS_MS = [60 * 1000, 5 * 60 * 1000, 15 * 60 * 1000, 30 * 60 * 1000];
   const RECOVERY_CHECK_DELAY_MS = 8 * 1000;
   const RECOVERY_COOLDOWN_MS = 15 * 60 * 1000;
   const RECOVERY_FLAG_KEY = 'baccarat-bridge-recovering';
+  const RECOVERY_SUPERVISOR_KEY = 'baccarat-bridge-recovery-supervisor';
   const CLICK_REPORT_INTERVAL_MS = 5 * 60 * 1000;
 
   // 只在游戏相关页面上工作:其他页面(控制台/搜索引擎/追踪器)不采集、不保活、不发心跳。
@@ -33,6 +36,8 @@
   let recoveryTimer = null;
   let recoveryCheckTimer = null;
   let inlineCheckTimer = null;
+  let supervisoryRecoveryTimer = null;
+  let supervisoryRecoveryAttempts = 0;
   let triedInlineRecovery = false;
   let lastHealthyAt = Date.now();
   let lastClickReportAt = 0;
@@ -67,30 +72,17 @@
 
   function sendDiagnostic() {
     const bodyText = document.body ? document.body.innerText : '';
-    // 附带本页全部 iframe 地址:用于确认新房间游戏框的实际域名。
-    const iframeSrcs = [];
-    try {
-      for (const f of document.querySelectorAll('iframe[src]')) {
-        let s = '';
-        try {
-          s = String(f.src || '');
-        } catch (_) {
-          s = '';
-        }
-        if (s) iframeSrcs.push(s.replace(/\\?.*$/, '').slice(0, 140));
-      }
-    } catch (_) {
-      // ignore
-    }
+    const htmlLength = document.documentElement
+      ? document.documentElement.outerHTML.length
+      : 0;
     sendToBackground({
       kind: 'diagnostic',
       url: location.href,
-      title: document.title,
       frame: frameKind(),
       readyState: document.readyState,
-      bodyTextPreview: bodyText.slice(0, 5000),
-      htmlPreview: (document.documentElement ? document.documentElement.outerHTML : '').slice(0, 8000)
-        + '\n\n[BRIDGE-IFRAMES]\n' + iframeSrcs.join('\n'),
+      titleLength: String(document.title || '').length,
+      bodyTextLength: bodyText.length,
+      htmlLength,
       candidateCount: document.querySelectorAll(
         '[class*="room"],[id*="room"],[class*="table"],[id*="table"],[class*="game"],[id*="game"]'
       ).length,
@@ -352,20 +344,6 @@
     }
   }
 
-  function notifyTablesRestored(proof) {
-    for (const room of knownRooms.values()) {
-      for (const table of room.tables || []) {
-        if (!table || !table.tableId) continue;
-        sendToBackground({
-          kind: 'tableRestored',
-          roomId: room.roomId,
-          tableId: table.tableId,
-          proof,
-        });
-      }
-    }
-  }
-
   function checkSessionExpired(bodyText) {
     if (!isSessionExpiredText(bodyText)) {
       lastHealthyAt = Date.now();
@@ -377,7 +355,7 @@
         kind: 'sessionExpired',
         url: location.href,
         frame: frameKind(),
-        textPreview: bodyText.slice(0, 1000),
+        textLength: bodyText.length,
         recovering: recoveryAttempts > 0,
         timestamp: new Date().toISOString(),
       });
@@ -391,7 +369,10 @@
     if (recoveryTimer) return;
     // 页面健康超过冷却期后又过期，视为新一轮过期，重新计数。
     if (Date.now() - lastHealthyAt > RECOVERY_COOLDOWN_MS) recoveryAttempts = 0;
-    if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) return;
+    if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+      scheduleSupervisoryRecovery();
+      return;
+    }
     const delay = RECOVERY_DELAYS_MS[Math.min(recoveryAttempts, RECOVERY_DELAYS_MS.length - 1)];
     recoveryTimer = setTimeout(() => {
       recoveryTimer = null;
@@ -417,6 +398,38 @@
     }, delay);
   }
 
+  function clearSupervisoryRecovery() {
+    if (supervisoryRecoveryTimer) {
+      clearTimeout(supervisoryRecoveryTimer);
+      supervisoryRecoveryTimer = null;
+    }
+    supervisoryRecoveryAttempts = 0;
+    try {
+      sessionStorage.removeItem(RECOVERY_SUPERVISOR_KEY);
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  function scheduleSupervisoryRecovery() {
+    if (supervisoryRecoveryTimer) return;
+    const delay = SUPERVISORY_RECOVERY_DELAYS_MS[
+      Math.min(supervisoryRecoveryAttempts, SUPERVISORY_RECOVERY_DELAYS_MS.length - 1)
+    ];
+    supervisoryRecoveryAttempts += 1;
+    try {
+      sessionStorage.setItem(RECOVERY_SUPERVISOR_KEY, String(supervisoryRecoveryAttempts));
+    } catch (_) {
+      // sessionStorage 不可用时仍在当前页面继续监督重试。
+    }
+    supervisoryRecoveryTimer = setTimeout(() => {
+      supervisoryRecoveryTimer = null;
+      recoveryAttempts = 0;
+      triedInlineRecovery = true;
+      scheduleRecoveryReload();
+    }, delay);
+  }
+
   /** 原地重试点击 6 秒后判定:已恢复则复位上报,仍过期则升级为 reload。 */
   function scheduleInlineCheck() {
     inlineCheckTimer = setTimeout(() => {
@@ -425,7 +438,8 @@
       if (!isSessionExpiredText(bodyText)) {
         recoveryAttempts = 0;
         triedInlineRecovery = false;
-        notifyTablesRestored('session-recovered');
+        sessionExpiredSent = false;
+        clearSupervisoryRecovery();
         sendSessionAction('recovered', 'inline try-again');
         return;
       }
@@ -465,12 +479,14 @@
     if (!isSessionExpiredText(bodyText)) {
       recoveryAttempts = 0;
       triedInlineRecovery = false;
-      notifyTablesRestored('session-recovered');
+      sessionExpiredSent = false;
+      clearSupervisoryRecovery();
       sendSessionAction('recovered');
       return;
     }
     if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
       sendSessionAction('recovery-failed', 'still expired after ' + recoveryAttempts + ' reload attempts');
+      scheduleSupervisoryRecovery();
       return;
     }
     if (!triedInlineRecovery && clickTryAgain()) {
@@ -689,11 +705,15 @@
 
   // reload 恢复判定：带恢复标记加载的页面，加载 8 秒后判定是否真正恢复。
   let pendingFlag = null;
+  let pendingSupervisorAttempts = null;
   try {
     pendingFlag = sessionStorage.getItem(RECOVERY_FLAG_KEY);
+    pendingSupervisorAttempts = sessionStorage.getItem(RECOVERY_SUPERVISOR_KEY);
   } catch (_) {
     pendingFlag = null;
+    pendingSupervisorAttempts = null;
   }
+  supervisoryRecoveryAttempts = Math.max(0, Number(pendingSupervisorAttempts) || 0);
   if (pendingFlag) {
     recoveryAttempts = Math.max(1, Number(pendingFlag) || 1);
     sessionExpiredSent = true; // 恢复检查期间抑制重复的 sessionExpired 上报

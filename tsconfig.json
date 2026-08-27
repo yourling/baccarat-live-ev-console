@@ -23,5 +23,8 @@
     "packages/**/*.ts",
     "apps/desktop/**/*.ts",
     "apps/desktop/**/*.tsx"
+  ],
+  "exclude": [
+    "apps/desktop/release/**"
   ]
 }

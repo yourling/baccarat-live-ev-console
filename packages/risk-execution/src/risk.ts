@@ -2,9 +2,13 @@ import {
   assertValidRiskLimits,
   assertValidTableProfile,
   type BetIntent,
+  type ExecutionMarket,
+  type ExecutionSource,
+  type OddsConfig,
   type RiskExposureState,
   type RiskLimits,
   type RiskReservation,
+  type TableLimits,
   type TableProfile,
   newId,
 } from '@baccarat/contracts';
@@ -26,6 +30,16 @@ export interface RiskReservationStore {
   transaction<T>(fn: () => T): T;
 }
 
+export interface ExecutionRiskIntent {
+  intentId: string;
+  tableId: string;
+  shoeId: string;
+  handId: string;
+  market: ExecutionMarket;
+  executionSource: ExecutionSource;
+  amount: number;
+}
+
 function finitePositive(value: number, field: string): void {
   if (!Number.isFinite(value) || value <= 0) throw new RangeError(`${field} must be a finite positive number`);
 }
@@ -38,8 +52,14 @@ function holdsRiskExposure(status: RiskReservation['status']): boolean {
   return status === 'RESERVED' || status === 'UNKNOWN';
 }
 
-export function activeReservationKey(tableId: string, shoeId: string, handId: string, market: string): string {
-  return `${tableId}:${shoeId}:${handId}:${market}`;
+export function activeReservationKey(
+  tableId: string,
+  shoeId: string,
+  handId: string,
+  market: string,
+  executionSource: ExecutionSource = 'strategy',
+): string {
+  return `${tableId}:${shoeId}:${handId}:${market}:${executionSource}`;
 }
 
 export function shoeLossKey(tableId: string, shoeId: string): string {
@@ -79,7 +99,10 @@ export class RiskManager {
       for (const r of this.store.listReservations()) {
         this.reservations.set(r.reservationId, r);
         if (holdsRiskExposure(r.status)) {
-          this.activeByKey.set(activeReservationKey(r.tableId, r.shoeId, r.handId, r.market), r.reservationId);
+          this.activeByKey.set(
+            activeReservationKey(r.tableId, r.shoeId, r.handId, r.market, r.executionSource),
+            r.reservationId,
+          );
           recomputedExposure += r.maxLoss;
           recomputedPending += 1;
         }
@@ -128,6 +151,10 @@ export class RiskManager {
     return tableId ? all.filter(r => r.tableId === tableId) : all;
   }
 
+  hasUnknownReservations(tableId?: string): boolean {
+    return this.snapshot(tableId).some(reservation => reservation.status === 'UNKNOWN');
+  }
+
   private persistState(): void {
     if (this.store) this.store.saveRiskState(this.state);
   }
@@ -135,24 +162,46 @@ export class RiskManager {
 
   tryReserve(intent: BetIntent, profile: TableProfile, limits: RiskLimits): ReserveResult {
     assertValidTableProfile(profile);
+    return this.tryReserveExecution({
+      intentId: intent.intentId,
+      tableId: intent.tableId,
+      shoeId: intent.shoeId,
+      handId: intent.handId,
+      market: intent.market,
+      executionSource: 'strategy',
+      amount: intent.amount,
+    }, profile.limits, profile.odds[intent.market], limits);
+  }
+
+  tryReserveExecution(
+    intent: ExecutionRiskIntent,
+    tableLimits: TableLimits,
+    odds: OddsConfig,
+    limits: RiskLimits,
+  ): ReserveResult {
     assertValidRiskLimits(limits);
     this.rollDayIfNeeded();
     if (!intent || typeof intent !== 'object') return { ok: false, reason: 'invalid-intent' };
     finitePositive(intent.amount, 'intent.amount');
     if (!intent.tableId || !intent.shoeId || !intent.handId) return { ok: false, reason: 'invalid-intent-keys' };
 
-    const key = activeReservationKey(intent.tableId, intent.shoeId, intent.handId, intent.market);
+    const key = activeReservationKey(
+      intent.tableId,
+      intent.shoeId,
+      intent.handId,
+      intent.market,
+      intent.executionSource,
+    );
     if (this.activeByKey.has(key)) {
       return { ok: false, reason: 'duplicate:already-reserved' };
     }
 
-    const odds = profile.odds[intent.market];
     if (!odds) return { ok: false, reason: 'missing-odds' };
     const lossMultiplier = odds.loss;
     const netWin = odds.netWin;
     let amount = intent.amount;
-    const minBet = profile.limits.minBet;
-    const maxBet = profile.limits.maxBet;
+    const minBet = tableLimits.minBet;
+    const maxBet = tableLimits.maxBet;
     const shrink = limits.insufficientBehavior === 'shrink';
     const needs = (stake: number) => stake * lossMultiplier;
     const capAmount = (allowedLoss: number): number => {
@@ -201,6 +250,7 @@ export class RiskManager {
       shoeId: intent.shoeId,
       handId: intent.handId,
       market: intent.market,
+      executionSource: intent.executionSource,
       amount,
       maxLoss: amount * lossMultiplier,
       maxProfit: amount * netWin,
@@ -275,29 +325,32 @@ export class RiskManager {
     tableId: string,
     shoeId: string,
     handId: string,
-    outcomes: { bankerPair: boolean; playerPair: boolean } | undefined,
-    profile: TableProfile,
+    settlement: {
+      outcomes?: { bankerPair: boolean; playerPair: boolean };
+      playerCards?: readonly { rank: string }[];
+      bankerCards?: readonly { rank: string }[];
+    } | { bankerPair: boolean; playerPair: boolean } | undefined,
+    _profile?: TableProfile,
   ): RiskReservation[] {
     this.rollDayIfNeeded();
     const matches = this.snapshot().filter(
-      r => holdsRiskExposure(r.status) && r.tableId === tableId && r.shoeId === shoeId && r.handId === handId,
+      r => r.status === 'RESERVED' && r.tableId === tableId && r.shoeId === shoeId && r.handId === handId,
     );
     if (matches.length === 0) return [];
 
+    const normalizedSettlement = normalizeSettlement(settlement);
     const nextState = structuredClone(this.state);
     const settled: RiskReservation[] = [];
     for (const r of matches) {
       const updated = structuredClone(r);
-      const won = outcomes?.[r.market];
-      if (won === undefined) {
+      const realizedPnl = realizedPnlForReservation(r, normalizedSettlement);
+      if (realizedPnl === undefined) {
         updated.status = 'UNKNOWN';
-        if (r.status === 'RESERVED') updated.releaseReason = 'hand-settled-without-outcome';
+        updated.releaseReason = 'hand-settled-without-authoritative-outcome';
       } else {
         updated.status = 'SETTLED';
         updated.settledAt = new Date().toISOString();
-        updated.realizedPnl = won
-          ? updated.amount * profile.odds[r.market].netWin
-          : -updated.amount * profile.odds[r.market].loss;
+        updated.realizedPnl = realizedPnl;
         nextState.reservedExposure = clampNonNegative(nextState.reservedExposure - updated.maxLoss);
         nextState.pendingExecutions = clampNonNegative(nextState.pendingExecutions - 1);
         nextState.executedToday += updated.amount;
@@ -316,7 +369,13 @@ export class RiskManager {
     }
     for (const updated of settled) {
       this.reservations.set(updated.reservationId, updated);
-      const key = activeReservationKey(updated.tableId, updated.shoeId, updated.handId, updated.market);
+      const key = activeReservationKey(
+        updated.tableId,
+        updated.shoeId,
+        updated.handId,
+        updated.market,
+        updated.executionSource,
+      );
       if (holdsRiskExposure(updated.status)) this.activeByKey.set(key, updated.reservationId);
       else this.activeByKey.delete(key);
     }
@@ -349,7 +408,13 @@ export class RiskManager {
     }
     for (const updated of expired) {
       this.reservations.set(updated.reservationId, updated);
-      this.activeByKey.delete(activeReservationKey(updated.tableId, updated.shoeId, updated.handId, updated.market));
+      this.activeByKey.delete(activeReservationKey(
+        updated.tableId,
+        updated.shoeId,
+        updated.handId,
+        updated.market,
+        updated.executionSource,
+      ));
     }
     this.state = nextState;
     return expired;
@@ -372,9 +437,75 @@ export class RiskManager {
       });
     }
     this.reservations.set(updated.reservationId, updated);
-    const key = activeReservationKey(updated.tableId, updated.shoeId, updated.handId, updated.market);
+    const key = activeReservationKey(
+      updated.tableId,
+      updated.shoeId,
+      updated.handId,
+      updated.market,
+      updated.executionSource,
+    );
     if (holdsRiskExposure(updated.status)) this.activeByKey.set(key, updated.reservationId);
     else this.activeByKey.delete(key);
     this.state = nextState;
   }
+}
+
+type NormalizedSettlement = {
+  readonly outcomes?: { bankerPair: boolean; playerPair: boolean };
+  readonly winner?: 'banker' | 'player' | 'tie';
+};
+
+function normalizeSettlement(
+  settlement: {
+    outcomes?: { bankerPair: boolean; playerPair: boolean };
+    playerCards?: readonly { rank: string }[];
+    bankerCards?: readonly { rank: string }[];
+  } | { bankerPair: boolean; playerPair: boolean } | undefined,
+): NormalizedSettlement {
+  if (settlement === undefined) return {};
+  if ('bankerPair' in settlement && 'playerPair' in settlement) {
+    return { outcomes: settlement };
+  }
+  return {
+    ...(settlement.outcomes === undefined ? {} : { outcomes: settlement.outcomes }),
+    ...(
+      settlement.playerCards === undefined || settlement.bankerCards === undefined
+        ? {}
+        : { winner: baccaratWinner(settlement.playerCards, settlement.bankerCards) }
+    ),
+  };
+}
+
+function realizedPnlForReservation(
+  reservation: RiskReservation,
+  settlement: NormalizedSettlement,
+): number | undefined {
+  if (reservation.market === 'bankerPair' || reservation.market === 'playerPair') {
+    const won = settlement.outcomes?.[reservation.market];
+    return won === undefined ? undefined : won ? reservation.maxProfit : -reservation.maxLoss;
+  }
+  if (settlement.winner === undefined) return undefined;
+  if (settlement.winner === 'tie') return 0;
+  return settlement.winner === reservation.market ? reservation.maxProfit : -reservation.maxLoss;
+}
+
+function baccaratWinner(
+  playerCards: readonly { rank: string }[],
+  bankerCards: readonly { rank: string }[],
+): 'banker' | 'player' | 'tie' {
+  const player = baccaratScore(playerCards);
+  const banker = baccaratScore(bankerCards);
+  if (player === banker) return 'tie';
+  return banker > player ? 'banker' : 'player';
+}
+
+function baccaratScore(cards: readonly { rank: string }[]): number {
+  return cards.reduce((sum, card) => sum + baccaratCardValue(card.rank), 0) % 10;
+}
+
+function baccaratCardValue(rank: string): number {
+  if (rank === 'A') return 1;
+  if (rank === '10' || rank === 'J' || rank === 'Q' || rank === 'K') return 0;
+  const value = Number(rank);
+  return Number.isInteger(value) && value >= 2 && value <= 9 ? value : 0;
 }

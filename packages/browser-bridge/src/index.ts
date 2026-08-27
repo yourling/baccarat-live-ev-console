@@ -1,4 +1,5 @@
 export * from './protocol.js';
+export * from './identity.js';
 export * from './server.js';
 export * from './evolution.js';
 export * from './mstrom-protocol.js';

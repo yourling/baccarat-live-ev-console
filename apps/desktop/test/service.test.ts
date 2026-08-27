@@ -100,6 +100,34 @@ async function selectMonitorTable(service: DesktopConsoleService, tableId: strin
   await service.updateMonitorTableIds([tableId]);
 }
 
+function freshLiveFeed(tableId: string): TableExport {
+  return {
+    tableId,
+    start: async () => undefined,
+    stop: async () => undefined,
+    flush: async () => undefined,
+    keepAlive: async () => ({ ok: true, latencyMs: 10 }),
+    health: () => ({
+      tableId,
+      state: 'CONNECTED',
+      lastAckedSeq: 1,
+      lastEmittedSeq: 1,
+      bufferDepth: 0,
+      reconnectCount: 0,
+      lastObservationAt: new Date().toISOString(),
+      stalenessMs: 10,
+    }),
+  };
+}
+
+function authenticateLiveBridge(bridge: BrowserBridgeServer): void {
+  vi.spyOn(bridge, 'getExtensionStatus').mockReturnValue({
+    connectionCount: 1,
+    authenticated: true,
+    lastSeenAt: '2026-08-27T01:00:00.000Z',
+  });
+}
+
 function installFakeBridge(service: DesktopConsoleService, receipt: BetReceipt) {
   const bridge = new BrowserBridgeServer();
   const liveGateCalls: boolean[] = [];
@@ -107,8 +135,14 @@ function installFakeBridge(service: DesktopConsoleService, receipt: BetReceipt) 
     liveGateCalls.push(enabled);
   });
   const requestBet = vi.spyOn(bridge, 'requestBet').mockResolvedValue(receipt);
+  const liveReadiness = vi.spyOn(
+    service as unknown as {
+      liveTableReasons: (tableId: string, approved?: boolean) => string[];
+    },
+    'liveTableReasons',
+  ).mockReturnValue([]);
   service['browserBridge'] = bridge;
-  return { bridge, liveGateCalls, setLiveBetEnabled, requestBet };
+  return { bridge, liveGateCalls, setLiveBetEnabled, requestBet, liveReadiness };
 }
 
 function monitorShoeEvent(
@@ -303,7 +337,7 @@ describe('desktop console demo sessions', () => {
         sourceSeq: 4,
         source: 'room-monitor',
         schemaVersion: EVENT_SCHEMA_VERSION,
-        continuityProof: 'd055-restored-proof',
+        continuityProof: `cursor-v1:${'c'.repeat(64)}`,
       });
 
       expect(service.snapshot().snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
@@ -402,13 +436,15 @@ describe('desktop console demo sessions', () => {
     const bridge = new BrowserBridgeServer();
     const requestBet = vi.spyOn(bridge, 'requestBet').mockResolvedValue(null);
     vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    authenticateLiveBridge(bridge);
     service['browserBridge'] = bridge;
 
     try {
       await service.updateMonitorTableIds(['D055']);
       service['orchestrator'].registerTable(defaultProfile('D055'), 'shadow', 20);
-      await service.setExecutionMode('D055', 'live');
+      service['liveFeeds'].set('D055', freshLiveFeed('D055'));
       await service.injectEvent(monitorShoeEvent('D055', 'd055-global-stop-execution-shoe', 'physical-shoe'));
+      await service.setExecutionMode('D055', 'live');
       const actor = service['orchestrator'].getActor('D055');
       if (!actor) throw new Error('global-stop execution test actor was not registered');
       actor.updateConfiguration({ ...actor.getProfile(), minEV: -10 }, 20);
@@ -443,7 +479,49 @@ describe('desktop console demo sessions', () => {
     }
   });
 
-  it('starts keepalive before a blocked live pair execution completes', async () => {
+  it.each(['shadow', 'simulated'] as const)(
+    'blocks automatic pair execution after a global stop in %s mode',
+    async executionMode => {
+      const service = new DesktopConsoleService(':memory:');
+      try {
+        await service.updateMonitorTableIds(['D055']);
+        service['orchestrator'].registerTable(defaultProfile('D055'), executionMode, 20);
+        await service.injectEvent(monitorShoeEvent('D055', `d055-${executionMode}-stop-shoe`, 'physical-shoe'));
+        const actor = service['orchestrator'].getActor('D055');
+        if (!actor) throw new Error(`${executionMode} global-stop test actor was not registered`);
+        actor.updateConfiguration({ ...actor.getProfile(), minEV: -10 }, 20);
+        await service.setAutomationEnabled(true);
+        await service.setAutomationEnabled(false);
+
+        await service.injectEvent({
+          type: 'autoArmChanged',
+          eventId: `d055-${executionMode}-rearmed-after-global-stop`,
+          tableId: 'D055',
+          timestamp: '2026-08-23T11:00:01.000Z',
+          sourceSeq: 2,
+          source: 'operator',
+          schemaVersion: EVENT_SCHEMA_VERSION,
+          shoeId: 'monitor-session-D055',
+          armed: true,
+        });
+        await service.injectEvent({
+          ...openedPlatformRound('D055', `d055-${executionMode}-window-after-global-stop`, `GD055-${executionMode}-global-stop`),
+          sourceSeq: 3,
+        });
+
+        expect(service.snapshot().reservations).toEqual([]);
+        expect(service.snapshot().receipts).toEqual([]);
+        expect(service.snapshot().decisions).toContainEqual(expect.objectContaining({
+          tableId: 'D055',
+          reason: expect.stringContaining('global-automation-disabled'),
+        }));
+      } finally {
+        await service.close();
+      }
+    },
+  );
+
+  it('does not overlap an automatic pair execution with a keepalive wager', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();
     let releasePair: () => void = () => undefined;
@@ -473,13 +551,15 @@ describe('desktop console demo sessions', () => {
         createdAt: '2026-08-23T11:00:02.000Z',
       }));
     vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    authenticateLiveBridge(bridge);
     service['browserBridge'] = bridge;
 
     try {
       await service.updateMonitorTableIds(['D055']);
       service['orchestrator'].registerTable(defaultProfile('D055'), 'shadow', 20);
-      await service.setExecutionMode('D055', 'live');
+      service['liveFeeds'].set('D055', freshLiveFeed('D055'));
       await service.injectEvent(monitorShoeEvent('D055', 'd055-overlap-shoe', 'physical-shoe'));
+      await service.setExecutionMode('D055', 'live');
       const actor = service['orchestrator'].getActor('D055');
       if (!actor) throw new Error('overlap test actor was not registered');
       actor.updateConfiguration({ ...actor.getProfile(), minEV: -10 }, 20);
@@ -491,13 +571,11 @@ describe('desktop console demo sessions', () => {
       });
       await pairStarted;
 
-      expect(requestOperationalWager).toHaveBeenCalledWith(expect.objectContaining({
-        wager: expect.objectContaining({ source: 'keepalive', market: 'banker' }),
-      }));
-      expect(requestBet).toHaveBeenCalledTimes(1);
-
       releasePair();
       await opening;
+
+      expect(requestOperationalWager).not.toHaveBeenCalled();
+      expect(requestBet).toHaveBeenCalledTimes(1);
     } finally {
       await service.close();
     }
@@ -683,6 +761,8 @@ describe('desktop console demo sessions', () => {
         lastEmittedSeq: 0,
         bufferDepth: 0,
         reconnectCount: 0,
+        lastObservationAt: new Date().toISOString(),
+        stalenessMs: 10,
       }),
     } satisfies TableExport;
     const discoverRooms = vi.spyOn(BrowserBridgeServer.prototype, 'discoverRooms').mockResolvedValue([{
@@ -691,6 +771,7 @@ describe('desktop console demo sessions', () => {
     }]);
     const openTable = vi.spyOn(BrowserBridgeServer.prototype, 'openTable').mockReturnValue(feed);
     const setLiveBetEnabled = vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    authenticateLiveBridge(bridge);
     service['browserBridge'] = bridge;
 
     try {
@@ -699,11 +780,11 @@ describe('desktop console demo sessions', () => {
       const actor = service['orchestrator'].getActor('D055');
       if (!actor) throw new Error('fail-closed test actor was not registered');
 
-      await service.setExecutionMode('D055', 'live');
       await service.injectEvent({
         ...monitorShoeEvent('D055', 'd055-fail-closed-shoe', 'physical-shoe'),
         sourceSeq: 2,
       });
+      await service.setExecutionMode('D055', 'live');
       await service.setAutomationEnabled(true);
       await service.setAutoBet('D055', true, 'monitor-session-D055');
 
@@ -755,6 +836,8 @@ describe('desktop console demo sessions', () => {
         lastEmittedSeq: 0,
         bufferDepth: 0,
         reconnectCount: 0,
+        lastObservationAt: new Date().toISOString(),
+        stalenessMs: 10,
       }),
     } satisfies TableExport;
     const discoverRooms = vi.spyOn(BrowserBridgeServer.prototype, 'discoverRooms').mockResolvedValue([{
@@ -763,6 +846,7 @@ describe('desktop console demo sessions', () => {
     }]);
     const openTable = vi.spyOn(BrowserBridgeServer.prototype, 'openTable').mockReturnValue(feed);
     const setLiveBetEnabled = vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    authenticateLiveBridge(bridge);
     service['browserBridge'] = bridge;
 
     try {
@@ -771,11 +855,11 @@ describe('desktop console demo sessions', () => {
       const actor = service['orchestrator'].getActor('D055');
       if (!actor) throw new Error('hanging-feed test actor was not registered');
 
-      await service.setExecutionMode('D055', 'live');
       await service.injectEvent({
         ...monitorShoeEvent('D055', 'd055-hanging-feed-shoe', 'physical-shoe'),
         sourceSeq: 2,
       });
+      await service.setExecutionMode('D055', 'live');
       await service.setAutomationEnabled(true);
       await service.setAutoBet('D055', true, 'monitor-session-D055');
 
@@ -827,6 +911,8 @@ describe('desktop console demo sessions', () => {
         lastEmittedSeq: 0,
         bufferDepth: 0,
         reconnectCount: 0,
+        lastObservationAt: new Date().toISOString(),
+        stalenessMs: 10,
       }),
     } satisfies TableExport;
     const discoverRooms = vi.spyOn(BrowserBridgeServer.prototype, 'discoverRooms').mockResolvedValue([{
@@ -835,6 +921,7 @@ describe('desktop console demo sessions', () => {
     }]);
     const openTable = vi.spyOn(BrowserBridgeServer.prototype, 'openTable').mockReturnValue(feed);
     const setLiveBetEnabled = vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    authenticateLiveBridge(bridge);
     service['browserBridge'] = bridge;
 
     try {
@@ -843,11 +930,11 @@ describe('desktop console demo sessions', () => {
       const actor = service['orchestrator'].getActor('D055');
       if (!actor) throw new Error('stop monitor test actor was not registered');
 
-      await service.setExecutionMode('D055', 'live');
       await service.injectEvent({
         ...monitorShoeEvent('D055', 'd055-stop-monitor-shoe', 'physical-shoe'),
         sourceSeq: 2,
       });
+      await service.setExecutionMode('D055', 'live');
       await service.setAutomationEnabled(true);
       await service.setAutoBet('D055', true, 'monitor-session-D055');
 
@@ -936,6 +1023,7 @@ describe('desktop console demo sessions', () => {
   it('can inject two demo sessions into the same ledger', async () => {
     const service = new DesktopConsoleService(':memory:');
     try {
+      await service.setAutomationEnabled(true);
       const first = await service.runDemo(42);
       expect(first.receipts.length).toBeGreaterThan(0);
       const light = service.snapshot({ includeHistory: false });
@@ -1053,9 +1141,12 @@ describe('desktop console demo sessions', () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();
     const setLiveBetEnabled = vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    authenticateLiveBridge(bridge);
     try {
       service['browserBridge'] = bridge;
-      service['orchestrator'].registerTable(defaultProfile('D055'), 'shadow', 100);
+      await service.updateMonitorTableIds(['D055']);
+      service['liveFeeds'].set('D055', freshLiveFeed('D055'));
+      await service.injectEvent(monitorShoeEvent('D055', 'd055-live-gate-shoe', 'physical-shoe'));
 
       // When: the operator switches this table to live and then back to shadow.
       const live = await service.setExecutionMode('D055', 'live');
@@ -1241,6 +1332,25 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('blocks one-shot live bets when runtime readiness is lost', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const command = oneShotCommand();
+    await selectMonitorTable(service, command.tableId);
+    const receipt = oneShotReceipt(command);
+    installOneShotActor(service, command, receipt);
+    const { liveGateCalls, requestBet, liveReadiness } = installFakeBridge(service, receipt);
+    liveReadiness.mockReturnValue(['table-feed-stale']);
+
+    try {
+      await expect(service.executeOneShotLiveBet(command)).rejects.toThrow(/table-feed-stale/i);
+      expect(liveGateCalls).toEqual([]);
+      expect(requestBet).not.toHaveBeenCalled();
+    } finally {
+      liveReadiness.mockRestore();
+      await service.close();
+    }
+  });
+
   it('rejects one-shot live bets while any registered table has persistent live mode', async () => {
     const service = new DesktopConsoleService(':memory:');
     const command = oneShotCommand();
@@ -1369,7 +1479,7 @@ describe('desktop console demo sessions', () => {
         reservationId: acceptedReceipt.reservationId,
       };
     });
-    const { liveGateCalls } = installFakeBridge(service, receipt);
+    const { liveGateCalls, liveReadiness } = installFakeBridge(service, receipt);
     const actor = service['orchestrator'].getActor(command.tableId);
     if (!actor) throw new Error('one-shot test actor was not registered');
     const setAutoBetCall = vi.spyOn(actor, 'setAutoBet');
@@ -1395,6 +1505,7 @@ describe('desktop console demo sessions', () => {
       expect(liveGateCalls).toEqual([true, false, true]);
       expect(service.snapshot().snapshot.tables.D055?.executionMode).toBe('live');
     } finally {
+      liveReadiness.mockRestore();
       await service.close();
     }
   });
@@ -1737,7 +1848,7 @@ describe('desktop console demo sessions', () => {
       expect(start).toHaveBeenCalledTimes(1);
       expect(openTable).toHaveBeenCalledTimes(1);
 
-      sink.onRestored('D055', 'synthetic continuity proof');
+      sink.onRestored('D055', `cursor-v1:${'d'.repeat(64)}`);
       await new Promise<void>(resolve => setImmediate(resolve));
       await new Promise<void>(resolve => setImmediate(resolve));
       expect(service.snapshot().snapshot.tables.D055?.projection.connectionStatus).toBe('CONNECTED');
@@ -1896,6 +2007,7 @@ describe('desktop console demo sessions', () => {
   it('does not mix non-monitor historical receipts into cumulative income points', async () => {
     const service = new DesktopConsoleService(':memory:');
     try {
+      await service.setAutomationEnabled(true);
       const historical = await service.runDemo(42);
       expect(historical.receipts.some(receipt => receipt.tableId !== 'D055')).toBe(true);
 

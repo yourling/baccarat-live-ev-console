@@ -3,6 +3,7 @@ import {
   assertValidCard,
   assertValidEventEnvelope,
   assertValidTableProfile,
+  isValidContinuityProof,
   type BurnModel,
   type Card,
   type CardRank,
@@ -311,7 +312,7 @@ export function applyEvent(
       break;
     }
     case 'connectionRestored': {
-      if (event.continuityProof) {
+      if (isValidContinuityProof(event.continuityProof)) {
         updated.connectionStatus = 'CONNECTED';
         if (updated.status === 'RESYNCING') {
           updated.status = updated.redCardSeen ? 'RED_CARD_WIND_DOWN' : 'TRACKING';

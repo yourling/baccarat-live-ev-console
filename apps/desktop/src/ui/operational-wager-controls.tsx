@@ -17,6 +17,7 @@ type OperationalWagerStatus = 'ACCEPTED' | 'REJECTED' | 'UNKNOWN';
 
 export function OperationalWagerControls(props: {
   readonly actor: TableActorSnapshot;
+  readonly runtimeBlockedReason?: string;
   readonly onSnapshot: (snapshot: Awaited<ReturnType<NonNullable<Window['desktop']>['snapshot']>>) => void;
 }) {
   const [amount, setAmount] = useState('20');
@@ -26,7 +27,7 @@ export function OperationalWagerControls(props: {
   const { confirm, dialog } = useConfirmationDialog();
   const parsedAmount = Number(amount);
   const amountIsValid = Number.isFinite(parsedAmount) && parsedAmount > 0;
-  const gateReason = operationalWagerGateReason(props.actor);
+  const gateReason = props.runtimeBlockedReason ?? operationalWagerGateReason(props.actor);
   const blockedReason = gateReason ?? (amountIsValid ? null : '金额必须是大于 0 的数字');
 
   async function submit(market: OperationalWagerMarket): Promise<void> {

@@ -25,11 +25,17 @@ describe('extension background live bet routing', () => {
       expect.anything(),
       expect.objectContaining({ kind: 'executeBet' }),
     );
-    expect(sentMessages(harness.socket).filter(message => message['kind'] === 'betResult')).toEqual([{
+    const betResults = sentMessages(harness.socket)
+      .filter(message => message['kind'] === 'betResult');
+    expect(betResults).toHaveLength(1);
+    expect(betResults[0]).toEqual(expect.objectContaining({
       kind: 'betResult',
       requestId: 'request-1',
       receipt: harness.receipt,
-    }]);
+      bridgeSessionId: expect.stringMatching(/^bridge-/),
+      bridgeSeq: expect.any(Number),
+    }));
+    expect(Number.isSafeInteger(betResults[0]?.['bridgeSeq'])).toBe(true);
   });
 
   it('fails closed when more than one exact Dafabet popup tab exists', async () => {

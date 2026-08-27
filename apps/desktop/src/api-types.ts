@@ -159,6 +159,55 @@ export interface DesktopAutomationState {
   readonly enabled: boolean;
 }
 
+export type DesktopRuntimeIncidentCode =
+  | 'bridge-auth-failed'
+  | 'bridge-disconnected'
+  | 'continuity-invalidated'
+  | 'table-feed-stale'
+  | 'session-recovery-exhausted'
+  | 'unknown-execution'
+  | 'settlement-gap'
+  | 'scheduler-failure'
+  | 'monitor-failure';
+
+export interface DesktopRuntimeIncident {
+  readonly incidentId: string;
+  readonly code: DesktopRuntimeIncidentCode;
+  readonly severity: 'degraded' | 'blocked';
+  readonly message: string;
+  readonly tableId?: string;
+  readonly firstOccurredAt: string;
+  readonly lastOccurredAt: string;
+  readonly occurrences: number;
+  readonly active: boolean;
+  readonly resolvedAt?: string;
+}
+
+export interface DesktopRuntimeTableState {
+  readonly approved: boolean;
+  readonly active: boolean;
+  readonly reasons: readonly string[];
+  readonly feedState?: 'CONNECTED' | 'RESYNCING' | 'DISCONNECTED';
+  readonly feedStalenessMs?: number;
+}
+
+export interface DesktopRuntimeState {
+  readonly status: 'healthy' | 'degraded' | 'blocked';
+  readonly executionReady: boolean;
+  readonly monitorActive: boolean;
+  readonly approvedLiveTableIds: readonly string[];
+  readonly activeLiveTableIds: readonly string[];
+  readonly bridge: {
+    readonly running: boolean;
+    readonly connectionCount: number;
+    readonly authenticated: boolean;
+    readonly lastSeenAt?: string;
+  };
+  readonly reasons: readonly string[];
+  readonly tables: Readonly<Record<string, DesktopRuntimeTableState>>;
+  readonly incidents: readonly DesktopRuntimeIncident[];
+}
+
 export function parseDesktopOperationalWagerCommand(value: unknown): DesktopOperationalWagerCommand {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new TypeError('operational wager command must be an object');
@@ -245,6 +294,7 @@ export interface DesktopConsoleSnapshot {
   recordCounts: DesktopRecordCounts;
   keepalive: DesktopKeepaliveState;
   automation: DesktopAutomationState;
+  runtime: DesktopRuntimeState;
   operationalWagers: readonly OperationalWagerRecord[];
   events: NormalizedEvent[];
   decisions: DecisionSnapshot[];

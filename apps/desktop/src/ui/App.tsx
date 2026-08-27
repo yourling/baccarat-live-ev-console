@@ -7,6 +7,7 @@ import type {
   CardRank,
   ConnectionStatus,
   DecisionSnapshot,
+  ExecutionMarket,
   NormalizedEvent,
   RiskLimits,
   RiskReservation,
@@ -112,7 +113,9 @@ interface RiskSettingsDraft {
 
 const CARD_RANKS: CardRank[] = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
 
-const MARKET_LABELS: Record<BettingMarket, string> = {
+const MARKET_LABELS: Record<ExecutionMarket, string> = {
+  banker: '庄',
+  player: '闲',
   bankerPair: '庄对',
   playerPair: '闲对',
 };
@@ -547,7 +550,8 @@ export function App() {
   }, [page, activePageCount]);
 
   const risk = snapshot?.snapshot.riskState;
-  const alertCount = tables.reduce((total, table) => total + tableAlerts(table).length, 0);
+  const runtimeAlertCount = snapshot?.runtime.incidents.filter(incident => incident.active).length ?? 0;
+  const alertCount = tables.reduce((total, table) => total + tableAlerts(table).length, runtimeAlertCount);
   const eligibleCount = new Set(
     (snapshot?.decisions ?? [])
       .filter(isCurrentlyEligible)
@@ -607,9 +611,7 @@ export function App() {
   async function toggleAutomation() {
     if (!window.desktop) return;
     const enabled = !(snapshot?.automation.enabled ?? false);
-    const liveTableIds = tables
-      .filter(table => table.executionMode === 'live')
-      .map(table => table.tableId);
+    const liveTableIds = snapshot?.runtime.approvedLiveTableIds ?? [];
     if (enabled && liveTableIds.length > 0) {
       const confirmed = await confirm({
         title: '开启实盘自动投注',
@@ -737,6 +739,12 @@ export function App() {
       )}
       {error && <div className="notice notice--danger">{error}</div>}
       {snapshot?.demoError && <div className="notice notice--danger">运行提示：{snapshot.demoError}</div>}
+      {snapshot && snapshot.runtime.status !== 'healthy' && (
+        <div className={cx('notice', snapshot.runtime.status === 'blocked' ? 'notice--danger' : 'notice--warning')}>
+          {snapshot.runtime.status === 'blocked' ? '无人值守执行已阻断' : '无人值守运行已降级'}
+          {snapshot.runtime.reasons.length > 0 ? `：${snapshot.runtime.reasons.map(runtimeReasonLabel).join('、')}` : ''}
+        </div>
+      )}
 
       <section className="summary-bar" aria-label="运行摘要">
         <SummaryItem label="监控牌桌" value={String(tables.length)} />
@@ -819,6 +827,7 @@ export function App() {
                   key={table.tableId}
                   actor={table}
                   events={snapshot?.events ?? []}
+                  runtime={snapshot?.runtime.tables[table.tableId]}
                   onSnapshot={setSnapshot}
                   onOpenSettings={() => setSelectedMonitorTableId(table.tableId)}
                   dragging={draggedTableId === table.tableId}
@@ -856,6 +865,7 @@ export function App() {
       {selectedMonitorTable && (
         <MonitorTableSettingsDialog
           actor={selectedMonitorTable}
+          liveApproved={snapshot?.runtime.approvedLiveTableIds.includes(selectedMonitorTable.tableId) ?? false}
           riskLimits={snapshot?.snapshot.riskLimits}
           liveModeConfirmationOpen={pendingLiveExecutionTableId === selectedMonitorTable.tableId}
           onClose={() => {
@@ -907,6 +917,7 @@ export function App() {
 function TableMonitorRow(props: {
   actor: TableActorSnapshot;
   events: NormalizedEvent[];
+  runtime?: DesktopConsoleSnapshot['runtime']['tables'][string];
   onSnapshot: (snapshot: DesktopConsoleSnapshot) => void;
   onOpenSettings: () => void;
   dragging: boolean;
@@ -988,13 +999,20 @@ function TableMonitorRow(props: {
           <div><span>连接</span><strong>{CONNECTION_LABELS[projection.connectionStatus]}</strong></div>
         </div>
       </div>
-      <OperationalWagerControls actor={actor} onSnapshot={props.onSnapshot} />
+      <OperationalWagerControls
+        actor={actor}
+        runtimeBlockedReason={props.runtime?.approved && !props.runtime.active
+          ? `无人值守执行已阻断：${props.runtime.reasons.map(runtimeReasonLabel).join('、')}`
+          : undefined}
+        onSnapshot={props.onSnapshot}
+      />
     </article>
   );
 }
 
 function MonitorTableSettingsDialog(props: {
   actor: TableActorSnapshot;
+  liveApproved: boolean;
   riskLimits?: RiskLimits;
   liveModeConfirmationOpen: boolean;
   onClose: () => void;
@@ -1033,7 +1051,7 @@ function MonitorTableSettingsDialog(props: {
             <label>
               <span>执行模式</span>
               <select
-                value={actor.executionMode === 'live' ? 'live' : 'shadow'}
+                value={props.liveApproved ? 'live' : 'shadow'}
                 disabled={actor.executionMode === 'simulated'}
                 onChange={event => {
                   const mode = event.target.value;
@@ -1711,7 +1729,11 @@ function ledgerResult(reservation: RiskReservation, receipt: ReceiptRow | undefi
   }
   if (receipt?.receipt.status === 'REJECTED') return { label: '下注被拒', tone: 'danger' };
   if (reservation.status === 'RELEASED' || reservation.status === 'EXPIRED') return { label: '未执行', tone: 'neutral' };
-  const outcome = outcomeOverride ?? settledOutcome(events, reservation.tableId, reservation.shoeId, reservation.handId, reservation.market);
+  const outcome = outcomeOverride ?? (
+    reservation.market === 'bankerPair' || reservation.market === 'playerPair'
+      ? settledOutcome(events, reservation.tableId, reservation.shoeId, reservation.handId, reservation.market)
+      : undefined
+  );
   if (outcome === true) return { label: '命中待结算', tone: 'good' };
   if (outcome === false) return { label: '未中待结算', tone: 'danger' };
   return { label: '待结算', tone: 'warning' };
@@ -1886,6 +1908,23 @@ function tableAlerts(actor: TableActorSnapshot): string[] {
   if (projection.autoBetStatus === 'NEEDS_MANUAL_RECOVERY') alerts.push('需要人工恢复');
   if (projection.status === 'INVALIDATED') alerts.push('牌靴作废');
   return alerts;
+}
+
+function runtimeReasonLabel(reason: string): string {
+  const labels: Record<string, string> = {
+    'live-not-approved': '未批准实盘',
+    'bridge-not-running': '浏览器桥未运行',
+    'bridge-not-authenticated': '浏览器扩展身份未认证',
+    'table-feed-missing': '牌桌数据流未连接',
+    'table-feed-disconnected': '牌桌数据流已断开',
+    'table-feed-stale': '牌桌数据已过期',
+    'physical-shoe-baseline-unknown': '实体牌靴基线未知',
+    'table-connection-not-restored': '牌桌连续性未恢复',
+    'shoe-sealed': '当前牌靴已封存',
+    'unknown-execution-pending': '存在结果未知的资金敞口',
+    'settlement-gap': '存在跨局未结算预留',
+  };
+  return labels[reason] ?? reason;
 }
 
 function decisionChoiceLabel(decision: DecisionHandRecord): string {
