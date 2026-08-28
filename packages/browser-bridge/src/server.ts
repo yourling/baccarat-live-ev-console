@@ -71,6 +71,7 @@ export type BrowserBridgeRuntimeEvent =
   | { readonly kind: 'extension-authenticated'; readonly sessionId: string; readonly timestamp: string }
   | { readonly kind: 'extension-disconnected'; readonly reason: string; readonly timestamp: string }
   | { readonly kind: 'continuity-invalidated'; readonly reason: string; readonly timestamp: string }
+  | { readonly kind: 'execution-gate-revoked'; readonly reason: string; readonly timestamp: string }
   | { readonly kind: 'table-disconnected'; readonly tableId: string; readonly reason: string; readonly timestamp: string }
   | { readonly kind: 'session-recovery-exhausted'; readonly detail?: string; readonly timestamp: string }
   | { readonly kind: 'session-recovered'; readonly timestamp: string };
@@ -313,6 +314,7 @@ class BridgeTableExport implements TableExport {
   private cursor: TableCursor;
   private pending: NormalizedEvent[] = [];
   private processing = false;
+  private drainRequested = false;
   private error?: Error;
   private lastEmittedSeq = 0;
   private reconnectCount = 0;
@@ -467,7 +469,10 @@ class BridgeTableExport implements TableExport {
   }
 
   private async drain(): Promise<void> {
-    if (this.processing) return;
+    if (this.processing) {
+      this.drainRequested = true;
+      return;
+    }
     this.processing = true;
     try {
       if (this.paused && !(await this.restoreFromPending())) return;
@@ -511,6 +516,10 @@ class BridgeTableExport implements TableExport {
     } finally {
       this.processing = false;
       this.resolveFlushWaiters();
+      if (this.drainRequested) {
+        this.drainRequested = false;
+        void this.drain();
+      }
     }
   }
 
@@ -575,6 +584,10 @@ export class BrowserBridgeServer implements RoomMonitor {
   private readonly mstromRuntimeParsers = new Map<string, MstromRuntimeParser>();
   private readonly parsedSourceSeqByTable = new Map<string, number>();
   private readonly parsedEventIds = new Set<string>();
+  private readonly protocolObservationStartedAt = new Map<string, number>();
+  private readonly protocolLastObservedAt = new Map<string, number>();
+  private readonly runtimeStateLastObservedAt = new Map<string, number>();
+  private readonly runtimeStateStaleTableIds = new Set<string>();
   private configuredSelectedTables: ReadonlySet<string> | undefined;
   private runtimeSelectedTables: ReadonlySet<string> | undefined;
   private effectiveSelectedTables: ReadonlySet<string> | undefined;
@@ -775,6 +788,10 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.mstromRuntimeParsers.clear();
     this.parsedSourceSeqByTable.clear();
     this.parsedEventIds.clear();
+    this.protocolObservationStartedAt.clear();
+    this.protocolLastObservedAt.clear();
+    this.runtimeStateLastObservedAt.clear();
+    this.runtimeStateStaleTableIds.clear();
     for (const [key, exportInstance] of this.exports) {
       if (!key.startsWith('dafabet-live::')) continue;
       void exportInstance.stop();
@@ -1044,10 +1061,11 @@ export class BrowserBridgeServer implements RoomMonitor {
         } else if (message.source === 'baccarat-bridge-runtime-selection') {
           this.applyRuntimeSelection(message.data);
         } else if (message.source === 'baccarat-bridge-runtime-state') {
-          const tableId = runtimeStateTableId(message.data);
-          if (tableId !== null && this.isTableSelected(tableId)) {
-            this.noteTableObservation(tableId);
-            this.ingestParsedEvents(this.getMstromRuntimeParser(tableId).parse(message.data));
+          const runtimeState = runtimeStateObservation(message.data);
+          if (runtimeState !== undefined && this.isTableSelected(runtimeState.tableId)) {
+            this.noteRuntimeStateObservation(runtimeState.tableId);
+            this.noteTableObservation(runtimeState.tableId);
+            this.ingestParsedEvents(this.getMstromRuntimeParser(runtimeState.tableId).parse(message.data));
           }
         } else if (
           message.source === 'baccarat-bridge-ws'
@@ -1057,6 +1075,8 @@ export class BrowserBridgeServer implements RoomMonitor {
           const bytes = Uint8Array.from(Buffer.from(message.data, 'base64'));
           const parsed = parseMstromFrame(bytes);
           if (parsed.ok && this.isTableSelected(parsed.frame.tableId)) {
+            this.noteProtocolObservation(parsed.frame.tableId);
+            if (this.runtimeStateStaleTableIds.has(parsed.frame.tableId)) break;
             this.noteTableObservation(parsed.frame.tableId);
             this.ingestParsedEvents(
               this.getMstromProtocolParser(parsed.frame.tableId).ingest(parsed.frame, new Date().toISOString()),
@@ -1070,7 +1090,16 @@ export class BrowserBridgeServer implements RoomMonitor {
         break;
       case 'sessionAction':
         console.log('[session-action]', JSON.stringify(redactedLifecycleMessage(message)));
-        if (message.action === 'recovery-failed') {
+        if (
+          message.action === 'command-executed'
+          && message.detail?.startsWith('reloadGameTabs:')
+        ) {
+          this.emitRuntimeEvent({
+            kind: 'execution-gate-revoked',
+            reason: 'game-tabs-reloaded',
+            timestamp: message.timestamp,
+          });
+        } else if (message.action === 'recovery-failed') {
           this.emitRuntimeEvent({
             kind: 'session-recovery-exhausted',
             ...(message.detail === undefined ? {} : { detail: message.detail }),
@@ -1159,6 +1188,10 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.mstromProtocolParsers.delete(tableId);
     this.mstromRuntimeParsers.delete(tableId);
     this.parsedSourceSeqByTable.delete(tableId);
+    this.protocolObservationStartedAt.delete(tableId);
+    this.protocolLastObservedAt.delete(tableId);
+    this.runtimeStateLastObservedAt.delete(tableId);
+    this.runtimeStateStaleTableIds.delete(tableId);
   }
 
   private getMstromShoeSession(tableId: string): MstromShoeSessionRegistry {
@@ -1322,6 +1355,50 @@ export class BrowserBridgeServer implements RoomMonitor {
     }
   }
 
+  private noteProtocolObservation(tableId: string, observedAt = Date.now()): void {
+    if (!this.protocolObservationStartedAt.has(tableId)) {
+      this.protocolObservationStartedAt.set(tableId, observedAt);
+    }
+    this.protocolLastObservedAt.set(tableId, observedAt);
+  }
+
+  private noteRuntimeStateObservation(tableId: string, observedAt = Date.now()): void {
+    this.runtimeStateLastObservedAt.set(tableId, observedAt);
+    this.runtimeStateStaleTableIds.delete(tableId);
+  }
+
+  private checkRuntimeStateFreshness(now = Date.now()): void {
+    for (const [tableId, protocolLastObservedAt] of this.protocolLastObservedAt) {
+      if (!this.isTableSelected(tableId)) continue;
+      if (now - protocolLastObservedAt > this.tableStaleAfterMs) continue;
+      const runtimeLastObservedAt = this.runtimeStateLastObservedAt.get(tableId);
+      const runtimeObservationAge = runtimeLastObservedAt === undefined
+        ? now - (this.protocolObservationStartedAt.get(tableId) ?? now)
+        : now - runtimeLastObservedAt;
+      if (runtimeObservationAge <= this.tableStaleAfterMs) continue;
+      this.markRuntimeStateStale(tableId);
+    }
+  }
+
+  private markRuntimeStateStale(tableId: string): void {
+    if (this.runtimeStateStaleTableIds.has(tableId)) return;
+    this.runtimeStateStaleTableIds.add(tableId);
+    let exportFound = false;
+    for (const [key, exportInstance] of this.exports) {
+      if (!key.endsWith(`::${tableId}`)) continue;
+      exportFound = true;
+      exportInstance.handleDisconnect('table-feed-stale');
+    }
+    if (exportFound) return;
+    this.noteStaleTable(tableId);
+    this.emitRuntimeEvent({
+      kind: 'table-disconnected',
+      tableId,
+      reason: 'table-feed-stale',
+      timestamp: new Date().toISOString(),
+    });
+  }
+
   private clearStaleTable(tableId: string): void {
     if (!this.staleTableIds.delete(tableId) || this.staleTableIds.size > 0) return;
     this.clearStalePageReloadTimer();
@@ -1432,6 +1509,7 @@ export class BrowserBridgeServer implements RoomMonitor {
       for (const exportInstance of this.exports.values()) {
         exportInstance.checkFreshness(now);
       }
+      this.checkRuntimeStateFreshness(now);
     }, intervalMs);
     this.freshnessTimer.unref();
   }
@@ -1477,16 +1555,6 @@ export class BrowserBridgeServer implements RoomMonitor {
   }
 }
 
-function runtimeStateTableId(raw: string): string | null {
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== 'object' || parsed === null) return null;
-    const tableId = Reflect.get(parsed, 'tableId');
-    return typeof tableId === 'string' && tableId.length > 0 ? tableId : null;
-  } catch {
-    return null;
-  }
-}
 
 function isBetReceipt(value: BridgeExecutionReceipt): value is BetReceipt {
   return 'intentId' in value;

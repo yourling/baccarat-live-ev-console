@@ -77,6 +77,26 @@ function authenticateBridge(bridge: BrowserBridgeServer): void {
 }
 
 describe('DesktopConsoleService unattended runtime', () => {
+  it('keeps operational keepalive disabled after a browser recovery revokes the execution gate', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'baccarat-runtime-card-stale-'));
+    const service = new DesktopConsoleService(join(directory, 'console.sqlite'));
+    try {
+      await service.setAutomationEnabled(true);
+      service['handleBridgeRuntimeEvent']({
+        kind: 'execution-gate-revoked',
+        reason: 'game-tabs-reloaded',
+        timestamp: new Date().toISOString(),
+      });
+      await service['executionStateOperation'];
+
+      expect(service.snapshot().keepalive.enabled).toBe(false);
+      expect(service['persistentLiveGateEnabled']).toBe(false);
+    } finally {
+      await service.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('restores live approval fail closed, then resumes only after every runtime gate passes', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'baccarat-unattended-restart-'));
     const dbPath = join(directory, 'console.sqlite');

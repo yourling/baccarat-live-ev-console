@@ -300,7 +300,7 @@ describe('desktop console demo sessions', () => {
     }
   });
 
-  it('starts global automation immediately and arms pair EV after a verified shoe or restore', async () => {
+  it('starts global automation after verification but requires explicit re-enable after disconnect', async () => {
     const service = new DesktopConsoleService(':memory:');
     try {
       await service.updateMonitorTableIds(['D055']);
@@ -340,7 +340,13 @@ describe('desktop console demo sessions', () => {
         continuityProof: `cursor-v1:${'c'.repeat(64)}`,
       });
 
-      expect(service.snapshot().snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
+      const recovered = service.snapshot();
+      expect(recovered.keepalive.enabled).toBe(false);
+      expect(recovered.snapshot.tables.D055?.projection.autoBetStatus).toBe('DISARMED');
+
+      const restarted = await service.setAutomationEnabled(true);
+      expect(restarted.keepalive.enabled).toBe(true);
+      expect(restarted.snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
 
       const stopped = await service.setAutomationEnabled(false);
 
@@ -1841,15 +1847,27 @@ describe('desktop console demo sessions', () => {
       await service.updateMonitorTableIds(['D055']);
       await service.startLiveRoomMonitor(0);
       if (!sink?.onDisconnect || !sink.onRestored) throw new Error('table export sink was not registered');
+      await service.injectEvent(monitorShoeEvent('D055', 'disconnect-race-shoe', 'physical-shoe'));
+
+      const actor = service['orchestrator'].getActor('D055');
+      if (!actor) throw new Error('table actor was not registered');
+      await actor.setAutoBet(true);
 
       sink.onDisconnect('D055', 'synthetic disconnect');
-      await new Promise<void>(resolve => setImmediate(resolve));
+      await service['executionStateOperation'];
       await service.startLiveRoomMonitor(0);
       expect(start).toHaveBeenCalledTimes(1);
       expect(openTable).toHaveBeenCalledTimes(1);
+      expect(service['ledger'].listEvents('D055')).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'autoDisarmChanged' }),
+        expect.objectContaining({ type: 'connectionLost' }),
+      ]));
+      expect(service.snapshot().runtime.incidents).not.toContainEqual(expect.objectContaining({
+        code: 'monitor-failure',
+        active: true,
+      }));
 
-      sink.onRestored('D055', `cursor-v1:${'d'.repeat(64)}`);
-      await new Promise<void>(resolve => setImmediate(resolve));
+      await sink.onRestored('D055', `cursor-v1:${'d'.repeat(64)}`);
       await new Promise<void>(resolve => setImmediate(resolve));
       expect(service.snapshot().snapshot.tables.D055?.projection.connectionStatus).toBe('CONNECTED');
     } finally {

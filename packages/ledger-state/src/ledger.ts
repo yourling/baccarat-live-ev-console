@@ -401,6 +401,7 @@ const SCHEMA_VERSION = '4';
 // allow: SIZE_OK — SQLite schema, atomic persistence, and read projections share one transaction boundary.
 export class SqliteLedger {
   private db: Database.Database;
+  private readonly allocatedSourceSeqByTable = new Map<string, number>();
 
   constructor(dbPath: string = ':memory:') {
     if (dbPath !== ':memory:') {
@@ -1008,6 +1009,14 @@ export class SqliteLedger {
   nextSourceSeq(tableId: string): number {
     const row = this.db.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM events WHERE table_id = ?').get(tableId) as { next_seq: number };
     return row.next_seq;
+  }
+
+  allocateSourceSeq(tableId: string, minimum = 0): number {
+    const persistedNext = this.nextSourceSeq(tableId);
+    const allocatedNext = this.allocatedSourceSeqByTable.get(tableId) ?? persistedNext;
+    const next = Math.max(persistedNext, allocatedNext, minimum);
+    this.allocatedSourceSeqByTable.set(tableId, next + 1);
+    return next;
   }
 
   countEvents(tableId?: string): number {

@@ -752,7 +752,7 @@ async function handleRemoteCommand(name, tableIds = [], generation) {
     for (const tab of tabs) {
       if (!tab.id || !exactDafabetBaccaratPopup(tab.url)) continue;
       try {
-        await chrome.tabs.reload(tab.id);
+        await chrome.tabs.reload(tab.id, { bypassCache: true });
         reloaded += 1;
       } catch (_) {
         // A tab may close while recovery is being scheduled.

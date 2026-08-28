@@ -463,6 +463,15 @@ describe('ledger persistence and append safety', () => {
     led.close();
   });
 
+  it('atomically allocates unique sourceSeq values across event producers', () => {
+    const led = new SqliteLedger();
+    expect(led.allocateSourceSeq('t1')).toBe(1);
+    expect(led.allocateSourceSeq('t1', 1_000_000_000)).toBe(1_000_000_000);
+    expect(led.allocateSourceSeq('t1')).toBe(1_000_000_001);
+    expect(led.allocateSourceSeq('t2')).toBe(1);
+    led.close();
+  });
+
   it('allows identical shoe/hand/market receipts and reservations on different tables', () => {
     const led = new SqliteLedger();
     const now = new Date().toISOString();

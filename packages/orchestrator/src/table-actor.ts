@@ -617,7 +617,10 @@ export class TableActor {
   }
 
   private nextSyntheticSeq(): number {
-    const next = Math.max(SYNTHETIC_SEQ_BASE, this.ledger.nextSourceSeq(this.tableId), this.syntheticSeq);
+    const next = this.ledger.allocateSourceSeq(
+      this.tableId,
+      Math.max(SYNTHETIC_SEQ_BASE, this.syntheticSeq),
+    );
     this.syntheticSeq = next + 1;
     return next;
   }

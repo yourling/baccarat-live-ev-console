@@ -179,7 +179,6 @@ export class DesktopConsoleService {
   private demoStopRequested = false;
   private demoTask: Promise<void> | null = null;
   private demoError?: string;
-  private readonly monitorSourceSeq = new Map<string, number>();
   private browserBridge?: BrowserBridgeServer;
   private browserBridgePort = 0;
   private liveExecutionMode: ExecutionMode = 'shadow';
@@ -617,6 +616,7 @@ export class DesktopConsoleService {
           await this.reconcileUnattendedExecution();
           return;
         case 'extension-disconnected':
+          this.operationalWagers.disableKeepaliveImmediately();
           this.runtimeObservedTableIds.clear();
           this.ensureRuntimeIncident({
             code: 'bridge-disconnected',
@@ -626,6 +626,7 @@ export class DesktopConsoleService {
           await this.failCloseLiveExecution(this.liveApprovals.list());
           return;
         case 'continuity-invalidated':
+          this.operationalWagers.disableKeepaliveImmediately();
           this.runtimeObservedTableIds.clear();
           this.ensureRuntimeIncident({
             code: 'continuity-invalidated',
@@ -634,7 +635,13 @@ export class DesktopConsoleService {
           });
           await this.failCloseLiveExecution(this.liveApprovals.list());
           return;
+        case 'execution-gate-revoked':
+          this.operationalWagers.disableKeepaliveImmediately();
+          this.persistentLiveGateEnabled = false;
+          await this.failCloseLiveExecution(this.liveApprovals.list());
+          return;
         case 'table-disconnected':
+          this.operationalWagers.disableKeepaliveImmediately();
           this.runtimeObservedTableIds.delete(event.tableId);
           this.ensureRuntimeIncident({
             code: event.reason === 'table-feed-stale' ? 'table-feed-stale' : 'bridge-disconnected',
@@ -645,6 +652,7 @@ export class DesktopConsoleService {
           await this.failCloseLiveExecution([event.tableId]);
           return;
         case 'session-recovery-exhausted':
+          this.operationalWagers.disableKeepaliveImmediately();
           this.runtimeObservedTableIds.clear();
           this.ensureRuntimeIncident({
             code: 'session-recovery-exhausted',
@@ -665,11 +673,7 @@ export class DesktopConsoleService {
 
   /** 为监控层导出的源事件与连接事件分配不冲突的账本 sourceSeq。 */
   private nextMonitorSourceSeq(tableId: string): number {
-    const base = this.ledger.nextSourceSeq(tableId);
-    const reserved = this.monitorSourceSeq.get(tableId) ?? base;
-    const next = Math.max(base, reserved);
-    this.monitorSourceSeq.set(tableId, next + 1);
-    return next;
+    return this.ledger.allocateSourceSeq(tableId);
   }
 
   private enqueueLiveMonitorOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -709,6 +713,9 @@ export class DesktopConsoleService {
   }
 
   private async enqueueMonitorEvent(event: NormalizedEvent): Promise<void> {
+    if (event.type === 'connectionLost') {
+      this.operationalWagers.disableKeepaliveImmediately();
+    }
     if (
       event.type === 'newShoeSignal'
       || event.type === 'cardObserved'
@@ -1041,7 +1048,6 @@ export class DesktopConsoleService {
               // BridgeTableExport performs its own reconnect. Keep the identity
               // registered while it is disconnected: deleting it would make the
               // periodic attach call start() on the same already-started export.
-              const sourceSeq = this.nextMonitorSourceSeq(tableId);
               void this.enqueueExecutionStateOperation(async () => {
                 if (reason === 'table-feed-stale') {
                   this.ensureRuntimeIncident({
@@ -1052,6 +1058,7 @@ export class DesktopConsoleService {
                   });
                 }
                 await this.failCloseLiveExecution([tableId]);
+                const sourceSeq = this.nextMonitorSourceSeq(tableId);
                 await this.enqueueMonitorEvent({
                   type: 'connectionLost',
                   eventId: newId('evt'),

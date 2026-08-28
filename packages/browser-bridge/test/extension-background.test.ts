@@ -81,7 +81,7 @@ describe('extension background multitable command', () => {
 
     expect(harness.chrome.storage.local.set).toHaveBeenCalledWith({ liveBetEnabled: false });
     expect(harness.chrome.tabs.reload).toHaveBeenCalledOnce();
-    expect(harness.chrome.tabs.reload).toHaveBeenCalledWith(42);
+    expect(harness.chrome.tabs.reload).toHaveBeenCalledWith(42, { bypassCache: true });
     expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
       kind: 'sessionAction',
       action: 'command-executed',

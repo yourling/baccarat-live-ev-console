@@ -547,6 +547,71 @@ describe('browser bridge server', () => {
     });
   });
 
+  it('fails closed when protocol frames continue but runtime card state stops', async () => {
+    const sample = fixtures.find(fixture => fixture.id === 'bcst-phase1-betting-01');
+    if (!sample) throw new Error('betting fixture missing');
+    const runtimeEvents: BrowserBridgeRuntimeEvent[] = [];
+    const server = new BrowserBridgeServer({
+      tableStaleAfterMs: 1_000,
+      stalePageReloadAfterMs: 60_000,
+      selectedTableIds: ['P020'],
+      onRuntimeEvent: event => runtimeEvents.push(event),
+    });
+    const feed = server.openTable('dafabet-live', 'P020');
+    const events: NormalizedEvent[] = [];
+    await feed.start({ onBatch: batch => { events.push(...batch.events); } });
+    const runtimeCapture = (roundId: string) => ({
+      kind: 'networkCapture' as const,
+      source: 'baccarat-bridge-runtime-state',
+      url: 'https://gci.agad.mstrom-uno.com/pc/pcv2/index.jsp?',
+      direction: 'recv',
+      encoding: 'text',
+      data: JSON.stringify({
+        tableId: 'P020',
+        roundId,
+        gmstatus: 1,
+        playerScore: null,
+        bankerScore: null,
+        playerCards: [],
+        bankerCards: [],
+        capturedAt: new Date().toISOString(),
+      }),
+    });
+
+    server.ingestClientMessage(runtimeCapture('GP020-1'));
+    await feed.flush();
+    const runtimeObservations = Reflect.get(server, 'runtimeStateLastObservedAt');
+    if (!(runtimeObservations instanceof Map)) throw new Error('runtime observation map unavailable');
+    runtimeObservations.set('P020', Date.now() - 2_000);
+    server.ingestClientMessage({
+      kind: 'networkCapture',
+      source: 'baccarat-bridge-ws',
+      url: 'wss://ty242c.mmxxpp.com.cn:5000',
+      direction: 'recv',
+      encoding: 'base64',
+      data: sample.base64,
+    });
+    const checkRuntimeStateFreshness = Reflect.get(server, 'checkRuntimeStateFreshness');
+    if (typeof checkRuntimeStateFreshness !== 'function') {
+      throw new Error('runtime-state freshness watchdog unavailable');
+    }
+    Reflect.apply(checkRuntimeStateFreshness, server, [Date.now()]);
+
+    expect(feed.health().state).toBe('DISCONNECTED');
+    expect(runtimeEvents).toContainEqual(expect.objectContaining({
+      kind: 'table-disconnected',
+      tableId: 'P020',
+      reason: 'table-feed-stale',
+    }));
+
+    server.ingestClientMessage(runtimeCapture('GP020-2'));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await feed.flush();
+    expect(feed.health().state).toBe('CONNECTED');
+    expect(events.some(event => event.type === 'bettingWindowOpened' && event.handId === 'GP020-2')).toBe(true);
+    await server.close();
+  });
+
   it('requests a fail-closed game-page reload after feed progress remains stale', async () => {
     const server = new BrowserBridgeServer({
       port: 0,
@@ -2189,6 +2254,38 @@ describe('browser bridge runtime supervision', () => {
       expect.objectContaining({ kind: 'session-recovery-exhausted' }),
       expect.objectContaining({ kind: 'session-recovered' }),
     ]));
+  });
+
+  it('revokes the execution gate when the extension reloads game tabs', () => {
+    const events: BrowserBridgeRuntimeEvent[] = [];
+    const server = new BrowserBridgeServer({
+      onRuntimeEvent: event => events.push(event),
+    });
+
+    server.ingestClientMessage({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: 'chrome-extension://test/background.js',
+      frame: 'background',
+      detail: 'reloadGameTabs:reloaded=1:tables=4',
+      timestamp: '2026-08-27T01:02:00.000Z',
+    });
+    server.ingestClientMessage({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: 'chrome-extension://test/background.js',
+      frame: 'background',
+      detail: 'reloadExtension:completed',
+      timestamp: '2026-08-27T01:03:00.000Z',
+    });
+
+    expect(events.filter(event => event.kind === 'execution-gate-revoked')).toEqual([
+      expect.objectContaining({
+        kind: 'execution-gate-revoked',
+        reason: 'game-tabs-reloaded',
+        timestamp: '2026-08-27T01:02:00.000Z',
+      }),
+    ]);
   });
 
   it('redacts diagnostic URLs and never retains title, body, or HTML previews', () => {
