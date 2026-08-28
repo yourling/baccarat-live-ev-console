@@ -10,6 +10,7 @@ import {
 import {
   parseDesktopKeepaliveSettings,
   parseDesktopOperationalWagerCommand,
+  parseDesktopUnknownWagerReconciliationCommand,
   parseOneShotLiveBetCommand,
 } from '../src/api-types.js';
 
@@ -76,6 +77,10 @@ function registerIpc(): void {
     getService().executeOneShotLiveBet(parseOneShotLiveBetCommand(command)));
   ipcMain.handle('console:execute-operational-wager', (_event, command: unknown) =>
     getService().executeOperationalWager(parseDesktopOperationalWagerCommand(command)));
+  ipcMain.handle('console:reconcile-unknown-operational-wager', (_event, command: unknown) =>
+    getService().reconcileUnknownOperationalWager(
+      parseDesktopUnknownWagerReconciliationCommand(command),
+    ));
   ipcMain.handle('console:update-keepalive-settings', (_event, settings: unknown) =>
     getService().updateKeepaliveSettings(parseDesktopKeepaliveSettings(settings)));
   ipcMain.handle('console:set-automation-enabled', (_event, enabled: unknown) => {

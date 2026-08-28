@@ -44,4 +44,11 @@ export interface OperationalWagerRecord {
   readonly reservationId?: string;
   readonly reason?: string;
   readonly receipt?: OperationalWagerAuditReceipt;
+  readonly reconciliation?: OperationalWagerReconciliation;
+}
+
+export interface OperationalWagerReconciliation {
+  readonly status: 'ACCEPTED';
+  readonly reason: 'operator-confirmed-platform-accepted';
+  readonly reconciledAt: string;
 }

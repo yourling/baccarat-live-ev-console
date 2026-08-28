@@ -177,6 +177,38 @@ describe('risk manager', () => {
     }));
   });
 
+  it('settles a committed UNKNOWN banker exposure from authoritative cards', () => {
+    const manager = new RiskManager();
+    const reserved = manager.tryReserveExecution({
+      intentId: 'unknown-banker-live',
+      tableId: 'D066',
+      shoeId: 'shoe-11',
+      handId: 'hand-268280',
+      market: 'banker',
+      executionSource: 'manual',
+      amount: 20,
+    }, profile.limits, { netWin: 0.95, loss: 1 }, limits);
+    expect(reserved.reservation).toBeDefined();
+    manager.markUnknown(reserved.reservation!.reservationId, 'result-timeout', 'receipt-unknown');
+
+    const settled = manager.settleUnknown(reserved.reservation!.reservationId, {
+      playerCards: [{ rank: '5' }, { rank: 'A' }],
+      bankerCards: [{ rank: '9' }, { rank: '9' }],
+    }, 'operator-confirmed-platform-accepted');
+
+    expect(settled).toEqual(expect.objectContaining({
+      status: 'SETTLED',
+      realizedPnl: 19,
+      releaseReason: 'operator-confirmed-platform-accepted',
+    }));
+    expect(manager.getState()).toEqual(expect.objectContaining({
+      reservedExposure: 0,
+      pendingExecutions: 0,
+      executedToday: 20,
+      dayLoss: -19,
+    }));
+  });
+
   it('uses execution source in operational reservation idempotency', () => {
     const m = new RiskManager();
     const reserve = (executionSource: 'manual' | 'keepalive') => m.tryReserveExecution({

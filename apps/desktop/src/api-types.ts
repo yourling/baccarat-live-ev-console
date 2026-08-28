@@ -127,6 +127,11 @@ export interface DesktopOperationalWagerCommand {
   readonly amount: number;
 }
 
+export interface DesktopUnknownWagerReconciliationCommand {
+  readonly reservationId: string;
+  readonly wagerId: string;
+}
+
 export type DesktopOperationalWagerResult = {
   readonly status: 'ACCEPTED' | 'REJECTED' | 'UNKNOWN';
   readonly tableId: string;
@@ -224,6 +229,26 @@ export function parseDesktopOperationalWagerCommand(value: unknown): DesktopOper
   return { tableId, market, amount };
 }
 
+export function parseDesktopUnknownWagerReconciliationCommand(
+  value: unknown,
+): DesktopUnknownWagerReconciliationCommand {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('unknown wager reconciliation command must be an object');
+  }
+  return {
+    reservationId: readRequiredTrimmedString(value, 'reservationId'),
+    wagerId: readRequiredTrimmedString(value, 'wagerId'),
+  };
+}
+
+function readRequiredTrimmedString(value: object, field: string): string {
+  const raw = Reflect.get(value, field);
+  if (typeof raw !== 'string' || raw.length === 0 || raw.trim() !== raw) {
+    throw new TypeError(`${field} must be a non-empty trimmed string`);
+  }
+  return raw;
+}
+
 export function parseDesktopKeepaliveSettings(value: unknown): DesktopKeepaliveStrategySettings {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new TypeError('keepalive settings must be an object');
@@ -259,6 +284,7 @@ export interface LedgerPageRow {
   reservation: RiskReservation;
   decision?: DecisionSnapshot;
   receipt?: ReceiptRow;
+  operationalWager?: OperationalWagerRecord;
   outcome?: boolean;
 }
 

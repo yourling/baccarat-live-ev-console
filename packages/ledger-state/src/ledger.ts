@@ -600,6 +600,56 @@ export class SqliteLedger {
     return rows.reverse().map(row => JSON.parse(row.payload) as OperationalWagerRecord);
   }
 
+  getOperationalWager(wagerId: string): OperationalWagerRecord | undefined {
+    const row = this.db.prepare('SELECT payload FROM operational_wagers WHERE wager_id = ?')
+      .get(wagerId) as { payload: string } | undefined;
+    return row ? JSON.parse(row.payload) as OperationalWagerRecord : undefined;
+  }
+
+  reconcileOperationalWager(
+    wagerId: string,
+    reconciliation: NonNullable<OperationalWagerRecord['reconciliation']>,
+  ): OperationalWagerRecord {
+    const existing = this.getOperationalWager(wagerId);
+    if (!existing) throw new LedgerConflictError(`operational wager ${wagerId} not found`);
+    if (existing.reconciliation) {
+      if (stableStringify(existing.reconciliation) !== stableStringify(reconciliation)) {
+        throw new LedgerConflictError(`operational wager ${wagerId} already has a different reconciliation`);
+      }
+      return existing;
+    }
+    if (existing.status !== 'UNKNOWN' || existing.receipt?.status !== 'UNKNOWN') {
+      throw new LedgerConflictError(`operational wager ${wagerId} is not a reconcilable UNKNOWN`);
+    }
+    const updated: OperationalWagerRecord = { ...existing, reconciliation };
+    const result = this.db.prepare(`
+      UPDATE operational_wagers SET payload = ? WHERE wager_id = ?
+    `).run(stableStringify(updated), wagerId);
+    if (result.changes !== 1) {
+      throw new LedgerConflictError(`operational wager ${wagerId} was not updated`);
+    }
+    return updated;
+  }
+
+  getHandSettlement(
+    tableId: string,
+    shoeId: string,
+    handId: string,
+  ): Extract<NormalizedEvent, { type: 'handSettled' }> | undefined {
+    const row = this.db.prepare(`
+      SELECT payload FROM events
+      WHERE table_id = ?
+        AND type = 'handSettled'
+        AND json_extract(payload, '$.shoeId') = ?
+        AND json_extract(payload, '$.handId') = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(tableId, shoeId, handId) as { payload: string } | undefined;
+    return row
+      ? JSON.parse(row.payload) as Extract<NormalizedEvent, { type: 'handSettled' }>
+      : undefined;
+  }
+
   hasOperationalWager(
     tableId: string,
     shoeId: string,
@@ -648,7 +698,7 @@ export class SqliteLedger {
     }
 
     const operationalRows = this.db.prepare(
-      'SELECT o.table_id AS tableId, COUNT(*) AS bets, COALESCE(SUM(CAST(json_extract(o.payload, \'$.wager.amount\') AS REAL)), 0) AS amount FROM operational_wagers o WHERE json_extract(o.payload, \'$.status\') = \'ACCEPTED\' AND json_type(o.payload, \'$.receipt\') IS NOT NULL AND ' + operationalScope.where + ' GROUP BY o.table_id'
+      'SELECT o.table_id AS tableId, COUNT(*) AS bets, COALESCE(SUM(CAST(json_extract(o.payload, \'$.wager.amount\') AS REAL)), 0) AS amount FROM operational_wagers o WHERE (json_extract(o.payload, \'$.status\') = \'ACCEPTED\' OR json_extract(o.payload, \'$.reconciliation.status\') = \'ACCEPTED\') AND json_type(o.payload, \'$.receipt\') IS NOT NULL AND ' + operationalScope.where + ' GROUP BY o.table_id'
     ).all(...operationalScope.params) as { tableId: string; bets: number; amount: number }[];
     for (const row of operationalRows) {
       const target = ensureRow(row.tableId);
@@ -693,7 +743,8 @@ export class SqliteLedger {
         FROM operational_wagers o
         LEFT JOIN reservations res
           ON res.reservation_id = json_extract(o.payload, '$.reservationId')
-        WHERE json_extract(o.payload, '$.status') = 'ACCEPTED'
+        WHERE (json_extract(o.payload, '$.status') = 'ACCEPTED'
+          OR json_extract(o.payload, '$.reconciliation.status') = 'ACCEPTED')
           AND json_type(o.payload, '$.receipt') IS NOT NULL
           AND ${operationalScope.where}
       )

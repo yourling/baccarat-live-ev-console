@@ -36,6 +36,23 @@ function openWindow(tableId: string): Extract<NormalizedEvent, { type: 'bettingW
   };
 }
 
+function bankerWinSettlement(tableId: string): Extract<NormalizedEvent, { type: 'handSettled' }> {
+  return {
+    type: 'handSettled',
+    eventId: `settled-${tableId}`,
+    tableId,
+    timestamp: '2026-08-25T00:00:03.000Z',
+    sourceSeq: 3,
+    source: 'mstrom-protocol',
+    schemaVersion: EVENT_SCHEMA_VERSION,
+    shoeId: `shoe-${tableId}`,
+    handId: `hand-${tableId}`,
+    playerCards: [{ rank: '5' }, { rank: 'A' }],
+    bankerCards: [{ rank: '9' }, { rank: '9' }],
+    outcomes: { bankerPair: false, playerPair: false },
+  };
+}
+
 function freshFeed(tableId: string, state: 'CONNECTED' | 'DISCONNECTED' = 'CONNECTED'): TableExport {
   return {
     tableId,
@@ -188,6 +205,101 @@ describe('DesktopConsoleService operational wagers', () => {
       });
       expect(requestOperationalWager).not.toHaveBeenCalled();
       expect(result.snapshot.reservations).toEqual([]);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('reconciles only a committed UNKNOWN against the exact settled hand without reopening execution', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const setLiveBetEnabled = vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    authenticateBridge(bridge);
+    const requestOperationalWager = vi.spyOn(bridge, 'requestOperationalWager')
+      .mockImplementation(async (request: OperationalWagerExecutionRequest) => ({
+        receiptId: `receipt-${request.wager.wagerId}`,
+        wagerId: request.wager.wagerId,
+        tableId: request.wager.tableId,
+        shoeId: request.wager.shoeId,
+        handId: request.wager.handId,
+        market: request.wager.market,
+        amount: request.wager.amount,
+        source: request.wager.source,
+        status: 'UNKNOWN',
+        createdAt: '2026-08-25T00:00:02.000Z',
+        raw: { reason: 'result-timeout', commitPoint: 'confirmBet', commitStarted: true },
+      }));
+
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['D066']);
+      service['liveFeeds'].set('D066', freshFeed('D066'));
+      await service.injectEvent(physicalShoe('D066'));
+      await service.injectEvent(openWindow('D066'));
+      await service.setExecutionMode('D066', 'live');
+
+      const unknown = await service.executeOperationalWager({
+        tableId: 'D066',
+        market: 'banker',
+        amount: 20,
+      });
+      expect(unknown.status).toBe('UNKNOWN');
+      expect(unknown.wager).toBeDefined();
+      const reservation = unknown.snapshot.reservations.find(candidate =>
+        candidate.intentId === unknown.wager!.wagerId);
+      expect(reservation).toMatchObject({ status: 'UNKNOWN', maxProfit: 19 });
+      expect(unknown.snapshot.runtime.incidents).toContainEqual(expect.objectContaining({
+        code: 'unknown-execution',
+        tableId: 'D066',
+        active: true,
+      }));
+      expect(unknown.snapshot.snapshot.tables.D066?.executionMode).toBe('shadow');
+      expect(setLiveBetEnabled).toHaveBeenLastCalledWith(false);
+
+      await expect(service.reconcileUnknownOperationalWager({
+        reservationId: reservation!.reservationId,
+        wagerId: unknown.wager!.wagerId,
+      })).rejects.toThrow('authoritative hand settlement is not available');
+
+      await service.injectEvent(bankerWinSettlement('D066'));
+      const reconciled = await service.reconcileUnknownOperationalWager({
+        reservationId: reservation!.reservationId,
+        wagerId: unknown.wager!.wagerId,
+      });
+      const settled = reconciled.reservations.find(candidate =>
+        candidate.reservationId === reservation!.reservationId);
+      expect(settled).toMatchObject({
+        status: 'SETTLED',
+        realizedPnl: 19,
+        releaseReason: 'operator-confirmed-platform-accepted',
+      });
+      expect(reconciled.snapshot.riskState).toMatchObject({
+        pendingExecutions: 0,
+        reservedExposure: 0,
+        executedToday: 20,
+        dayLoss: -19,
+      });
+      expect(reconciled.operationalWagers).toContainEqual(expect.objectContaining({
+        status: 'UNKNOWN',
+        receipt: expect.objectContaining({ status: 'UNKNOWN' }),
+        reconciliation: expect.objectContaining({ status: 'ACCEPTED' }),
+      }));
+      expect(reconciled.runtime.incidents).toContainEqual(expect.objectContaining({
+        code: 'unknown-execution',
+        tableId: 'D066',
+        active: false,
+      }));
+      expect(reconciled.snapshot.tables.D066?.executionMode).toBe('shadow');
+      expect(reconciled.automation.enabled).toBe(false);
+      expect(requestOperationalWager).toHaveBeenCalledTimes(1);
+
+      const idempotent = await service.reconcileUnknownOperationalWager({
+        reservationId: reservation!.reservationId,
+        wagerId: unknown.wager!.wagerId,
+      });
+      expect(idempotent.reservations.find(candidate =>
+        candidate.reservationId === reservation!.reservationId)?.realizedPnl).toBe(19);
+      expect(requestOperationalWager).toHaveBeenCalledTimes(1);
     } finally {
       await service.close();
     }

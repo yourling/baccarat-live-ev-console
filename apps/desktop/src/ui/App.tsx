@@ -14,7 +14,7 @@ import type {
   ShoeStateProjection,
   TableStatus,
 } from '@baccarat/contracts';
-import type { DecisionHandRecord } from '@baccarat/ledger-state';
+import type { DecisionHandRecord, OperationalWagerRecord } from '@baccarat/ledger-state';
 import type {
   DesktopConsoleSnapshot,
   DesktopKeepaliveState,
@@ -78,6 +78,7 @@ interface BetLedgerRow {
   reservation: RiskReservation;
   decision?: DecisionSnapshot;
   receipt?: ReceiptRow;
+  operationalWager?: OperationalWagerRecord;
   createdAt: string;
   resultLabel: string;
   resultTone: 'good' | 'danger' | 'warning' | 'neutral';
@@ -208,6 +209,7 @@ export function App() {
   const [draggedTableId, setDraggedTableId] = useState<string | null>(null);
   const [monitorDropTarget, setMonitorDropTarget] = useState<MonitorDropTarget | null>(null);
   const [monitorTableSaving, setMonitorTableSaving] = useState(false);
+  const [reconcilingReservationId, setReconcilingReservationId] = useState<string | null>(null);
   const [selectedMonitorTableId, setSelectedMonitorTableId] = useState<string | null>(null);
   const [pendingLiveExecutionTableId, setPendingLiveExecutionTableId] = useState<string | null>(null);
   const timerRef = useRef<number | null>(null);
@@ -578,6 +580,35 @@ export function App() {
     setRecordQueryRevision(previous => previous + 1);
   }
 
+  const reconcileUnknownOperationalWager = useCallback(async (row: BetLedgerRow) => {
+    if (!window.desktop || !row.operationalWager || !canReconcileUnknownOperationalWager(row)) return;
+    const accepted = await confirm({
+      title: '确认平台已成交',
+      description: '此操作只核对本地账本，不会再次下注，也不会自动恢复无人值守执行。',
+      details: [
+        { label: '牌桌 / 牌局', value: `${row.reservation.tableId} / ${row.reservation.handId}` },
+        { label: '下注', value: `${MARKET_LABELS[row.reservation.market]} ${formatAmount(row.reservation.amount)}` },
+      ],
+      confirmLabel: '确认平台已成交',
+      tone: 'danger',
+    });
+    if (!accepted) return;
+    setReconcilingReservationId(row.reservation.reservationId);
+    setError(null);
+    try {
+      const nextSnapshot = await window.desktop.reconcileUnknownOperationalWager({
+        reservationId: row.reservation.reservationId,
+        wagerId: row.operationalWager.wager.wagerId,
+      });
+      setSnapshot(nextSnapshot);
+      setRecordQueryRevision(previous => previous + 1);
+    } catch (reconciliationError) {
+      setError(reconciliationError instanceof Error ? reconciliationError.message : String(reconciliationError));
+    } finally {
+      setReconcilingReservationId(null);
+    }
+  }, [confirm]);
+
   function changeRecordPage(nextPage: number) {
     setPage(nextPage);
     setRecordQueryRevision(previous => previous + 1);
@@ -894,7 +925,7 @@ export function App() {
 
       {view === 'events' && recordPage?.kind === 'events' && <><EventTable events={recordEvents} totalCount={recordTotal} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
 
-      {view === 'ledger' && recordPage?.kind === 'ledger' && <><BetLedgerView rows={recordLedgerRows} totalCount={recordTotal} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
+      {view === 'ledger' && recordPage?.kind === 'ledger' && <><BetLedgerView rows={recordLedgerRows} totalCount={recordTotal} reconcilingReservationId={reconcilingReservationId} onReconcile={reconcileUnknownOperationalWager} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
 
       {view === 'settings' && (
         <SystemSettingsView
@@ -1369,10 +1400,30 @@ function summarizeOverview(rows: OverviewTableRow[]): OverviewStats {
 }
 
 function isExecutedLedgerRow(row: BetLedgerRow): boolean {
-  return Boolean(row.receipt && row.receipt.receipt.status !== 'REJECTED');
+  if (row.receipt) return row.receipt.receipt.status !== 'REJECTED';
+  return row.operationalWager?.status === 'ACCEPTED'
+    || row.operationalWager?.reconciliation?.status === 'ACCEPTED';
 }
 
-function BetLedgerView(props: { rows: BetLedgerRow[]; totalCount: number }) {
+function canReconcileUnknownOperationalWager(row: BetLedgerRow): boolean {
+  const operationalWager = row.operationalWager;
+  const raw = operationalWager?.receipt?.raw;
+  return row.reservation.status === 'UNKNOWN'
+    && operationalWager?.reservationId === row.reservation.reservationId
+    && operationalWager.status === 'UNKNOWN'
+    && operationalWager.receipt?.status === 'UNKNOWN'
+    && typeof raw === 'object'
+    && raw !== null
+    && Reflect.get(raw, 'commitStarted') === true
+    && Reflect.get(raw, 'commitPoint') === 'confirmBet';
+}
+
+function BetLedgerView(props: {
+  rows: BetLedgerRow[];
+  totalCount: number;
+  reconcilingReservationId: string | null;
+  onReconcile: (row: BetLedgerRow) => Promise<void>;
+}) {
   return (
     <>
       {props.rows.length === 0 ? <EmptyState title="暂无下注记录" detail="" /> : (
@@ -1392,7 +1443,23 @@ function BetLedgerView(props: { rows: BetLedgerRow[]; totalCount: number }) {
                   <td data-label="下注时 EV" className={row.decision ? evTone(row.decision.evMean) : 'text--muted'}>{row.decision ? formatSignedPercent(row.decision.evMean) : '-'}</td>
                   <td data-label="下注金额">{formatAmount(row.reservation.amount)}</td>
                   <td data-label="期望盈利" className={typeof row.expectedPnl === 'number' ? evTone(row.expectedPnl) : 'text--muted'}>{typeof row.expectedPnl === 'number' ? formatSignedAmount(row.expectedPnl) : '-'}</td>
-                  <td data-label="回执">{row.receipt ? receiptStatusLabel(row.receipt.receipt.status) : reservationStatusLabel(row.reservation.status)}</td>
+                  <td data-label="回执">
+                    {row.receipt
+                      ? receiptStatusLabel(row.receipt.receipt.status)
+                      : row.operationalWager
+                        ? receiptStatusLabel(row.operationalWager.reconciliation?.status ?? row.operationalWager.receipt?.status ?? row.operationalWager.status)
+                        : reservationStatusLabel(row.reservation.status)}
+                    {canReconcileUnknownOperationalWager(row) && (
+                      <button
+                        type="button"
+                        className="button button--small button--danger-ghost ledger-reconcile"
+                        disabled={props.reconcilingReservationId !== null}
+                        onClick={() => void props.onReconcile(row)}
+                      >
+                        {props.reconcilingReservationId === row.reservation.reservationId ? '核对中...' : '确认平台已成交'}
+                      </button>
+                    )}
+                  </td>
                   <td data-label="实际结果"><span className={'ledger-result ledger-result--' + row.resultTone}>{row.resultLabel}</span></td>
                   <td data-label="净盈亏" className={typeof row.realizedPnl === 'number' ? evTone(row.realizedPnl) : 'text--muted'}>{typeof row.realizedPnl === 'number' ? formatSignedAmount(row.realizedPnl) : '-'}</td>
                 </tr>
@@ -1698,12 +1765,15 @@ function buildBetLedgerRows(snapshot: DesktopConsoleSnapshot | null): BetLedgerR
   if (!snapshot) return [];
   const decisions = new Map(snapshot.decisions.map(decision => [ledgerKey(decision.tableId, decision.shoeId, decision.handId, decision.market), decision]));
   const receipts = new Map(snapshot.receipts.map(row => [ledgerKey(row.tableId, row.shoeId, row.handId, row.market), row]));
+  const operationalWagers = new Map(snapshot.operationalWagers.flatMap(record =>
+    record.reservationId === undefined ? [] : [[record.reservationId, record] as const]));
   return snapshot.reservations.map(reservation => {
     const key = ledgerKey(reservation.tableId, reservation.shoeId, reservation.handId, reservation.market);
     const decision = decisions.get(key);
     const receipt = receipts.get(key);
+    const operationalWager = operationalWagers.get(reservation.reservationId);
     const result = ledgerResult(reservation, receipt, snapshot.events);
-    return { reservation, decision, receipt, createdAt: decision?.createdAt ?? reservation.createdAt, resultLabel: result.label, resultTone: result.tone, realizedPnl: reservation.realizedPnl, expectedPnl: decision ? reservation.amount * decision.evMean : undefined };
+    return { reservation, decision, receipt, operationalWager, createdAt: decision?.createdAt ?? operationalWager?.wager.createdAt ?? reservation.createdAt, resultLabel: result.label, resultTone: result.tone, realizedPnl: reservation.realizedPnl, expectedPnl: decision ? reservation.amount * decision.evMean : undefined };
   }).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
@@ -1714,6 +1784,7 @@ function ledgerPageRowsToView(rows: LedgerPageRow[]): BetLedgerRow[] {
       reservation: row.reservation,
       decision: row.decision,
       receipt: row.receipt,
+      operationalWager: row.operationalWager,
       createdAt: row.decision?.createdAt ?? row.reservation.createdAt,
       resultLabel: result.label,
       resultTone: result.tone,

@@ -311,6 +311,45 @@ export class RiskManager {
     return true;
   }
 
+  settleUnknown(
+    reservationId: string,
+    settlement: {
+      outcomes?: { bankerPair: boolean; playerPair: boolean };
+      playerCards?: readonly { rank: string }[];
+      bankerCards?: readonly { rank: string }[];
+    },
+    reason: string,
+  ): RiskReservation {
+    this.rollDayIfNeeded();
+    const reservation = this.reservations.get(reservationId);
+    if (!reservation || reservation.status !== 'UNKNOWN') {
+      throw new Error(`reservation ${reservationId} is not an UNKNOWN exposure`);
+    }
+    const realizedPnl = realizedPnlForReservation(
+      reservation,
+      normalizeSettlement(settlement),
+    );
+    if (realizedPnl === undefined) {
+      throw new Error(`reservation ${reservationId} has no authoritative settlement outcome`);
+    }
+
+    const updated = structuredClone(reservation);
+    updated.status = 'SETTLED';
+    updated.settledAt = new Date().toISOString();
+    updated.realizedPnl = realizedPnl;
+    updated.releaseReason = reason;
+    const nextState = structuredClone(this.state);
+    nextState.reservedExposure = clampNonNegative(nextState.reservedExposure - updated.maxLoss);
+    nextState.pendingExecutions = clampNonNegative(nextState.pendingExecutions - 1);
+    nextState.executedToday += updated.amount;
+    nextState.dayLoss -= realizedPnl;
+    nextState.tableLosses[updated.tableId] = (nextState.tableLosses[updated.tableId] ?? 0) - realizedPnl;
+    nextState.shoeLosses[shoeLossKey(updated.tableId, updated.shoeId)] =
+      (nextState.shoeLosses[shoeLossKey(updated.tableId, updated.shoeId)] ?? 0) - realizedPnl;
+    this.commitReservationUpdate(updated, nextState);
+    return structuredClone(updated);
+  }
+
 
   attachReceipt(reservationId: string, receiptId: string): void {
     const r = this.reservations.get(reservationId);

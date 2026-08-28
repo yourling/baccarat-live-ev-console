@@ -425,6 +425,7 @@ h2 { color: #f4f7fa; font-size: 18px; }
 .ledger-result--danger { border-color: #813c42; background: #3b1f24; color: #ffaaa9; }
 .ledger-result--warning { border-color: #806231; background: #352817; color: #f2c978; }
 .ledger-result--neutral { background: #182530; color: #afc0ce; }
+.ledger-reconcile { display: block; margin-top: 6px; white-space: nowrap; }
 
 .system-settings { margin-top: 18px; }
 .system-settings__header {

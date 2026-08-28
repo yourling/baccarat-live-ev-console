@@ -213,6 +213,26 @@ describe('Dafabet mstrom MAIN-world bet runtime', () => {
     });
   });
 
+  it('re-reads getter-backed pcv2 pools after confirmBet', async () => {
+    const store = makeStore('unknown');
+    const initialDonePool = store.donePool;
+    const initialDiffPool = store.diffPool;
+    let currentDonePool = initialDonePool;
+    let currentDiffPool = initialDiffPool;
+    Object.defineProperty(store, 'donePool', { get: () => currentDonePool });
+    Object.defineProperty(store, 'diffPool', { get: () => currentDiffPool });
+    store.confirmBet.mockImplementation(() => {
+      currentDonePool = new FakePool({ 4: 10, 5: 0 });
+      currentDiffPool = new FakePool();
+    });
+
+    const runtime = loadRuntime(store);
+    const result = await runtime.execute(validRequest());
+
+    expect(result).toMatchObject({ status: 'ACCEPTED' });
+    expect(store.confirmBet).toHaveBeenCalledOnce();
+  });
+
   it('rejects and restores the original stake when the add delta is not exact', async () => {
     const store = makeStore('wrong-delta');
     store.stakePool.setAmount(4, 2);

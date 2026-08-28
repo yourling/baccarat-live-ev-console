@@ -45,6 +45,7 @@ import {
   type DesktopRecordPage,
   type DesktopRecordQuery,
   type DesktopRuntimeState,
+  type DesktopUnknownWagerReconciliationCommand,
   type MonitorTableCandidate,
   type OneShotLiveBetCommand,
   type OneShotLiveBetResult,
@@ -1322,6 +1323,7 @@ export class DesktopConsoleService {
         reservation,
         decision: this.ledger.getDecision(reservation.tableId, reservation.shoeId, reservation.handId, reservation.market),
         receipt: this.ledger.getReceipt(reservation.tableId, reservation.shoeId, reservation.handId, reservation.market),
+        operationalWager: this.ledger.getOperationalWager(reservation.intentId),
         outcome: this.ledger.getSettledOutcome(reservation.tableId, reservation.shoeId, reservation.handId, reservation.market),
       })),
     };
@@ -1499,6 +1501,104 @@ export class DesktopConsoleService {
       await this.enqueueExecutionStateOperation(() => this.failCloseLiveExecution(this.liveApprovals.list()));
     }
     return { ...result, snapshot: this.snapshot() };
+  }
+
+  async reconcileUnknownOperationalWager(
+    command: DesktopUnknownWagerReconciliationCommand,
+  ): Promise<DesktopConsoleSnapshot> {
+    return await this.enqueueExecutionStateOperation(async () => {
+      await this.startupFailCloseTask;
+      const reservation = this.orchestrator.getReservations()
+        .find(candidate => candidate.reservationId === command.reservationId);
+      if (!reservation) throw new Error(`reservation ${command.reservationId} not found`);
+
+      const record = this.ledger.getOperationalWager(command.wagerId);
+      if (!record) throw new Error(`operational wager ${command.wagerId} not found`);
+      const matchesReservation = record.reservationId === reservation.reservationId
+        && record.wager.wagerId === reservation.intentId
+        && record.wager.tableId === reservation.tableId
+        && record.wager.shoeId === reservation.shoeId
+        && record.wager.handId === reservation.handId
+        && record.wager.market === reservation.market
+        && record.wager.amount === reservation.amount
+        && record.wager.source === reservation.executionSource;
+      if (!matchesReservation) {
+        throw new Error('operational wager does not match the UNKNOWN reservation');
+      }
+
+      if (reservation.status !== 'UNKNOWN' && reservation.status !== 'SETTLED') {
+        throw new Error(`reservation ${command.reservationId} is neither UNKNOWN nor reconciled`);
+      }
+      if (record.status !== 'UNKNOWN' || record.receipt?.status !== 'UNKNOWN') {
+        throw new Error(`operational wager ${command.wagerId} is not a receipted UNKNOWN`);
+      }
+      const receipt = record.receipt;
+      const receiptMatchesWager = receipt.wagerId === record.wager.wagerId
+        && receipt.tableId === record.wager.tableId
+        && receipt.shoeId === record.wager.shoeId
+        && receipt.handId === record.wager.handId
+        && receipt.market === record.wager.market
+        && receipt.amount === record.wager.amount
+        && receipt.source === record.wager.source;
+      if (!receiptMatchesWager) {
+        throw new Error('UNKNOWN receipt does not match the operational wager');
+      }
+      const receiptRaw = receipt.raw;
+      if (
+        typeof receiptRaw !== 'object'
+        || receiptRaw === null
+        || Reflect.get(receiptRaw, 'commitStarted') !== true
+        || Reflect.get(receiptRaw, 'commitPoint') !== 'confirmBet'
+      ) {
+        throw new Error('UNKNOWN receipt has no proof that confirmBet started');
+      }
+
+      const settlement = this.ledger.getHandSettlement(
+        reservation.tableId,
+        reservation.shoeId,
+        reservation.handId,
+      );
+      if (!settlement) {
+        throw new Error('authoritative hand settlement is not available for this exact wager');
+      }
+      if (
+        (reservation.market === 'bankerPair' || reservation.market === 'playerPair')
+        && settlement.outcomes === undefined
+      ) {
+        throw new Error('authoritative pair outcome is not available for this exact wager');
+      }
+
+      if (
+        record.reconciliation !== undefined
+        && (
+          record.reconciliation.status !== 'ACCEPTED'
+          || record.reconciliation.reason !== 'operator-confirmed-platform-accepted'
+        )
+      ) {
+        throw new Error('operational wager has an invalid reconciliation audit');
+      }
+      if (reservation.status === 'SETTLED') {
+        if (record.reconciliation === undefined) {
+          throw new Error('settled reservation has no matching reconciliation audit');
+        }
+        return this.snapshot();
+      }
+      const reconciliation = record.reconciliation ?? {
+        status: 'ACCEPTED' as const,
+        reason: 'operator-confirmed-platform-accepted' as const,
+        reconciledAt: new Date().toISOString(),
+      };
+      this.ledger.reconcileOperationalWager(command.wagerId, reconciliation);
+      this.orchestrator.settleUnknownReservation(
+        command.reservationId,
+        settlement,
+        reconciliation.reason,
+      );
+      this.refreshAccountingIncidents();
+      this.cachedSummary = undefined;
+      this.cachedRecordCounts = undefined;
+      return this.snapshot();
+    });
   }
 
   async updateKeepaliveSettings(settings: KeepaliveStrategySettings): Promise<DesktopConsoleSnapshot> {

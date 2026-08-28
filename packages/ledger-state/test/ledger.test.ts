@@ -597,6 +597,80 @@ describe('operational wager income summary', () => {
     }]);
     ledger.close();
   });
+
+  it('keeps the original UNKNOWN receipt and counts an accepted reconciliation once', () => {
+    const ledger = new SqliteLedger();
+    const createdAt = '2026-08-28T01:00:00.000Z';
+    const record = {
+      reservationId: 'rsv-reconciled-banker',
+      status: 'UNKNOWN' as const,
+      reason: 'platform-acknowledgement-unknown',
+      wager: {
+        wagerId: 'opw-reconciled-banker',
+        tableId: 'D066',
+        shoeId: 'shoe-D066',
+        handId: 'hand-D066',
+        market: 'banker' as const,
+        amount: 20,
+        source: 'manual' as const,
+        createdAt,
+      },
+      receipt: {
+        receiptId: 'receipt-reconciled-banker',
+        wagerId: 'opw-reconciled-banker',
+        tableId: 'D066',
+        shoeId: 'shoe-D066',
+        handId: 'hand-D066',
+        market: 'banker' as const,
+        amount: 20,
+        source: 'manual' as const,
+        status: 'UNKNOWN' as const,
+        createdAt,
+        raw: { commitStarted: true, reason: 'result-timeout' },
+      },
+    };
+    ledger.saveOperationalWager(record);
+    ledger.saveReservation({
+      reservationId: record.reservationId,
+      intentId: record.wager.wagerId,
+      tableId: record.wager.tableId,
+      shoeId: record.wager.shoeId,
+      handId: record.wager.handId,
+      market: record.wager.market,
+      executionSource: record.wager.source,
+      amount: 20,
+      maxLoss: 20,
+      maxProfit: 19,
+      status: 'SETTLED',
+      createdAt,
+      settledAt: '2026-08-28T01:01:00.000Z',
+      realizedPnl: 19,
+    });
+    const reconciliation = {
+      status: 'ACCEPTED' as const,
+      reason: 'operator-confirmed-platform-accepted' as const,
+      reconciledAt: '2026-08-28T01:02:00.000Z',
+    };
+
+    const first = ledger.reconcileOperationalWager(record.wager.wagerId, reconciliation);
+    const second = ledger.reconcileOperationalWager(record.wager.wagerId, reconciliation);
+
+    expect(second).toEqual(first);
+    expect(first).toMatchObject({
+      status: 'UNKNOWN',
+      receipt: { status: 'UNKNOWN', raw: { commitStarted: true } },
+      reconciliation,
+    });
+    expect(ledger.getMonitorSummary()).toMatchObject({
+      rows: [{ tableId: 'D066', bets: 1, amount: 20, actualPnl: 19 }],
+      incomePoints: [{ createdAt, actualPnl: 19 }],
+    });
+    expect(() => ledger.reconcileOperationalWager(record.wager.wagerId, {
+      ...reconciliation,
+      reconciledAt: '2026-08-28T01:03:00.000Z',
+    })).toThrow(LedgerConflictError);
+    ledger.close();
+  });
 });
 
 

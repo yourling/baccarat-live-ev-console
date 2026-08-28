@@ -513,11 +513,13 @@ async function executeMstromBetOneShot(request) {
       commitStarted = true;
       await store.confirmBet();
     } catch (_) {
-      const doneAfterError = readPoolAmount(donePool, parsed.playType);
+      // pcv2 exposes donePool as a getter and replaces diffPool in confirmBet().
+      // Always re-read both pools after the commit point.
+      const doneAfterError = readPoolAmount(readStoreValue(store, 'donePool'), parsed.playType);
       if (doneAfterError !== null && doneAfterError - beforeDone >= parsed.amount) {
         return accepted(parsed);
       }
-      if (explicitFailure(diffPool, parsed.playType)) {
+      if (explicitFailure(readStoreValue(store, 'diffPool'), parsed.playType)) {
         return committedRejected(parsed, 'platform-rejected');
       }
       return unknown(parsed, 'confirm-failed-uncertain');
@@ -525,11 +527,11 @@ async function executeMstromBetOneShot(request) {
 
     const deadline = Date.now() + REQUEST_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      const doneAmount = readPoolAmount(donePool, parsed.playType);
+      const doneAmount = readPoolAmount(readStoreValue(store, 'donePool'), parsed.playType);
       if (doneAmount !== null && doneAmount - beforeDone >= parsed.amount) {
         return accepted(parsed);
       }
-      if (explicitFailure(diffPool, parsed.playType)) {
+      if (explicitFailure(readStoreValue(store, 'diffPool'), parsed.playType)) {
         return committedRejected(parsed, 'platform-rejected');
       }
       await delay(Math.min(POLL_INTERVAL_MS, Math.max(1, deadline - Date.now())));
