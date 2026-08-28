@@ -581,7 +581,7 @@ export function App() {
   }
 
   const reconcileUnknownOperationalWager = useCallback(async (row: BetLedgerRow) => {
-    if (!window.desktop || !row.operationalWager || !canReconcileUnknownOperationalWager(row)) return;
+    if (!window.desktop || !row.operationalWager || !canReconcileOperationalWager(row)) return;
     const accepted = await confirm({
       title: '确认平台已成交',
       description: '此操作只核对本地账本，不会再次下注，也不会自动恢复无人值守执行。',
@@ -1400,18 +1400,21 @@ function summarizeOverview(rows: OverviewTableRow[]): OverviewStats {
 }
 
 function isExecutedLedgerRow(row: BetLedgerRow): boolean {
+  if (row.operationalWager?.reconciliation?.status === 'ACCEPTED') return true;
   if (row.receipt) return row.receipt.receipt.status !== 'REJECTED';
-  return row.operationalWager?.status === 'ACCEPTED'
-    || row.operationalWager?.reconciliation?.status === 'ACCEPTED';
+  return row.operationalWager?.status === 'ACCEPTED';
 }
 
-function canReconcileUnknownOperationalWager(row: BetLedgerRow): boolean {
+function canReconcileOperationalWager(row: BetLedgerRow): boolean {
   const operationalWager = row.operationalWager;
   const raw = operationalWager?.receipt?.raw;
-  return row.reservation.status === 'UNKNOWN'
+  const statusPairMatches = row.reservation.status === 'UNKNOWN'
+    ? operationalWager?.status === 'UNKNOWN' && operationalWager.receipt?.status === 'UNKNOWN'
+    : row.reservation.status === 'RELEASED'
+      && operationalWager?.status === 'REJECTED'
+      && operationalWager.receipt?.status === 'REJECTED';
+  return statusPairMatches
     && operationalWager?.reservationId === row.reservation.reservationId
-    && operationalWager.status === 'UNKNOWN'
-    && operationalWager.receipt?.status === 'UNKNOWN'
     && typeof raw === 'object'
     && raw !== null
     && Reflect.get(raw, 'commitStarted') === true
@@ -1449,7 +1452,7 @@ function BetLedgerView(props: {
                       : row.operationalWager
                         ? receiptStatusLabel(row.operationalWager.reconciliation?.status ?? row.operationalWager.receipt?.status ?? row.operationalWager.status)
                         : reservationStatusLabel(row.reservation.status)}
-                    {canReconcileUnknownOperationalWager(row) && (
+                    {canReconcileOperationalWager(row) && (
                       <button
                         type="button"
                         className="button button--small button--danger-ghost ledger-reconcile"

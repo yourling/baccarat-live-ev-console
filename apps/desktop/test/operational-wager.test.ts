@@ -40,6 +40,35 @@ describe('tryKeepaliveInOrder', () => {
     expect(result).toEqual({ status: 'UNKNOWN', tableId: 'D055' });
   });
 
+  it('stops the pass after a rejected request reached the platform commit point', async () => {
+    // Given: the first table submitted confirmBet but the platform rejected it.
+    const requestWager = vi.fn()
+      .mockResolvedValueOnce({
+        status: 'REJECTED',
+        attempted: true,
+        committed: true,
+        reason: 'platform-rejected',
+      })
+      .mockResolvedValueOnce({ status: 'ACCEPTED' });
+
+    // When: the keepalive interval becomes due.
+    const result = await tryKeepaliveInOrder({
+      tableIds: ['D055', 'D065'],
+      amount: 20,
+      market: 'player',
+      requestWager,
+    });
+
+    // Then: the scheduler does not submit a second table in the same cycle.
+    expect(requestWager).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({
+      status: 'REJECTED',
+      tableId: 'D055',
+      attempted: true,
+      reason: 'platform-rejected',
+    });
+  });
+
   it('makes one complete failed pass when every table rejects the wager', async () => {
     // Given: every monitored table is unavailable for the requested wager.
     const requestWager = vi.fn()

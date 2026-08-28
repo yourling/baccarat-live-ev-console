@@ -1523,16 +1523,29 @@ export class DesktopConsoleService {
         && record.wager.amount === reservation.amount
         && record.wager.source === reservation.executionSource;
       if (!matchesReservation) {
-        throw new Error('operational wager does not match the UNKNOWN reservation');
+        throw new Error('operational wager does not match the reservation');
       }
 
-      if (reservation.status !== 'UNKNOWN' && reservation.status !== 'SETTLED') {
-        throw new Error(`reservation ${command.reservationId} is neither UNKNOWN nor reconciled`);
-      }
-      if (record.status !== 'UNKNOWN' || record.receipt?.status !== 'UNKNOWN') {
-        throw new Error(`operational wager ${command.wagerId} is not a receipted UNKNOWN`);
-      }
       const receipt = record.receipt;
+      if (!receipt) throw new Error(`operational wager ${command.wagerId} has no platform receipt`);
+      const receiptRaw = receipt.raw;
+      const commitStarted = typeof receiptRaw === 'object'
+        && receiptRaw !== null
+        && Reflect.get(receiptRaw, 'commitStarted') === true
+        && Reflect.get(receiptRaw, 'commitPoint') === 'confirmBet';
+      const unknownExecution = record.status === 'UNKNOWN' && receipt.status === 'UNKNOWN';
+      const committedRejectedExecution = record.status === 'REJECTED'
+        && receipt.status === 'REJECTED'
+        && commitStarted;
+      if (!unknownExecution && !committedRejectedExecution) {
+        throw new Error(`operational wager ${command.wagerId} is not a reconcilable committed execution`);
+      }
+      if (
+        reservation.status !== 'SETTLED'
+        && (unknownExecution ? reservation.status !== 'UNKNOWN' : reservation.status !== 'RELEASED')
+      ) {
+        throw new Error(`reservation ${command.reservationId} does not match the execution receipt state`);
+      }
       const receiptMatchesWager = receipt.wagerId === record.wager.wagerId
         && receipt.tableId === record.wager.tableId
         && receipt.shoeId === record.wager.shoeId
@@ -1541,16 +1554,10 @@ export class DesktopConsoleService {
         && receipt.amount === record.wager.amount
         && receipt.source === record.wager.source;
       if (!receiptMatchesWager) {
-        throw new Error('UNKNOWN receipt does not match the operational wager');
+        throw new Error('platform receipt does not match the operational wager');
       }
-      const receiptRaw = receipt.raw;
-      if (
-        typeof receiptRaw !== 'object'
-        || receiptRaw === null
-        || Reflect.get(receiptRaw, 'commitStarted') !== true
-        || Reflect.get(receiptRaw, 'commitPoint') !== 'confirmBet'
-      ) {
-        throw new Error('UNKNOWN receipt has no proof that confirmBet started');
+      if (!commitStarted) {
+        throw new Error('platform receipt has no proof that confirmBet started');
       }
 
       const settlement = this.ledger.getHandSettlement(
@@ -1589,11 +1596,19 @@ export class DesktopConsoleService {
         reconciledAt: new Date().toISOString(),
       };
       this.ledger.reconcileOperationalWager(command.wagerId, reconciliation);
-      this.orchestrator.settleUnknownReservation(
-        command.reservationId,
-        settlement,
-        reconciliation.reason,
-      );
+      if (unknownExecution) {
+        this.orchestrator.settleUnknownReservation(
+          command.reservationId,
+          settlement,
+          reconciliation.reason,
+        );
+      } else {
+        this.orchestrator.settleReleasedReservation(
+          command.reservationId,
+          settlement,
+          reconciliation.reason,
+        );
+      }
       this.refreshAccountingIncidents();
       this.cachedSummary = undefined;
       this.cachedRecordCounts = undefined;

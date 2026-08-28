@@ -234,20 +234,26 @@ async function executeMstromBetOneShot(request) {
     }
   }
 
-  function explicitFailure(diffPool, playType) {
-    const rows = stakeRows(diffPool);
-    const row = rows && rows.find(item => item && item.playType === playType);
-    if (row && row.pending === false && row.success === false) {
-      const rowAmount = finiteNumber(Number(row.amount));
-      if (rowAmount === null || rowAmount > 0) return true;
-    }
+  function pendingSequences(store) {
     try {
-      return diffPool && diffPool.pending === false && diffPool.success === false
-        && finiteNumber(Number(diffPool.totalAmount)) !== null
-        && Number(diffPool.totalAmount) > 0;
+      const pending = readStoreValue(store, 'pendingBetSeqForResp');
+      if (!pending || typeof pending[Symbol.iterator] !== 'function') return null;
+      return [...pending].map(value => String(value));
     } catch (_) {
-      return false;
+      return null;
     }
+  }
+
+  function newPendingSequences(before, after) {
+    if (before === null || after === null) return [];
+    const existing = new Set(before);
+    return after.filter(sequence => !existing.has(sequence));
+  }
+
+  function submittedSequencesCompleted(store, submitted) {
+    if (submitted.length === 0) return false;
+    const current = pendingSequences(store);
+    return current !== null && submitted.every(sequence => !current.includes(sequence));
   }
 
   function historyPlayTypes(parsed) {
@@ -496,6 +502,7 @@ async function executeMstromBetOneShot(request) {
     const beforeStake = readPoolAmount(stakePool, parsed.playType);
     const beforeDone = readPoolAmount(donePool, parsed.playType);
     const beforeHistory = readHistoryAmount(parsed);
+    const beforePendingSequences = pendingSequences(store);
     if (beforeStake === null || beforeDone === null || typeof stakePool.calculateDiff !== 'function') {
       return rejected(parsed, 'pool-state-unreadable');
     }
@@ -549,10 +556,13 @@ async function executeMstromBetOneShot(request) {
       return rejected(parsed, 'pre-confirm-state-changed');
     }
 
+    let submittedSequences = [];
     try {
       // COMMIT_POINT: once this call begins, the platform may have accepted the bet.
       commitStarted = true;
-      await store.confirmBet();
+      const confirmation = store.confirmBet();
+      submittedSequences = newPendingSequences(beforePendingSequences, pendingSequences(store));
+      await confirmation;
     } catch (_) {
       // pcv2 exposes donePool as a getter and replaces diffPool in confirmBet().
       // Always re-read both pools after the commit point.
@@ -568,9 +578,6 @@ async function executeMstromBetOneShot(request) {
       ) {
         return accepted(parsed, 'bet-history');
       }
-      if (explicitFailure(readStoreValue(store, 'diffPool'), parsed.playType)) {
-        return committedRejected(parsed, 'platform-rejected');
-      }
       return unknown(parsed, 'confirm-failed-uncertain', {
         beforeDone,
         observedDone: doneAfterError,
@@ -582,6 +589,7 @@ async function executeMstromBetOneShot(request) {
     const deadline = Date.now() + REQUEST_TIMEOUT_MS;
     let observedDone = beforeDone;
     let observedHistory = beforeHistory;
+    let responseCompleted = false;
     while (Date.now() < deadline) {
       const doneAmount = readPoolAmount(readStoreValue(store, 'donePool'), parsed.playType);
       observedDone = doneAmount;
@@ -597,16 +605,25 @@ async function executeMstromBetOneShot(request) {
       ) {
         return accepted(parsed, 'bet-history');
       }
-      if (explicitFailure(readStoreValue(store, 'diffPool'), parsed.playType)) {
-        return committedRejected(parsed, 'platform-rejected');
-      }
+      responseCompleted ||= submittedSequencesCompleted(store, submittedSequences);
       await delay(Math.min(POLL_INTERVAL_MS, Math.max(1, deadline - Date.now())));
+    }
+    const observedStake = readPoolAmount(readStoreValue(store, 'stakePool'), parsed.playType);
+    if (
+      responseCompleted
+      && readStoreValue(store, 'gmcode') === parsed.handId
+      && observedStake !== null
+      && observedStake === beforeStake
+    ) {
+      return committedRejected(parsed, 'platform-rejected');
     }
     return unknown(parsed, 'result-timeout', {
       beforeDone,
       observedDone,
       beforeHistory,
       observedHistory,
+      responseCompleted,
+      observedStake,
     });
   }
 

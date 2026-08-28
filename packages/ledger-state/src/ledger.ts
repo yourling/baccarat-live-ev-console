@@ -618,8 +618,14 @@ export class SqliteLedger {
       }
       return existing;
     }
-    if (existing.status !== 'UNKNOWN' || existing.receipt?.status !== 'UNKNOWN') {
-      throw new LedgerConflictError(`operational wager ${wagerId} is not a reconcilable UNKNOWN`);
+    const committedRejected = existing.status === 'REJECTED'
+      && existing.receipt?.status === 'REJECTED'
+      && typeof existing.receipt.raw === 'object'
+      && existing.receipt.raw !== null
+      && Reflect.get(existing.receipt.raw, 'commitStarted') === true
+      && Reflect.get(existing.receipt.raw, 'commitPoint') === 'confirmBet';
+    if ((existing.status !== 'UNKNOWN' || existing.receipt?.status !== 'UNKNOWN') && !committedRejected) {
+      throw new LedgerConflictError(`operational wager ${wagerId} is not a reconcilable committed execution`);
     }
     const updated: OperationalWagerRecord = { ...existing, reconciliation };
     const result = this.db.prepare(`

@@ -6,11 +6,12 @@ export type KeepaliveWagerResponse = {
   readonly status: OperationalWagerStatus;
   readonly reason?: string;
   readonly attempted?: boolean;
+  readonly committed?: boolean;
 };
 
 export type KeepaliveAttemptResult =
   | { readonly status: 'ACCEPTED'; readonly tableId: string; readonly reason?: string }
-  | { readonly status: 'REJECTED'; readonly tableId: null; readonly attempted: boolean; readonly reason?: string }
+  | { readonly status: 'REJECTED'; readonly tableId: string | null; readonly attempted: boolean; readonly reason?: string }
   | { readonly status: 'UNKNOWN'; readonly tableId: string; readonly reason?: string };
 
 export interface KeepaliveAttemptInput {
@@ -37,6 +38,14 @@ export async function tryKeepaliveInOrder(input: KeepaliveAttemptInput): Promise
       case 'REJECTED':
         attempted ||= response.attempted === true;
         lastReason = response.reason;
+        if (response.committed === true) {
+          return {
+            status: 'REJECTED',
+            tableId,
+            attempted: true,
+            ...(response.reason === undefined ? {} : { reason: response.reason }),
+          };
+        }
         break;
       default:
         return assertNeverOperationalWagerStatus(response.status);

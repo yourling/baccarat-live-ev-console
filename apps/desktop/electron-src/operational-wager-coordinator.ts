@@ -135,6 +135,7 @@ export class OperationalWagerCoordinator {
           return {
             status: response.status,
             attempted: response.wager !== undefined,
+            committed: receiptCommitStarted(response),
             ...(response.reason === undefined ? {} : { reason: response.reason }),
           };
         },
@@ -276,6 +277,11 @@ function readOptionalStatus(value: object, field: string): Record<string, Operat
 
 function isRecord(value: unknown): value is object {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function receiptCommitStarted(result: OperationalWagerResult): boolean {
+  const raw = result.receipt?.raw;
+  return isRecord(raw) && Reflect.get(raw, 'commitStarted') === true;
 }
 
 function isKeepaliveWagerMarket(value: string): value is KeepaliveWagerMarket {

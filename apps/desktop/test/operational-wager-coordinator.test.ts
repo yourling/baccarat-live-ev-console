@@ -151,6 +151,65 @@ describe('OperationalWagerCoordinator', () => {
     }
   });
 
+  it('does not fall through to another table after a committed platform rejection', async () => {
+    const ledger = new SqliteLedger(':memory:');
+    const calls: string[] = [];
+    const coordinator = new OperationalWagerCoordinator({
+      ledger,
+      actor: tableId => ({
+        placeOperationalWager: async command => {
+          calls.push(tableId);
+          const acceptedResult = accepted(tableId, command);
+          if (tableId !== 'D001') return acceptedResult;
+          const wager = acceptedResult.wager;
+          if (wager === undefined) throw new Error('test wager was not created');
+          return {
+            status: 'REJECTED',
+            tableId,
+            reason: 'platform-rejected',
+            wager,
+            receipt: {
+              receiptId: 'receipt-D001',
+              wagerId: wager.wagerId,
+              tableId: wager.tableId,
+              shoeId: wager.shoeId,
+              handId: wager.handId,
+              market: wager.market,
+              amount: wager.amount,
+              source: wager.source,
+              status: 'REJECTED',
+              createdAt: wager.createdAt,
+              raw: { commitPoint: 'confirmBet', commitStarted: true },
+            },
+          };
+        },
+      }),
+      monitorTableIds: () => ['D001', 'D002'],
+      serialize: async operation => await operation(),
+    });
+
+    try {
+      await coordinator.updateKeepalive({
+        enabled: true,
+        intervalMinutes: 5,
+        market: 'player',
+        amount: 20,
+      }, BASE_TIME);
+
+      expect(calls).toEqual(['D001']);
+      expect(coordinator.getKeepaliveState()).toMatchObject({
+        enabled: true,
+        lastAttemptAt: BASE_TIME.toISOString(),
+        lastStatus: 'REJECTED',
+        lastTableId: 'D001',
+        lastReason: 'platform-rejected',
+      });
+    } finally {
+      coordinator.close();
+      ledger.close();
+    }
+  });
+
   it('does not dispatch a queued keepalive after immediate disable', async () => {
     const ledger = new SqliteLedger(':memory:');
     let ready = false;

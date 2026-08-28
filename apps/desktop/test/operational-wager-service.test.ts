@@ -305,6 +305,88 @@ describe('DesktopConsoleService operational wagers', () => {
     }
   });
 
+  it('reconciles a committed REJECTED receipt that the platform history proves was executed', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    authenticateBridge(bridge);
+    vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    const requestOperationalWager = vi.spyOn(bridge, 'requestOperationalWager')
+      .mockImplementation(async (request: OperationalWagerExecutionRequest) => ({
+        receiptId: `receipt-${request.wager.wagerId}`,
+        wagerId: request.wager.wagerId,
+        tableId: request.wager.tableId,
+        shoeId: request.wager.shoeId,
+        handId: request.wager.handId,
+        market: request.wager.market,
+        amount: request.wager.amount,
+        source: request.wager.source,
+        status: 'REJECTED',
+        createdAt: '2026-08-25T00:00:02.000Z',
+        raw: { reason: 'platform-rejected', commitPoint: 'confirmBet', commitStarted: true },
+      }));
+
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['D056']);
+      service['liveFeeds'].set('D056', freshFeed('D056'));
+      await service.injectEvent(physicalShoe('D056'));
+      await service.injectEvent(openWindow('D056'));
+      await service.setExecutionMode('D056', 'live');
+
+      const rejected = await service.executeOperationalWager({
+        tableId: 'D056',
+        market: 'player',
+        amount: 20,
+      });
+      expect(rejected.status).toBe('REJECTED');
+      const reservation = rejected.snapshot.reservations.find(candidate =>
+        candidate.intentId === rejected.wager!.wagerId);
+      expect(reservation).toMatchObject({
+        status: 'RELEASED',
+        releaseReason: 'receipt-rejected',
+      });
+      expect(rejected.snapshot.snapshot.riskState).toMatchObject({
+        reservedExposure: 0,
+        pendingExecutions: 0,
+        executedToday: 0,
+      });
+
+      await service.injectEvent(bankerWinSettlement('D056'));
+      const reconciled = await service.reconcileUnknownOperationalWager({
+        reservationId: reservation!.reservationId,
+        wagerId: rejected.wager!.wagerId,
+      });
+
+      expect(reconciled.reservations.find(candidate =>
+        candidate.reservationId === reservation!.reservationId)).toMatchObject({
+        status: 'SETTLED',
+        realizedPnl: -20,
+        releaseReason: 'operator-confirmed-platform-accepted',
+      });
+      expect(reconciled.snapshot.riskState).toMatchObject({
+        reservedExposure: 0,
+        pendingExecutions: 0,
+        executedToday: 20,
+        dayLoss: 20,
+      });
+      expect(reconciled.operationalWagers).toContainEqual(expect.objectContaining({
+        status: 'REJECTED',
+        receipt: expect.objectContaining({ status: 'REJECTED' }),
+        reconciliation: expect.objectContaining({ status: 'ACCEPTED' }),
+      }));
+      expect(requestOperationalWager).toHaveBeenCalledTimes(1);
+
+      const idempotent = await service.reconcileUnknownOperationalWager({
+        reservationId: reservation!.reservationId,
+        wagerId: rejected.wager!.wagerId,
+      });
+      expect(idempotent.snapshot.riskState.executedToday).toBe(20);
+      expect(requestOperationalWager).toHaveBeenCalledTimes(1);
+    } finally {
+      await service.close();
+    }
+  });
+
   it('keeps live keepalive blocked until a physical-shoe baseline is observed', async () => {
     // Given: global automation is enabled while a live table is attached mid-shoe.
     const service = new DesktopConsoleService(':memory:');

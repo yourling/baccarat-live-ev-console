@@ -209,6 +209,45 @@ describe('risk manager', () => {
     }));
   });
 
+  it('reconciles a released platform rejection as executed without releasing exposure twice', () => {
+    const manager = new RiskManager();
+    const reserved = manager.tryReserveExecution({
+      intentId: 'misclassified-rejection',
+      tableId: 'D066',
+      shoeId: 'shoe-11',
+      handId: 'hand-26828174',
+      market: 'player',
+      executionSource: 'keepalive',
+      amount: 20,
+    }, profile.limits, { netWin: 1, loss: 1 }, limits);
+    expect(reserved.reservation).toBeDefined();
+    expect(manager.release(
+      reserved.reservation!.reservationId,
+      false,
+      'receipt-rejected',
+      'receipt-misclassified',
+    )).toBe(true);
+    expect(manager.getState()).toMatchObject({ reservedExposure: 0, pendingExecutions: 0 });
+
+    const settled = manager.settleReleased(reserved.reservation!.reservationId, {
+      playerCards: [{ rank: '4' }, { rank: '4' }],
+      bankerCards: [{ rank: '2' }, { rank: '3' }],
+    }, 'operator-confirmed-platform-accepted');
+
+    expect(settled).toEqual(expect.objectContaining({
+      status: 'SETTLED',
+      realizedPnl: 20,
+      releaseReason: 'operator-confirmed-platform-accepted',
+      receiptId: 'receipt-misclassified',
+    }));
+    expect(manager.getState()).toEqual(expect.objectContaining({
+      reservedExposure: 0,
+      pendingExecutions: 0,
+      executedToday: 20,
+      dayLoss: -20,
+    }));
+  });
+
   it('uses execution source in operational reservation idempotency', () => {
     const m = new RiskManager();
     const reserve = (executionSource: 'manual' | 'keepalive') => m.tryReserveExecution({

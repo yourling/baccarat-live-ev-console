@@ -671,6 +671,72 @@ describe('operational wager income summary', () => {
     })).toThrow(LedgerConflictError);
     ledger.close();
   });
+
+  it('keeps a committed REJECTED receipt while an accepted reconciliation corrects execution totals', () => {
+    const ledger = new SqliteLedger();
+    const createdAt = '2026-08-28T02:00:00.000Z';
+    const record = {
+      reservationId: 'rsv-misclassified-rejection',
+      status: 'REJECTED' as const,
+      wager: {
+        wagerId: 'opw-misclassified-rejection',
+        tableId: 'D056',
+        shoeId: 'shoe-D056',
+        handId: 'GD0562682819B',
+        market: 'player' as const,
+        amount: 20,
+        source: 'keepalive' as const,
+        createdAt,
+      },
+      receipt: {
+        receiptId: 'receipt-misclassified-rejection',
+        wagerId: 'opw-misclassified-rejection',
+        tableId: 'D056',
+        shoeId: 'shoe-D056',
+        handId: 'GD0562682819B',
+        market: 'player' as const,
+        amount: 20,
+        source: 'keepalive' as const,
+        status: 'REJECTED' as const,
+        createdAt,
+        raw: { commitStarted: true, commitPoint: 'confirmBet', reason: 'platform-rejected' },
+      },
+    };
+    ledger.saveOperationalWager(record);
+    ledger.saveReservation({
+      reservationId: record.reservationId,
+      intentId: record.wager.wagerId,
+      tableId: record.wager.tableId,
+      shoeId: record.wager.shoeId,
+      handId: record.wager.handId,
+      market: record.wager.market,
+      executionSource: record.wager.source,
+      amount: 20,
+      maxLoss: 20,
+      maxProfit: 20,
+      status: 'SETTLED',
+      createdAt,
+      settledAt: '2026-08-28T02:01:00.000Z',
+      realizedPnl: 20,
+    });
+    const reconciliation = {
+      status: 'ACCEPTED' as const,
+      reason: 'operator-confirmed-platform-accepted' as const,
+      reconciledAt: '2026-08-28T02:02:00.000Z',
+    };
+
+    const reconciled = ledger.reconcileOperationalWager(record.wager.wagerId, reconciliation);
+
+    expect(reconciled).toMatchObject({
+      status: 'REJECTED',
+      receipt: { status: 'REJECTED', raw: { reason: 'platform-rejected' } },
+      reconciliation,
+    });
+    expect(ledger.getMonitorSummary()).toMatchObject({
+      rows: [{ tableId: 'D056', bets: 1, amount: 20, actualPnl: 20 }],
+    });
+    ledger.close();
+  });
 });
 
 

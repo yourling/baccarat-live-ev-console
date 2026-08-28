@@ -40,19 +40,33 @@ function makeStore(ack: Ack = 'accepted', overrides: Record<string, unknown> = {
   const stakePool = new FakePool({ 4: 0, 5: 0 });
   const donePool = new FakePool({ 4: 0, 5: 0 });
   const diffPool = new FakePool({ 4: 0, 5: 0 });
+  const pendingBetSeqForResp = new Set<string>();
+  let nextSequence = 1;
   const addChipByPlayType = vi.fn((playType: number, amount: number) => stakePool.setAmount(playType, stakePool.getAmount(playType) + (ack === 'wrong-delta' ? amount + 1 : amount)));
   const confirmBet = vi.fn(() => {
+    const sequence = String(nextSequence++);
+    pendingBetSeqForResp.add(sequence);
     if (ack === 'accepted') {
-      donePool.setAmount(4, stakePool.getAmount(4));
-      donePool.setAmount(5, stakePool.getAmount(5));
-      diffPool.statuses.set(4, { pending: false, success: true });
-      diffPool.statuses.set(5, { pending: false, success: true });
+      setTimeout(() => {
+        donePool.setAmount(4, stakePool.getAmount(4));
+        donePool.setAmount(5, stakePool.getAmount(5));
+        diffPool.statuses.set(4, { pending: false, success: true });
+        diffPool.statuses.set(5, { pending: false, success: true });
+        pendingBetSeqForResp.delete(sequence);
+      }, 0);
       return;
     }
-    if (ack === 'rejected') { diffPool.setAmount(4, 10); diffPool.statuses.set(4, { pending: false, success: false }); }
+    if (ack === 'rejected') {
+      diffPool.setAmount(4, 10);
+      diffPool.statuses.set(4, { pending: false, success: false });
+      setTimeout(() => {
+        stakePool.setAmount(4, donePool.getAmount(4));
+        pendingBetSeqForResp.delete(sequence);
+      }, 0);
+    }
   });
   return {
-    vid: 'D065', gmcode: 'GD065-1', betEnabled: true, stakePool, donePool, diffPool, addChipByPlayType, confirmBet,
+    vid: 'D065', gmcode: 'GD065-1', betEnabled: true, stakePool, donePool, diffPool, pendingBetSeqForResp, addChipByPlayType, confirmBet,
     getDisablePlayTypes: () => [], getBalance: () => 100, getBetLimitByPlayType: () => ({ min: 1, max: 1000 }), ...overrides,
   };
 }
@@ -338,15 +352,40 @@ describe('Dafabet mstrom MAIN-world bet runtime', () => {
   });
 
   it('returns REJECTED for an explicit platform failure', async () => {
-    const store = makeStore('rejected');
+    vi.useFakeTimers();
+    try {
+      const store = makeStore('rejected');
+      const runtime = loadRuntime(store);
+      const resultPromise = runtime.execute(validRequest());
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(store.diffPool.getAllStakeData()).toContainEqual(expect.objectContaining({
+        playType: 4,
+        pending: false,
+        success: false,
+      }));
+      expect(store.confirmBet).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(5100);
+      expect(await resultPromise).toMatchObject({
+        status: 'REJECTED',
+        raw: { commitPoint: 'confirmBet', commitStarted: true },
+      });
+      expect(store.stakePool.getAmount(4)).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not treat the initial diffPool success=false row as a rejection', async () => {
+    const store = makeStore('accepted');
+    store.diffPool.statuses.set(4, { pending: false, success: false });
     const runtime = loadRuntime(store);
+
     const result = await runtime.execute(validRequest());
-    expect(result).toMatchObject({ status: 'REJECTED' });
+
+    expect(result).toMatchObject({ status: 'ACCEPTED' });
     expect(store.confirmBet).toHaveBeenCalledOnce();
-    expect(store.stakePool.getAmount(4)).toBe(10);
-    expect(result).toMatchObject({
-      raw: { commitPoint: 'confirmBet', commitStarted: true },
-    });
   });
 
   it('returns UNKNOWN and locks the execution when confirmBet throws without an observable outcome', async () => {
