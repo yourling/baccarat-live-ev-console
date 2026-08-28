@@ -500,6 +500,83 @@ describe('browser bridge server', () => {
     });
   });
 
+  it('requests a fail-closed game-page reload after feed progress remains stale', async () => {
+    const server = new BrowserBridgeServer({
+      port: 0,
+      tableStaleAfterMs: 1_000,
+      stalePageReloadAfterMs: 1_000,
+    });
+    const port = await server.start();
+    const extension = extensionClient(port);
+    const feed = server.openTable('r1', 't1');
+    await feed.start({ onBatch: () => {} });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        extension.once('open', resolve);
+        extension.once('error', reject);
+      });
+      const reload = new Promise<{ readonly name?: string; readonly tableIds?: readonly string[] }>(resolve => {
+        extension.on('message', data => {
+          const message = JSON.parse(data.toString()) as {
+            readonly kind?: string;
+            readonly name?: string;
+            readonly tableIds?: readonly string[];
+          };
+          if (message.kind === 'command' && message.name === 'reloadGameTabs') resolve(message);
+        });
+      });
+      const checkFreshness = Reflect.get(feed, 'checkFreshness');
+      if (typeof checkFreshness !== 'function') throw new Error('freshness watchdog unavailable');
+      Reflect.apply(checkFreshness, feed, [Date.now() + 2_000]);
+
+      await expect(reload).resolves.toEqual(expect.objectContaining({
+        name: 'reloadGameTabs',
+        tableIds: ['t1'],
+      }));
+    } finally {
+      extension.close();
+      await server.close();
+    }
+  });
+
+  it('cancels a pending stale-page reload when any real table observation resumes', async () => {
+    const server = new BrowserBridgeServer({
+      port: 0,
+      tableStaleAfterMs: 1_000,
+      stalePageReloadAfterMs: 1_000,
+    });
+    const port = await server.start();
+    const extension = extensionClient(port);
+    const feed = server.openTable('r1', 't1');
+    await feed.start({ onBatch: () => {} });
+    const commands: string[] = [];
+    try {
+      await new Promise<void>((resolve, reject) => {
+        extension.once('open', resolve);
+        extension.once('error', reject);
+      });
+      extension.on('message', data => {
+        const message = JSON.parse(data.toString()) as { readonly kind?: string; readonly name?: string };
+        if (message.kind === 'command' && message.name !== undefined) commands.push(message.name);
+      });
+      const checkFreshness = Reflect.get(feed, 'checkFreshness');
+      if (typeof checkFreshness !== 'function') throw new Error('freshness watchdog unavailable');
+      Reflect.apply(checkFreshness, feed, [Date.now() + 2_000]);
+      server.ingestClientMessage({
+        kind: 'tableEvent',
+        roomId: 'r1',
+        tableId: 't1',
+        event: bridgeEvent(),
+      });
+      await new Promise<void>(resolve => setTimeout(resolve, 20));
+
+      expect(commands).not.toContain('reloadGameTabs');
+    } finally {
+      extension.close();
+      await server.close();
+    }
+  });
+
   it('keeps observer clients read-only while allowing local command clients', async () => {
     const server = new BrowserBridgeServer({ port: 0 });
     const port = await server.start();

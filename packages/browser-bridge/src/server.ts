@@ -48,6 +48,7 @@ export interface BrowserBridgeServerOptions {
   multiviewOpenedGraceMs?: number;
   selectedTableIds?: readonly string[];
   tableStaleAfterMs?: number;
+  stalePageReloadAfterMs?: number;
   extensionHeartbeatTimeoutMs?: number;
   requireExtensionSequence?: boolean;
   allowedExtensionId?: string;
@@ -101,6 +102,8 @@ const MULTIVIEW_RECOVERY_COOLDOWN_MS = 10_000;
 /** 页面确认已打开多台后，留给真实页面完成加载的宽限时间。 */
 const MULTIVIEW_OPENED_GRACE_MS = 60_000;
 const TABLE_STALE_AFTER_MS = 45_000;
+const STALE_PAGE_RELOAD_AFTER_MS = 8 * 60_000;
+const STALE_PAGE_RELOAD_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000] as const;
 const EXTENSION_HEARTBEAT_TIMEOUT_MS = 15_000;
 
 type BridgeSocketRole = 'extension' | 'observer' | 'command';
@@ -314,6 +317,7 @@ class BridgeTableExport implements TableExport {
     tableId: string,
     private readonly staleAfterMs: number,
     private readonly onDisconnected?: (tableId: string, reason: string) => void,
+    private readonly onObserved?: (tableId: string) => void,
   ) {
     this.roomId = roomId;
     this.tableId = tableId;
@@ -394,6 +398,7 @@ class BridgeTableExport implements TableExport {
 
   noteObservation(): void {
     this.lastObservationAt = Date.now();
+    this.onObserved?.(this.tableId);
   }
 
   markTransportContinuous(): void {
@@ -569,9 +574,13 @@ export class BrowserBridgeServer implements RoomMonitor {
   private readonly multiviewRecoveryCooldownMs: number;
   private readonly multiviewOpenedGraceMs: number;
   private readonly tableStaleAfterMs: number;
+  private readonly stalePageReloadAfterMs: number;
   private readonly extensionHeartbeatTimeoutMs: number;
   private readonly requireExtensionSequence: boolean;
   private freshnessTimer?: NodeJS.Timeout;
+  private stalePageReloadTimer?: NodeJS.Timeout;
+  private stalePageReloadAttempts = 0;
+  private readonly staleTableIds = new Set<string>();
   private readonly socketLastSeenAt = new Map<WebSocket, number>();
   private readonly socketBridgeSession = new Map<WebSocket, string>();
   private readonly lastBridgeSeqBySession = new Map<string, number>();
@@ -591,6 +600,10 @@ export class BrowserBridgeServer implements RoomMonitor {
       options.multiviewOpenedGraceMs ?? MULTIVIEW_OPENED_GRACE_MS,
     );
     this.tableStaleAfterMs = Math.max(1_000, options.tableStaleAfterMs ?? TABLE_STALE_AFTER_MS);
+    this.stalePageReloadAfterMs = Math.max(
+      this.tableStaleAfterMs,
+      options.stalePageReloadAfterMs ?? STALE_PAGE_RELOAD_AFTER_MS,
+    );
     this.extensionHeartbeatTimeoutMs = Math.max(
       1_000,
       options.extensionHeartbeatTimeoutMs ?? EXTENSION_HEARTBEAT_TIMEOUT_MS,
@@ -704,6 +717,8 @@ export class BrowserBridgeServer implements RoomMonitor {
 
   async close(): Promise<void> {
     this.clearMultiviewRecoveryTimer();
+    this.clearStalePageReloadTimer();
+    this.staleTableIds.clear();
     if (this.freshnessTimer) {
       clearInterval(this.freshnessTimer);
       this.freshnessTimer = undefined;
@@ -743,6 +758,9 @@ export class BrowserBridgeServer implements RoomMonitor {
 
   /** Starts an independent logical monitor session without claiming a physical shoe reset. */
   beginMonitorSession(): void {
+    this.clearStalePageReloadTimer();
+    this.staleTableIds.clear();
+    this.stalePageReloadAttempts = 0;
     this.mstromShoeSessions.clear();
     this.mstromProtocolParsers.clear();
     this.mstromRuntimeParsers.clear();
@@ -880,6 +898,9 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.configuredSelectedTables = nextSelectedTables;
     this.refreshEffectiveSelectedTables();
     this.pruneUnselectedTables();
+    for (const staleTableId of this.staleTableIds) {
+      if (!nextSelectedTables.has(staleTableId)) this.clearStaleTable(staleTableId);
+    }
     for (const tableId of trackedTableIds) {
       if (!nextSelectedTables.has(tableId) || !wasPreviouslySelected(tableId)) {
         this.resetMstromTableState(tableId);
@@ -1283,6 +1304,47 @@ export class BrowserBridgeServer implements RoomMonitor {
     }
   }
 
+  private clearStaleTable(tableId: string): void {
+    if (!this.staleTableIds.delete(tableId) || this.staleTableIds.size > 0) return;
+    this.clearStalePageReloadTimer();
+    this.stalePageReloadAttempts = 0;
+  }
+
+  private noteStaleTable(tableId: string): void {
+    const wasEmpty = this.staleTableIds.size === 0;
+    this.staleTableIds.add(tableId);
+    if (!wasEmpty || this.stalePageReloadTimer !== undefined) return;
+    this.stalePageReloadAttempts = 0;
+    this.scheduleStalePageReload(
+      Math.max(0, this.stalePageReloadAfterMs - this.tableStaleAfterMs),
+    );
+  }
+
+  private scheduleStalePageReload(delayMs: number): void {
+    if (this.stalePageReloadTimer !== undefined || this.staleTableIds.size === 0) return;
+    this.stalePageReloadTimer = setTimeout(() => {
+      this.stalePageReloadTimer = undefined;
+      if (this.staleTableIds.size === 0) return;
+      this.broadcastToSockets({
+        kind: 'command',
+        name: 'reloadGameTabs',
+        tableIds: [...this.staleTableIds].sort(),
+      });
+      const retryDelay = STALE_PAGE_RELOAD_RETRY_DELAYS_MS[
+        Math.min(this.stalePageReloadAttempts, STALE_PAGE_RELOAD_RETRY_DELAYS_MS.length - 1)
+      ];
+      this.stalePageReloadAttempts += 1;
+      this.scheduleStalePageReload(retryDelay);
+    }, delayMs);
+    this.stalePageReloadTimer.unref();
+  }
+
+  private clearStalePageReloadTimer(): void {
+    if (this.stalePageReloadTimer === undefined) return;
+    clearTimeout(this.stalePageReloadTimer);
+    this.stalePageReloadTimer = undefined;
+  }
+
   private acceptExtensionSequence(raw: unknown, socket: WebSocket): boolean {
     if (!this.requireExtensionSequence) return true;
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
@@ -1374,6 +1436,7 @@ export class BrowserBridgeServer implements RoomMonitor {
       tableId,
       this.tableStaleAfterMs,
       (disconnectedTableId, reason) => {
+        if (reason === 'table-feed-stale') this.noteStaleTable(disconnectedTableId);
         this.emitRuntimeEvent({
           kind: 'table-disconnected',
           tableId: disconnectedTableId,
@@ -1381,6 +1444,7 @@ export class BrowserBridgeServer implements RoomMonitor {
           timestamp: new Date().toISOString(),
         });
       },
+      observedTableId => this.clearStaleTable(observedTableId),
     );
     this.exports.set(key, created);
     return created;

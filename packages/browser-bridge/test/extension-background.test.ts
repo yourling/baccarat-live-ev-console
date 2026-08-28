@@ -66,6 +66,37 @@ function isMstromFinalInjection(value: unknown): boolean {
 }
 
 describe('extension background multitable command', () => {
+  it('revokes the live gate before reloading a frozen baccarat popup', async () => {
+    const harness = await createHarness();
+
+    harness.socket.emit('message', {
+      data: JSON.stringify({
+        kind: 'command',
+        name: 'reloadGameTabs',
+        tableIds: ['D066', 'D067'],
+      }),
+    });
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    expect(harness.chrome.storage.local.set).toHaveBeenCalledWith({ liveBetEnabled: false });
+    expect(harness.chrome.tabs.reload).toHaveBeenCalledOnce();
+    expect(harness.chrome.tabs.reload).toHaveBeenCalledWith(42);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      detail: 'reloadGameTabs:reloaded=1:tables=2',
+    }));
+
+    harness.socket.emit('message', { data: JSON.stringify(liveRequest('blocked-after-reload')) });
+    await flushBetHarnessAsyncWork();
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      requestId: 'blocked-after-reload',
+      error: 'live betting is disabled in the browser extension',
+    }));
+  });
+
   it('opens the casino multitable view only in every frame of the active game tab', async () => {
     FakeWebSocket.instances.length = 0;
     const executeScript = vi.fn().mockResolvedValue([

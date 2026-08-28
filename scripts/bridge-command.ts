@@ -2,7 +2,7 @@ import { WebSocket } from 'ws';
 
 const [name = '', ...tableIds] = process.argv.slice(2);
 if (!name) {
-  console.error('用法: tsx scripts/bridge-command.ts <reloadExtension|openMultiView|probeBetReadiness|replayRuntimeState|liveOn|liveOff|calibrate|trustedOn|trustedOff|calibrateClear> [tableId...]');
+  console.error('用法: tsx scripts/bridge-command.ts <reloadExtension|reloadGameTabs|openMultiView|probeBetReadiness|replayRuntimeState|liveOn|liveOff|calibrate|trustedOn|trustedOff|calibrateClear> [tableId...]');
   process.exit(1);
 }
 const port = Number(process.env.BRIDGE_PORT ?? 17890);

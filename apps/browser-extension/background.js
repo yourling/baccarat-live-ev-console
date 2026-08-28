@@ -648,6 +648,35 @@ async function handleRemoteCommand(name, tableIds = [], generation) {
     setTimeout(() => chrome.runtime.reload(), EXTENSION_RELOAD_DELAY_MS);
     return;
   }
+  if (name === 'reloadGameTabs') {
+    // A frozen feed is a fail-closed boundary. Revoke the execution gate before
+    // reloading so a stale page cannot retain authorization across recovery.
+    liveBetSessionEnabled = false;
+    await chrome.storage.local.set({ liveBetEnabled: false });
+    const tabs = await chrome.tabs.query({
+      url: [`${DAFABET_BACCARAT_POPUP_URL}*`],
+    });
+    if (generation !== activeSocketGeneration) return;
+    let reloaded = 0;
+    for (const tab of tabs) {
+      if (!tab.id || !exactDafabetBaccaratPopup(tab.url)) continue;
+      try {
+        await chrome.tabs.reload(tab.id);
+        reloaded += 1;
+      } catch (_) {
+        // A tab may close while recovery is being scheduled.
+      }
+    }
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: 'allFrames',
+      detail: `reloadGameTabs:reloaded=${reloaded}:tables=${tableIds.length}`,
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
   if (name === 'openMultiView') {
     await openActiveGameTabInMultiplay(tableIds);
     return;
