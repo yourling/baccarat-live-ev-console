@@ -59,7 +59,22 @@ function makeStore(ack: Ack = 'accepted', overrides: Record<string, unknown> = {
 
 function loadRuntime(store: unknown, extra: Record<string, unknown> = {}) {
   const getBetTableStore = vi.fn(() => store);
-  const context = vm.createContext({ chrome: { scripting: {} }, VideoGameCore: { LinkStoreFactory: { instance: { getBetTableStore } } }, location: { href: 'https://gci.agad.mstrom-uno.com/pc/pcv1/', hostname: 'gci.agad.mstrom-uno.com' }, Date, Promise, setTimeout, clearTimeout, ...extra });
+  const extraCore = typeof extra.VideoGameCore === 'object' && extra.VideoGameCore !== null
+    ? extra.VideoGameCore as Record<string, unknown>
+    : {};
+  const context = vm.createContext({
+    chrome: { scripting: {} },
+    ...extra,
+    VideoGameCore: {
+      ...extraCore,
+      LinkStoreFactory: { instance: { getBetTableStore } },
+    },
+    location: { href: 'https://gci.agad.mstrom-uno.com/pc/pcv1/', hostname: 'gci.agad.mstrom-uno.com' },
+    Date,
+    Promise,
+    setTimeout,
+    clearTimeout,
+  });
   vm.runInContext(source, context, { filename: 'msstrom-bet-runtime.js' });
   const runtimeFunction = (name: string) => {
     const value = Reflect.get(context, name);
@@ -231,6 +246,59 @@ describe('Dafabet mstrom MAIN-world bet runtime', () => {
 
     expect(result).toMatchObject({ status: 'ACCEPTED' });
     expect(store.confirmBet).toHaveBeenCalledOnce();
+  });
+
+  it('accepts the matching official bet-history increment when the table done pool stays stale', async () => {
+    const store = makeStore('unknown');
+    const historyStore = { dataList: [] as Array<Record<string, unknown>> };
+    store.confirmBet.mockImplementation(() => {
+      historyStore.dataList = [{
+        vid: 'D065',
+        gmcode: 'GD065-1',
+        playType: 4,
+        betAmount: 10,
+      }];
+    });
+    const runtime = loadRuntime(store, {
+      VideoGameCore: { MultiBetHistoryStore: { instance: historyStore } },
+    });
+
+    const result = await runtime.execute(validRequest());
+
+    expect(result).toMatchObject({
+      status: 'ACCEPTED',
+      raw: { acknowledgement: 'bet-history', commitStarted: true },
+    });
+    expect(store.donePool.getAmount(4)).toBe(0);
+    expect(store.confirmBet).toHaveBeenCalledOnce();
+  });
+
+  it('requires an official bet-history amount increase and does not accept a pre-existing row', async () => {
+    vi.useFakeTimers();
+    try {
+      const store = makeStore('unknown');
+      const historyStore = {
+        dataList: [{ vid: 'D065', gmcode: 'GD065-1', playType: 4, betAmount: 10 }],
+      };
+      const runtime = loadRuntime(store, {
+        VideoGameCore: { MultiBetHistoryStore: { instance: historyStore } },
+      });
+
+      const resultPromise = runtime.execute(validRequest());
+      await vi.advanceTimersByTimeAsync(5100);
+
+      expect(await resultPromise).toMatchObject({
+        status: 'UNKNOWN',
+        raw: {
+          reason: 'result-timeout',
+          beforeHistory: 10,
+          observedHistory: 10,
+        },
+      });
+      expect(store.confirmBet).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('rejects and restores the original stake when the add delta is not exact', async () => {

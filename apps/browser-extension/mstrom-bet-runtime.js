@@ -250,6 +250,44 @@ async function executeMstromBetOneShot(request) {
     }
   }
 
+  function historyPlayTypes(parsed) {
+    const playTypes = [parsed.playType];
+    if (parsed.market !== 'banker') return playTypes;
+    try {
+      const noCommission = finiteNumber(Number(globalThis.VideoGameCore && globalThis.VideoGameCore.PLAYTYPE_BANKER_NO_COMMISSION));
+      if (noCommission !== null && !playTypes.includes(noCommission)) playTypes.push(noCommission);
+    } catch (_) {
+      return playTypes;
+    }
+    return playTypes;
+  }
+
+  function readHistoryAmount(parsed) {
+    try {
+      const core = globalThis.VideoGameCore;
+      const historyStore = core && core.MultiBetHistoryStore && core.MultiBetHistoryStore.instance;
+      if (!historyStore || !Array.isArray(historyStore.dataList)) return null;
+      const playTypes = historyPlayTypes(parsed);
+      let total = 0;
+      for (const row of historyStore.dataList) {
+        if (
+          !row
+          || row.vid !== parsed.tableId
+          || row.gmcode !== parsed.handId
+          || !playTypes.includes(Number(row.playType))
+        ) {
+          continue;
+        }
+        const amount = finiteNumber(Number(row.betAmount));
+        if (amount === null || amount < 0) return null;
+        total += amount;
+      }
+      return total;
+    } catch (_) {
+      return null;
+    }
+  }
+
   function optionalBalance(store) {
     try {
       const value = store && typeof store.getBalance === 'function'
@@ -394,22 +432,24 @@ async function executeMstromBetOneShot(request) {
     });
   }
 
-  function unknown(parsed, reason) {
+  function unknown(parsed, reason, diagnostics = {}) {
     return makeReceipt(parsed, 'UNKNOWN', {
       reason,
       tableId: parsed.tableId,
       playType: parsed.playType,
       commitPoint: commitStarted ? COMMIT_POINT : null,
       commitStarted,
+      ...diagnostics,
     });
   }
 
-  function accepted(parsed) {
+  function accepted(parsed, acknowledgement) {
     return makeReceipt(parsed, 'ACCEPTED', {
       tableId: parsed.tableId,
       playType: parsed.playType,
       commitPoint: COMMIT_POINT,
       commitStarted: true,
+      acknowledgement,
     });
   }
 
@@ -455,6 +495,7 @@ async function executeMstromBetOneShot(request) {
 
     const beforeStake = readPoolAmount(stakePool, parsed.playType);
     const beforeDone = readPoolAmount(donePool, parsed.playType);
+    const beforeHistory = readHistoryAmount(parsed);
     if (beforeStake === null || beforeDone === null || typeof stakePool.calculateDiff !== 'function') {
       return rejected(parsed, 'pool-state-unreadable');
     }
@@ -517,26 +558,56 @@ async function executeMstromBetOneShot(request) {
       // Always re-read both pools after the commit point.
       const doneAfterError = readPoolAmount(readStoreValue(store, 'donePool'), parsed.playType);
       if (doneAfterError !== null && doneAfterError - beforeDone >= parsed.amount) {
-        return accepted(parsed);
+        return accepted(parsed, 'done-pool');
+      }
+      const historyAfterError = readHistoryAmount(parsed);
+      if (
+        beforeHistory !== null
+        && historyAfterError !== null
+        && historyAfterError - beforeHistory >= parsed.amount
+      ) {
+        return accepted(parsed, 'bet-history');
       }
       if (explicitFailure(readStoreValue(store, 'diffPool'), parsed.playType)) {
         return committedRejected(parsed, 'platform-rejected');
       }
-      return unknown(parsed, 'confirm-failed-uncertain');
+      return unknown(parsed, 'confirm-failed-uncertain', {
+        beforeDone,
+        observedDone: doneAfterError,
+        beforeHistory,
+        observedHistory: historyAfterError,
+      });
     }
 
     const deadline = Date.now() + REQUEST_TIMEOUT_MS;
+    let observedDone = beforeDone;
+    let observedHistory = beforeHistory;
     while (Date.now() < deadline) {
       const doneAmount = readPoolAmount(readStoreValue(store, 'donePool'), parsed.playType);
+      observedDone = doneAmount;
       if (doneAmount !== null && doneAmount - beforeDone >= parsed.amount) {
-        return accepted(parsed);
+        return accepted(parsed, 'done-pool');
+      }
+      const historyAmount = readHistoryAmount(parsed);
+      observedHistory = historyAmount;
+      if (
+        beforeHistory !== null
+        && historyAmount !== null
+        && historyAmount - beforeHistory >= parsed.amount
+      ) {
+        return accepted(parsed, 'bet-history');
       }
       if (explicitFailure(readStoreValue(store, 'diffPool'), parsed.playType)) {
         return committedRejected(parsed, 'platform-rejected');
       }
       await delay(Math.min(POLL_INTERVAL_MS, Math.max(1, deadline - Date.now())));
     }
-    return unknown(parsed, 'result-timeout');
+    return unknown(parsed, 'result-timeout', {
+      beforeDone,
+      observedDone,
+      beforeHistory,
+      observedHistory,
+    });
   }
 
   const parsed = parseRequest(request);
