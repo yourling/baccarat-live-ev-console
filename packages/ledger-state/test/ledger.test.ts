@@ -188,6 +188,57 @@ describe('ledger persistence and append safety', () => {
     }
   });
 
+  it('replays legacy invalid continuity proofs fail-closed without rewriting the ledger', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-legacy-continuity-'));
+    const dbPath = join(dir, 'legacy.sqlite');
+    const profile = defaultProfile('t1');
+    const first = new SqliteLedger(dbPath);
+    first.appendEvent(ev({
+      type: 'newShoeSignal',
+      shoeId: 'shoe-1',
+      baseline: 'physical-shoe',
+      profile: { ...profile, autoConfirmNewShoe: true },
+    }, 1));
+    first.appendEvent(ev({ type: 'connectionLost' }, 2));
+    first.close();
+
+    const legacyEvent = ev({
+      type: 'connectionRestored',
+      continuityProof: 'synthetic continuity proof',
+    }, 3);
+    const raw = new Database(dbPath);
+    raw.prepare(`
+      INSERT INTO events (event_id, table_id, seq, type, payload, payload_hash, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      legacyEvent.eventId,
+      legacyEvent.tableId,
+      legacyEvent.sourceSeq,
+      legacyEvent.type,
+      JSON.stringify(legacyEvent),
+      'legacy-test-hash',
+      legacyEvent.timestamp,
+    );
+    raw.close();
+
+    const reopened = new SqliteLedger(dbPath);
+    const replay = reopened.replay('t1');
+    expect(replay.state.get('t1')).toMatchObject({
+      status: 'RESYNCING',
+      connectionStatus: 'RESYNCING',
+      autoBetStatus: 'DISARMED',
+    });
+    expect(
+      (reopened.listEvents('t1')[2] as Extract<NormalizedEvent, { type: 'connectionRestored' }>).continuityProof,
+    ).toBe('synthetic continuity proof');
+    expect(() => reopened.appendEvent(ev({
+      type: 'connectionRestored',
+      continuityProof: 'still-invalid',
+    }, 4))).toThrowError(ContractValidationError);
+    reopened.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('treats same eventId+payload as idempotent duplicate', () => {
     const led = new SqliteLedger();
     const e = ev({ type: 'newShoeSignal', shoeId: 's1', profile: { ...defaultProfile('t1'), autoConfirmNewShoe: true } }, 1);

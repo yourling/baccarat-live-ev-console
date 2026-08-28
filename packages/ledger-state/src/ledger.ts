@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
   assertValidEventEnvelope,
+  isValidContinuityProof,
   type BetReceipt,
   type BettingMarket,
   type DecisionSnapshot,
@@ -71,6 +72,19 @@ function semanticStoredEventPayload(payload: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function storedEventForReplay(event: NormalizedEvent): NormalizedEvent {
+  if (
+    event.type !== 'connectionRestored'
+    || event.continuityProof === undefined
+    || isValidContinuityProof(event.continuityProof)
+  ) {
+    return event;
+  }
+  // Legacy builds persisted descriptive strings here. Preserve the immutable
+  // event for audit, but never let an unverified string restore continuity.
+  return { ...event, continuityProof: undefined };
 }
 
 export interface MonitorSummaryRow {
@@ -943,7 +957,7 @@ export class SqliteLedger {
 
   replay(tableId?: string): { state: Map<string, ShoeStateProjection>; hash: string } {
     const events = this.listEvents(tableId);
-    const state = replayEvents(events);
+    const state = replayEvents(events.map(storedEventForReplay));
     return { state, hash: sha256(stableStringify(events)) };
   }
 
