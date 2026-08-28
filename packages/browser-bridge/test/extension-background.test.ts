@@ -503,6 +503,46 @@ describe('extension background multitable command', () => {
     }));
   });
 
+  it('reports safe frame structure when no target bet store is found', async () => {
+    const harness = await createHarness({
+      probeResults: [{
+        frameId: 7,
+        result: {
+          frameUrl: 'https://gci.agad.mstrom-uno.com/pc/pcv2/index.jsp',
+          host: 'gci.agad.mstrom-uno.com',
+          tableId: 'D067',
+          ownsTargetStore: false,
+          diagnostics: {
+            corePresent: true,
+            coreKeys: ['LinkStoreFactory'],
+            linkFactoryPresent: true,
+            linkFactoryKeys: ['getBetTableStore', 'betStoreMap'],
+            gameLinkStorePresent: true,
+            gameLinkStoreKeys: ['visibleVids'],
+          },
+        },
+      }],
+    });
+
+    harness.socket.emit('message', {
+      data: JSON.stringify({
+        kind: 'command',
+        name: 'probeBetReadiness',
+        tableIds: ['D067'],
+      }),
+    });
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      detail: expect.stringContaining(
+        'frames=host=gci.agad.mstrom-uno.com,core=true,coreKeys=LinkStoreFactory,linkFactory=true,linkKeys=getBetTableStore,betStoreMap',
+      ),
+    }));
+  });
+
 });
 describe('extension background live bet gate', () => {
   it.each(['close', 'error'] as const)(

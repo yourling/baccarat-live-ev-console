@@ -389,6 +389,31 @@ async function probeMstromBetReadiness(tableIds, generation) {
         && MSTROM_FRAME_HOST_PATTERN.test(String(result.host || ''));
     });
     const result = candidates.length === 1 ? candidates[0].result : null;
+    const frameDiagnostics = candidates.length === 0
+      ? probes
+        .map(entry => entry && entry.result)
+        .filter(frameResult => frameResult && MSTROM_FRAME_HOST_PATTERN.test(String(frameResult.host || '')))
+        .map(frameResult => {
+          const diagnostics = frameResult.diagnostics || {};
+          const coreKeys = Array.isArray(diagnostics.coreKeys) ? diagnostics.coreKeys.slice(0, 8).join(',') : '';
+          const linkKeys = Array.isArray(diagnostics.linkFactoryKeys)
+            ? diagnostics.linkFactoryKeys.slice(0, 12).join(',')
+            : '';
+          const gameLinkKeys = Array.isArray(diagnostics.gameLinkStoreKeys)
+            ? diagnostics.gameLinkStoreKeys.slice(0, 8).join(',')
+            : '';
+          return [
+            `host=${String(frameResult.host || '')}`,
+            `core=${diagnostics.corePresent === true}`,
+            `coreKeys=${coreKeys}`,
+            `linkFactory=${diagnostics.linkFactoryPresent === true}`,
+            `linkKeys=${linkKeys}`,
+            `gameLink=${diagnostics.gameLinkStorePresent === true}`,
+            `gameLinkKeys=${gameLinkKeys}`,
+          ].join(',');
+        })
+        .join('|')
+      : '';
     send({
       kind: 'sessionAction',
       action: 'command-executed',
@@ -402,6 +427,7 @@ async function probeMstromBetReadiness(tableIds, generation) {
         `addChip=${result && result.hasAddChip === true}`,
         `confirm=${result && result.hasConfirm === true}`,
         `calculateDiff=${result && result.hasCalculateDiff === true}`,
+        ...(frameDiagnostics ? [`frames=${frameDiagnostics}`] : []),
       ].join(':'),
       timestamp: new Date().toISOString(),
     });

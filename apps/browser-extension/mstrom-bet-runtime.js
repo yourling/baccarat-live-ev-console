@@ -16,6 +16,25 @@ function probeMstromBetStore(tableId) {
     return typeof value === 'string' && /^[A-Z]\d{3}$/.test(value);
   }
 
+  function diagnosticKeys(value) {
+    if (!value || (typeof value !== 'object' && typeof value !== 'function')) return [];
+    const keys = [];
+    let cursor = value;
+    for (let depth = 0; cursor && depth < 3 && keys.length < 40; depth += 1) {
+      try {
+        for (const key of Object.getOwnPropertyNames(cursor)) {
+          if (!/bet|store|table|link|game/i.test(key) || keys.includes(key)) continue;
+          keys.push(key);
+          if (keys.length >= 40) break;
+        }
+        cursor = Object.getPrototypeOf(cursor);
+      } catch (_) {
+        break;
+      }
+    }
+    return keys;
+  }
+
   function frameInfo() {
     try {
       const pageLocation = globalThis.location || {};
@@ -102,6 +121,9 @@ function probeMstromBetStore(tableId) {
 
   const locationInfo = frameInfo();
   const store = getStore(tableId);
+  const core = globalThis.VideoGameCore;
+  const linkFactory = core && core.LinkStoreFactory && core.LinkStoreFactory.instance;
+  const gameLinkStore = core && core.GameLinkStore && core.GameLinkStore.instance;
   let disabledPlayTypes = null;
   if (store && typeof store.getDisablePlayTypes === 'function') {
     try {
@@ -131,6 +153,14 @@ function probeMstromBetStore(tableId) {
     hasAddChip: Boolean(store && typeof store.addChipByPlayType === 'function'),
     hasConfirm: Boolean(store && typeof store.confirmBet === 'function'),
     hasCalculateDiff: Boolean(stakePool && typeof stakePool.calculateDiff === 'function'),
+    diagnostics: {
+      corePresent: Boolean(core),
+      coreKeys: diagnosticKeys(core),
+      linkFactoryPresent: Boolean(linkFactory),
+      linkFactoryKeys: diagnosticKeys(linkFactory),
+      gameLinkStorePresent: Boolean(gameLinkStore),
+      gameLinkStoreKeys: diagnosticKeys(gameLinkStore),
+    },
   };
 }
 

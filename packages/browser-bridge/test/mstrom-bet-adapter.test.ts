@@ -124,6 +124,14 @@ describe('Dafabet mstrom MAIN-world bet runtime', () => {
       hasAddChip: true,
       hasConfirm: true,
       hasCalculateDiff: true,
+      diagnostics: {
+        corePresent: true,
+        coreKeys: ['LinkStoreFactory'],
+        linkFactoryPresent: true,
+        linkFactoryKeys: ['getBetTableStore'],
+        gameLinkStorePresent: false,
+        gameLinkStoreKeys: [],
+      },
     });
     expect(probe).not.toHaveProperty('token');
     expect(probe).not.toHaveProperty('sessionToken');
