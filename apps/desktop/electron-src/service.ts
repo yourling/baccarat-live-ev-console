@@ -203,6 +203,7 @@ export class DesktopConsoleService {
 
   constructor(readonly dbPath: string) {
     this.ledger = new SqliteLedger(dbPath);
+    this.ledger.repairPrecommitUnknownOperationalReservations();
     const repairedAcceptedReservations = this.ledger
       .restoreInvalidlyExpiredAcceptedOperationalReservations();
     const defaultExecutor = new SimulatedAdapter({ events: [] });

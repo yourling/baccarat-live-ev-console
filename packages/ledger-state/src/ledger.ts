@@ -69,7 +69,23 @@ type AcceptedOperationalReservationRepairAudit = {
   readonly repairs: readonly AcceptedOperationalReservationRepair[];
 };
 
+export interface PrecommitUnknownOperationalReservationRepair {
+  readonly reservationId: string;
+  readonly wagerId: string;
+  readonly tableId: string;
+  readonly shoeId: string;
+  readonly handId: string;
+  readonly previousStatus: 'UNKNOWN';
+  readonly previousReason: string;
+  readonly repairedAt: string;
+}
+
+type PrecommitUnknownOperationalReservationRepairAudit = {
+  readonly repairs: readonly PrecommitUnknownOperationalReservationRepair[];
+};
+
 const ACCEPTED_RESERVATION_REPAIR_AUDIT_KEY = 'ledger:accepted-reservation-repairs:v1';
+const PRECOMMIT_UNKNOWN_REPAIR_AUDIT_KEY = 'ledger:precommit-unknown-repairs:v1';
 const INVALID_ACCEPTED_EXPIRY_REASONS = new Set([
   'new-shoe-signal-received',
   'shoe-invalidated',
@@ -700,6 +716,96 @@ export class SqliteLedger {
             ...repairs.filter(repair => !existingIds.has(repair.reservationId)),
           ],
         });
+      }
+    });
+
+    return repairs;
+  }
+
+  repairPrecommitUnknownOperationalReservations(
+    repairedAt = new Date().toISOString(),
+  ): PrecommitUnknownOperationalReservationRepair[] {
+    const rows = this.db.prepare(`
+      SELECT r.payload AS reservation_payload, o.payload AS wager_payload
+      FROM reservations r
+      INNER JOIN operational_wagers o
+        ON o.wager_id = r.intent_id
+       AND json_extract(o.payload, '$.reservationId') = r.reservation_id
+      WHERE r.status = 'UNKNOWN'
+        AND json_extract(o.payload, '$.status') = 'UNKNOWN'
+        AND json_type(o.payload, '$.receipt') IS NULL
+    `).all() as { reservation_payload: string; wager_payload: string }[];
+    const repairs: PrecommitUnknownOperationalReservationRepair[] = [];
+
+    this.transaction(() => {
+      for (const row of rows) {
+        const reservation = JSON.parse(row.reservation_payload) as RiskReservation;
+        const record = JSON.parse(row.wager_payload) as OperationalWagerRecord;
+        const reason = record.reason;
+        if (typeof reason !== 'string') continue;
+        const routingFailure = /^bridge-request-error:expected exactly one matching frame for ([A-Z]\d{3}), found \d+$/.exec(reason);
+        if (
+          reservation.status !== 'UNKNOWN'
+          || reservation.receiptId !== undefined
+          || routingFailure?.[1] !== reservation.tableId
+          || reservation.releaseReason !== reason
+          || record.status !== 'UNKNOWN'
+          || record.receipt !== undefined
+          || record.reservationId !== reservation.reservationId
+          || record.wager.wagerId !== reservation.intentId
+          || record.wager.tableId !== reservation.tableId
+          || record.wager.shoeId !== reservation.shoeId
+          || record.wager.handId !== reservation.handId
+          || record.wager.market !== reservation.market
+          || record.wager.amount !== reservation.amount
+          || record.wager.source !== reservation.executionSource
+        ) {
+          continue;
+        }
+
+        const released: RiskReservation = {
+          ...reservation,
+          status: 'RELEASED',
+          releasedAt: repairedAt,
+          releaseReason: reason,
+        };
+        const rejected: OperationalWagerRecord = {
+          ...record,
+          status: 'REJECTED',
+        };
+        this.updateReservation(released);
+        const result = this.db.prepare(`
+          UPDATE operational_wagers SET status = ?, payload = ? WHERE wager_id = ?
+        `).run('REJECTED', stableStringify(rejected), record.wager.wagerId);
+        if (result.changes !== 1) {
+          throw new LedgerConflictError(`operational wager ${record.wager.wagerId} was not repaired`);
+        }
+        repairs.push({
+          reservationId: reservation.reservationId,
+          wagerId: record.wager.wagerId,
+          tableId: reservation.tableId,
+          shoeId: reservation.shoeId,
+          handId: reservation.handId,
+          previousStatus: 'UNKNOWN',
+          previousReason: reason,
+          repairedAt,
+        });
+      }
+
+      if (repairs.length > 0) {
+        const existing = this.getConfig<PrecommitUnknownOperationalReservationRepairAudit>(
+          PRECOMMIT_UNKNOWN_REPAIR_AUDIT_KEY,
+        );
+        const existingIds = new Set((existing?.repairs ?? []).map(repair => repair.reservationId));
+        this.setConfig<PrecommitUnknownOperationalReservationRepairAudit>(
+          PRECOMMIT_UNKNOWN_REPAIR_AUDIT_KEY,
+          {
+            repairs: [
+              ...(existing?.repairs ?? []),
+              ...repairs.filter(repair => !existingIds.has(repair.reservationId)),
+            ],
+          },
+        );
       }
     });
 

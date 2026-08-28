@@ -38,7 +38,7 @@ describe('extension background live bet routing', () => {
     expect(Number.isSafeInteger(betResults[0]?.['bridgeSeq'])).toBe(true);
   });
 
-  it('fails closed when more than one exact Dafabet popup tab exists', async () => {
+  it('returns a precommit rejection when more than one exact Dafabet popup tab exists', async () => {
     const harness = await createHarness({
       tabs: [
         { id: 42, url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/live-baccarat-pa' },
@@ -56,8 +56,13 @@ describe('extension background live bet routing', () => {
     expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
       kind: 'betResult',
       requestId: 'request-1',
-      receipt: null,
-      error: expect.stringContaining('exactly one Dafabet'),
+      receipt: expect.objectContaining({
+        status: 'REJECTED',
+        raw: expect.objectContaining({
+          commitStarted: false,
+          reason: expect.stringContaining('exactly one Dafabet'),
+        }),
+      }),
     }));
   });
 
@@ -78,8 +83,56 @@ describe('extension background live bet routing', () => {
     }));
     expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
       kind: 'betResult',
-      receipt: null,
-      error: expect.stringContaining('found 0'),
+      receipt: expect.objectContaining({
+        status: 'REJECTED',
+        raw: expect.objectContaining({
+          commitStarted: false,
+          reason: expect.stringContaining('found 0'),
+        }),
+      }),
+    }));
+  });
+
+  it('returns a matching operational rejection when the table frame is absent before execution', async () => {
+    const harness = await createHarness({ probeResults: [] });
+    const request = {
+      kind: 'betRequest',
+      requestId: 'operational-precommit-rejection',
+      request: {
+        mode: 'live',
+        wager: {
+          wagerId: 'opw-precommit-rejection',
+          tableId: 'D067',
+          shoeId: 'shoe-1',
+          handId: 'GD06726824AB',
+          market: 'player',
+          amount: 20,
+          source: 'keepalive',
+          createdAt: '2026-08-24T12:00:00.000Z',
+        },
+      },
+    };
+
+    harness.socket.emit('message', { data: JSON.stringify(request) });
+    await flushAsyncWork();
+    await flushAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes('executeMstromBetOneShot'),
+    )).toBe(false);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      requestId: request.requestId,
+      receipt: expect.objectContaining({
+        wagerId: request.request.wager.wagerId,
+        tableId: request.request.wager.tableId,
+        handId: request.request.wager.handId,
+        status: 'REJECTED',
+        raw: expect.objectContaining({
+          commitPoint: 'preflight',
+          commitStarted: false,
+        }),
+      }),
     }));
   });
 
@@ -100,8 +153,13 @@ describe('extension background live bet routing', () => {
     )).toBe(false);
     expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
       kind: 'betResult',
-      receipt: null,
-      error: expect.stringContaining('exactly one matching frame'),
+      receipt: expect.objectContaining({
+        status: 'REJECTED',
+        raw: expect.objectContaining({
+          commitStarted: false,
+          reason: expect.stringContaining('exactly one matching frame'),
+        }),
+      }),
     }));
   });
 
@@ -127,8 +185,13 @@ describe('extension background live bet routing', () => {
     expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
       kind: 'betResult',
       requestId: 'request-1',
-      receipt: null,
-      error: expect.stringContaining('matching frame'),
+      receipt: expect.objectContaining({
+        status: 'REJECTED',
+        raw: expect.objectContaining({
+          commitStarted: false,
+          reason: expect.stringContaining('matching frame'),
+        }),
+      }),
     }));
   });
 
@@ -147,8 +210,13 @@ describe('extension background live bet routing', () => {
     }));
     expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
       kind: 'betResult',
-      receipt: null,
-      error: expect.stringContaining('disabled'),
+      receipt: expect.objectContaining({
+        status: 'REJECTED',
+        raw: expect.objectContaining({
+          commitStarted: false,
+          reason: expect.stringContaining('disabled'),
+        }),
+      }),
     }));
   });
 

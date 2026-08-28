@@ -93,7 +93,13 @@ describe('extension background multitable command', () => {
     expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
       kind: 'betResult',
       requestId: 'blocked-after-reload',
-      error: 'live betting is disabled in the browser extension',
+      receipt: expect.objectContaining({
+        status: 'REJECTED',
+        raw: expect.objectContaining({
+          commitStarted: false,
+          reason: expect.stringContaining('live betting is disabled'),
+        }),
+      }),
     }));
   });
 

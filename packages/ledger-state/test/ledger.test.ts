@@ -113,6 +113,67 @@ describe('ledger replay', () => {
     ledger.close();
   });
 
+  it('reclassifies only proven precommit frame-routing UNKNOWN wagers as rejected', () => {
+    const ledger = new SqliteLedger();
+    const reason = 'bridge-request-error:expected exactly one matching frame for D066, found 0';
+    const reservation: RiskReservation = {
+      reservationId: 'rsv-precommit-unknown',
+      intentId: 'opw-precommit-unknown',
+      tableId: 'D066',
+      shoeId: 'shoe-1',
+      handId: 'GD066268281FN',
+      market: 'player',
+      executionSource: 'keepalive',
+      amount: 20,
+      maxLoss: 20,
+      maxProfit: 20,
+      status: 'UNKNOWN',
+      createdAt: '2026-08-28T17:28:32.015Z',
+      releaseReason: reason,
+    };
+    const wager: OperationalWagerRecord = {
+      wager: {
+        wagerId: reservation.intentId,
+        tableId: reservation.tableId,
+        shoeId: reservation.shoeId,
+        handId: reservation.handId,
+        market: 'player',
+        amount: reservation.amount,
+        source: 'keepalive',
+        createdAt: reservation.createdAt,
+      },
+      reservationId: reservation.reservationId,
+      status: 'UNKNOWN',
+      reason,
+    };
+    expect(ledger.saveReservation(reservation)).toBe(true);
+    expect(ledger.saveOperationalWager(wager)).toBe(true);
+
+    const repairs = ledger.repairPrecommitUnknownOperationalReservations(
+      '2026-08-29T01:30:00.000Z',
+    );
+
+    expect(repairs).toEqual([expect.objectContaining({
+      reservationId: reservation.reservationId,
+      wagerId: wager.wager.wagerId,
+      previousStatus: 'UNKNOWN',
+      previousReason: reason,
+    })]);
+    expect(ledger.listReservations('D066')[0]).toEqual(expect.objectContaining({
+      status: 'RELEASED',
+      releasedAt: '2026-08-29T01:30:00.000Z',
+      releaseReason: reason,
+    }));
+    expect(ledger.getOperationalWager(wager.wager.wagerId)).toEqual(expect.objectContaining({
+      status: 'REJECTED',
+      reason,
+    }));
+    expect(ledger.getConfig<{ repairs: unknown[] }>('ledger:precommit-unknown-repairs:v1')?.repairs)
+      .toHaveLength(1);
+    expect(ledger.repairPrecommitUnknownOperationalReservations()).toEqual([]);
+    ledger.close();
+  });
+
   it('does not restore an expired reservation when ACCEPTED receipt evidence mismatches', () => {
     const ledger = new SqliteLedger();
     const reservation: RiskReservation = {

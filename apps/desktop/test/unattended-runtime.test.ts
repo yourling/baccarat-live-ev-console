@@ -190,6 +190,78 @@ describe('DesktopConsoleService unattended runtime', () => {
     }
   });
 
+  it('repairs a persisted UNKNOWN that is proven to have failed before frame execution', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'baccarat-unattended-precommit-repair-'));
+    const dbPath = join(directory, 'console.sqlite');
+    const first = new DesktopConsoleService(dbPath);
+    let firstClosed = false;
+    try {
+      await first.updateMonitorTableIds(['D066']);
+      const reason = 'bridge-request-error:expected exactly one matching frame for D066, found 0';
+      const reservation: RiskReservation = {
+        reservationId: 'precommit-unknown-restart',
+        intentId: 'precommit-unknown-wager',
+        tableId: 'D066',
+        shoeId: 'shoe-D066',
+        handId: 'GD066268281FN',
+        market: 'player',
+        executionSource: 'keepalive',
+        amount: 20,
+        maxLoss: 20,
+        maxProfit: 20,
+        status: 'UNKNOWN',
+        createdAt: '2026-08-28T17:28:32.015Z',
+        releaseReason: reason,
+      };
+      expect(first['ledger'].saveReservation(reservation)).toBe(true);
+      expect(first['ledger'].saveOperationalWager({
+        wager: {
+          wagerId: reservation.intentId,
+          tableId: reservation.tableId,
+          shoeId: reservation.shoeId,
+          handId: reservation.handId,
+          market: 'player',
+          amount: reservation.amount,
+          source: 'keepalive',
+          createdAt: reservation.createdAt,
+        },
+        reservationId: reservation.reservationId,
+        status: 'UNKNOWN',
+        reason,
+      })).toBe(true);
+
+      await first.close();
+      firstClosed = true;
+
+      const restarted = new DesktopConsoleService(dbPath);
+      try {
+        await restarted['startupFailCloseTask'];
+        const snapshot = restarted.snapshot();
+        expect(snapshot.reservations).toContainEqual(expect.objectContaining({
+          reservationId: reservation.reservationId,
+          status: 'RELEASED',
+          releaseReason: reason,
+        }));
+        expect(snapshot.snapshot.riskState).toMatchObject({
+          reservedExposure: 0,
+          pendingExecutions: 0,
+        });
+        expect(snapshot.runtime.reasons).not.toContain('unknown-execution-pending');
+        expect(restarted['ledger'].getOperationalWager(reservation.intentId)).toEqual(
+          expect.objectContaining({ status: 'REJECTED', reason }),
+        );
+        expect(restarted['ledger'].getConfig<{ repairs: unknown[] }>(
+          'ledger:precommit-unknown-repairs:v1',
+        )?.repairs).toHaveLength(1);
+      } finally {
+        await restarted.close();
+      }
+    } finally {
+      if (!firstClosed) await first.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('restores a legacy-expired ACCEPTED wager as pending exposure on startup', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'baccarat-unattended-accepted-repair-'));
     const dbPath = join(directory, 'console.sqlite');

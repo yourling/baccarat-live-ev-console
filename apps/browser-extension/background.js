@@ -237,6 +237,57 @@ function unknownBetReceipt(request, requestId, reason) {
   };
 }
 
+function precommitRejectedBetReceipt(request, requestId, reason) {
+  const wager = request && request.wager ? request.wager : null;
+  if (wager && typeof wager === 'object') {
+    const tableId = typeof wager.tableId === 'string' ? wager.tableId : '';
+    const handId = typeof wager.handId === 'string' ? wager.handId : '';
+    return {
+      receiptId: `mstrom-bridge-operational-rejected-${requestId}-${Date.now()}`,
+      wagerId: typeof wager.wagerId === 'string' ? wager.wagerId : '',
+      tableId,
+      shoeId: typeof wager.shoeId === 'string' ? wager.shoeId : '',
+      handId,
+      market: wager.market,
+      amount: wager.amount,
+      source: wager.source,
+      status: 'REJECTED',
+      externalRef: `mstrom:${tableId}:${handId}`,
+      createdAt: new Date().toISOString(),
+      raw: {
+        runtimeRevision: MSTROM_BET_RUNTIME_REVISION,
+        reason,
+        commitPoint: 'preflight',
+        commitStarted: false,
+        tableId,
+        handId,
+      },
+    };
+  }
+  const intent = request && request.intent ? request.intent : {};
+  const tableId = typeof intent.tableId === 'string' ? intent.tableId : '';
+  const handId = typeof intent.handId === 'string' ? intent.handId : '';
+  return {
+    receiptId: `mstrom-bridge-rejected-${requestId}-${Date.now()}`,
+    intentId: String(intent.intentId || ''),
+    reservationId: String(request && request.reservationId || ''),
+    status: 'REJECTED',
+    amount: intent.amount,
+    market: intent.market,
+    mode: 'live',
+    externalRef: `mstrom:${tableId}:${handId}`,
+    createdAt: new Date().toISOString(),
+    raw: {
+      runtimeRevision: MSTROM_BET_RUNTIME_REVISION,
+      reason,
+      commitPoint: 'preflight',
+      commitStarted: false,
+      tableId,
+      handId,
+    },
+  };
+}
+
 function validateLiveBetMessage(message) {
   const request = message && message.request;
   if (!message || typeof message.requestId !== 'string' || !message.requestId) {
@@ -263,40 +314,49 @@ function validateLiveBetMessage(message) {
 
 async function executeUniqueMstromBet(message, generation) {
   const parsed = validateLiveBetMessage(message);
-  assertLiveBetSession(generation);
+  let tabId;
+  let frameId;
+  try {
+    assertLiveBetSession(generation);
+    const tabs = await chrome.tabs.query({
+      url: [`${DAFABET_BACCARAT_POPUP_URL}*`],
+    });
+    assertLiveBetSession(generation);
+    const targets = tabs.filter(tab => tab.id && exactDafabetBaccaratPopup(tab.url));
+    if (targets.length !== 1) {
+      throw new Error(`expected exactly one Dafabet baccarat popup tab, found ${targets.length}`);
+    }
+    tabId = targets[0].id;
 
-  const tabs = await chrome.tabs.query({
-    url: [`${DAFABET_BACCARAT_POPUP_URL}*`],
-  });
-  assertLiveBetSession(generation);
-  const targets = tabs.filter(tab => tab.id && exactDafabetBaccaratPopup(tab.url));
-  if (targets.length !== 1) {
-    throw new Error(`expected exactly one Dafabet baccarat popup tab, found ${targets.length}`);
+    assertLiveBetSession(generation);
+    const probes = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: 'MAIN',
+      args: [parsed.tableId],
+      func: globalThis.probeMstromBetStore,
+    });
+    assertLiveBetSession(generation);
+    const candidates = probes.filter(entry => {
+      const result = entry && entry.result;
+      return result
+        && (result.status === 'ready' || result.ownsTargetStore === true)
+        && result.tableId === parsed.tableId
+        && result.runtimeRevision === MSTROM_BET_RUNTIME_REVISION
+        && MSTROM_FRAME_HOST_PATTERN.test(String(result.host || ''));
+    });
+    if (candidates.length !== 1 || !Number.isInteger(candidates[0].frameId)) {
+      throw new Error(`expected exactly one matching frame for ${parsed.tableId}, found ${candidates.length}`);
+    }
+    frameId = candidates[0].frameId;
+    assertLiveBetSession(generation);
+  } catch (error) {
+    return precommitRejectedBetReceipt(
+      parsed.request,
+      parsed.requestId,
+      `precommit-routing-failed:${betErrorMessage(error)}`,
+    );
   }
-  const tabId = targets[0].id;
 
-  assertLiveBetSession(generation);
-  const probes = await chrome.scripting.executeScript({
-    target: { tabId, allFrames: true },
-    world: 'MAIN',
-    args: [parsed.tableId],
-    func: globalThis.probeMstromBetStore,
-  });
-  assertLiveBetSession(generation);
-  const candidates = probes.filter(entry => {
-    const result = entry && entry.result;
-    return result
-      && (result.status === 'ready' || result.ownsTargetStore === true)
-      && result.tableId === parsed.tableId
-      && result.runtimeRevision === MSTROM_BET_RUNTIME_REVISION
-      && MSTROM_FRAME_HOST_PATTERN.test(String(result.host || ''));
-  });
-  if (candidates.length !== 1 || !Number.isInteger(candidates[0].frameId)) {
-    throw new Error(`expected exactly one matching frame for ${parsed.tableId}, found ${candidates.length}`);
-  }
-
-  const frameId = candidates[0].frameId;
-  assertLiveBetSession(generation);
   let executions;
   try {
     executions = await chrome.scripting.executeScript({
