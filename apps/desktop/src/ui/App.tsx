@@ -1409,7 +1409,8 @@ function canReconcileOperationalWager(row: BetLedgerRow): boolean {
   const operationalWager = row.operationalWager;
   const raw = operationalWager?.receipt?.raw;
   const statusPairMatches = row.reservation.status === 'UNKNOWN'
-    ? operationalWager?.status === 'UNKNOWN' && operationalWager.receipt?.status === 'UNKNOWN'
+    ? operationalWager?.status === 'UNKNOWN'
+      && operationalWager.receipt !== undefined
     : row.reservation.status === 'RELEASED'
       && operationalWager?.status === 'REJECTED'
       && operationalWager.receipt?.status === 'REJECTED';
@@ -1447,7 +1448,9 @@ function BetLedgerView(props: {
                   <td data-label="下注金额">{formatAmount(row.reservation.amount)}</td>
                   <td data-label="期望盈利" className={typeof row.expectedPnl === 'number' ? evTone(row.expectedPnl) : 'text--muted'}>{typeof row.expectedPnl === 'number' ? formatSignedAmount(row.expectedPnl) : '-'}</td>
                   <td data-label="回执">
-                    {row.receipt
+                    {row.operationalWager?.status === 'UNKNOWN' && row.operationalWager.reconciliation === undefined
+                      ? receiptStatusLabel('UNKNOWN')
+                      : row.receipt
                       ? receiptStatusLabel(row.receipt.receipt.status)
                       : row.operationalWager
                         ? receiptStatusLabel(row.operationalWager.reconciliation?.status ?? row.operationalWager.receipt?.status ?? row.operationalWager.status)
@@ -1775,14 +1778,14 @@ function buildBetLedgerRows(snapshot: DesktopConsoleSnapshot | null): BetLedgerR
     const decision = decisions.get(key);
     const receipt = receipts.get(key);
     const operationalWager = operationalWagers.get(reservation.reservationId);
-    const result = ledgerResult(reservation, receipt, snapshot.events);
+    const result = ledgerResult(reservation, receipt, snapshot.events, undefined, operationalWager);
     return { reservation, decision, receipt, operationalWager, createdAt: decision?.createdAt ?? operationalWager?.wager.createdAt ?? reservation.createdAt, resultLabel: result.label, resultTone: result.tone, realizedPnl: reservation.realizedPnl, expectedPnl: decision ? reservation.amount * decision.evMean : undefined };
   }).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
 function ledgerPageRowsToView(rows: LedgerPageRow[]): BetLedgerRow[] {
   return rows.map(row => {
-    const result = ledgerResult(row.reservation, row.receipt, [], row.outcome);
+    const result = ledgerResult(row.reservation, row.receipt, [], row.outcome, row.operationalWager);
     return {
       reservation: row.reservation,
       decision: row.decision,
@@ -1797,9 +1800,18 @@ function ledgerPageRowsToView(rows: LedgerPageRow[]): BetLedgerRow[] {
   });
 }
 
-function ledgerResult(reservation: RiskReservation, receipt: ReceiptRow | undefined, events: NormalizedEvent[], outcomeOverride?: boolean): { label: string; tone: BetLedgerRow['resultTone'] } {
+function ledgerResult(
+  reservation: RiskReservation,
+  receipt: ReceiptRow | undefined,
+  events: NormalizedEvent[],
+  outcomeOverride?: boolean,
+  operationalWager?: OperationalWagerRecord,
+): { label: string; tone: BetLedgerRow['resultTone'] } {
   if (typeof reservation.realizedPnl === 'number') {
     return reservation.realizedPnl > 0 ? { label: '命中', tone: 'good' } : reservation.realizedPnl < 0 ? { label: '未中', tone: 'danger' } : { label: '持平', tone: 'neutral' };
+  }
+  if (operationalWager?.status === 'UNKNOWN' || reservation.status === 'UNKNOWN') {
+    return { label: '结果未知', tone: 'warning' };
   }
   if (receipt?.receipt.status === 'REJECTED') return { label: '下注被拒', tone: 'danger' };
   if (reservation.status === 'RELEASED' || reservation.status === 'EXPIRED') return { label: '未执行', tone: 'neutral' };

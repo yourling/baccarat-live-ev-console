@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { OperationalWagerExecutionRequest } from '@baccarat/adapter-contract';
-import { BrowserBridgeServer } from '@baccarat/browser-bridge';
+import { BrowserBridgeServer, OperationalWagerRuntimeRevisionError } from '@baccarat/browser-bridge';
 import { EVENT_SCHEMA_VERSION, defaultProfile, type NormalizedEvent } from '@baccarat/contracts';
 import type { TableExport } from '@baccarat/room-monitor';
 import { parseDesktopKeepaliveSettings } from '../src/api-types.js';
@@ -305,7 +305,7 @@ describe('DesktopConsoleService operational wagers', () => {
     }
   });
 
-  it('reconciles a committed REJECTED receipt that the platform history proves was executed', async () => {
+  it('fail-closes a committed REJECTED receipt and reconciles it only from exact platform history', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();
     authenticateBridge(bridge);
@@ -333,28 +333,31 @@ describe('DesktopConsoleService operational wagers', () => {
       await service.injectEvent(openWindow('D056'));
       await service.setExecutionMode('D056', 'live');
 
-      const rejected = await service.executeOperationalWager({
+      const unknown = await service.executeOperationalWager({
         tableId: 'D056',
         market: 'player',
         amount: 20,
       });
-      expect(rejected.status).toBe('REJECTED');
-      const reservation = rejected.snapshot.reservations.find(candidate =>
-        candidate.intentId === rejected.wager!.wagerId);
+      expect(unknown.status).toBe('UNKNOWN');
+      expect(unknown.receipt?.status).toBe('REJECTED');
+      const reservation = unknown.snapshot.reservations.find(candidate =>
+        candidate.intentId === unknown.wager!.wagerId);
       expect(reservation).toMatchObject({
-        status: 'RELEASED',
-        releaseReason: 'receipt-rejected',
+        status: 'UNKNOWN',
+        releaseReason: 'committed-rejection-uncertain',
       });
-      expect(rejected.snapshot.snapshot.riskState).toMatchObject({
-        reservedExposure: 0,
-        pendingExecutions: 0,
+      expect(unknown.snapshot.snapshot.riskState).toMatchObject({
+        reservedExposure: 20,
+        pendingExecutions: 1,
         executedToday: 0,
       });
+      expect(unknown.snapshot.automation.enabled).toBe(false);
+      expect(unknown.snapshot.snapshot.tables.D056?.executionMode).toBe('shadow');
 
       await service.injectEvent(bankerWinSettlement('D056'));
       const reconciled = await service.reconcileUnknownOperationalWager({
         reservationId: reservation!.reservationId,
-        wagerId: rejected.wager!.wagerId,
+        wagerId: unknown.wager!.wagerId,
       });
 
       expect(reconciled.reservations.find(candidate =>
@@ -370,7 +373,7 @@ describe('DesktopConsoleService operational wagers', () => {
         dayLoss: 20,
       });
       expect(reconciled.operationalWagers).toContainEqual(expect.objectContaining({
-        status: 'REJECTED',
+        status: 'UNKNOWN',
         receipt: expect.objectContaining({ status: 'REJECTED' }),
         reconciliation: expect.objectContaining({ status: 'ACCEPTED' }),
       }));
@@ -378,10 +381,75 @@ describe('DesktopConsoleService operational wagers', () => {
 
       const idempotent = await service.reconcileUnknownOperationalWager({
         reservationId: reservation!.reservationId,
-        wagerId: rejected.wager!.wagerId,
+        wagerId: unknown.wager!.wagerId,
       });
       expect(idempotent.snapshot.riskState.executedToday).toBe(20);
       expect(requestOperationalWager).toHaveBeenCalledTimes(1);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('preserves an obsolete runtime receipt while fail-closing the reservation', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    authenticateBridge(bridge);
+    vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    vi.spyOn(bridge, 'requestOperationalWager')
+      .mockImplementation(async (request: OperationalWagerExecutionRequest) => {
+        throw new OperationalWagerRuntimeRevisionError({
+          receiptId: `receipt-${request.wager.wagerId}`,
+          wagerId: request.wager.wagerId,
+          tableId: request.wager.tableId,
+          shoeId: request.wager.shoeId,
+          handId: request.wager.handId,
+          market: request.wager.market,
+          amount: request.wager.amount,
+          source: request.wager.source,
+          status: 'ACCEPTED',
+          createdAt: '2026-08-25T00:00:02.000Z',
+          raw: { runtimeRevision: 'obsolete-runtime', commitStarted: true, commitPoint: 'confirmBet' },
+        });
+      });
+
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['D055']);
+      service['liveFeeds'].set('D055', freshFeed('D055'));
+      await service.injectEvent(physicalShoe('D055'));
+      await service.injectEvent(openWindow('D055'));
+      await service.setExecutionMode('D055', 'live');
+
+      const result = await service.executeOperationalWager({
+        tableId: 'D055',
+        market: 'banker',
+        amount: 20,
+      });
+
+      expect(result).toMatchObject({
+        status: 'UNKNOWN',
+        receipt: { status: 'ACCEPTED', raw: { runtimeRevision: 'obsolete-runtime' } },
+        snapshot: {
+          automation: { enabled: false },
+          reservations: [expect.objectContaining({ status: 'UNKNOWN', receiptId: expect.any(String) })],
+          operationalWagers: [expect.objectContaining({
+            status: 'UNKNOWN',
+            receipt: expect.objectContaining({ status: 'ACCEPTED' }),
+          })],
+        },
+      });
+      const reservation = result.snapshot.reservations.find(candidate =>
+        candidate.intentId === result.wager?.wagerId);
+      await service.injectEvent(bankerWinSettlement('D055'));
+      const reconciled = await service.reconcileUnknownOperationalWager({
+        reservationId: reservation!.reservationId,
+        wagerId: result.wager!.wagerId,
+      });
+      expect(reconciled.reservations.find(candidate =>
+        candidate.reservationId === reservation!.reservationId)).toMatchObject({
+        status: 'SETTLED',
+        realizedPnl: 19,
+      });
     } finally {
       await service.close();
     }

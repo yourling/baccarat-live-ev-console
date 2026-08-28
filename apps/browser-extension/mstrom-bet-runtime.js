@@ -3,6 +3,7 @@ if (typeof chrome === 'undefined' || !chrome || !chrome.scripting) {
 } else {
 function probeMstromBetStore(tableId) {
   const PLAY_TYPES = Object.freeze({ banker: 1, player: 2, bankerPair: 4, playerPair: 5 });
+  const RUNTIME_REVISION = 'mstrom-bet-runtime/2026-08-28.1';
 
   function isObject(value) {
     return value !== null && typeof value === 'object';
@@ -135,6 +136,7 @@ function probeMstromBetStore(tableId) {
   }
   const stakePool = store ? readStoreValue(store, 'stakePool') : null;
   return {
+    runtimeRevision: RUNTIME_REVISION,
     frameUrl: locationInfo.frameUrl,
     host: locationInfo.host,
     tableId: String(tableId || ''),
@@ -166,6 +168,7 @@ function probeMstromBetStore(tableId) {
 
 async function executeMstromBetOneShot(request) {
   const PLAY_TYPES = Object.freeze({ banker: 1, player: 2, bankerPair: 4, playerPair: 5 });
+  const RUNTIME_REVISION = 'mstrom-bet-runtime/2026-08-28.1';
   const POLL_INTERVAL_MS = 50;
   const REQUEST_TIMEOUT_MS = 5000;
   const COMMIT_POINT = 'confirmBet';
@@ -232,28 +235,6 @@ async function executeMstromBetOneShot(request) {
     } catch (_) {
       return true;
     }
-  }
-
-  function pendingSequences(store) {
-    try {
-      const pending = readStoreValue(store, 'pendingBetSeqForResp');
-      if (!pending || typeof pending[Symbol.iterator] !== 'function') return null;
-      return [...pending].map(value => String(value));
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function newPendingSequences(before, after) {
-    if (before === null || after === null) return [];
-    const existing = new Set(before);
-    return after.filter(sequence => !existing.has(sequence));
-  }
-
-  function submittedSequencesCompleted(store, submitted) {
-    if (submitted.length === 0) return false;
-    const current = pendingSequences(store);
-    return current !== null && submitted.every(sequence => !current.includes(sequence));
   }
 
   function historyPlayTypes(parsed) {
@@ -390,6 +371,7 @@ async function executeMstromBetOneShot(request) {
   }
 
   function makeReceipt(parsed, status, raw) {
+    const revisionedRaw = { runtimeRevision: RUNTIME_REVISION, ...raw };
     const createdAt = new Date().toISOString();
     if (parsed.kind === 'operational') {
       return {
@@ -404,7 +386,7 @@ async function executeMstromBetOneShot(request) {
         status,
         externalRef: `mstrom:${parsed.tableId}:${parsed.handId}:${parsed.playType}`,
         createdAt,
-        raw,
+        raw: revisionedRaw,
       };
     }
     return {
@@ -417,7 +399,7 @@ async function executeMstromBetOneShot(request) {
       mode: 'live',
       externalRef: `mstrom:${parsed.tableId}:${parsed.handId}:${parsed.playType}`,
       createdAt,
-      raw,
+      raw: revisionedRaw,
     };
   }
 
@@ -428,13 +410,6 @@ async function executeMstromBetOneShot(request) {
       playType: parsed.playType,
       commitStarted: false,
       ...raw,
-    });
-  }
-
-  function committedRejected(parsed, reason) {
-    return rejected(parsed, reason, {
-      commitPoint: COMMIT_POINT,
-      commitStarted: true,
     });
   }
 
@@ -502,7 +477,6 @@ async function executeMstromBetOneShot(request) {
     const beforeStake = readPoolAmount(stakePool, parsed.playType);
     const beforeDone = readPoolAmount(donePool, parsed.playType);
     const beforeHistory = readHistoryAmount(parsed);
-    const beforePendingSequences = pendingSequences(store);
     if (beforeStake === null || beforeDone === null || typeof stakePool.calculateDiff !== 'function') {
       return rejected(parsed, 'pool-state-unreadable');
     }
@@ -556,12 +530,10 @@ async function executeMstromBetOneShot(request) {
       return rejected(parsed, 'pre-confirm-state-changed');
     }
 
-    let submittedSequences = [];
     try {
       // COMMIT_POINT: once this call begins, the platform may have accepted the bet.
       commitStarted = true;
       const confirmation = store.confirmBet();
-      submittedSequences = newPendingSequences(beforePendingSequences, pendingSequences(store));
       await confirmation;
     } catch (_) {
       // pcv2 exposes donePool as a getter and replaces diffPool in confirmBet().
@@ -589,7 +561,6 @@ async function executeMstromBetOneShot(request) {
     const deadline = Date.now() + REQUEST_TIMEOUT_MS;
     let observedDone = beforeDone;
     let observedHistory = beforeHistory;
-    let responseCompleted = false;
     while (Date.now() < deadline) {
       const doneAmount = readPoolAmount(readStoreValue(store, 'donePool'), parsed.playType);
       observedDone = doneAmount;
@@ -605,24 +576,14 @@ async function executeMstromBetOneShot(request) {
       ) {
         return accepted(parsed, 'bet-history');
       }
-      responseCompleted ||= submittedSequencesCompleted(store, submittedSequences);
       await delay(Math.min(POLL_INTERVAL_MS, Math.max(1, deadline - Date.now())));
     }
     const observedStake = readPoolAmount(readStoreValue(store, 'stakePool'), parsed.playType);
-    if (
-      responseCompleted
-      && readStoreValue(store, 'gmcode') === parsed.handId
-      && observedStake !== null
-      && observedStake === beforeStake
-    ) {
-      return committedRejected(parsed, 'platform-rejected');
-    }
     return unknown(parsed, 'result-timeout', {
       beforeDone,
       observedDone,
       beforeHistory,
       observedHistory,
-      responseCompleted,
       observedStake,
     });
   }

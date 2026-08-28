@@ -157,13 +157,22 @@ export async function executeControlledOperationalWager(
     );
   } catch (error) {
     const reason = bridgeRequestErrorReason(error);
-    context.riskManager.markUnknown(reservation.reservationId, reason);
+    const errorReceipt = operationalReceiptFromError(error);
+    const matchingReceipt = errorReceipt && receiptMatchesWager(errorReceipt, wager)
+      ? errorReceipt
+      : undefined;
+    context.riskManager.markUnknown(
+      reservation.reservationId,
+      reason,
+      matchingReceipt?.receiptId,
+    );
     const result = saveResult(
       context.ledger,
       wager,
       reservation.reservationId,
       'UNKNOWN',
       reason,
+      matchingReceipt,
     );
     await context.disarmOnUnknown(reason);
     return result;
@@ -207,6 +216,20 @@ export async function executeControlledOperationalWager(
     );
   }
   if (receipt.status === 'REJECTED') {
+    if (receiptCommitStarted(receipt)) {
+      const reason = 'committed-rejection-uncertain';
+      context.riskManager.markUnknown(reservation.reservationId, reason, receipt.receiptId);
+      const result = saveResult(
+        context.ledger,
+        wager,
+        reservation.reservationId,
+        'UNKNOWN',
+        reason,
+        receipt,
+      );
+      await context.disarmOnUnknown(reason);
+      return result;
+    }
     context.riskManager.release(
       reservation.reservationId,
       false,
@@ -283,6 +306,21 @@ function receiptMatchesWager(
     && receipt.market === wager.market
     && receipt.amount === wager.amount
     && receipt.source === wager.source;
+}
+
+function receiptCommitStarted(receipt: OperationalWagerReceipt): boolean {
+  return typeof receipt.raw === 'object'
+    && receipt.raw !== null
+    && Reflect.get(receipt.raw, 'commitStarted') === true;
+}
+
+function operationalReceiptFromError(error: unknown): OperationalWagerReceipt | undefined {
+  if (typeof error !== 'object' || error === null) return undefined;
+  const receipt = Reflect.get(error, 'receipt');
+  if (typeof receipt !== 'object' || receipt === null) return undefined;
+  const status = Reflect.get(receipt, 'status');
+  if (status !== 'ACCEPTED' && status !== 'REJECTED' && status !== 'UNKNOWN') return undefined;
+  return receipt as OperationalWagerReceipt;
 }
 
 function bridgeRequestErrorReason(error: unknown): string {

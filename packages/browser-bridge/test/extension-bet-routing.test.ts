@@ -86,8 +86,8 @@ describe('extension background live bet routing', () => {
   it('fails closed when two frames expose the requested table store', async () => {
     const harness = await createHarness({
       probeResults: [
-        { frameId: 7, result: { status: 'ready', host: 'gci.agad.mstrom-uno.com', tableId: 'D067' } },
-        { frameId: 9, result: { status: 'ready', host: 'live2.673ing.com', tableId: 'D067' } },
+        { frameId: 7, result: { status: 'ready', runtimeRevision: 'mstrom-bet-runtime/2026-08-28.1', host: 'gci.agad.mstrom-uno.com', tableId: 'D067' } },
+        { frameId: 9, result: { status: 'ready', runtimeRevision: 'mstrom-bet-runtime/2026-08-28.1', host: 'live2.673ing.com', tableId: 'D067' } },
       ],
     });
 
@@ -102,6 +102,33 @@ describe('extension background live bet routing', () => {
       kind: 'betResult',
       receipt: null,
       error: expect.stringContaining('exactly one matching frame'),
+    }));
+  });
+
+  it('fails closed before confirmBet when the injected runtime revision is obsolete', async () => {
+    const harness = await createHarness({
+      probeResults: [{
+        frameId: 7,
+        result: {
+          status: 'ready',
+          host: 'gci.agad.mstrom-uno.com',
+          tableId: 'D067',
+        },
+      }],
+    });
+
+    harness.socket.emit('message', { data: JSON.stringify(liveRequest()) });
+    await flushAsyncWork();
+    await flushAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes('executeMstromBetOneShot'),
+    )).toBe(false);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      requestId: 'request-1',
+      receipt: null,
+      error: expect.stringContaining('matching frame'),
     }));
   });
 

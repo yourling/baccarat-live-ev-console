@@ -11,6 +11,7 @@ const EXTENSION_RELOAD_DELAY_MS = 1000;
 const DAFABET_BACCARAT_POPUP_URL = 'https://www.dafabet.net/sc/live-dealer/popup-launch/live-baccarat-pa';
 const GAME_TAB_URL_PATTERN = /^https?:\/\/(?:[a-z0-9-]+\.)*(?:dafabet\.(?:net|com)|df888evo\.com|egcvi\.com|mstrom-uno\.com|673ing\.com)(?::\d+)?(?:[/?#]|$)/i;
 const MSTROM_FRAME_HOST_PATTERN = /(^|\.)(?:mstrom-uno|673ing)\.com$/i;
+const MSTROM_BET_RUNTIME_REVISION = 'mstrom-bet-runtime/2026-08-28.1';
 const betRequests = new Map();
 let liveBetSessionEnabled = false;
 const BRIDGE_SESSION_ID = [
@@ -203,6 +204,7 @@ function unknownBetReceipt(request, requestId, reason) {
       externalRef: `mstrom:${tableId}:${handId}`,
       createdAt: new Date().toISOString(),
       raw: {
+        runtimeRevision: MSTROM_BET_RUNTIME_REVISION,
         reason,
         commitPoint: 'confirmBet',
         commitStarted: true,
@@ -225,6 +227,7 @@ function unknownBetReceipt(request, requestId, reason) {
     externalRef: `mstrom:${tableId}:${handId}`,
     createdAt: new Date().toISOString(),
     raw: {
+      runtimeRevision: MSTROM_BET_RUNTIME_REVISION,
       reason,
       commitPoint: 'confirmBet',
       commitStarted: true,
@@ -285,6 +288,7 @@ async function executeUniqueMstromBet(message, generation) {
     return result
       && (result.status === 'ready' || result.ownsTargetStore === true)
       && result.tableId === parsed.tableId
+      && result.runtimeRevision === MSTROM_BET_RUNTIME_REVISION
       && MSTROM_FRAME_HOST_PATTERN.test(String(result.host || ''));
   });
   if (candidates.length !== 1 || !Number.isInteger(candidates[0].frameId)) {
@@ -386,6 +390,7 @@ async function probeMstromBetReadiness(tableIds, generation) {
       return result
         && (result.status === 'ready' || result.ownsTargetStore === true)
         && result.tableId === tableId
+        && result.runtimeRevision === MSTROM_BET_RUNTIME_REVISION
         && MSTROM_FRAME_HOST_PATTERN.test(String(result.host || ''));
     });
     const result = candidates.length === 1 ? candidates[0].result : null;

@@ -135,6 +135,7 @@ describe('Dafabet mstrom MAIN-world bet runtime', () => {
     const runtime = loadRuntime(store);
     const probe = runtime.probe('D065');
     expect(probe).toEqual({
+      runtimeRevision: 'mstrom-bet-runtime/2026-08-28.1',
       frameUrl: 'https://gci.agad.mstrom-uno.com/pc/pcv1/',
       host: 'gci.agad.mstrom-uno.com',
       tableId: 'D065',
@@ -351,7 +352,7 @@ describe('Dafabet mstrom MAIN-world bet runtime', () => {
     expect(store.confirmBet).not.toHaveBeenCalled();
   });
 
-  it('returns REJECTED for an explicit platform failure', async () => {
+  it('returns UNKNOWN when post-confirm state only suggests a platform failure', async () => {
     vi.useFakeTimers();
     try {
       const store = makeStore('rejected');
@@ -368,8 +369,13 @@ describe('Dafabet mstrom MAIN-world bet runtime', () => {
 
       await vi.advanceTimersByTimeAsync(5100);
       expect(await resultPromise).toMatchObject({
-        status: 'REJECTED',
-        raw: { commitPoint: 'confirmBet', commitStarted: true },
+        status: 'UNKNOWN',
+        raw: {
+          reason: 'result-timeout',
+          commitPoint: 'confirmBet',
+          commitStarted: true,
+          runtimeRevision: 'mstrom-bet-runtime/2026-08-28.1',
+        },
       });
       expect(store.stakePool.getAmount(4)).toBe(0);
     } finally {

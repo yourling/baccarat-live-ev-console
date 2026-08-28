@@ -8,6 +8,7 @@ import {
   BUNDLED_BROWSER_EXTENSION_ID,
   BUNDLED_BROWSER_EXTENSION_TOKEN,
   BrowserBridgeServer,
+  MSTROM_BET_RUNTIME_REVISION,
   redactBridgeDiagnostic,
   type BrowserBridgeRuntimeEvent,
 } from '../src/index.js';
@@ -363,6 +364,7 @@ describe('browser bridge server', () => {
           source: 'keepalive',
           status: 'ACCEPTED',
           createdAt: '2026-08-25T00:00:01.000Z',
+          raw: { runtimeRevision: MSTROM_BET_RUNTIME_REVISION },
         },
       }));
     });
@@ -377,6 +379,51 @@ describe('browser bridge server', () => {
 
     client.close();
     await server.close();
+  });
+
+  it('fails closed when an operational receipt comes from an obsolete bet runtime', async () => {
+    const server = new BrowserBridgeServer({ port: 0 });
+    const port = await server.start();
+    const client = extensionClient(port);
+    await new Promise<void>((resolve, reject) => {
+      client.once('open', resolve);
+      client.once('error', reject);
+    });
+    client.on('message', data => {
+      const message = JSON.parse(data.toString()) as { readonly kind?: string; readonly requestId?: string };
+      if (message.kind !== 'betRequest' || message.requestId === undefined) return;
+      client.send(JSON.stringify({
+        kind: 'betResult',
+        requestId: message.requestId,
+        receipt: {
+          receiptId: 'obsolete-runtime-receipt',
+          wagerId: 'operational-1',
+          tableId: 'D055',
+          shoeId: 'shoe-1',
+          handId: 'GD055-1',
+          market: 'banker',
+          amount: 20,
+          source: 'keepalive',
+          status: 'REJECTED',
+          createdAt: '2026-08-25T00:00:01.000Z',
+          raw: { commitStarted: true, runtimeRevision: 'obsolete-runtime' },
+        },
+      }));
+    });
+
+    try {
+      await expect(server.requestOperationalWager(operationalWagerRequest())).rejects.toMatchObject({
+        message: expect.stringContaining('runtime revision mismatch'),
+        receipt: expect.objectContaining({
+          receiptId: 'obsolete-runtime-receipt',
+          status: 'REJECTED',
+          raw: expect.objectContaining({ commitStarted: true }),
+        }),
+      });
+    } finally {
+      client.close();
+      await server.close();
+    }
   });
 
   it('rejects a web-page origin before it becomes an extension socket', async () => {
@@ -768,6 +815,7 @@ describe('browser bridge server', () => {
       source: keepaliveRequest.wager.source,
       status: 'ACCEPTED' as const,
       createdAt: '2026-08-25T00:00:00.000Z',
+      raw: { runtimeRevision: MSTROM_BET_RUNTIME_REVISION },
     };
 
     try {

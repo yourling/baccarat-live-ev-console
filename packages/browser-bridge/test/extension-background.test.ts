@@ -599,6 +599,7 @@ describe('extension background live bet gate', () => {
         frameId: 7,
         result: {
           status: 'ready',
+          runtimeRevision: 'mstrom-bet-runtime/2026-08-28.1',
           frameUrl: 'https://gci.agad.mstrom-uno.com/pc/pcv1/index.jsp',
           host: 'gci.agad.mstrom-uno.com',
           tableId: 'D067',
@@ -637,6 +638,7 @@ describe('extension background live bet gate', () => {
             frameId: 7,
             result: {
               status: 'ready',
+              runtimeRevision: 'mstrom-bet-runtime/2026-08-28.1',
               frameUrl: 'https://gci.agad.mstrom-uno.com/pc/pcv1/index.jsp',
               host: 'gci.agad.mstrom-uno.com',
               tableId: 'D067',
@@ -706,6 +708,7 @@ describe('extension background live bet gate', () => {
           frameId: 7,
           result: {
             status: 'ready',
+            runtimeRevision: 'mstrom-bet-runtime/2026-08-28.1',
             host: 'gci.agad.mstrom-uno.com',
             tableId: 'D067',
           },

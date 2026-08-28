@@ -1533,7 +1533,8 @@ export class DesktopConsoleService {
         && receiptRaw !== null
         && Reflect.get(receiptRaw, 'commitStarted') === true
         && Reflect.get(receiptRaw, 'commitPoint') === 'confirmBet';
-      const unknownExecution = record.status === 'UNKNOWN' && receipt.status === 'UNKNOWN';
+      const unknownExecution = record.status === 'UNKNOWN'
+        && commitStarted;
       const committedRejectedExecution = record.status === 'REJECTED'
         && receipt.status === 'REJECTED'
         && commitStarted;
@@ -1542,7 +1543,7 @@ export class DesktopConsoleService {
       }
       if (
         reservation.status !== 'SETTLED'
-        && (unknownExecution ? reservation.status !== 'UNKNOWN' : reservation.status !== 'RELEASED')
+        && (record.status === 'UNKNOWN' ? reservation.status !== 'UNKNOWN' : reservation.status !== 'RELEASED')
       ) {
         throw new Error(`reservation ${command.reservationId} does not match the execution receipt state`);
       }
@@ -1596,7 +1597,7 @@ export class DesktopConsoleService {
         reconciledAt: new Date().toISOString(),
       };
       this.ledger.reconcileOperationalWager(command.wagerId, reconciliation);
-      if (unknownExecution) {
+      if (record.status === 'UNKNOWN') {
         this.orchestrator.settleUnknownReservation(
           command.reservationId,
           settlement,

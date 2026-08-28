@@ -40,6 +40,15 @@ import { parseMstromFrame } from './mstrom-protocol.js';
 import { MstromRuntimeParser } from './mstrom-runtime.js';
 import { MstromShoeSessionRegistry } from './mstrom-shoe-session.js';
 
+export const MSTROM_BET_RUNTIME_REVISION = 'mstrom-bet-runtime/2026-08-28.1';
+
+export class OperationalWagerRuntimeRevisionError extends Error {
+  constructor(readonly receipt: OperationalWagerReceipt) {
+    super('browser extension mstrom bet runtime revision mismatch');
+    this.name = 'OperationalWagerRuntimeRevisionError';
+  }
+}
+
 export interface BrowserBridgeServerOptions {
   port?: number;
   host?: string;
@@ -814,7 +823,16 @@ export class BrowserBridgeServer implements RoomMonitor {
 
   async requestOperationalWager(request: OperationalWagerExecutionRequest): Promise<OperationalWagerReceipt | null> {
     const receipt = await this.requestExecution(request);
-    if (receipt === null || isOperationalWagerReceipt(receipt)) return receipt;
+    if (receipt === null) return null;
+    if (isOperationalWagerReceipt(receipt)) {
+      const revision = typeof receipt.raw === 'object' && receipt.raw !== null
+        ? Reflect.get(receipt.raw, 'runtimeRevision')
+        : undefined;
+      if (revision !== MSTROM_BET_RUNTIME_REVISION) {
+        throw new OperationalWagerRuntimeRevisionError(receipt);
+      }
+      return receipt;
+    }
     throw new Error('browser extension returned a pair-bet receipt for an operational wager request');
   }
 
