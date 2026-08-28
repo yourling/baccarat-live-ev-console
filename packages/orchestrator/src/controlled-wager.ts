@@ -91,7 +91,9 @@ export async function executeControlledOperationalWager(
   const projection = context.projection;
   const isManualSimulation = command.source === 'manual' && context.executionMode !== 'live';
   if (!isManualSimulation) {
-    if (projection.shoeBaseline !== 'physical-shoe') return rejected('physical-shoe-required');
+    if (command.source !== 'keepalive' && projection.shoeBaseline !== 'physical-shoe') {
+      return rejected('physical-shoe-required');
+    }
     if (projection.connectionStatus !== 'CONNECTED') return rejected('connected-required');
     if (projection.status !== 'BETTING_WINDOW') return rejected('betting-window-required');
     if (projection.sealed) return rejected('shoe-sealed');

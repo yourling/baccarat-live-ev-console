@@ -455,7 +455,7 @@ describe('DesktopConsoleService operational wagers', () => {
     }
   });
 
-  it('keeps live keepalive blocked until a physical-shoe baseline is observed', async () => {
+  it('allows fixed keepalive on an observed window before the physical-shoe baseline is known', async () => {
     // Given: global automation is enabled while a live table is attached mid-shoe.
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();
@@ -488,29 +488,11 @@ describe('DesktopConsoleService operational wagers', () => {
       await service.setAutomationEnabled(true);
       expect(requestOperationalWager).not.toHaveBeenCalled();
 
-      // When: a window opens before a physical-shoe confirmation.
+      // When: a protocol-backed window opens before a physical-shoe confirmation.
       await service.injectEvent(openWindow('D001'));
-
-      // Then: no live request is allowed from the unknown monitor baseline.
-      expect(requestOperationalWager).not.toHaveBeenCalled();
-
-      // When: a new physical shoe and its first window are observed.
-      await service.injectEvent({
-        ...physicalShoe('D001'),
-        eventId: 'physical-shoe-D001',
-        shoeId: 'physical-shoe-D001',
-        sourceSeq: 3,
-      });
-      await service.injectEvent({
-        ...openWindow('D001'),
-        eventId: 'physical-open-D001',
-        shoeId: 'physical-shoe-D001',
-        handId: 'physical-hand-D001',
-        sourceSeq: 4,
-      });
       await waitFor(() => requestOperationalWager.mock.calls.length > 0);
 
-      // Then: keepalive may use the controlled live path.
+      // Then: fixed keepalive uses the controlled live path, while EV pair automation stays disarmed.
       expect(requestOperationalWager).toHaveBeenCalledWith(expect.objectContaining({
         mode: 'live',
         wager: expect.objectContaining({
@@ -526,6 +508,8 @@ describe('DesktopConsoleService operational wagers', () => {
           source: 'keepalive',
         }),
       }));
+      expect(service.snapshot().snapshot.tables.D001?.projection.autoBetStatus).toBe('DISARMED');
+      expect(service.snapshot().runtime.reasons).not.toContain('physical-shoe-baseline-unknown');
     } finally {
       await service.close();
     }

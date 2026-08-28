@@ -316,8 +316,7 @@ export class DesktopConsoleService {
     const actor = this.orchestrator.getActor(tableId);
     if (actor?.snapshot().executionMode !== 'live') return true;
     return this.liveAuthorizationSources.has(tableId)
-      && !this.hasUnknownExecution()
-      && !this.hasSettlementGap(tableId);
+      && !this.hasUnknownExecution();
   }
 
   private hasUnknownExecution(tableId?: string): boolean {
@@ -335,7 +334,11 @@ export class DesktopConsoleService {
     readonly message: string;
     readonly tableId?: string;
   }): void {
-    if (this.runtimeIncidents.hasActive(input.code, input.tableId)) return;
+    const active = this.runtimeIncidents.list().find(incident =>
+      incident.active
+      && incident.code === input.code
+      && incident.tableId === input.tableId);
+    if (active?.severity === input.severity) return;
     this.runtimeIncidents.record(input);
   }
 
@@ -357,7 +360,7 @@ export class DesktopConsoleService {
         })
         .map(reservation => reservation.tableId),
     );
-    if (unknownTableIds.size > 0 || settlementGapTableIds.size > 0) {
+    if (unknownTableIds.size > 0) {
       this.operationalWagers.disableKeepaliveImmediately();
     }
     const knownTableIds = new Set([
@@ -380,7 +383,7 @@ export class DesktopConsoleService {
       if (settlementGapTableIds.has(tableId)) {
         this.ensureRuntimeIncident({
           code: 'settlement-gap',
-          severity: 'blocked',
+          severity: 'degraded',
           tableId,
           message: `Unsettled execution for ${tableId} is still awaiting its exact hand settlement`,
         });
@@ -400,7 +403,7 @@ export class DesktopConsoleService {
     if (unresolved.length === 0) return false;
     this.ensureRuntimeIncident({
       code: 'settlement-gap',
-      severity: 'blocked',
+      severity: 'degraded',
       tableId: event.tableId,
       message: `New hand ${event.handId} opened with ${unresolved.length} unsettled reservation(s) from a prior hand`,
     });
@@ -471,10 +474,16 @@ export class DesktopConsoleService {
     if (!this.liveApprovals.has(tableId) || !this.liveAuthorizationSources.has(tableId)) {
       return 'unattended-runtime-blocked:live-authorization-missing';
     }
-    const reasons = this.liveTableReasons(tableId);
+    const reasons = this.keepaliveTableReasons(tableId);
     return reasons.length === 0
       ? undefined
       : `unattended-runtime-blocked:${reasons.join(',')}`;
+  }
+
+  private keepaliveTableReasons(tableId: string): LiveExecutionBlockReason[] {
+    return this.liveTableReasons(tableId).filter(reason =>
+      reason !== 'physical-shoe-baseline-unknown'
+      && reason !== 'settlement-gap');
   }
 
   private runtimeSnapshot(): DesktopRuntimeState {
@@ -489,7 +498,7 @@ export class DesktopConsoleService {
           approved: this.liveApprovals.has(tableId),
           active: actor?.snapshot().executionMode === 'live'
             && this.liveAuthorizationSources.has(tableId),
-          reasons: this.liveApprovals.has(tableId) ? this.liveTableReasons(tableId) : [],
+          reasons: this.liveApprovals.has(tableId) ? this.keepaliveTableReasons(tableId) : [],
           ...(feedHealth === undefined ? {} : {
             feedState: feedHealth.state,
             ...(feedHealth.stalenessMs === undefined ? {} : { feedStalenessMs: feedHealth.stalenessMs }),
@@ -538,10 +547,9 @@ export class DesktopConsoleService {
     for (const tableId of approvedTableIds) {
       const actor = this.orchestrator.getActor(tableId);
       if (!actor) continue;
-      const reasons = this.liveTableReasons(tableId);
+      const reasons = this.keepaliveTableReasons(tableId);
       const authorization = this.liveAuthorizationSources.get(tableId);
-      const accountingBlocked = reasons.includes('unknown-execution-pending')
-        || reasons.includes('settlement-gap');
+      const accountingBlocked = reasons.includes('unknown-execution-pending');
       if (reasons.length > 0) {
         if (authorization === 'unattended' || accountingBlocked) {
           await this.resetMonitorExecutionState(tableId);
@@ -711,9 +719,7 @@ export class DesktopConsoleService {
     ) {
       this.runtimeObservedTableIds.add(event.tableId);
     }
-    if (event.type === 'bettingWindowOpened' && this.detectSettlementGap(event)) {
-      await this.failCloseLiveExecution([event.tableId]);
-    }
+    if (event.type === 'bettingWindowOpened') this.detectSettlementGap(event);
     await this.orchestrator.enqueue(event.tableId, event);
     this.refreshAccountingIncidents();
     if (event.type === 'handSettled') this.resolveSettlementGapIfCleared(event.tableId);
@@ -1678,10 +1684,6 @@ export class DesktopConsoleService {
       await this.startupFailCloseTask;
       if (enabled && this.hasUnknownExecution()) {
         throw new Error('unresolved UNKNOWN execution blocks automation');
-      }
-      const settlementGapTable = this.monitorTableIds.find(tableId => this.hasSettlementGap(tableId));
-      if (enabled && settlementGapTable !== undefined) {
-        throw new Error(`unresolved settlement gap blocks automation for ${settlementGapTable}`);
       }
       const current = this.operationalWagers.getKeepaliveState();
       await this.applyKeepaliveSettings({

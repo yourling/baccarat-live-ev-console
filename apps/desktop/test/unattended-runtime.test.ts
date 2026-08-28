@@ -349,7 +349,7 @@ describe('DesktopConsoleService unattended runtime', () => {
     }
   });
 
-  it('blocks the next hand and persists an incident when an accepted wager has no settlement', async () => {
+  it('retains exposure without blocking unattended execution when an accepted wager has no settlement', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();
     vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
@@ -380,15 +380,21 @@ describe('DesktopConsoleService unattended runtime', () => {
         market: 'banker',
         amount: 20,
       });
+      service['runtimeIncidents'].record({
+        code: 'settlement-gap',
+        severity: 'blocked',
+        tableId: 'D055',
+        message: 'legacy settlement gap policy',
+      });
 
       await service.injectEvent(openWindow('D055', 'hand-2', 3));
 
       const snapshot = service.snapshot();
-      expect(snapshot.snapshot.tables.D055?.executionMode).toBe('shadow');
-      expect(snapshot.runtime.tables.D055?.reasons).toContain('settlement-gap');
+      expect(snapshot.snapshot.tables.D055?.executionMode).toBe('live');
+      expect(snapshot.runtime.tables.D055?.reasons).not.toContain('settlement-gap');
       expect(snapshot.runtime.incidents).toContainEqual(expect.objectContaining({
         code: 'settlement-gap',
-        severity: 'blocked',
+        severity: 'degraded',
         tableId: 'D055',
         active: true,
       }));
@@ -409,7 +415,12 @@ describe('DesktopConsoleService unattended runtime', () => {
         reservedExposure: 20,
         pendingExecutions: 1,
       });
-      expect(afterRollover.runtime.tables.D055?.reasons).toContain('settlement-gap');
+      expect(afterRollover.runtime.tables.D055?.reasons).not.toContain('settlement-gap');
+
+      const enabled = await service.setAutomationEnabled(true);
+      expect(enabled.keepalive.enabled).toBe(true);
+      expect(enabled.runtime.executionReady).toBe(true);
+      expect(enabled.runtime.status).toBe('degraded');
     } finally {
       await service.close();
     }
