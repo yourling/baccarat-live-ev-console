@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import Database from 'better-sqlite3';
-import { LedgerConflictError, ProjectionError, SqliteLedger, modelRevisionFor, profileVersionFor, replayEvents } from '../src/index.js';
+import { LedgerConflictError, ProjectionError, SqliteLedger, modelRevisionFor, profileVersionFor, replayEvents, type OperationalWagerRecord } from '../src/index.js';
 import type { DecisionSnapshot, NormalizedEvent, RiskReservation, ShoeStateProjection } from '@baccarat/contracts';
 import { ContractValidationError, defaultProfile, newId } from '@baccarat/contracts';
 
@@ -44,6 +44,127 @@ function decision(
 }
 
 describe('ledger replay', () => {
+  it('restores only exactly matched ACCEPTED operational reservations expired by legacy shoe rollover', () => {
+    const ledger = new SqliteLedger();
+    const reservation: RiskReservation = {
+      reservationId: 'rsv-accepted-expired',
+      intentId: 'opw-accepted-expired',
+      tableId: 'D066',
+      shoeId: 'shoe-1',
+      handId: 'hand-1',
+      market: 'player',
+      executionSource: 'keepalive',
+      amount: 20,
+      maxLoss: 20,
+      maxProfit: 20,
+      status: 'EXPIRED',
+      receiptId: 'receipt-accepted-expired',
+      createdAt: '2026-08-28T16:14:10.458Z',
+      releasedAt: '2026-08-28T16:34:35.590Z',
+      releaseReason: 'new-shoe-signal-received',
+    };
+    const wager: OperationalWagerRecord = {
+      wager: {
+        wagerId: reservation.intentId,
+        tableId: reservation.tableId,
+        shoeId: reservation.shoeId,
+        handId: reservation.handId,
+        market: 'player',
+        amount: reservation.amount,
+        source: 'keepalive',
+        createdAt: '2026-08-28T16:14:10.457Z',
+      },
+      reservationId: reservation.reservationId,
+      status: 'ACCEPTED',
+      receipt: {
+        receiptId: reservation.receiptId!,
+        wagerId: reservation.intentId,
+        tableId: reservation.tableId,
+        shoeId: reservation.shoeId,
+        handId: reservation.handId,
+        market: 'player',
+        amount: reservation.amount,
+        source: 'keepalive',
+        status: 'ACCEPTED',
+        createdAt: '2026-08-28T16:14:11.330Z',
+      },
+    };
+    expect(ledger.saveReservation(reservation)).toBe(true);
+    expect(ledger.saveOperationalWager(wager)).toBe(true);
+
+    const repairs = ledger.restoreInvalidlyExpiredAcceptedOperationalReservations(
+      '2026-08-29T00:00:00.000Z',
+    );
+    expect(repairs).toEqual([expect.objectContaining({
+      reservationId: reservation.reservationId,
+      wagerId: wager.wager.wagerId,
+      previousStatus: 'EXPIRED',
+      previousReason: 'new-shoe-signal-received',
+    })]);
+    expect(ledger.listReservations('D066')[0]).toEqual(expect.objectContaining({
+      status: 'RESERVED',
+      receiptId: reservation.receiptId,
+    }));
+    expect(ledger.listReservations('D066')[0]?.releasedAt).toBeUndefined();
+    expect(ledger.listReservations('D066')[0]?.releaseReason).toBeUndefined();
+    expect(ledger.getConfig<{ repairs: unknown[] }>('ledger:accepted-reservation-repairs:v1')?.repairs)
+      .toHaveLength(1);
+    expect(ledger.restoreInvalidlyExpiredAcceptedOperationalReservations()).toEqual([]);
+    ledger.close();
+  });
+
+  it('does not restore an expired reservation when ACCEPTED receipt evidence mismatches', () => {
+    const ledger = new SqliteLedger();
+    const reservation: RiskReservation = {
+      reservationId: 'rsv-mismatch',
+      intentId: 'opw-mismatch',
+      tableId: 'D066',
+      shoeId: 'shoe-1',
+      handId: 'hand-1',
+      market: 'player',
+      executionSource: 'keepalive',
+      amount: 20,
+      maxLoss: 20,
+      maxProfit: 20,
+      status: 'EXPIRED',
+      receiptId: 'receipt-mismatch',
+      createdAt: baseTime,
+      releasedAt: baseTime,
+      releaseReason: 'new-shoe-signal-received',
+    };
+    expect(ledger.saveReservation(reservation)).toBe(true);
+    expect(ledger.saveOperationalWager({
+      wager: {
+        wagerId: reservation.intentId,
+        tableId: reservation.tableId,
+        shoeId: reservation.shoeId,
+        handId: reservation.handId,
+        market: 'player',
+        amount: 20,
+        source: 'keepalive',
+        createdAt: baseTime,
+      },
+      reservationId: reservation.reservationId,
+      status: 'ACCEPTED',
+      receipt: {
+        receiptId: reservation.receiptId!,
+        wagerId: reservation.intentId,
+        tableId: reservation.tableId,
+        shoeId: reservation.shoeId,
+        handId: reservation.handId,
+        market: 'player',
+        amount: 21,
+        source: 'keepalive',
+        status: 'ACCEPTED',
+        createdAt: baseTime,
+      },
+    })).toBe(true);
+
+    expect(ledger.restoreInvalidlyExpiredAcceptedOperationalReservations()).toEqual([]);
+    expect(ledger.listReservations('D066')[0]?.status).toBe('EXPIRED');
+    ledger.close();
+  });
+
   it('replays same stream deterministically and gives same hash', () => {
     const profile = defaultProfile('t1');
     const events: NormalizedEvent[] = [

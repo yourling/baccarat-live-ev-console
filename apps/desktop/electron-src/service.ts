@@ -203,6 +203,8 @@ export class DesktopConsoleService {
 
   constructor(readonly dbPath: string) {
     this.ledger = new SqliteLedger(dbPath);
+    const repairedAcceptedReservations = this.ledger
+      .restoreInvalidlyExpiredAcceptedOperationalReservations();
     const defaultExecutor = new SimulatedAdapter({ events: [] });
     this.currentExecutor = defaultExecutor;
     this.orchestrator = new Orchestrator({
@@ -217,6 +219,21 @@ export class DesktopConsoleService {
         });
       },
     });
+    for (const repair of repairedAcceptedReservations) {
+      const settlement = this.ledger.getHandSettlement(
+        repair.tableId,
+        repair.shoeId,
+        repair.handId,
+      );
+      if (settlement) {
+        this.orchestrator.recoverAcceptedHandSettlement(
+          repair.tableId,
+          repair.shoeId,
+          repair.handId,
+          settlement,
+        );
+      }
+    }
     const persistedLiveTableIds = Object.values(this.orchestrator.listTableConfigs())
       .filter(config => config.executionMode === 'live')
       .map(config => config.profile.tableId);
@@ -323,16 +340,31 @@ export class DesktopConsoleService {
   }
 
   private refreshAccountingIncidents(): void {
+    const reservations = this.orchestrator.getReservations();
     const unknownTableIds = new Set(
-      this.orchestrator.getReservations()
+      reservations
         .filter(reservation => reservation.status === 'UNKNOWN')
         .map(reservation => reservation.tableId),
     );
-    if (unknownTableIds.size > 0) this.operationalWagers.disableKeepaliveImmediately();
+    const settlementGapTableIds = new Set(
+      reservations
+        .filter(reservation => {
+          if (reservation.status !== 'RESERVED') return false;
+          const projection = this.orchestrator.getActor(reservation.tableId)?.getProjection();
+          if (!projection) return false;
+          return (projection.shoeId !== '' && projection.shoeId !== reservation.shoeId)
+            || (projection.currentHandId !== null && projection.currentHandId !== reservation.handId);
+        })
+        .map(reservation => reservation.tableId),
+    );
+    if (unknownTableIds.size > 0 || settlementGapTableIds.size > 0) {
+      this.operationalWagers.disableKeepaliveImmediately();
+    }
     const knownTableIds = new Set([
       ...this.monitorTableIds,
       ...this.liveApprovals.list(),
       ...this.orchestrator.listActors().map(actor => actor.tableId),
+      ...reservations.map(reservation => reservation.tableId),
     ]);
     for (const tableId of knownTableIds) {
       if (unknownTableIds.has(tableId)) {
@@ -344,6 +376,16 @@ export class DesktopConsoleService {
         });
       } else {
         this.runtimeIncidents.resolve('unknown-execution', tableId);
+      }
+      if (settlementGapTableIds.has(tableId)) {
+        this.ensureRuntimeIncident({
+          code: 'settlement-gap',
+          severity: 'blocked',
+          tableId,
+          message: `Unsettled execution for ${tableId} is still awaiting its exact hand settlement`,
+        });
+      } else if (this.orchestrator.getActor(tableId)) {
+        this.runtimeIncidents.resolve('settlement-gap', tableId);
       }
     }
   }

@@ -54,6 +54,28 @@ type OperationalWagerRow = {
   payload: string;
 };
 
+export interface AcceptedOperationalReservationRepair {
+  readonly reservationId: string;
+  readonly wagerId: string;
+  readonly tableId: string;
+  readonly shoeId: string;
+  readonly handId: string;
+  readonly previousStatus: 'EXPIRED';
+  readonly previousReason: string;
+  readonly repairedAt: string;
+}
+
+type AcceptedOperationalReservationRepairAudit = {
+  readonly repairs: readonly AcceptedOperationalReservationRepair[];
+};
+
+const ACCEPTED_RESERVATION_REPAIR_AUDIT_KEY = 'ledger:accepted-reservation-repairs:v1';
+const INVALID_ACCEPTED_EXPIRY_REASONS = new Set([
+  'new-shoe-signal-received',
+  'shoe-invalidated',
+  'reconciled-on-startup',
+]);
+
 
 function semanticEventPayload(value: object): string {
   const semanticFields: Record<string, unknown> = {};
@@ -604,6 +626,84 @@ export class SqliteLedger {
     const row = this.db.prepare('SELECT payload FROM operational_wagers WHERE wager_id = ?')
       .get(wagerId) as { payload: string } | undefined;
     return row ? JSON.parse(row.payload) as OperationalWagerRecord : undefined;
+  }
+
+  restoreInvalidlyExpiredAcceptedOperationalReservations(
+    repairedAt = new Date().toISOString(),
+  ): AcceptedOperationalReservationRepair[] {
+    const rows = this.db.prepare(`
+      SELECT r.payload AS reservation_payload, o.payload AS wager_payload
+      FROM reservations r
+      INNER JOIN operational_wagers o
+        ON o.wager_id = r.intent_id
+       AND json_extract(o.payload, '$.reservationId') = r.reservation_id
+      WHERE r.status = 'EXPIRED'
+        AND json_extract(o.payload, '$.status') = 'ACCEPTED'
+        AND json_extract(o.payload, '$.receipt.status') = 'ACCEPTED'
+    `).all() as { reservation_payload: string; wager_payload: string }[];
+    const repairs: AcceptedOperationalReservationRepair[] = [];
+
+    this.transaction(() => {
+      for (const row of rows) {
+        const reservation = JSON.parse(row.reservation_payload) as RiskReservation;
+        const record = JSON.parse(row.wager_payload) as OperationalWagerRecord;
+        const receipt = record.receipt;
+        const previousReason = reservation.releaseReason;
+        if (
+          reservation.status !== 'EXPIRED'
+          || previousReason === undefined
+          || !INVALID_ACCEPTED_EXPIRY_REASONS.has(previousReason)
+          || record.status !== 'ACCEPTED'
+          || receipt?.status !== 'ACCEPTED'
+          || record.reservationId !== reservation.reservationId
+          || record.wager.wagerId !== reservation.intentId
+          || record.wager.tableId !== reservation.tableId
+          || record.wager.shoeId !== reservation.shoeId
+          || record.wager.handId !== reservation.handId
+          || record.wager.market !== reservation.market
+          || record.wager.amount !== reservation.amount
+          || record.wager.source !== reservation.executionSource
+          || receipt.receiptId !== reservation.receiptId
+          || receipt.wagerId !== record.wager.wagerId
+          || receipt.tableId !== record.wager.tableId
+          || receipt.shoeId !== record.wager.shoeId
+          || receipt.handId !== record.wager.handId
+          || receipt.market !== record.wager.market
+          || receipt.amount !== record.wager.amount
+          || receipt.source !== record.wager.source
+        ) {
+          continue;
+        }
+
+        const { releasedAt: _releasedAt, releaseReason: _releaseReason, ...restored } = reservation;
+        this.updateReservation({ ...restored, status: 'RESERVED' });
+        repairs.push({
+          reservationId: reservation.reservationId,
+          wagerId: record.wager.wagerId,
+          tableId: reservation.tableId,
+          shoeId: reservation.shoeId,
+          handId: reservation.handId,
+          previousStatus: 'EXPIRED',
+          previousReason,
+          repairedAt,
+        });
+      }
+
+      if (repairs.length > 0) {
+        const existing = this.getConfig<AcceptedOperationalReservationRepairAudit>(
+          ACCEPTED_RESERVATION_REPAIR_AUDIT_KEY,
+        );
+        const existingIds = new Set((existing?.repairs ?? []).map(repair => repair.reservationId));
+        this.setConfig<AcceptedOperationalReservationRepairAudit>(ACCEPTED_RESERVATION_REPAIR_AUDIT_KEY, {
+          repairs: [
+            ...(existing?.repairs ?? []),
+            ...repairs.filter(repair => !existingIds.has(repair.reservationId)),
+          ],
+        });
+      }
+    });
+
+    return repairs;
   }
 
   reconcileOperationalWager(

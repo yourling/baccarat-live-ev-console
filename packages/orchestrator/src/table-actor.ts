@@ -890,6 +890,15 @@ export class Orchestrator {
     return this.riskManager.settleReleased(reservationId, settlement, reason);
   }
 
+  recoverAcceptedHandSettlement(
+    tableId: string,
+    shoeId: string,
+    handId: string,
+    settlement: Parameters<RiskManager['settleHand']>[3],
+  ): ReturnType<RiskManager['settleHand']> {
+    return this.riskManager.settleHand(tableId, shoeId, handId, settlement);
+  }
+
   snapshot(): OrchestratorSnapshot {
     const tables: Record<string, TableActorSnapshot> = {};
     for (const actor of this.actors.values()) tables[actor.tableId] = actor.snapshot();

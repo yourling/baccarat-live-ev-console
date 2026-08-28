@@ -190,6 +190,97 @@ describe('DesktopConsoleService unattended runtime', () => {
     }
   });
 
+  it('restores a legacy-expired ACCEPTED wager as pending exposure on startup', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'baccarat-unattended-accepted-repair-'));
+    const dbPath = join(directory, 'console.sqlite');
+    const first = new DesktopConsoleService(dbPath);
+    let firstClosed = false;
+    try {
+      await first.updateMonitorTableIds(['D066']);
+      await first.injectEvent(physicalShoe('D066'));
+      await first.injectEvent({
+        ...physicalShoe('D066', 2),
+        shoeId: 'shoe-D066-next',
+      });
+      const reservation: RiskReservation = {
+        reservationId: 'legacy-expired-accepted',
+        intentId: 'legacy-expired-accepted-wager',
+        tableId: 'D066',
+        shoeId: 'shoe-D066',
+        handId: 'hand-D066',
+        market: 'player',
+        executionSource: 'keepalive',
+        amount: 20,
+        maxLoss: 20,
+        maxProfit: 20,
+        status: 'EXPIRED',
+        receiptId: 'legacy-expired-accepted-receipt',
+        createdAt: '2026-08-27T01:00:01.000Z',
+        releasedAt: '2026-08-27T01:20:00.000Z',
+        releaseReason: 'new-shoe-signal-received',
+      };
+      expect(first['ledger'].saveReservation(reservation)).toBe(true);
+      expect(first['ledger'].saveOperationalWager({
+        wager: {
+          wagerId: reservation.intentId,
+          tableId: reservation.tableId,
+          shoeId: reservation.shoeId,
+          handId: reservation.handId,
+          market: 'player',
+          amount: reservation.amount,
+          source: 'keepalive',
+          createdAt: reservation.createdAt,
+        },
+        reservationId: reservation.reservationId,
+        status: 'ACCEPTED',
+        receipt: {
+          receiptId: reservation.receiptId!,
+          wagerId: reservation.intentId,
+          tableId: reservation.tableId,
+          shoeId: reservation.shoeId,
+          handId: reservation.handId,
+          market: 'player',
+          amount: reservation.amount,
+          source: 'keepalive',
+          status: 'ACCEPTED',
+          createdAt: '2026-08-27T01:00:02.000Z',
+        },
+      })).toBe(true);
+
+      await first.close();
+      firstClosed = true;
+
+      const restarted = new DesktopConsoleService(dbPath);
+      try {
+        await restarted['startupFailCloseTask'];
+        const snapshot = restarted.snapshot();
+        expect(snapshot.reservations).toContainEqual(expect.objectContaining({
+          reservationId: reservation.reservationId,
+          status: 'RESERVED',
+          receiptId: reservation.receiptId,
+        }));
+        expect(snapshot.snapshot.riskState).toMatchObject({
+          reservedExposure: 20,
+          pendingExecutions: 1,
+        });
+        expect(snapshot.runtime.incidents).toContainEqual(expect.objectContaining({
+          code: 'settlement-gap',
+          tableId: 'D066',
+          active: true,
+        }));
+        expect(snapshot.keepalive.enabled).toBe(false);
+        expect(restarted['ledger'].getConfig<{ repairs: unknown[] }>(
+          'ledger:accepted-reservation-repairs:v1',
+        )?.repairs).toHaveLength(1);
+      } finally {
+        await restarted.close();
+      }
+    } finally {
+      if (!firstClosed) await first.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('does not reuse a prior process physical-shoe connection as current continuity', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'baccarat-unattended-continuity-'));
     const dbPath = join(directory, 'console.sqlite');
@@ -301,6 +392,24 @@ describe('DesktopConsoleService unattended runtime', () => {
         tableId: 'D055',
         active: true,
       }));
+
+      await service.injectEvent({
+        ...physicalShoe('D055', 4),
+        eventId: 'shoe-D055-next',
+        shoeId: 'shoe-D055-next',
+      });
+      const afterRollover = service.snapshot();
+      expect(afterRollover.reservations).toContainEqual(expect.objectContaining({
+        tableId: 'D055',
+        handId: 'hand-1',
+        status: 'RESERVED',
+        receiptId: expect.any(String),
+      }));
+      expect(afterRollover.snapshot.riskState).toMatchObject({
+        reservedExposure: 20,
+        pendingExecutions: 1,
+      });
+      expect(afterRollover.runtime.tables.D055?.reasons).toContain('settlement-gap');
     } finally {
       await service.close();
     }

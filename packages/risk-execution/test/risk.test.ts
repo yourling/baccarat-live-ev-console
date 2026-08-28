@@ -342,6 +342,42 @@ describe('risk manager', () => {
     expect(m.getState().pendingExecutions).toBe(0);
   });
 
+  it('keeps an accepted reservation exposed across shoe rollover and restart until exact settlement', () => {
+    const ledger = new SqliteLedger();
+    const first = new RiskManager(ledger);
+    const reserved = first.tryReserve(intent('s1', 'h1'), profile, limits);
+    expect(reserved.ok).toBe(true);
+    first.attachReceipt(reserved.reservation!.reservationId, 'accepted-receipt');
+
+    expect(first.expireOpenForShoe('t1', 's1', 'new-shoe-signal')).toEqual([]);
+    expect(first.snapshot()[0]).toMatchObject({
+      status: 'RESERVED',
+      receiptId: 'accepted-receipt',
+    });
+    expect(first.getState()).toMatchObject({ reservedExposure: 10, pendingExecutions: 1 });
+
+    const restarted = new RiskManager(ledger);
+    restarted.reconcileTable('t1', 's2', false);
+    expect(restarted.snapshot()[0]).toMatchObject({
+      status: 'RESERVED',
+      receiptId: 'accepted-receipt',
+    });
+    expect(restarted.getState()).toMatchObject({ reservedExposure: 10, pendingExecutions: 1 });
+
+    const settled = restarted.settleHand('t1', 's1', 'h1', {
+      bankerPair: false,
+      playerPair: false,
+    });
+    expect(settled[0]).toMatchObject({ status: 'SETTLED', realizedPnl: -10 });
+    expect(restarted.getState()).toMatchObject({
+      reservedExposure: 0,
+      pendingExecutions: 0,
+      executedToday: 10,
+      dayLoss: 10,
+    });
+    ledger.close();
+  });
+
   it('persists reservations and risk state through restart', () => {
     const ledger = new SqliteLedger();
     const m1 = new RiskManager(ledger);

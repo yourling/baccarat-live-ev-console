@@ -463,7 +463,10 @@ export class RiskManager {
 
   expireOpenForShoe(tableId: string, shoeId: string, reason: string): RiskReservation[] {
     const matches = this.snapshot().filter(
-      r => r.status === 'RESERVED' && r.tableId === tableId && r.shoeId === shoeId,
+      r => r.status === 'RESERVED'
+        && r.tableId === tableId
+        && r.shoeId === shoeId
+        && r.receiptId === undefined,
     );
     if (matches.length === 0) return [];
     const nextState = structuredClone(this.state);
