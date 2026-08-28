@@ -609,6 +609,46 @@ export function App() {
     }
   }, [confirm]);
 
+  const settlePendingOperationalWager = useCallback(async (
+    row: BetLedgerRow,
+    outcome: 'WIN' | 'LOSS' | 'PUSH',
+  ) => {
+    if (!window.desktop || !row.operationalWager || !canSettlePendingOperationalWager(row)) return;
+    const outcomeLabel = outcome === 'WIN' ? '赢' : outcome === 'LOSS' ? '输' : '和';
+    const realizedPnl = outcome === 'WIN'
+      ? row.reservation.maxProfit
+      : outcome === 'LOSS'
+        ? -row.reservation.maxLoss
+        : 0;
+    const accepted = await confirm({
+      title: `确认人工结算为${outcomeLabel}`,
+      description: '此操作只闭合本地账本，不会下注，也不会改变自动投注或无人值守开关。',
+      details: [
+        { label: '牌桌 / 牌局', value: `${row.reservation.tableId} / ${row.reservation.handId}` },
+        { label: '下注', value: `${MARKET_LABELS[row.reservation.market]} ${formatAmount(row.reservation.amount)}` },
+        { label: '净盈亏', value: formatSignedAmount(realizedPnl) },
+      ],
+      confirmLabel: `确认${outcomeLabel}`,
+      tone: 'danger',
+    });
+    if (!accepted) return;
+    setReconcilingReservationId(row.reservation.reservationId);
+    setError(null);
+    try {
+      const nextSnapshot = await window.desktop.settlePendingOperationalWager({
+        reservationId: row.reservation.reservationId,
+        wagerId: row.operationalWager.wager.wagerId,
+        outcome,
+      });
+      setSnapshot(nextSnapshot);
+      setRecordQueryRevision(previous => previous + 1);
+    } catch (settlementError) {
+      setError(settlementError instanceof Error ? settlementError.message : String(settlementError));
+    } finally {
+      setReconcilingReservationId(null);
+    }
+  }, [confirm]);
+
   function changeRecordPage(nextPage: number) {
     setPage(nextPage);
     setRecordQueryRevision(previous => previous + 1);
@@ -925,7 +965,7 @@ export function App() {
 
       {view === 'events' && recordPage?.kind === 'events' && <><EventTable events={recordEvents} totalCount={recordTotal} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
 
-      {view === 'ledger' && recordPage?.kind === 'ledger' && <><BetLedgerView rows={recordLedgerRows} totalCount={recordTotal} reconcilingReservationId={reconcilingReservationId} onReconcile={reconcileUnknownOperationalWager} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
+      {view === 'ledger' && recordPage?.kind === 'ledger' && <><BetLedgerView rows={recordLedgerRows} totalCount={recordTotal} reconcilingReservationId={reconcilingReservationId} onReconcile={reconcileUnknownOperationalWager} onSettle={settlePendingOperationalWager} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
 
       {view === 'settings' && (
         <SystemSettingsView
@@ -1422,11 +1462,26 @@ function canReconcileOperationalWager(row: BetLedgerRow): boolean {
     && Reflect.get(raw, 'commitPoint') === 'confirmBet';
 }
 
+function canSettlePendingOperationalWager(row: BetLedgerRow): boolean {
+  return row.reservation.status === 'RESERVED'
+    && row.operationalWager?.status === 'ACCEPTED'
+    && row.operationalWager.receipt?.status === 'ACCEPTED'
+    && row.operationalWager.reservationId === row.reservation.reservationId
+    && row.operationalWager.settlement === undefined;
+}
+
+function pendingSettlementOutcomes(row: BetLedgerRow): readonly ('WIN' | 'LOSS' | 'PUSH')[] {
+  return row.reservation.market === 'bankerPair' || row.reservation.market === 'playerPair'
+    ? ['WIN', 'LOSS']
+    : ['WIN', 'LOSS', 'PUSH'];
+}
+
 function BetLedgerView(props: {
   rows: BetLedgerRow[];
   totalCount: number;
   reconcilingReservationId: string | null;
   onReconcile: (row: BetLedgerRow) => Promise<void>;
+  onSettle: (row: BetLedgerRow, outcome: 'WIN' | 'LOSS' | 'PUSH') => Promise<void>;
 }) {
   return (
     <>
@@ -1466,7 +1521,24 @@ function BetLedgerView(props: {
                       </button>
                     )}
                   </td>
-                  <td data-label="实际结果"><span className={'ledger-result ledger-result--' + row.resultTone}>{row.resultLabel}</span></td>
+                  <td data-label="实际结果">
+                    <span className={'ledger-result ledger-result--' + row.resultTone}>{row.resultLabel}</span>
+                    {canSettlePendingOperationalWager(row) && (
+                      <div className="ledger-settlement-actions">
+                        {pendingSettlementOutcomes(row).map(outcome => (
+                          <button
+                            type="button"
+                            className="button button--small button--ghost"
+                            disabled={props.reconcilingReservationId !== null}
+                            key={outcome}
+                            onClick={() => void props.onSettle(row, outcome)}
+                          >
+                            {outcome === 'WIN' ? '赢' : outcome === 'LOSS' ? '输' : '和'}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </td>
                   <td data-label="净盈亏" className={typeof row.realizedPnl === 'number' ? evTone(row.realizedPnl) : 'text--muted'}>{typeof row.realizedPnl === 'number' ? formatSignedAmount(row.realizedPnl) : '-'}</td>
                 </tr>
               ))}</tbody>

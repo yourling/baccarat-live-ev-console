@@ -3,6 +3,7 @@ import type {
   DesktopKeepaliveStrategySettings,
   DesktopOperationalWagerCommand,
   DesktopOperationalWagerResult,
+  DesktopPendingSettlementCommand,
   DesktopUnknownWagerReconciliationCommand,
   DesktopRecordPage,
   DesktopRecordQuery,
@@ -37,6 +38,7 @@ declare global {
       executeOneShotLiveBet: (command: OneShotLiveBetCommand) => Promise<OneShotLiveBetResult>;
       executeOperationalWager: (command: DesktopOperationalWagerCommand) => Promise<DesktopOperationalWagerResult>;
       reconcileUnknownOperationalWager: (command: DesktopUnknownWagerReconciliationCommand) => Promise<DesktopConsoleSnapshot>;
+      settlePendingOperationalWager: (command: DesktopPendingSettlementCommand) => Promise<DesktopConsoleSnapshot>;
       updateKeepaliveSettings: (settings: DesktopKeepaliveStrategySettings) => Promise<DesktopConsoleSnapshot>;
       setAutomationEnabled: (enabled: boolean) => Promise<DesktopConsoleSnapshot>;
       confirmPhysicalShoe: (tableId: string) => Promise<DesktopConsoleSnapshot>;

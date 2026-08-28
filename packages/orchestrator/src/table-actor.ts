@@ -885,6 +885,14 @@ export class Orchestrator {
     return this.riskManager.settleUnknown(reservationId, settlement, reason);
   }
 
+  settleReservedReservationManually(
+    reservationId: string,
+    realizedPnl: number,
+    reason: string,
+  ): ReturnType<RiskManager['settleReservedManually']> {
+    return this.riskManager.settleReservedManually(reservationId, realizedPnl, reason);
+  }
+
   settleReleasedReservation(
     reservationId: string,
     settlement: Parameters<RiskManager['settleReleased']>[1],

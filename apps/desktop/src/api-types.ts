@@ -132,6 +132,12 @@ export interface DesktopUnknownWagerReconciliationCommand {
   readonly wagerId: string;
 }
 
+export interface DesktopPendingSettlementCommand {
+  readonly reservationId: string;
+  readonly wagerId: string;
+  readonly outcome: 'WIN' | 'LOSS' | 'PUSH';
+}
+
 export type DesktopOperationalWagerResult = {
   readonly status: 'ACCEPTED' | 'REJECTED' | 'UNKNOWN';
   readonly tableId: string;
@@ -238,6 +244,21 @@ export function parseDesktopUnknownWagerReconciliationCommand(
   return {
     reservationId: readRequiredTrimmedString(value, 'reservationId'),
     wagerId: readRequiredTrimmedString(value, 'wagerId'),
+  };
+}
+
+export function parseDesktopPendingSettlementCommand(value: unknown): DesktopPendingSettlementCommand {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('pending settlement command must be an object');
+  }
+  const outcome = Reflect.get(value, 'outcome');
+  if (outcome !== 'WIN' && outcome !== 'LOSS' && outcome !== 'PUSH') {
+    throw new TypeError(`unsupported pending settlement outcome: ${String(outcome)}`);
+  }
+  return {
+    reservationId: readRequiredTrimmedString(value, 'reservationId'),
+    wagerId: readRequiredTrimmedString(value, 'wagerId'),
+    outcome,
   };
 }
 

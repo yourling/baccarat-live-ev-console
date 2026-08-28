@@ -846,6 +846,31 @@ export class SqliteLedger {
     return updated;
   }
 
+  settleOperationalWager(
+    wagerId: string,
+    settlement: NonNullable<OperationalWagerRecord['settlement']>,
+  ): OperationalWagerRecord {
+    const existing = this.getOperationalWager(wagerId);
+    if (!existing) throw new LedgerConflictError(`operational wager ${wagerId} not found`);
+    if (existing.settlement) {
+      if (stableStringify(existing.settlement) !== stableStringify(settlement)) {
+        throw new LedgerConflictError(`operational wager ${wagerId} already has a different settlement`);
+      }
+      return existing;
+    }
+    if (existing.status !== 'ACCEPTED' || existing.receipt?.status !== 'ACCEPTED') {
+      throw new LedgerConflictError(`operational wager ${wagerId} is not an accepted pending settlement`);
+    }
+    const updated: OperationalWagerRecord = { ...existing, settlement };
+    const result = this.db.prepare(`
+      UPDATE operational_wagers SET payload = ? WHERE wager_id = ?
+    `).run(stableStringify(updated), wagerId);
+    if (result.changes !== 1) {
+      throw new LedgerConflictError(`operational wager ${wagerId} settlement was not updated`);
+    }
+    return updated;
+  }
+
   getHandSettlement(
     tableId: string,
     shoeId: string,

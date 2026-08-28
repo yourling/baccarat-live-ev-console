@@ -45,10 +45,18 @@ export interface OperationalWagerRecord {
   readonly reason?: string;
   readonly receipt?: OperationalWagerAuditReceipt;
   readonly reconciliation?: OperationalWagerReconciliation;
+  readonly settlement?: OperationalWagerSettlement;
 }
 
 export interface OperationalWagerReconciliation {
   readonly status: 'ACCEPTED';
   readonly reason: 'operator-confirmed-platform-accepted';
   readonly reconciledAt: string;
+}
+
+export interface OperationalWagerSettlement {
+  readonly outcome: 'WIN' | 'LOSS' | 'PUSH';
+  readonly realizedPnl: number;
+  readonly reason: 'operator-confirmed-platform-settlement';
+  readonly settledAt: string;
 }

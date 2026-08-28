@@ -10,6 +10,7 @@ import {
 import {
   parseDesktopKeepaliveSettings,
   parseDesktopOperationalWagerCommand,
+  parseDesktopPendingSettlementCommand,
   parseDesktopUnknownWagerReconciliationCommand,
   parseOneShotLiveBetCommand,
 } from '../src/api-types.js';
@@ -80,6 +81,10 @@ function registerIpc(): void {
   ipcMain.handle('console:reconcile-unknown-operational-wager', (_event, command: unknown) =>
     getService().reconcileUnknownOperationalWager(
       parseDesktopUnknownWagerReconciliationCommand(command),
+    ));
+  ipcMain.handle('console:settle-pending-operational-wager', (_event, command: unknown) =>
+    getService().settlePendingOperationalWager(
+      parseDesktopPendingSettlementCommand(command),
     ));
   ipcMain.handle('console:update-keepalive-settings', (_event, settings: unknown) =>
     getService().updateKeepaliveSettings(parseDesktopKeepaliveSettings(settings)));

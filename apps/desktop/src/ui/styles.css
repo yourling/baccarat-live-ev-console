@@ -426,6 +426,8 @@ h2 { color: #f4f7fa; font-size: 18px; }
 .ledger-result--warning { border-color: #806231; background: #352817; color: #f2c978; }
 .ledger-result--neutral { background: #182530; color: #afc0ce; }
 .ledger-reconcile { display: block; margin-top: 6px; white-space: nowrap; }
+.ledger-settlement-actions { display: flex; gap: 4px; margin-top: 6px; }
+.ledger-settlement-actions .button { min-width: 32px; padding-inline: 7px; }
 
 .system-settings { margin-top: 18px; }
 .system-settings__header {

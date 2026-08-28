@@ -3,7 +3,7 @@ import type { OperationalWagerExecutionRequest } from '@baccarat/adapter-contrac
 import { BrowserBridgeServer, OperationalWagerRuntimeRevisionError } from '@baccarat/browser-bridge';
 import { EVENT_SCHEMA_VERSION, defaultProfile, type NormalizedEvent } from '@baccarat/contracts';
 import type { TableExport } from '@baccarat/room-monitor';
-import { parseDesktopKeepaliveSettings } from '../src/api-types.js';
+import { parseDesktopKeepaliveSettings, parseDesktopPendingSettlementCommand } from '../src/api-types.js';
 import { DesktopConsoleService } from '../electron-src/service.js';
 
 function physicalShoe(tableId: string): Extract<NormalizedEvent, { type: 'newShoeSignal' }> {
@@ -33,6 +33,16 @@ function openWindow(tableId: string): Extract<NormalizedEvent, { type: 'bettingW
     shoeId: `shoe-${tableId}`,
     handId: `hand-${tableId}`,
     market: 'bankerPair',
+  };
+}
+
+function nextOpenWindow(tableId: string): Extract<NormalizedEvent, { type: 'bettingWindowOpened' }> {
+  return {
+    ...openWindow(tableId),
+    eventId: `open-next-${tableId}`,
+    timestamp: '2026-08-25T00:00:04.000Z',
+    sourceSeq: 3,
+    handId: `hand-next-${tableId}`,
   };
 }
 
@@ -93,6 +103,111 @@ describe('DesktopConsoleService operational wagers', () => {
       market: 'banker',
       amount: 20,
     });
+  });
+
+  it('validates manual pending-settlement outcomes', () => {
+    expect(parseDesktopPendingSettlementCommand({
+      reservationId: 'rsv-1',
+      wagerId: 'opw-1',
+      outcome: 'LOSS',
+    })).toEqual({ reservationId: 'rsv-1', wagerId: 'opw-1', outcome: 'LOSS' });
+    expect(() => parseDesktopPendingSettlementCommand({
+      reservationId: 'rsv-1',
+      wagerId: 'opw-1',
+      outcome: 'VOID',
+    })).toThrow('unsupported pending settlement outcome');
+  });
+
+  it('manually settles an accepted historical wager without changing unattended execution', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const setLiveBetEnabled = vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    authenticateBridge(bridge);
+    vi.spyOn(bridge, 'requestOperationalWager')
+      .mockImplementation(async (request: OperationalWagerExecutionRequest) => ({
+        receiptId: `receipt-${request.wager.wagerId}`,
+        wagerId: request.wager.wagerId,
+        tableId: request.wager.tableId,
+        shoeId: request.wager.shoeId,
+        handId: request.wager.handId,
+        market: request.wager.market,
+        amount: request.wager.amount,
+        source: request.wager.source,
+        status: 'ACCEPTED',
+        createdAt: '2026-08-25T00:00:02.000Z',
+      }));
+
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['D001']);
+      service['liveFeeds'].set('D001', freshFeed('D001'));
+      await service.injectEvent(physicalShoe('D001'));
+      await service.injectEvent(openWindow('D001'));
+      await service.setExecutionMode('D001', 'live');
+      const accepted = await service.executeOperationalWager({
+        tableId: 'D001',
+        market: 'player',
+        amount: 20,
+      });
+      const reservation = accepted.snapshot.reservations.find(candidate =>
+        candidate.intentId === accepted.wager?.wagerId);
+      if (!reservation || !accepted.wager) throw new Error('accepted reservation missing');
+      await service.injectEvent(nextOpenWindow('D001'));
+      await service.setAutomationEnabled(true);
+
+      const before = service.snapshot();
+      const gateCallsBefore = setLiveBetEnabled.mock.calls.length;
+      expect(before.runtime.incidents).toContainEqual(expect.objectContaining({
+        code: 'settlement-gap',
+        tableId: 'D001',
+        active: true,
+      }));
+      expect(before.snapshot.tables.D001?.executionMode).toBe('live');
+      expect(before.automation.enabled).toBe(true);
+
+      const settled = await service.settlePendingOperationalWager({
+        reservationId: reservation.reservationId,
+        wagerId: accepted.wager.wagerId,
+        outcome: 'LOSS',
+      });
+
+      expect(settled.reservations).toContainEqual(expect.objectContaining({
+        reservationId: reservation.reservationId,
+        status: 'SETTLED',
+        realizedPnl: -20,
+        releaseReason: 'operator-confirmed-platform-settlement',
+      }));
+      expect(settled.snapshot.riskState.pendingExecutions)
+        .toBe(before.snapshot.riskState.pendingExecutions - 1);
+      expect(settled.snapshot.riskState.reservedExposure)
+        .toBe(before.snapshot.riskState.reservedExposure - reservation.maxLoss);
+      expect(settled.operationalWagers).toContainEqual(expect.objectContaining({
+        settlement: expect.objectContaining({ outcome: 'LOSS', realizedPnl: -20 }),
+      }));
+      expect(settled.runtime.incidents).toContainEqual(expect.objectContaining({
+        code: 'settlement-gap',
+        tableId: 'D001',
+        active: false,
+      }));
+      expect(settled.snapshot.tables.D001?.executionMode).toBe('live');
+      expect(settled.automation.enabled).toBe(true);
+      expect(setLiveBetEnabled).toHaveBeenCalledTimes(gateCallsBefore);
+
+      const idempotent = await service.settlePendingOperationalWager({
+        reservationId: reservation.reservationId,
+        wagerId: accepted.wager.wagerId,
+        outcome: 'LOSS',
+      });
+      expect(idempotent.reservations.find(candidate =>
+        candidate.reservationId === reservation.reservationId)?.realizedPnl).toBe(-20);
+      await expect(service.settlePendingOperationalWager({
+        reservationId: reservation.reservationId,
+        wagerId: accepted.wager.wagerId,
+        outcome: 'WIN',
+      })).rejects.toThrow('different settlement audit');
+    } finally {
+      await service.close();
+    }
   });
 
   it('returns an audited manual wager and persists keepalive settings', async () => {

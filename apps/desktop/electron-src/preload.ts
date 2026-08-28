@@ -6,6 +6,7 @@ import type {
   DesktopKeepaliveStrategySettings,
   DesktopOperationalWagerCommand,
   DesktopOperationalWagerResult,
+  DesktopPendingSettlementCommand,
   DesktopUnknownWagerReconciliationCommand,
   DesktopSnapshotOptions,
   OneShotLiveBetCommand,
@@ -32,6 +33,8 @@ const api = {
     ipcRenderer.invoke('console:execute-operational-wager', command),
   reconcileUnknownOperationalWager: (command: DesktopUnknownWagerReconciliationCommand) =>
     ipcRenderer.invoke('console:reconcile-unknown-operational-wager', command),
+  settlePendingOperationalWager: (command: DesktopPendingSettlementCommand) =>
+    ipcRenderer.invoke('console:settle-pending-operational-wager', command),
   updateKeepaliveSettings: (settings: DesktopKeepaliveStrategySettings) =>
     ipcRenderer.invoke('console:update-keepalive-settings', settings),
   setAutomationEnabled: (enabled: boolean) => ipcRenderer.invoke('console:set-automation-enabled', enabled),

@@ -45,6 +45,7 @@ import {
   type DesktopRecordPage,
   type DesktopRecordQuery,
   type DesktopRuntimeState,
+  type DesktopPendingSettlementCommand,
   type DesktopUnknownWagerReconciliationCommand,
   type MonitorTableCandidate,
   type OneShotLiveBetCommand,
@@ -1666,6 +1667,86 @@ export class DesktopConsoleService {
           reconciliation.reason,
         );
       }
+      this.refreshAccountingIncidents();
+      this.cachedSummary = undefined;
+      this.cachedRecordCounts = undefined;
+      return this.snapshot();
+    });
+  }
+
+  async settlePendingOperationalWager(
+    command: DesktopPendingSettlementCommand,
+  ): Promise<DesktopConsoleSnapshot> {
+    return await this.enqueueExecutionStateOperation(async () => {
+      await this.startupFailCloseTask;
+      const reservation = this.orchestrator.getReservations()
+        .find(candidate => candidate.reservationId === command.reservationId);
+      if (!reservation) throw new Error(`reservation ${command.reservationId} not found`);
+
+      const record = this.ledger.getOperationalWager(command.wagerId);
+      if (!record) throw new Error(`operational wager ${command.wagerId} not found`);
+      const receipt = record.receipt;
+      const matchesReservation = record.reservationId === reservation.reservationId
+        && record.wager.wagerId === reservation.intentId
+        && record.wager.tableId === reservation.tableId
+        && record.wager.shoeId === reservation.shoeId
+        && record.wager.handId === reservation.handId
+        && record.wager.market === reservation.market
+        && record.wager.amount === reservation.amount
+        && record.wager.source === reservation.executionSource;
+      if (!matchesReservation) throw new Error('operational wager does not match the reservation');
+      if (record.status !== 'ACCEPTED' || receipt?.status !== 'ACCEPTED') {
+        throw new Error(`operational wager ${command.wagerId} is not an accepted pending settlement`);
+      }
+      const receiptMatchesWager = receipt.wagerId === record.wager.wagerId
+        && receipt.tableId === record.wager.tableId
+        && receipt.shoeId === record.wager.shoeId
+        && receipt.handId === record.wager.handId
+        && receipt.market === record.wager.market
+        && receipt.amount === record.wager.amount
+        && receipt.source === record.wager.source;
+      if (!receiptMatchesWager) throw new Error('platform receipt does not match the operational wager');
+
+      if (
+        command.outcome === 'PUSH'
+        && (reservation.market === 'bankerPair' || reservation.market === 'playerPair')
+      ) {
+        throw new Error('pair wagers cannot be settled as a push');
+      }
+      const realizedPnl = command.outcome === 'WIN'
+        ? reservation.maxProfit
+        : command.outcome === 'LOSS'
+          ? -reservation.maxLoss
+          : 0;
+
+      if (record.settlement !== undefined) {
+        if (
+          record.settlement.outcome !== command.outcome
+          || record.settlement.realizedPnl !== realizedPnl
+          || record.settlement.reason !== 'operator-confirmed-platform-settlement'
+        ) {
+          throw new Error('operational wager already has a different settlement audit');
+        }
+        if (reservation.status === 'SETTLED') return this.snapshot();
+      }
+      if (reservation.status !== 'RESERVED') {
+        throw new Error(`reservation ${command.reservationId} is not awaiting settlement`);
+      }
+      if (this.ledger.getHandSettlement(reservation.tableId, reservation.shoeId, reservation.handId)) {
+        throw new Error('authoritative hand settlement is already available for this exact wager');
+      }
+      const settlement = record.settlement ?? {
+        outcome: command.outcome,
+        realizedPnl,
+        reason: 'operator-confirmed-platform-settlement' as const,
+        settledAt: new Date().toISOString(),
+      };
+      this.ledger.settleOperationalWager(command.wagerId, settlement);
+      this.orchestrator.settleReservedReservationManually(
+        command.reservationId,
+        realizedPnl,
+        settlement.reason,
+      );
       this.refreshAccountingIncidents();
       this.cachedSummary = undefined;
       this.cachedRecordCounts = undefined;
