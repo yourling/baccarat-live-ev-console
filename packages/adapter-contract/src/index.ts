@@ -1,4 +1,5 @@
 export * from './normalizer.js';
+export * from './operational-wager.js';
 import type {
   BetIntent,
   BetReceipt,
@@ -20,16 +21,19 @@ export interface KeepAliveResult {
 
 export interface BetExecutionRequest {
   intent: BetIntent;
-  mode: 'simulated' | 'shadow';
+  mode: 'simulated' | 'shadow' | 'live';
   reservationId?: string;
 }
 
-export interface BrowserAdapter {
+export interface TableEventSource {
   readonly tableId: string;
-  readonly displayName: string;
   start(callback: AdapterEventCallback): Promise<void>;
   stop(): Promise<void>;
   keepAlive(): Promise<KeepAliveResult>;
+}
+
+export interface BrowserAdapter extends TableEventSource {
+  readonly displayName: string;
   requestBet(req: BetExecutionRequest): Promise<BetReceipt | null>;
 }
 
@@ -66,7 +70,7 @@ export class SimulatedAdapter implements BrowserAdapter {
   }
 
   async requestBet(req: BetExecutionRequest): Promise<BetReceipt | null> {
-    if (req.mode === 'shadow') return null;
+    if (req.mode !== 'simulated') return null;
     if (this.options.simulateLatencyMs && this.options.simulateLatencyMs > 0) {
       await delay(this.options.simulateLatencyMs);
     }

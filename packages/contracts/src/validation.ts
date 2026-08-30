@@ -1,6 +1,7 @@
 import {
   BETTING_MARKETS,
   CARD_RANKS,
+  isValidContinuityProof,
   type BettingMarket,
   type BurnModel,
   type Card,
@@ -84,6 +85,21 @@ export function assertValidTableProfile(profile: TableProfile, field = 'profile'
   }
   assertValidBurnModel(profile.burnModel, `${field}.burnModel`);
   finiteNumber(profile.minEV, `${field}.minEV`);
+  if (profile.monitorUrl !== undefined && profile.monitorUrl !== null && typeof profile.monitorUrl !== 'string') {
+    throw new ContractValidationError('monitorUrl must be a string', `${field}.monitorUrl`);
+  }
+  if (profile.betTiers !== undefined) {
+    if (!Array.isArray(profile.betTiers)) throw new ContractValidationError('betTiers must be an array', `${field}.betTiers`);
+    let previousMinEV = -Infinity;
+    profile.betTiers.forEach((tier, index) => {
+      nonNegativeNumber(tier.minEV, `${field}.betTiers[${index}].minEV`);
+      positiveNumber(tier.amount, `${field}.betTiers[${index}].amount`);
+      if (tier.minEV <= previousMinEV) {
+        throw new ContractValidationError('betTiers must be sorted by strictly increasing minEV', `${field}.betTiers`);
+      }
+      previousMinEV = tier.minEV;
+    });
+  }
   nonNegativeNumber(profile.limits.minBet, `${field}.limits.minBet`);
   positiveNumber(profile.limits.maxBet, `${field}.limits.maxBet`);
   if (profile.limits.minBet > profile.limits.maxBet) {
@@ -125,6 +141,22 @@ export function assertValidRiskLimits(limits: RiskLimits, field = 'riskLimits'):
   if (limits.insufficientBehavior !== 'skip' && limits.insufficientBehavior !== 'shrink') {
     throw new ContractValidationError('insufficientBehavior must be skip or shrink', `${field}.insufficientBehavior`);
   }
+  if (limits.betSizing !== undefined) {
+    if (limits.betSizing.mode !== 'fixed' && limits.betSizing.mode !== 'capitalPercent') {
+      throw new ContractValidationError('betSizing.mode must be fixed or capitalPercent', `${field}.betSizing.mode`);
+    }
+    if (limits.betSizing.mode === 'capitalPercent') {
+      if (!Number.isFinite(limits.betSizing.bankroll) || (limits.betSizing.bankroll as number) <= 0) {
+        throw new ContractValidationError('capitalPercent bankroll must be positive', `${field}.betSizing.bankroll`);
+      }
+      if (!Number.isFinite(limits.betSizing.percent) || (limits.betSizing.percent as number) <= 0 || (limits.betSizing.percent as number) > 1) {
+        throw new ContractValidationError('capitalPercent percent must be in (0, 1]', `${field}.betSizing.percent`);
+      }
+    }
+    if (limits.betSizing.maxPerBet !== undefined && (!Number.isFinite(limits.betSizing.maxPerBet) || limits.betSizing.maxPerBet <= 0)) {
+      throw new ContractValidationError('betSizing.maxPerBet must be positive', `${field}.betSizing.maxPerBet`);
+    }
+  }
 }
 
 const EVENT_TYPES = new Set([
@@ -160,5 +192,20 @@ export function assertValidEventEnvelope(event: NormalizedEvent): void {
   }
   if (event.schemaVersion !== undefined && event.schemaVersion !== 1) {
     throw new ContractValidationError(`unsupported event schema version: ${event.schemaVersion}`);
+  }
+  if (
+    event.type === 'newShoeSignal'
+    && event.baseline !== undefined
+    && event.baseline !== 'physical-shoe'
+    && event.baseline !== 'unknown-monitor-session'
+  ) {
+    throw new ContractValidationError(`unsupported shoe baseline: ${String(event.baseline)}`, 'baseline');
+  }
+  if (
+    event.type === 'connectionRestored'
+    && event.continuityProof !== undefined
+    && !isValidContinuityProof(event.continuityProof)
+  ) {
+    throw new ContractValidationError('invalid continuity proof', 'continuityProof');
   }
 }

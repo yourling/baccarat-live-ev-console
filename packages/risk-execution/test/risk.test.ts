@@ -32,6 +32,26 @@ function intent(shoe = 's1', hand = 'h1', market: BettingMarket = 'bankerPair', 
 }
 
 describe('risk manager', () => {
+  it('default risk limits allow both pair markets on one hand', () => {
+    const m = new RiskManager();
+    const first = m.tryReserve(intent('s-default', 'h-default', 'bankerPair'), profile, {
+      ...defaultRiskLimits,
+      defaultExposureCap: 1000,
+      perTableLossLimit: 1000,
+      perShoeLossLimit: 1000,
+      perDayLossLimit: 1000,
+    });
+    const second = m.tryReserve(intent('s-default', 'h-default', 'playerPair'), profile, {
+      ...defaultRiskLimits,
+      defaultExposureCap: 1000,
+      perTableLossLimit: 1000,
+      perShoeLossLimit: 1000,
+      perDayLossLimit: 1000,
+    });
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+  });
   it('reserves and releases atomically against internal state', () => {
     const m = new RiskManager();
     const r = m.tryReserve(intent(), profile, limits);
@@ -77,6 +97,21 @@ describe('risk manager', () => {
     expect(r.reason).toContain('global-exposure-cap');
   });
 
+  it('does not let UNKNOWN reservations consume new exposure or concurrency capacity', () => {
+    const m = new RiskManager();
+    const tightLimits = { ...limits, defaultExposureCap: 10, maxConcurrentExecutions: 1 };
+    const first = m.tryReserve(intent('s1', 'h1', 'bankerPair', 10), profile, tightLimits);
+    expect(first.ok).toBe(true);
+    expect(m.markUnknown(first.reservation!.reservationId, 'platform-acknowledgement-unknown')).toBe(true);
+
+    const duplicate = m.tryReserve(intent('s1', 'h1', 'bankerPair', 10), profile, tightLimits);
+    expect(duplicate.ok).toBe(false);
+    expect(duplicate.reason).toContain('duplicate');
+
+    const nextHand = m.tryReserve(intent('s1', 'h2', 'bankerPair', 10), profile, tightLimits);
+    expect(nextHand.ok).toBe(true);
+  });
+
   it('shrinks when policy is shrink, but skips below table min', () => {
     const m = new RiskManager();
     const capLimits = { ...limits, defaultExposureCap: 15, insufficientBehavior: 'shrink' as const };
@@ -112,14 +147,227 @@ describe('risk manager', () => {
     expect(state.shoeLosses['t1:s1']).toBeCloseTo(-100, 6);
   });
 
-  it('marks unknown outcome and releases exposure instead of inventing a result', () => {
+  it('settles banker/player reservations from cards using explicit payout terms', () => {
+    const bankerManager = new RiskManager();
+    const banker = bankerManager.tryReserveExecution({
+      intentId: 'banker-live',
+      tableId: 't1',
+      shoeId: 's-main',
+      handId: 'h-banker',
+      market: 'banker',
+      executionSource: 'keepalive',
+      amount: 20,
+    }, profile.limits, { netWin: 0.95, loss: 1 }, limits);
+    expect(banker.ok).toBe(true);
+
+    const bankerSettled = bankerManager.settleHand('t1', 's-main', 'h-banker', {
+      playerCards: [{ rank: '2' }, { rank: '3' }],
+      bankerCards: [{ rank: '4' }, { rank: '3' }],
+    });
+    expect(bankerSettled[0]).toEqual(expect.objectContaining({
+      market: 'banker',
+      status: 'SETTLED',
+      realizedPnl: 19,
+    }));
+
+    const playerManager = new RiskManager();
+    const player = playerManager.tryReserveExecution({
+      intentId: 'player-live',
+      tableId: 't1',
+      shoeId: 's-main',
+      handId: 'h-tie',
+      market: 'player',
+      executionSource: 'manual',
+      amount: 20,
+    }, profile.limits, { netWin: 1, loss: 1 }, limits);
+    expect(player.ok).toBe(true);
+    const tieSettled = playerManager.settleHand('t1', 's-main', 'h-tie', {
+      playerCards: [{ rank: '4' }, { rank: '3' }],
+      bankerCards: [{ rank: '2' }, { rank: '5' }],
+    });
+    expect(tieSettled[0]).toEqual(expect.objectContaining({
+      market: 'player',
+      status: 'SETTLED',
+      realizedPnl: 0,
+    }));
+  });
+
+  it('settles a committed UNKNOWN banker exposure from authoritative cards', () => {
+    const manager = new RiskManager();
+    const reserved = manager.tryReserveExecution({
+      intentId: 'unknown-banker-live',
+      tableId: 'D066',
+      shoeId: 'shoe-11',
+      handId: 'hand-268280',
+      market: 'banker',
+      executionSource: 'manual',
+      amount: 20,
+    }, profile.limits, { netWin: 0.95, loss: 1 }, limits);
+    expect(reserved.reservation).toBeDefined();
+    manager.markUnknown(reserved.reservation!.reservationId, 'result-timeout', 'receipt-unknown');
+
+    const settled = manager.settleUnknown(reserved.reservation!.reservationId, {
+      playerCards: [{ rank: '5' }, { rank: 'A' }],
+      bankerCards: [{ rank: '9' }, { rank: '9' }],
+    }, 'operator-confirmed-platform-accepted');
+
+    expect(settled).toEqual(expect.objectContaining({
+      status: 'SETTLED',
+      realizedPnl: 19,
+      releaseReason: 'operator-confirmed-platform-accepted',
+    }));
+    expect(manager.getState()).toEqual(expect.objectContaining({
+      reservedExposure: 0,
+      pendingExecutions: 0,
+      executedToday: 20,
+      dayLoss: -19,
+    }));
+  });
+
+  it('reconciles a released platform rejection as executed without releasing exposure twice', () => {
+    const manager = new RiskManager();
+    const reserved = manager.tryReserveExecution({
+      intentId: 'misclassified-rejection',
+      tableId: 'D066',
+      shoeId: 'shoe-11',
+      handId: 'hand-26828174',
+      market: 'player',
+      executionSource: 'keepalive',
+      amount: 20,
+    }, profile.limits, { netWin: 1, loss: 1 }, limits);
+    expect(reserved.reservation).toBeDefined();
+    expect(manager.release(
+      reserved.reservation!.reservationId,
+      false,
+      'receipt-rejected',
+      'receipt-misclassified',
+    )).toBe(true);
+    expect(manager.getState()).toMatchObject({ reservedExposure: 0, pendingExecutions: 0 });
+
+    const settled = manager.settleReleased(reserved.reservation!.reservationId, {
+      playerCards: [{ rank: '4' }, { rank: '4' }],
+      bankerCards: [{ rank: '2' }, { rank: '3' }],
+    }, 'operator-confirmed-platform-accepted');
+
+    expect(settled).toEqual(expect.objectContaining({
+      status: 'SETTLED',
+      realizedPnl: 20,
+      releaseReason: 'operator-confirmed-platform-accepted',
+      receiptId: 'receipt-misclassified',
+    }));
+    expect(manager.getState()).toEqual(expect.objectContaining({
+      reservedExposure: 0,
+      pendingExecutions: 0,
+      executedToday: 20,
+      dayLoss: -20,
+    }));
+  });
+
+  it('uses execution source in operational reservation idempotency', () => {
+    const m = new RiskManager();
+    const reserve = (executionSource: 'manual' | 'keepalive') => m.tryReserveExecution({
+      intentId: newId('opw'),
+      tableId: 't1',
+      shoeId: 's-source',
+      handId: 'h-source',
+      market: 'banker',
+      executionSource,
+      amount: 10,
+    }, profile.limits, { netWin: 0.95, loss: 1 }, limits);
+
+    expect(reserve('manual').ok).toBe(true);
+    expect(reserve('manual').reason).toBe('duplicate:already-reserved');
+    expect(reserve('keepalive').ok).toBe(true);
+  });
+
+  it('keeps an ambiguous acknowledgement active even after the hand settles', () => {
     const m = new RiskManager();
     const r = m.tryReserve(intent(), profile, limits);
     expect(r.ok).toBe(true);
-    const settled = m.settleHand('t1', 's1', 'h1', undefined, profile);
-    expect(settled[0]?.status).toBe('UNKNOWN');
-    expect(m.getState().reservedExposure).toBe(0);
-    expect(m.getState().pendingExecutions).toBe(0);
+    expect(m.markUnknown(r.reservation!.reservationId, 'platform-acknowledgement-unknown', 'receipt-unknown')).toBe(true);
+
+    expect(m.snapshot()[0]?.status).toBe('UNKNOWN');
+    expect(m.getState().reservedExposure).toBe(10);
+    expect(m.getState().pendingExecutions).toBe(1);
+    expect(m.tryReserve(intent(), profile, limits).reason).toBe('duplicate:already-reserved');
+
+    const settled = m.settleHand('t1', 's1', 'h1', { bankerPair: false, playerPair: false }, profile);
+    expect(settled).toEqual([]);
+    expect(m.snapshot()[0]).toEqual(expect.objectContaining({
+      status: 'UNKNOWN',
+      receiptId: 'receipt-unknown',
+    }));
+    expect(m.snapshot()[0]?.realizedPnl).toBeUndefined();
+    expect(m.getState().reservedExposure).toBe(10);
+    expect(m.getState().pendingExecutions).toBe(1);
+    expect(m.tryReserve(intent(), profile, limits).reason).toBe('duplicate:already-reserved');
+  });
+
+  it('persists an ambiguous platform acknowledgement as active exposure through restart', () => {
+    // Given: a live execution was submitted but the platform acknowledgement is ambiguous.
+    const ledger = new SqliteLedger();
+    const firstManager = new RiskManager(ledger);
+    const reserved = firstManager.tryReserve(intent(), profile, limits);
+    expect(reserved.ok).toBe(true);
+
+    // When: the executor reports an unknown acknowledgement and the process restarts.
+    expect(firstManager.markUnknown(
+      reserved.reservation!.reservationId,
+      'platform-acknowledgement-unknown',
+      'receipt-unknown',
+    )).toBe(true);
+    const restartedManager = new RiskManager(ledger);
+
+    // Then: the audit row, exposure, pending count, and active identity all survive.
+    expect(restartedManager.snapshot()[0]).toEqual(expect.objectContaining({
+      status: 'UNKNOWN',
+      receiptId: 'receipt-unknown',
+      releaseReason: 'platform-acknowledgement-unknown',
+    }));
+    expect(restartedManager.getState().reservedExposure).toBe(10);
+    expect(restartedManager.getState().pendingExecutions).toBe(1);
+    expect(restartedManager.tryReserve(intent(), profile, limits).reason).toBe('duplicate:already-reserved');
+    ledger.close();
+  });
+
+  it('settles a pair reservation after cards-only settlement left it unknown', () => {
+    const m = new RiskManager();
+    const reserved = m.tryReserve(intent(), profile, limits);
+    expect(reserved.ok).toBe(true);
+    const first = m.settleHand('t1', 's1', 'h1', {
+      playerCards: [{ rank: '4' }, { rank: '4' }],
+      bankerCards: [{ rank: '8' }, { rank: '6' }],
+    });
+    expect(first[0]?.status).toBe('UNKNOWN');
+    expect(first[0]?.releaseReason).toBe('hand-settled-without-authoritative-outcome');
+
+    const second = m.settleHand('t1', 's1', 'h1', {
+      outcomes: { bankerPair: false, playerPair: true },
+      playerCards: [{ rank: '4' }, { rank: '4' }],
+      bankerCards: [{ rank: '8' }, { rank: '6' }],
+    });
+    expect(second[0]).toMatchObject({ status: 'SETTLED', realizedPnl: -10 });
+    expect(m.getState()).toMatchObject({
+      reservedExposure: 0,
+      pendingExecutions: 0,
+      executedToday: 10,
+    });
+  });
+
+  it('does not invent pnl for an ambiguous hand settlement', () => {
+    const m = new RiskManager();
+    const reserved = m.tryReserve(intent(), profile, limits);
+    expect(reserved.ok).toBe(true);
+
+    // When: the hand settles without an authoritative outcome.
+    const changed = m.settleHand('t1', 's1', 'h1', undefined, profile);
+
+    // Then: the reservation remains UNKNOWN and the counters stay reserved.
+    expect(changed[0]?.status).toBe('UNKNOWN');
+    expect(changed[0]?.realizedPnl).toBeUndefined();
+    expect(m.getState().reservedExposure).toBe(10);
+    expect(m.getState().pendingExecutions).toBe(1);
+    expect(m.tryReserve(intent(), profile, limits).reason).toBe('duplicate:already-reserved');
   });
 
   it('expires reservations when a shoe is replaced', () => {
@@ -131,6 +379,42 @@ describe('risk manager', () => {
     expect(expired[0]?.status).toBe('EXPIRED');
     expect(m.getState().reservedExposure).toBe(0);
     expect(m.getState().pendingExecutions).toBe(0);
+  });
+
+  it('keeps an accepted reservation exposed across shoe rollover and restart until exact settlement', () => {
+    const ledger = new SqliteLedger();
+    const first = new RiskManager(ledger);
+    const reserved = first.tryReserve(intent('s1', 'h1'), profile, limits);
+    expect(reserved.ok).toBe(true);
+    first.attachReceipt(reserved.reservation!.reservationId, 'accepted-receipt');
+
+    expect(first.expireOpenForShoe('t1', 's1', 'new-shoe-signal')).toEqual([]);
+    expect(first.snapshot()[0]).toMatchObject({
+      status: 'RESERVED',
+      receiptId: 'accepted-receipt',
+    });
+    expect(first.getState()).toMatchObject({ reservedExposure: 10, pendingExecutions: 1 });
+
+    const restarted = new RiskManager(ledger);
+    restarted.reconcileTable('t1', 's2', false);
+    expect(restarted.snapshot()[0]).toMatchObject({
+      status: 'RESERVED',
+      receiptId: 'accepted-receipt',
+    });
+    expect(restarted.getState()).toMatchObject({ reservedExposure: 10, pendingExecutions: 1 });
+
+    const settled = restarted.settleHand('t1', 's1', 'h1', {
+      bankerPair: false,
+      playerPair: false,
+    });
+    expect(settled[0]).toMatchObject({ status: 'SETTLED', realizedPnl: -10 });
+    expect(restarted.getState()).toMatchObject({
+      reservedExposure: 0,
+      pendingExecutions: 0,
+      executedToday: 10,
+      dayLoss: 10,
+    });
+    ledger.close();
   });
 
   it('persists reservations and risk state through restart', () => {

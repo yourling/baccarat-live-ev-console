@@ -1,0 +1,472 @@
+import { describe, expect, it } from 'vitest';
+import type { NormalizedEvent } from '@baccarat/contracts';
+import { PragmaticRuntimeParser } from '../src/pragmatic-runtime.js';
+import { pragmaticNetworkObservation } from '../src/server.js';
+
+function snapshot(
+  tables: Array<Record<string, unknown>>,
+  view: 'single' | 'multi' = 'single',
+): string {
+  return JSON.stringify({
+    version: 1,
+    view,
+    observedAt: '2026-08-29T01:00:00.000Z',
+    tables,
+  });
+}
+
+describe('PragmaticRuntimeParser', () => {
+  it('backfills closesAt when the countdown arrives after the window already opened', () => {
+    const parser = new PragmaticRuntimeParser();
+    const opened = parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1',
+      roundId: '17260177624',
+      bettingOpen: true,
+    }]));
+    expect(opened.filter(event => event.type === 'bettingWindowOpened')).toHaveLength(2);
+    expect(opened.find(event => event.type === 'bettingWindowOpened')).not.toHaveProperty('closesAt');
+
+    const timed = parser.parse(JSON.stringify({
+      version: 1,
+      view: 'single',
+      observedAt: '2026-08-29T01:00:03.000Z',
+      tables: [{
+        tableId: 'speedbca14gesbc1',
+        roundId: '17260177624',
+        bettingOpen: true,
+        countdown: 5,
+      }],
+    }));
+    const eta = timed.filter(event => event.type === 'bettingWindowOpened') as Array<
+      Extract<NormalizedEvent, { type: 'bettingWindowOpened' }>
+    >;
+    expect(eta).toHaveLength(2);
+    expect(eta[0]?.closesAt).toBe('2026-08-29T01:00:08.000Z');
+
+    const sameEta = parser.parse(JSON.stringify({
+      version: 1,
+      view: 'single',
+      observedAt: '2026-08-29T01:00:04.000Z',
+      tables: [{
+        tableId: 'speedbca14gesbc1',
+        roundId: '17260177624',
+        bettingOpen: true,
+        countdown: 4,
+      }],
+    }));
+    expect(sameEta.filter(event => event.type === 'bettingWindowOpened')).toHaveLength(0);
+
+    const laterTick = parser.parse(JSON.stringify({
+      version: 1,
+      view: 'single',
+      observedAt: '2026-08-29T01:00:06.000Z',
+      tables: [{
+        tableId: 'speedbca14gesbc1',
+        roundId: '17260177624',
+        bettingOpen: true,
+        countdown: 2,
+      }],
+    }));
+    expect(laterTick.filter(event => event.type === 'bettingWindowOpened')).toHaveLength(0);
+  });
+
+  it('promotes an attached monitor session to a physical shoe on protocol shuffle', () => {
+    const parser = new PragmaticRuntimeParser();
+    const attached = parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh',
+      roundId: '16387761010',
+      bettingOpen: true,
+      source: 'protocol',
+    }]));
+    expect(attached.find(event => event.type === 'newShoeSignal')).toEqual(expect.objectContaining({
+      baseline: 'unknown-monitor-session',
+    }));
+
+    const shuffled = parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh',
+      roundId: '16387766710',
+      bettingOpen: true,
+      source: 'protocol',
+      shoeReset: 'protocol:h22z8qhp17sa0vkh:10',
+    }]));
+    const shoes = shuffled.filter(event => event.type === 'newShoeSignal');
+    expect(shoes).toEqual([
+      expect.objectContaining({
+        type: 'newShoeSignal',
+        baseline: 'physical-shoe',
+        shoeId: 'pragmatic-h22z8qhp17sa0vkh-2',
+      }),
+    ]);
+
+    const sameCycle = parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh',
+      roundId: '16387766710',
+      bettingOpen: true,
+      source: 'protocol',
+      shoeReset: 'protocol:h22z8qhp17sa0vkh:10',
+    }]));
+    expect(sameCycle.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+  });
+
+  it('opens both pair markets from a live single-table snapshot', () => {
+    const parser = new PragmaticRuntimeParser();
+    const events = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281',
+      roundId: '17260230224',
+      gameCount: 35,
+      bettingOpen: true,
+      countdown: 9,
+      playerCards: [],
+      bankerCards: [],
+    }]));
+
+    expect(events.map(event => event.type)).toEqual([
+      'newShoeSignal',
+      'bettingWindowOpened',
+      'bettingWindowOpened',
+    ]);
+    const shoe = events[0] as Extract<NormalizedEvent, { type: 'newShoeSignal' }>;
+    expect(shoe.baseline).toBe('unknown-monitor-session');
+    expect(events.filter(event => event.type === 'bettingWindowOpened').map(event => event.market)).toEqual([
+      'bankerPair',
+      'playerPair',
+    ]);
+  });
+
+  it('records two same-rank cards that have different shoe copies', () => {
+    const parser = new PragmaticRuntimeParser();
+    const events = parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh',
+      roundId: '16387761010',
+      bettingOpen: false,
+      playerCards: ['5D3', '5D4'],
+      bankerCards: ['AS1', '0S3'],
+      source: 'protocol',
+    }]));
+    const cards = events.filter(event => event.type === 'cardObserved');
+    expect(cards).toEqual([
+      expect.objectContaining({
+        position: 'player',
+        card: expect.objectContaining({ rank: '5', suit: 'D', raw: '5D3' }),
+      }),
+      expect.objectContaining({
+        position: 'player',
+        card: expect.objectContaining({ rank: '5', suit: 'D', raw: '5D4' }),
+      }),
+      expect.objectContaining({
+        position: 'banker',
+        card: expect.objectContaining({ rank: 'A', suit: 'S', raw: 'AS1' }),
+      }),
+      expect.objectContaining({
+        position: 'banker',
+        card: expect.objectContaining({ rank: '10', suit: 'S', raw: '0S3' }),
+      }),
+    ]);
+  });
+
+  it('settles a completed hand as soon as both sides have two cards', () => {
+    const parser = new PragmaticRuntimeParser();
+    const events = parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh',
+      roundId: '16387761010',
+      bettingOpen: false,
+      playerCards: ['QS', '9H'],
+      bankerCards: ['3S', '7D'],
+    }]));
+    expect(events.find(event => event.type === 'handSettled')).toEqual(expect.objectContaining({
+      type: 'handSettled',
+      handId: '16387761010',
+    }));
+  });
+
+  it('records cards once and settles the prior round when the next round appears', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: '17260230224', gameCount: 35,
+      bettingOpen: true, countdown: 9,
+    }]));
+
+    const dealt = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: '17260230224', gameCount: 35,
+      bettingOpen: false,
+      playerCards: ['2C', '2S'],
+      bankerCards: ['AH', '6D'],
+    }]));
+    expect(dealt.filter(event => event.type === 'cardObserved')).toHaveLength(4);
+    expect(dealt.filter(event => event.type === 'bettingWindowClosed')).toHaveLength(2);
+    expect(dealt.find(event => event.type === 'handSettled')).toBeUndefined();
+
+    const completed = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: '17260230224', gameCount: 35,
+      bettingOpen: false,
+      playerCards: ['2C', '2S', '9H'],
+      bankerCards: ['AH', '6D'],
+      source: 'protocol',
+    }]));
+    const settled = completed.find(event => event.type === 'handSettled') as
+      | Extract<NormalizedEvent, { type: 'handSettled' }>
+      | undefined;
+    expect(settled).toEqual(expect.objectContaining({
+      handId: '17260230224',
+      outcomes: { playerPair: true, bankerPair: false },
+    }));
+    expect(settled?.playerCards.map(card => card.rank)).toEqual(['2', '2', '9']);
+
+    const repeated = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: '17260230224', gameCount: 35,
+      bettingOpen: false,
+      playerCards: ['2C', '2S', '9H'],
+      bankerCards: ['AH', '6D'],
+    }]));
+    expect(repeated).toHaveLength(0);
+
+    const next = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: '17260235024', gameCount: 36,
+      bettingOpen: true, countdown: 8,
+    }]));
+    expect(next.find(event => event.type === 'handSettled')).toBeUndefined();
+  });
+
+  it('promotes a decreasing road count to a physical shoe reset', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-1', gameCount: 51,
+    }]));
+    const events = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 1,
+    }]));
+    const reset = events.find(event => event.type === 'newShoeSignal') as
+      | Extract<NormalizedEvent, { type: 'newShoeSignal' }>
+      | undefined;
+    expect(reset?.baseline).toBe('physical-shoe');
+    expect(reset?.shoeId).toBe('pragmatic-bc281koreanch281-2');
+  });
+
+  it('tracks simultaneous multitable rounds independently', () => {
+    const parser = new PragmaticRuntimeParser();
+    const events = parser.parse(snapshot([
+      { tableId: 'speedbca14gesbc1', roundId: '17260177624', bettingOpen: true, countdown: 7 },
+      { tableId: 'tobcbaccaragen92', roundId: '17260176724', bettingOpen: true, countdown: 4 },
+      { tableId: 'spijbnsu408vmv73', roundId: '17260175724' },
+    ], 'multi'));
+
+    expect(events.filter(event => event.type === 'newShoeSignal')).toHaveLength(3);
+    expect(events.filter(event => event.type === 'bettingWindowOpened')).toHaveLength(4);
+    expect(new Set(events.map(event => event.tableId))).toEqual(new Set([
+      'speedbca14gesbc1',
+      'tobcbaccaragen92',
+      'spijbnsu408vmv73',
+    ]));
+  });
+
+  it('does not consume unselected tables before they are added to monitoring', () => {
+    const parser = new PragmaticRuntimeParser();
+    const raw = snapshot([
+      { tableId: 'speedbca14gesbc1', roundId: '17260177624', bettingOpen: true, countdown: 7 },
+      { tableId: 'tobcbaccaragen92', roundId: '17260176724', bettingOpen: true, countdown: 4 },
+    ], 'multi');
+
+    expect(parser.parse(raw, tableId => tableId === 'speedbca14gesbc1')
+      .every(event => event.tableId === 'speedbca14gesbc1')).toBe(true);
+    const newlySelected = parser.parse(raw, tableId => tableId === 'tobcbaccaragen92');
+
+    expect(newlySelected.map(event => event.type)).toEqual([
+      'newShoeSignal',
+      'bettingWindowOpened',
+      'bettingWindowOpened',
+    ]);
+  });
+
+  it('can reset one table without disturbing another table state', () => {
+    const parser = new PragmaticRuntimeParser();
+    const raw = snapshot([
+      { tableId: 'speedbca14gesbc1', roundId: '17260177624', bettingOpen: true, countdown: 7 },
+      { tableId: 'tobcbaccaragen92', roundId: '17260176724', bettingOpen: true, countdown: 4 },
+    ], 'multi');
+    parser.parse(raw);
+
+    parser.resetTable('tobcbaccaragen92');
+    const replayed = parser.parse(raw);
+
+    expect(new Set(replayed.map(event => event.tableId))).toEqual(new Set(['tobcbaccaragen92']));
+    expect(replayed.map(event => event.type)).toEqual([
+      'newShoeSignal',
+      'bettingWindowOpened',
+      'bettingWindowOpened',
+    ]);
+  });
+
+  it('accepts protocol cards for a new round without an empty DOM open boundary', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh', roundId: '16387761010', bettingOpen: false,
+      playerCards: ['QS', '9H'], bankerCards: ['3S', '7D'], source: 'protocol',
+    }]));
+
+    const next = parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh', roundId: '16387766710', bettingOpen: false,
+      playerCards: ['KS', '9H'], bankerCards: ['2C', '3D'], source: 'protocol',
+    }]));
+    expect(next.filter(event => event.type === 'cardObserved')).toHaveLength(4);
+    expect(next.find(event => event.type === 'handSettled')).toEqual(expect.objectContaining({
+      handId: '16387766710',
+    }));
+  });
+
+  it('settles a previous hand when its delayed last card arrives after the next window', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'oq808ojps709qqaf', roundId: '16389075410', bettingOpen: true,
+      playerCards: [], bankerCards: [], source: 'protocol',
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'oq808ojps709qqaf', roundId: '16389075410', bettingOpen: false,
+      playerCards: ['KS', '9H'], bankerCards: ['2C'], source: 'protocol',
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'oq808ojps709qqaf', roundId: '16389079910', bettingOpen: true,
+      playerCards: [], bankerCards: [], source: 'protocol',
+    }]));
+    const delayed = parser.parse(snapshot([{
+      tableId: 'oq808ojps709qqaf', roundId: '16389075410', bettingOpen: false,
+      playerCards: ['KS', '9H'], bankerCards: ['2C', '3D'], source: 'protocol',
+    }]));
+    expect(delayed.filter(event => event.type === 'cardObserved')).toHaveLength(1);
+    expect(delayed.find(event => event.type === 'handSettled')).toEqual(expect.objectContaining({
+      handId: '16389075410',
+    }));
+  });
+
+  it('does not let a later partial DOM snapshot erase protocol cards', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh', roundId: '16387761010', bettingOpen: true,
+      playerCards: [], bankerCards: [], source: 'protocol',
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh', roundId: '16387761010', bettingOpen: false,
+      playerCards: ['QS', '9H'], bankerCards: ['3S'], source: 'protocol',
+    }]));
+
+    const partialDom = parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh', roundId: '16387761010', bettingOpen: false,
+      playerCards: ['QS'], bankerCards: ['3S'], source: 'dom',
+    }]));
+    expect(partialDom.filter(event => event.type === 'cardObserved')).toHaveLength(0);
+
+    const completed = parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh', roundId: '16387761010', bettingOpen: false,
+      playerCards: ['QS', '9H'], bankerCards: ['3S', '7D'], source: 'protocol',
+    }]));
+    expect(completed.filter(event => event.type === 'cardObserved')).toHaveLength(1);
+    expect(completed.find(event => event.type === 'handSettled')).toEqual(expect.objectContaining({
+      handId: '16387761010',
+      bankerCards: expect.arrayContaining([
+        expect.objectContaining({ rank: '3', suit: 'S' }),
+        expect.objectContaining({ rank: '7', suit: 'D' }),
+      ]),
+    }));
+  });
+
+  it('does not assign stale cards to a new round before an empty open boundary', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1', roundId: 'round-1', bettingOpen: false,
+      playerCards: ['2C', '2S'], bankerCards: ['AH', '6D'],
+    }]));
+
+    const staleTransition = parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1', roundId: 'round-2', bettingOpen: false,
+      playerCards: ['2C', '2S'], bankerCards: ['AH', '6D'],
+    }]));
+    expect(staleTransition.filter(event => event.type === 'cardObserved')).toHaveLength(0);
+
+    parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1', roundId: 'round-2', bettingOpen: true,
+      playerCards: [], bankerCards: [],
+    }]));
+    const actualCards = parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1', roundId: 'round-2', bettingOpen: false,
+      playerCards: ['7C', '8S'], bankerCards: ['9H', '10D'],
+    }]));
+    expect(actualCards.filter(event => event.type === 'cardObserved')).toHaveLength(4);
+  });
+
+  it('reopens the same-hand betting window after a false closed snapshot', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1', roundId: 'round-open', bettingOpen: true, countdown: 8,
+    }]));
+    const closed = parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1', roundId: 'round-open', bettingOpen: false,
+    }]));
+    expect(closed.filter(event => event.type === 'bettingWindowClosed')).toHaveLength(2);
+
+    const reopened = parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1', roundId: 'round-open', bettingOpen: true, countdown: 6,
+    }]));
+    expect(reopened.filter(event => event.type === 'bettingWindowOpened')).toHaveLength(2);
+  });
+
+  it('isolates lifecycle state for forty simultaneously monitored tables', () => {
+    const parser = new PragmaticRuntimeParser();
+    const tables = Array.from({ length: 40 }, (_, index) => ({
+      tableId: `pragmatictable${String(index).padStart(2, '0')}`,
+      roundId: `round-${index}`,
+      bettingOpen: true,
+      countdown: 9 - (index % 5),
+      playerCards: [],
+      bankerCards: [],
+    }));
+    const events = parser.parse(snapshot(tables, 'multi'));
+
+    expect(events.filter(event => event.type === 'newShoeSignal')).toHaveLength(40);
+    expect(events.filter(event => event.type === 'bettingWindowOpened')).toHaveLength(80);
+    expect(new Set(events.map(event => event.tableId))).toHaveLength(40);
+    expect(new Set(events.map(event => `${event.tableId}:${event.sourceSeq}`)).size).toBe(events.length);
+  });
+});
+
+describe('pragmaticNetworkObservation', () => {
+  it('exposes protocol shape without exposing unrelated field values', () => {
+    const observation = pragmaticNetworkObservation(JSON.stringify({
+      eventType: 'tableState',
+      tableId: 'speedbca14gesbc1',
+      round: { roundId: '17260818724', secret: 'must-not-leak' },
+      tables: [{ table_id: 'tobcbaccaragen92', status: 'OPEN' }],
+      token: 'private-token',
+    }), 'text');
+
+    expect(observation).toEqual(expect.objectContaining({
+      format: 'json',
+      tableIds: ['speedbca14gesbc1', 'tobcbaccaragen92'],
+      roundIds: ['17260818724'],
+      eventTypes: ['tableState'],
+    }));
+    expect(JSON.stringify(observation)).not.toContain('must-not-leak');
+    expect(JSON.stringify(observation)).not.toContain('private-token');
+  });
+
+  it('exposes only allowlisted game-state values for protocol calibration', () => {
+    const observation = pragmaticNetworkObservation(JSON.stringify({
+      card: {
+        table: 'bc281koreanch281', game: '17260818724', place: 'Player',
+        value: '7H', cardCount: '1', sc: '7H', seq: 99,
+        token: 'must-not-leak', balance: 12345,
+      },
+    }), 'text');
+
+    expect(observation.state).toEqual({
+      kind: 'card',
+      table: 'bc281koreanch281',
+      game: '17260818724',
+      cardValue: '7H',
+      cardCode: '7H',
+      place: 'Player',
+      cardCount: '1',
+      seq: 99,
+    });
+    expect(JSON.stringify(observation)).not.toContain('must-not-leak');
+    expect(JSON.stringify(observation)).not.toContain('12345');
+  });
+});

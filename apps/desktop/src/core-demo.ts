@@ -53,21 +53,77 @@ function mulberry32(seed: number) {
   };
 }
 
+const DEMO_SUITS = ['♠', '♥', '♦', '♣'] as const;
+
 function drawCard(deck: Record<CardRank, number>, rand: () => number): Card {
+  const suit = DEMO_SUITS[Math.floor(rand() * DEMO_SUITS.length)];
   const total = CARD_RANKS.reduce((sum, r) => sum + deck[r], 0);
-  if (total <= 0) return { rank: 'A' };
+  if (total <= 0) throw new Error('demo shoe has no cards left');
   let idx = Math.floor(rand() * total);
   for (const rank of CARD_RANKS) {
-    if (idx < deck[rank]) return { rank };
+    if (idx < deck[rank]) {
+      deck[rank] -= 1;
+      return { rank, suit };
+    }
     idx -= deck[rank];
   }
-  return { rank: 'A' };
+  throw new Error('demo shoe draw failed');
 }
 
 function freshDeck(decks: number): Record<CardRank, number> {
   const deck = { 'A':0,'2':0,'3':0,'4':0,'5':0,'6':0,'7':0,'8':0,'9':0,'10':0,'J':0,'Q':0,'K':0 } as Record<CardRank, number>;
   for (const r of CARD_RANKS) deck[r] = 4 * decks;
   return deck;
+}
+
+export interface BaccaratHand {
+  playerCards: Card[];
+  bankerCards: Card[];
+}
+
+function baccaratCardValue(card: Card): number {
+  if (card.rank === 'A') return 1;
+  if (card.rank === '10' || card.rank === 'J' || card.rank === 'Q' || card.rank === 'K') return 0;
+  return Number(card.rank);
+}
+
+function baccaratTotal(cards: Card[]): number {
+  return cards.reduce((sum, card) => sum + baccaratCardValue(card), 0) % 10;
+}
+
+function bankerDrawsAfterPlayerThird(bankerTotal: number, playerThirdValue: number): boolean {
+  if (bankerTotal <= 2) return true;
+  if (bankerTotal === 3) return playerThirdValue !== 8;
+  if (bankerTotal === 4) return playerThirdValue >= 2 && playerThirdValue <= 7;
+  if (bankerTotal === 5) return playerThirdValue >= 4 && playerThirdValue <= 7;
+  if (bankerTotal === 6) return playerThirdValue === 6 || playerThirdValue === 7;
+  return false;
+}
+
+export function dealBaccaratHand(deck: Record<CardRank, number>, rand: () => number): BaccaratHand {
+  const playerCards = [drawCard(deck, rand), drawCard(deck, rand)];
+  const bankerCards = [drawCard(deck, rand), drawCard(deck, rand)];
+  const playerInitialTotal = baccaratTotal(playerCards);
+  const bankerInitialTotal = baccaratTotal(bankerCards);
+
+  // A natural 8 or 9 ends the hand before either side can draw.
+  if (playerInitialTotal >= 8 || bankerInitialTotal >= 8) return { playerCards, bankerCards };
+
+  if (playerInitialTotal <= 5) {
+    const playerThird = drawCard(deck, rand);
+    playerCards.push(playerThird);
+    if (bankerDrawsAfterPlayerThird(bankerInitialTotal, baccaratCardValue(playerThird))) {
+      bankerCards.push(drawCard(deck, rand));
+    }
+  } else if (bankerInitialTotal <= 5) {
+    bankerCards.push(drawCard(deck, rand));
+  }
+
+  return { playerCards, bankerCards };
+}
+
+function isPair(cards: Card[]): boolean {
+  return cards.length >= 2 && cards[0].rank === cards[1].rank;
 }
 
 export interface RandomDemoStream {
@@ -81,7 +137,7 @@ export function demoProfiles(): [TableProfile, TableProfile] {
     ...defaultProfile('table-1'),
     autoConfirmNewShoe: true,
     autoBetArmedByDefault: true,
-    minEV: -0.2,
+    minEV: 0,
     limits: { minBet: 10, maxBet: 1000 },
     odds: { bankerPair: { netWin: 11, loss: 1 }, playerPair: { netWin: 11, loss: 1 } },
     betStrategy: { type: 'both' },
@@ -90,7 +146,7 @@ export function demoProfiles(): [TableProfile, TableProfile] {
     ...defaultProfile('table-2'),
     autoConfirmNewShoe: true,
     autoBetArmedByDefault: true,
-    minEV: -0.2,
+    minEV: 0,
     limits: { minBet: 10, maxBet: 500 },
     odds: { bankerPair: { netWin: 11, loss: 1 }, playerPair: { netWin: 11, loss: 1 } },
     betStrategy: { type: 'alternate', start: 'bankerPair' },
@@ -98,12 +154,12 @@ export function demoProfiles(): [TableProfile, TableProfile] {
   return [p1, p2];
 }
 
-export function buildRandomDemo(seed?: number): RandomDemoStream {
+export function buildRandomDemo(seed?: number, namespace?: string): RandomDemoStream {
   const actualSeed = seed ?? Math.floor(Math.random() * 0xffffffff);
   const profiles = demoProfiles();
   const streams = {
-    [profiles[0].tableId]: buildRandomTable(profiles[0].tableId, profiles[0], actualSeed),
-    [profiles[1].tableId]: buildRandomTable(profiles[1].tableId, profiles[1], actualSeed ^ 0x9e3779b9),
+    [profiles[0].tableId]: buildRandomTable(profiles[0].tableId, profiles[0], actualSeed, namespace),
+    [profiles[1].tableId]: buildRandomTable(profiles[1].tableId, profiles[1], actualSeed ^ 0x9e3779b9, namespace),
   };
   return { seed: actualSeed, profiles, streams };
 }
@@ -112,37 +168,43 @@ export function buildRandomTable(
   tableId: string,
   profile: TableProfile,
   seed: number,
+  namespace?: string,
 ): NormalizedEvent[] {
-  const b = new FixtureBuilder(tableId);
+  const b = new FixtureBuilder(tableId, undefined, namespace ? `${tableId}_${namespace}` : undefined);
   const rand = mulberry32(seed);
-  const deck = freshDeck(profile.numberOfDecks);
   const shoeCount = 1 + Math.floor(rand() * 3);
   for (let shoeIdx = 1; shoeIdx <= shoeCount; shoeIdx++) {
-    const shoeId = `${tableId}-shoe-${shoeIdx}`;
+    const deck = freshDeck(profile.numberOfDecks);
+    const shoeId = `${namespace ? `${namespace}_` : ``}${tableId}-shoe-${shoeIdx}`;
     b.newShoe(shoeId, profile);
     if (!profile.autoConfirmNewShoe) b.confirmShoe(shoeId, true);
+    const totalShoeCards = profile.numberOfDecks * 52;
+    // Cut-card signals are restricted to the final fifth of the shoe.
+    const redCutPoint = Math.floor(totalShoeCards * (0.80 + rand() * 0.15));
+    let cardsUsed = 0;
     let handIdx = 1;
     let redNext = false;
-    const maxHands = 3 + Math.floor(rand() * 4);
-    while (handIdx <= maxHands) {
+    while (handIdx <= 100 && cardsUsed < totalShoeCards) {
       const handId = `${shoeId}-h${handIdx}`;
       if (redNext) b.redCard(shoeId, handId);
       b.openWindow(shoeId, handId, 'bankerPair');
       if (profile.betStrategy.type !== 'alternate' || profile.betStrategy.start === 'playerPair') {
         b.openWindow(shoeId, handId, 'playerPair');
       }
-      const playerCards = [drawCard(deck, rand), drawCard(deck, rand)];
-      const bankerCards = [drawCard(deck, rand), drawCard(deck, rand)];
+      const hand = dealBaccaratHand(deck, rand);
+      const playerCards = hand.playerCards;
+      const bankerCards = hand.bankerCards;
       for (let i = 0; i < playerCards.length; i++) b.card(shoeId, handId, playerCards[i], `player${i + 1}`);
       for (let i = 0; i < bankerCards.length; i++) b.card(shoeId, handId, bankerCards[i], `banker${i + 1}`);
       b.closeWindow(shoeId, handId, 'bankerPair');
       if (profile.betStrategy.type !== 'alternate' || profile.betStrategy.start === 'playerPair') {
         b.closeWindow(shoeId, handId, 'playerPair');
       }
-      b.settle(shoeId, handId, playerCards, bankerCards);
+      b.settle(shoeId, handId, playerCards, bankerCards, { bankerPair: isPair(bankerCards), playerPair: isPair(playerCards) });
+      cardsUsed += playerCards.length + bankerCards.length;
       handIdx++;
       if (redNext) break;
-      if (handIdx >= 3 && rand() < 0.35) redNext = true;
+      if (cardsUsed >= redCutPoint) redNext = true;
     }
   }
   return b.build();

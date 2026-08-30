@@ -8,3 +8,25 @@ electron-dist/
 .DS_Store
 coverage/
 apps/desktop/node_modules/.vite/
+
+# Desktop packaging artifacts
+apps/desktop/release/
+
+# Local capture / research dumps (not product)
+.tmp-mstrom/
+scripts/temp-*.cjs
+eng.traineddata
+.jspace/
+
+# Accidental shell/path artifacts
+%SystemDrive%/
+NUL
+=
+({table
+
+# Local agent skill copies and unrelated side app
+apps/desktop/.agents/
+apps/desktop/.claude/
+apps/desktop/.trae/
+apps/desktop/skills/
+apps/lord-god-space/

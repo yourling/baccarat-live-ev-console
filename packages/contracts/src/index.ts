@@ -11,6 +11,13 @@ export interface Card {
 export type BettingMarket = 'bankerPair' | 'playerPair';
 export const BETTING_MARKETS: BettingMarket[] = ['bankerPair', 'playerPair'];
 
+/**
+ * Execution markets are broader than EV decision markets. Probability and
+ * strategy code must continue to use BettingMarket.
+ */
+export type ExecutionMarket = BettingMarket | 'banker' | 'player';
+export type ExecutionSource = 'strategy' | 'one-shot' | 'manual' | 'keepalive';
+
 export interface OddsConfig {
   netWin: number;
   loss: number;
@@ -34,6 +41,13 @@ export interface BurnModel {
   evidenceRef?: string;
 }
 
+export interface BetTier {
+  /** 使用该金额所需的最低 EV，按内部保守判断值匹配。 */
+  minEV: number;
+  /** 命中该阶梯时的每手下注金额。 */
+  amount: number;
+}
+
 export interface TableProfile {
   tableId: string;
   numberOfDecks: number;
@@ -44,6 +58,10 @@ export interface TableProfile {
   limits: TableLimits;
   autoConfirmNewShoe: boolean;
   betStrategy: BetStrategy;
+  /** 为空时回退到 Actor 的默认每手金额。 */
+  betTiers?: BetTier[];
+  /** 预留给后续桌台窗口或链接绑定，不参与概率和下注算法。 */
+  monitorUrl?: string;
   autoBetArmedByDefault?: boolean;
 }
 
@@ -63,11 +81,15 @@ export type TableStatus =
   | 'RESYNCING'
   | 'INVALIDATED';
 
+/** Whether the logical shoe begins at a verified physical shoe or an unknown mid-shoe monitor attach. */
+export type ShoeBaseline = 'physical-shoe' | 'unknown-monitor-session';
+
 export type AutoBetStatus = 'DISARMED' | 'ARMED' | 'NEEDS_MANUAL_RECOVERY';
 export type ConnectionStatus = 'CONNECTED' | 'RESYNCING' | 'DISCONNECTED' | 'EXPIRED';
 
 export interface ShoeStateProjection {
   shoeId: string;
+  shoeBaseline: ShoeBaseline;
   tableId: string;
   profileSnapshot: TableProfile;
   modelRevision: string;
@@ -75,7 +97,14 @@ export interface ShoeStateProjection {
   remainingCounts: Record<CardRank, number>;
   remainingTotal: number;
   seenCards: Card[];
+  /** Idempotency keys `${handId}:${position}:${rank}${suit}` so replayed cards do not consume inventory twice. */
+  cardInventoryKeys: string[];
   currentHandId: string | null;
+  /** Hand IDs already counted in this shoe, retained to ignore duplicate and out-of-order events. */
+  observedHandIds: string[];
+  /** True once the current hand has observed at least one card. */
+  currentHandHasCards: boolean;
+  bettingWindowClosesAt: string | null;
   handNumber: number;
   redCardSeen: boolean;
   burnModel: BurnModel;
@@ -115,6 +144,8 @@ export interface BaseEvent {
 export interface NewShoeSignalEvent extends BaseEvent {
   type: 'newShoeSignal';
   shoeId: string;
+  /** Omitted for legacy/physical sources; attach baselines must be explicit. */
+  baseline?: ShoeBaseline;
   profile?: Partial<TableProfile>;
 }
 
@@ -145,6 +176,7 @@ export interface BettingWindowClosedEvent extends BaseEvent {
   shoeId: string;
   handId: string;
   market: BettingMarket;
+  openingObserved?: boolean;
 }
 
 /**
@@ -181,7 +213,15 @@ export interface ConnectionLostEvent extends BaseEvent {
 
 export interface ConnectionRestoredEvent extends BaseEvent {
   type: 'connectionRestored';
+  /** Trusted monitor cursor proof in the form cursor-v1:<64 lowercase hex>. */
   continuityProof?: string;
+}
+
+export const CONTINUITY_PROOF_PREFIX = 'cursor-v1:';
+
+export function isValidContinuityProof(value: unknown): value is string {
+  return typeof value === 'string'
+    && /^cursor-v1:[a-f0-9]{64}$/.test(value);
 }
 
 export interface BetReceiptEvent extends BaseEvent {
@@ -241,7 +281,7 @@ export interface DecisionSnapshot {
   createdAt: string;
 }
 
-export type ExecutionMode = 'shadow' | 'simulated';
+export type ExecutionMode = 'shadow' | 'simulated' | 'live';
 export type BetStatus = 'SIMULATED' | 'ACCEPTED' | 'REJECTED' | 'UNKNOWN';
 
 export interface BetIntent {
@@ -266,7 +306,9 @@ export interface RiskReservation {
   tableId: string;
   shoeId: string;
   handId: string;
-  market: BettingMarket;
+  market: ExecutionMarket;
+  /** Missing on legacy rows and interpreted as "strategy". */
+  executionSource?: ExecutionSource;
   amount: number;
   maxLoss: number;
   /** 命中的最大盈利，用于结算审计。 */
@@ -293,6 +335,16 @@ export interface BetReceipt {
   raw?: unknown;
 }
 
+export interface BetSizingConfig {
+  mode: 'fixed' | 'capitalPercent';
+  /** capitalPercent 模式下的当前总资金。 */
+  bankroll?: number;
+  /** capitalPercent 模式下的每手比例，0.0025 表示 0.25%。 */
+  percent?: number;
+  /** 可选的单手金额硬上限。 */
+  maxPerBet?: number;
+}
+
 export interface RiskLimits {
   defaultExposureCap: number;
   perTableLossLimit: number;
@@ -300,6 +352,7 @@ export interface RiskLimits {
   perDayLossLimit: number;
   maxConcurrentExecutions: number;
   insufficientBehavior: 'skip' | 'shrink';
+  betSizing?: BetSizingConfig;
 }
 
 export interface RiskExposureState {

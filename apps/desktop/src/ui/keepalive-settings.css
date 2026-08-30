@@ -1,0 +1,22 @@
+.keepalive-settings .muted {
+  margin: 0 0 var(--space-3, 12px);
+}
+
+.keepalive-settings__fields {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.keepalive-settings__history {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3, 12px);
+  margin-top: var(--space-3, 12px);
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+@media (max-width: 960px) {
+  .keepalive-settings__fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
