@@ -52,8 +52,11 @@ export function emptyProjection(tableId: string): ShoeStateProjection {
     remainingCounts: { ...EMPTY } as ShoeStateProjection['remainingCounts'],
     remainingTotal: 0,
     seenCards: [],
+    cardInventoryKeys: [],
     currentHandId: null,
     observedHandIds: [],
+    currentHandHasCards: false,
+    bettingWindowClosesAt: null,
     handNumber: 0,
     redCardSeen: false,
     burnModel: { kind: 'unknown' },
@@ -70,6 +73,7 @@ function cloneProjection(s: ShoeStateProjection): ShoeStateProjection {
     profileSnapshot: structuredClone(s.profileSnapshot),
     remainingCounts: { ...s.remainingCounts },
     seenCards: s.seenCards.map(c => ({ ...c })),
+    cardInventoryKeys: [...(s.cardInventoryKeys ?? [])],
     observedHandIds: [...s.observedHandIds],
     burnModel: structuredClone(s.burnModel),
   };
@@ -83,6 +87,8 @@ function beginHand(
   if (projection.observedHandIds.includes(handId)) return 'stale';
   projection.observedHandIds.push(handId);
   projection.currentHandId = handId;
+  projection.currentHandHasCards = false;
+  projection.bettingWindowClosesAt = null;
   projection.handNumber = projection.observedHandIds.length;
   return 'new';
 }
@@ -189,16 +195,17 @@ export function applyEvent(
       updated.remainingCounts = recomputeRemaining(profile.numberOfDecks, [], profile.burnModel) as ShoeStateProjection['remainingCounts'];
       updated.remainingTotal = sumCounts(updated.remainingCounts);
       updated.seenCards = [];
+      updated.cardInventoryKeys = [];
       updated.currentHandId = null;
       updated.observedHandIds = [];
+      updated.currentHandHasCards = false;
+      updated.bettingWindowClosesAt = null;
       updated.handNumber = 0;
       updated.redCardSeen = false;
       updated.burnModel = structuredClone(profile.burnModel);
       updated.sealed = false;
       updated.status = profile.autoConfirmNewShoe ? 'TRACKING' : 'WAITING_CONFIRMATION';
-      updated.autoBetStatus = shoeBaseline === 'unknown-monitor-session'
-        ? 'DISARMED'
-        : profile.autoBetArmedByDefault ? 'ARMED' : 'DISARMED';
+      updated.autoBetStatus = profile.autoBetArmedByDefault ? 'ARMED' : 'DISARMED';
       updated.connectionStatus = 'CONNECTED';
       break;
     }
@@ -214,6 +221,13 @@ export function applyEvent(
       nonEmptyString(event.handId, 'handId', event);
       assertValidCard(event.card);
       if (!isCurrentShoe(event.shoeId, current)) break;
+      const copyId = typeof event.card.raw === 'string' && event.card.raw.trim().length > 0
+        ? event.card.raw.trim().toUpperCase()
+        : `${event.card.rank}${event.card.suit ?? ''}`;
+      const inventoryKey = `${event.handId}:${event.position ?? '*'}:${copyId}`;
+      updated.cardInventoryKeys = updated.cardInventoryKeys ?? [];
+      if (updated.cardInventoryKeys.includes(inventoryKey)) break;
+      updated.cardInventoryKeys.push(inventoryKey);
       const rank = event.card.rank;
       const physicalInventoryIsKnown = updated.shoeBaseline === 'physical-shoe';
       if (physicalInventoryIsKnown && updated.remainingCounts[rank] <= 0) {
@@ -226,11 +240,13 @@ export function applyEvent(
       updated.remainingTotal = Math.max(0, updated.remainingTotal - 1);
       updated.seenCards.push({ ...event.card });
       const handState = beginHand(updated, event.handId);
+      if (handState !== 'stale') updated.currentHandHasCards = true;
       if (
         handState !== 'stale'
         && (updated.status === 'BETTING_WINDOW' || updated.status === 'PENDING_SETTLEMENT')
       ) {
         updated.status = 'TRACKING';
+        updated.bettingWindowClosesAt = null;
       }
       break;
     }
@@ -243,8 +259,12 @@ export function applyEvent(
         break;
       }
       const handState = beginHand(updated, event.handId);
-      if (handState === 'stale' || (handState === 'current' && updated.status !== 'BETTING_WINDOW')) break;
+      if (handState === 'stale') break;
+      if (handState === 'current' && updated.currentHandHasCards) break;
       updated.status = 'BETTING_WINDOW';
+      if (typeof event.closesAt === 'string' && event.closesAt.length > 0) {
+        updated.bettingWindowClosesAt = event.closesAt;
+      }
       break;
     }
     case 'bettingWindowClosed': {
@@ -254,8 +274,10 @@ export function applyEvent(
       if (!isCurrentShoe(event.shoeId, current)) break;
       if (updated.redCardSeen) {
         updated.status = 'RED_CARD_WIND_DOWN';
+        updated.bettingWindowClosesAt = null;
       } else if (updated.status === 'BETTING_WINDOW' && updated.currentHandId === event.handId) {
         updated.status = 'TRACKING';
+        updated.bettingWindowClosesAt = null;
       }
       break;
     }
@@ -286,6 +308,7 @@ export function applyEvent(
         updated.sealed = true;
       } else if (updated.status === 'BETTING_WINDOW' || updated.status === 'TRACKING' || updated.status === 'PENDING_SETTLEMENT') {
         updated.status = 'TRACKING';
+        updated.bettingWindowClosesAt = null;
       }
       break;
     }
@@ -364,7 +387,7 @@ export function applyEvent(
         updated.autoBetStatus = 'DISARMED';
         break;
       }
-      if (updated.shoeBaseline === 'unknown-monitor-session' || updated.redCardSeen || updated.status === 'INVALIDATED' || updated.status === 'RESYNCING' || updated.status === 'WAITING_CONFIRMATION') {
+      if (updated.redCardSeen || updated.status === 'INVALIDATED' || updated.status === 'RESYNCING' || updated.status === 'WAITING_CONFIRMATION') {
         break;
       }
       updated.autoBetStatus = 'ARMED';

@@ -64,6 +64,7 @@ export interface OperationalWagerCoordinatorOptions {
   readonly ledger: SqliteLedger;
   readonly actor: (tableId: string) => OperationalWagerActor | undefined;
   readonly monitorTableIds: () => readonly string[];
+  readonly keepaliveTableIds?: () => readonly string[];
   readonly serialize: <T>(operation: () => Promise<T>) => Promise<T>;
   readonly runtimeBlockReason?: (
     tableId: string,
@@ -122,7 +123,7 @@ export class OperationalWagerCoordinator {
     this.running = true;
     try {
       const result = await tryKeepaliveInOrder({
-        tableIds: this.options.monitorTableIds(),
+        tableIds: this.options.keepaliveTableIds?.() ?? this.options.monitorTableIds(),
         market: this.state.market,
         amount: this.state.amount,
         requestWager: async (tableId, market, amount) => {
@@ -144,7 +145,6 @@ export class OperationalWagerCoordinator {
       if (shouldRecordAttempt) {
         this.state = {
           ...this.state,
-          ...(result.status === 'UNKNOWN' ? { enabled: false } : {}),
           lastAttemptAt: now.toISOString(),
           lastStatus: result.status,
           ...(result.tableId === null ? {} : { lastTableId: result.tableId }),
@@ -162,6 +162,7 @@ export class OperationalWagerCoordinator {
     readonly tableId: string;
     readonly market: OperationalWagerMarket;
     readonly amount: number;
+    readonly handId?: string;
   }): Promise<OperationalWagerResult> {
     return await this.options.serialize(async () => {
       return await this.execute({ ...input, source: 'manual' }, new Date());
@@ -173,6 +174,7 @@ export class OperationalWagerCoordinator {
       readonly tableId: string;
       readonly market: OperationalWagerMarket;
       readonly amount: number;
+      readonly handId?: string;
       readonly source: OperationalWagerSource;
     },
     now: Date,
@@ -201,9 +203,9 @@ export class OperationalWagerCoordinator {
       market: input.market,
       amount: input.amount,
       source: input.source,
+      ...(input.source === 'manual' && input.handId !== undefined ? { handId: input.handId } : {}),
       createdAt: now.toISOString(),
     });
-    if (result.status === 'UNKNOWN') this.disableKeepaliveImmediately();
     return result;
   }
 

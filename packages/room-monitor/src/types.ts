@@ -8,6 +8,9 @@ import {
 
 export interface TableDescriptor {
   tableId: string;
+  displayName?: string;
+  roundId?: string;
+  gameCount?: number;
   profile: TableProfile;
   monitorUrl?: string;
 }

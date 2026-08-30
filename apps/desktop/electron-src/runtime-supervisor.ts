@@ -27,6 +27,7 @@ export interface RuntimeIncident {
   readonly lastOccurredAt: string;
   readonly occurrences: number;
   readonly active: boolean;
+  readonly acknowledgedAt?: string;
   readonly resolvedAt?: string;
 }
 
@@ -85,6 +86,7 @@ export class RuntimeIncidentStore {
         lastOccurredAt: occurredAt,
         occurrences: existing.occurrences + 1,
       };
+      Reflect.deleteProperty(updated, 'acknowledgedAt');
       this.incidents.splice(existingIndex, 1);
       this.incidents.push(updated);
       this.trimAndPersist();
@@ -135,6 +137,30 @@ export class RuntimeIncidentStore {
       };
     });
     if (changed) this.persist();
+  }
+
+  acknowledge(incidentId: string): boolean {
+    const acknowledgedAt = this.now().toISOString();
+    let changed = false;
+    this.incidents = this.incidents.map(incident => {
+      if (incident.incidentId !== incidentId || incident.acknowledgedAt !== undefined) return incident;
+      changed = true;
+      return { ...incident, acknowledgedAt };
+    });
+    if (changed) this.persist();
+    return changed;
+  }
+
+  acknowledgeAllActive(): number {
+    const acknowledgedAt = this.now().toISOString();
+    let changed = 0;
+    this.incidents = this.incidents.map(incident => {
+      if (!incident.active || incident.acknowledgedAt !== undefined) return incident;
+      changed += 1;
+      return { ...incident, acknowledgedAt };
+    });
+    if (changed > 0) this.persist();
+    return changed;
   }
 
   hasActive(code: RuntimeIncidentCode, tableId?: string): boolean {
@@ -267,7 +293,6 @@ export function evaluateLiveExecutionReadiness(
   input: LiveExecutionReadinessInput,
 ): LiveExecutionBlockReason[] {
   const reasons: LiveExecutionBlockReason[] = [];
-  if (!input.approved) reasons.push('live-not-approved');
   if (!input.bridge.running) {
     reasons.push('bridge-not-running');
   } else if (!input.bridge.authenticated || input.bridge.connectionCount !== 1) {
@@ -292,7 +317,6 @@ export function evaluateLiveExecutionReadiness(
     reasons.push('table-connection-not-restored');
   }
   if (input.projection.sealed) reasons.push('shoe-sealed');
-  if (input.hasUnknownExecution) reasons.push('unknown-execution-pending');
   if (input.hasSettlementGap) reasons.push('settlement-gap');
   return reasons;
 }
@@ -331,6 +355,7 @@ function isRuntimeIncident(value: unknown): value is RuntimeIncident {
   const code = Reflect.get(value, 'code');
   const severity = Reflect.get(value, 'severity');
   const tableId = Reflect.get(value, 'tableId');
+  const acknowledgedAt = Reflect.get(value, 'acknowledgedAt');
   return isRuntimeIncidentCode(code)
     && (severity === 'degraded' || severity === 'blocked')
     && typeof Reflect.get(value, 'incidentId') === 'string'
@@ -339,7 +364,8 @@ function isRuntimeIncident(value: unknown): value is RuntimeIncident {
     && typeof Reflect.get(value, 'firstOccurredAt') === 'string'
     && typeof Reflect.get(value, 'lastOccurredAt') === 'string'
     && Number.isInteger(Reflect.get(value, 'occurrences'))
-    && typeof Reflect.get(value, 'active') === 'boolean';
+    && typeof Reflect.get(value, 'active') === 'boolean'
+    && (acknowledgedAt === undefined || typeof acknowledgedAt === 'string');
 }
 
 function isRuntimeIncidentCode(value: unknown): value is RuntimeIncidentCode {

@@ -20,14 +20,6 @@ export interface OneShotBetCommand {
 
 export type OneShotBetRejectionReason =
   | 'invalid-command'
-  | 'physical-shoe-required'
-  | 'connected-required'
-  | 'betting-window-required'
-  | 'current-shoe-mismatch'
-  | 'current-hand-mismatch'
-  | 'shoe-sealed'
-  | 'betting-window-closed'
-  | 'auto-bet-armed'
   | 'executor-required'
   | 'duplicate'
   | 'risk-rejected'
@@ -71,8 +63,6 @@ export async function executeOneShotBet(
 ): Promise<OneShotBetResult> {
   const invalid = validateCommand(command);
   if (invalid) return rejected(invalid);
-  const gate = gateReason(command, context);
-  if (gate) return rejected(gate);
   if (context.executor === null) return rejected('executor-required');
   if (hasDuplicate(context.ledger, context.tableId, command)) return rejected('duplicate');
 
@@ -148,22 +138,6 @@ function validateCommand(command: OneShotBetCommand): OneShotBetRejectionReason 
     : 'invalid-command';
 }
 
-function gateReason(
-  command: OneShotBetCommand,
-  context: OneShotBetContext,
-): OneShotBetRejectionReason | null {
-  const { projection } = context;
-  if (projection.shoeBaseline !== 'physical-shoe') return 'physical-shoe-required';
-  if (projection.connectionStatus !== 'CONNECTED') return 'connected-required';
-  if (projection.status !== 'BETTING_WINDOW') return 'betting-window-required';
-  if (command.shoeId !== projection.shoeId) return 'current-shoe-mismatch';
-  if (command.handId !== projection.currentHandId) return 'current-hand-mismatch';
-  if (projection.sealed) return 'shoe-sealed';
-  if (!isWindowOpen(context.ledger, context.tableId, command)) return 'betting-window-closed';
-  if (projection.autoBetStatus === 'ARMED') return 'auto-bet-armed';
-  return null;
-}
-
 function isMarket(value: unknown): value is BettingMarket {
   return value === 'bankerPair' || value === 'playerPair';
 }
@@ -179,25 +153,6 @@ function hasDuplicate(
       && reservation.handId === command.handId
       && reservation.market === command.market
     ));
-}
-
-function isWindowOpen(
-  ledger: SqliteLedger,
-  tableId: string,
-  command: OneShotBetCommand,
-): boolean {
-  let latest: 'opened' | 'closed' | null = null;
-  for (const event of ledger.listEvents(tableId)) {
-    if (
-      (event.type === 'bettingWindowOpened' || event.type === 'bettingWindowClosed')
-      && event.shoeId === command.shoeId
-      && event.handId === command.handId
-      && event.market === command.market
-    ) {
-      latest = event.type === 'bettingWindowOpened' ? 'opened' : 'closed';
-    }
-  }
-  return latest === 'opened';
 }
 
 function receiptMatchesIntent(

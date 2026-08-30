@@ -97,9 +97,14 @@ export interface ShoeStateProjection {
   remainingCounts: Record<CardRank, number>;
   remainingTotal: number;
   seenCards: Card[];
+  /** Idempotency keys `${handId}:${position}:${rank}${suit}` so replayed cards do not consume inventory twice. */
+  cardInventoryKeys: string[];
   currentHandId: string | null;
   /** Hand IDs already counted in this shoe, retained to ignore duplicate and out-of-order events. */
   observedHandIds: string[];
+  /** True once the current hand has observed at least one card. */
+  currentHandHasCards: boolean;
+  bettingWindowClosesAt: string | null;
   handNumber: number;
   redCardSeen: boolean;
   burnModel: BurnModel;

@@ -41,6 +41,8 @@ declare global {
       settlePendingOperationalWager: (command: DesktopPendingSettlementCommand) => Promise<DesktopConsoleSnapshot>;
       updateKeepaliveSettings: (settings: DesktopKeepaliveStrategySettings) => Promise<DesktopConsoleSnapshot>;
       setAutomationEnabled: (enabled: boolean) => Promise<DesktopConsoleSnapshot>;
+      acknowledgeRuntimeIncident: (incidentId: string) => Promise<DesktopConsoleSnapshot>;
+      acknowledgeAllRuntimeIncidents: () => Promise<DesktopConsoleSnapshot>;
       confirmPhysicalShoe: (tableId: string) => Promise<DesktopConsoleSnapshot>;
       applyManualCorrection: (tableId: string, correction: ManualCorrection, shoeId?: string) => Promise<DesktopConsoleSnapshot>;
       updateRiskLimits: (limits: RiskLimits) => Promise<DesktopConsoleSnapshot>;

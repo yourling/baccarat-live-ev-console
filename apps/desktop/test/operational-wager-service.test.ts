@@ -118,6 +118,54 @@ describe('DesktopConsoleService operational wagers', () => {
     })).toThrow('unsupported pending settlement outcome');
   });
 
+  it('opens the live gate for a manual wager without requiring a prior live-mode activation', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const setLiveBetEnabled = vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    const requestOperationalWager = vi.spyOn(bridge, 'requestOperationalWager')
+      .mockImplementation(async (request: OperationalWagerExecutionRequest) => ({
+        receiptId: `receipt-${request.wager.wagerId}`,
+        wagerId: request.wager.wagerId,
+        tableId: request.wager.tableId,
+        shoeId: request.wager.shoeId,
+        handId: request.wager.handId,
+        market: request.wager.market,
+        amount: request.wager.amount,
+        source: request.wager.source,
+        status: 'ACCEPTED',
+        createdAt: '2026-08-25T00:00:02.000Z',
+      }));
+    authenticateBridge(bridge);
+
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['D001']);
+      await service.injectEvent(physicalShoe('D001'));
+      await service.injectEvent(openWindow('D001'));
+
+      const result = await service.executeOperationalWager({
+        tableId: 'D001',
+        market: 'banker',
+        amount: 20,
+      });
+
+      expect(result.status).toBe('ACCEPTED');
+      expect(setLiveBetEnabled).toHaveBeenCalledWith(true);
+      expect(requestOperationalWager).toHaveBeenCalledWith(expect.objectContaining({
+        mode: 'live',
+        wager: expect.objectContaining({
+          tableId: 'D001',
+          market: 'banker',
+          source: 'manual',
+        }),
+      }));
+      expect(result.snapshot.snapshot.tables.D001?.executionMode).toBe('live');
+      expect(result.snapshot.runtime.tables.D001?.active).toBe(true);
+    } finally {
+      await service.close();
+    }
+  });
+
   it('manually settles an accepted historical wager without changing unattended execution', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();
@@ -210,7 +258,7 @@ describe('DesktopConsoleService operational wagers', () => {
     }
   });
 
-  it('returns an audited manual wager and persists keepalive settings', async () => {
+  it('returns an audited manual wager before a physical shoe baseline is known', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();
     let reservationSeenBeforeDispatch = false;
@@ -240,7 +288,10 @@ describe('DesktopConsoleService operational wagers', () => {
       authenticateBridge(bridge);
       await service.updateMonitorTableIds(['D001']);
       service['liveFeeds'].set('D001', freshFeed('D001'));
-      await service.injectEvent(physicalShoe('D001'));
+      await service.injectEvent({
+        ...physicalShoe('D001'),
+        baseline: 'unknown-monitor-session',
+      });
       await service.injectEvent(openWindow('D001'));
       await service.setExecutionMode('D001', 'live');
 
@@ -271,6 +322,8 @@ describe('DesktopConsoleService operational wagers', () => {
           operationalWagers: [expect.objectContaining({ status: 'ACCEPTED' })],
         },
       });
+      expect(wager.snapshot.snapshot.tables.D001?.projection.shoeBaseline)
+        .toBe('unknown-monitor-session');
       expect(reservationSeenBeforeDispatch).toBe(true);
       expect(wager.snapshot.reservations).toContainEqual(expect.objectContaining({
         market: 'player',
@@ -288,7 +341,50 @@ describe('DesktopConsoleService operational wagers', () => {
     }
   });
 
-  it('blocks a manual live wager when current table readiness is lost', async () => {
+  it('rejects a manual wager when the actor projection has not opened the betting window', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const requestOperationalWager = vi.spyOn(bridge, 'requestOperationalWager')
+      .mockImplementation(async (request: OperationalWagerExecutionRequest) => ({
+        receiptId: `receipt-${request.wager.wagerId}`,
+        wagerId: request.wager.wagerId,
+        tableId: request.wager.tableId,
+        shoeId: request.wager.shoeId,
+        handId: request.wager.handId,
+        market: request.wager.market,
+        amount: request.wager.amount,
+        source: request.wager.source,
+        status: 'ACCEPTED',
+        createdAt: '2026-08-25T00:00:02.000Z',
+      }));
+
+    try {
+      service['browserBridge'] = bridge;
+      authenticateBridge(bridge);
+      vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+      await service.updateMonitorTableIds(['D001']);
+      service['liveFeeds'].set('D001', freshFeed('D001'));
+      await service.injectEvent(physicalShoe('D001'));
+      await service.setExecutionMode('D001', 'live');
+
+      const result = await service.executeOperationalWager({
+        tableId: 'D001',
+        market: 'player',
+        amount: 20,
+        handId: 'visible-page-hand',
+      });
+
+      expect(result).toMatchObject({
+        status: 'REJECTED',
+        reason: 'betting-window-required',
+      });
+      expect(requestOperationalWager).not.toHaveBeenCalled();
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('routes a manual live wager through the bridge when current table readiness is stale', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();
     let feedState: 'CONNECTED' | 'DISCONNECTED' = 'CONNECTED';
@@ -315,11 +411,13 @@ describe('DesktopConsoleService operational wagers', () => {
       });
 
       expect(result).toMatchObject({
-        status: 'REJECTED',
-        reason: expect.stringContaining('table-feed-disconnected'),
+        status: 'UNKNOWN',
+        reason: expect.stringContaining('no browser extension connected'),
       });
-      expect(requestOperationalWager).not.toHaveBeenCalled();
-      expect(result.snapshot.reservations).toEqual([]);
+      expect(requestOperationalWager).toHaveBeenCalledTimes(1);
+      expect(result.snapshot.reservations).toEqual([
+        expect.objectContaining({ status: 'UNKNOWN' }),
+      ]);
     } finally {
       await service.close();
     }
@@ -367,45 +465,45 @@ describe('DesktopConsoleService operational wagers', () => {
         code: 'unknown-execution',
         tableId: 'D066',
         active: true,
+        severity: 'degraded',
       }));
-      expect(unknown.snapshot.snapshot.tables.D066?.executionMode).toBe('shadow');
-      expect(setLiveBetEnabled).toHaveBeenLastCalledWith(false);
+      expect(unknown.snapshot.snapshot.tables.D066?.executionMode).toBe('live');
+      expect(setLiveBetEnabled).toHaveBeenLastCalledWith(true);
 
       await expect(service.reconcileUnknownOperationalWager({
         reservationId: reservation!.reservationId,
         wagerId: unknown.wager!.wagerId,
       })).rejects.toThrow('authoritative hand settlement is not available');
 
-      await service.injectEvent(bankerWinSettlement('D066'));
-      const reconciled = await service.reconcileUnknownOperationalWager({
-        reservationId: reservation!.reservationId,
-        wagerId: unknown.wager!.wagerId,
-      });
-      const settled = reconciled.reservations.find(candidate =>
+      const settledSnapshot = await service.injectEvent(bankerWinSettlement('D066'));
+      const settled = settledSnapshot.reservations.find(candidate =>
         candidate.reservationId === reservation!.reservationId);
       expect(settled).toMatchObject({
         status: 'SETTLED',
         realizedPnl: 19,
-        releaseReason: 'operator-confirmed-platform-accepted',
+        releaseReason: 'committed-hand-settled',
       });
-      expect(reconciled.snapshot.riskState).toMatchObject({
+      expect(settledSnapshot.snapshot.riskState).toMatchObject({
         pendingExecutions: 0,
         reservedExposure: 0,
         executedToday: 20,
         dayLoss: -19,
       });
-      expect(reconciled.operationalWagers).toContainEqual(expect.objectContaining({
+      expect(settledSnapshot.operationalWagers).toContainEqual(expect.objectContaining({
         status: 'UNKNOWN',
         receipt: expect.objectContaining({ status: 'UNKNOWN' }),
-        reconciliation: expect.objectContaining({ status: 'ACCEPTED' }),
+        reconciliation: expect.objectContaining({
+          status: 'ACCEPTED',
+          reason: 'committed-hand-settled',
+        }),
       }));
-      expect(reconciled.runtime.incidents).toContainEqual(expect.objectContaining({
+      expect(settledSnapshot.runtime.incidents).toContainEqual(expect.objectContaining({
         code: 'unknown-execution',
         tableId: 'D066',
         active: false,
       }));
-      expect(reconciled.snapshot.tables.D066?.executionMode).toBe('shadow');
-      expect(reconciled.automation.enabled).toBe(false);
+      expect(settledSnapshot.snapshot.tables.D066?.executionMode).toBe('live');
+      expect(settledSnapshot.automation.enabled).toBe(false);
       expect(requestOperationalWager).toHaveBeenCalledTimes(1);
 
       const idempotent = await service.reconcileUnknownOperationalWager({
@@ -415,6 +513,67 @@ describe('DesktopConsoleService operational wagers', () => {
       expect(idempotent.reservations.find(candidate =>
         candidate.reservationId === reservation!.reservationId)?.realizedPnl).toBe(19);
       expect(requestOperationalWager).toHaveBeenCalledTimes(1);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('settles a Pragmatic market-click UNKNOWN once the exact hand has cards', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    authenticateBridge(bridge);
+    vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    vi.spyOn(bridge, 'requestOperationalWager')
+      .mockImplementation(async (request: OperationalWagerExecutionRequest) => ({
+        receiptId: `receipt-${request.wager.wagerId}`,
+        wagerId: request.wager.wagerId,
+        tableId: request.wager.tableId,
+        shoeId: request.wager.shoeId,
+        handId: request.wager.handId,
+        market: request.wager.market,
+        amount: request.wager.amount,
+        source: request.wager.source,
+        status: 'UNKNOWN',
+        createdAt: '2026-08-25T00:00:02.000Z',
+        raw: {
+          reason: 'platform-ack-not-observed',
+          commitPoint: 'market-click',
+          commitStarted: true,
+        },
+      }));
+
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['spijbnsu408vmv73']);
+      service['liveFeeds'].set('spijbnsu408vmv73', freshFeed('spijbnsu408vmv73'));
+      await service.injectEvent(physicalShoe('spijbnsu408vmv73'));
+      await service.injectEvent(openWindow('spijbnsu408vmv73'));
+      await service.setExecutionMode('spijbnsu408vmv73', 'live');
+
+      const unknown = await service.executeOperationalWager({
+        tableId: 'spijbnsu408vmv73',
+        market: 'banker',
+        amount: 10,
+      });
+      expect(unknown.status).toBe('UNKNOWN');
+      const reservation = unknown.snapshot.reservations.find(candidate =>
+        candidate.intentId === unknown.wager!.wagerId);
+      expect(reservation?.status).toBe('UNKNOWN');
+
+      const settledSnapshot = await service.injectEvent(bankerWinSettlement('spijbnsu408vmv73'));
+      expect(settledSnapshot.reservations.find(candidate =>
+        candidate.reservationId === reservation!.reservationId)).toMatchObject({
+        status: 'SETTLED',
+        realizedPnl: 9.5,
+        releaseReason: 'committed-hand-settled',
+      });
+      expect(settledSnapshot.operationalWagers).toContainEqual(expect.objectContaining({
+        reservationId: reservation!.reservationId,
+        reconciliation: expect.objectContaining({
+          status: 'ACCEPTED',
+          reason: 'committed-hand-settled',
+        }),
+      }));
     } finally {
       await service.close();
     }
@@ -467,7 +626,7 @@ describe('DesktopConsoleService operational wagers', () => {
         executedToday: 0,
       });
       expect(unknown.snapshot.automation.enabled).toBe(false);
-      expect(unknown.snapshot.snapshot.tables.D056?.executionMode).toBe('shadow');
+      expect(unknown.snapshot.snapshot.tables.D056?.executionMode).toBe('live');
 
       await service.injectEvent(bankerWinSettlement('D056'));
       const reconciled = await service.reconcileUnknownOperationalWager({
@@ -543,6 +702,7 @@ describe('DesktopConsoleService operational wagers', () => {
 
       expect(result).toMatchObject({
         status: 'UNKNOWN',
+        reason: 'browser-extension-bet-runtime-outdated',
         receipt: { status: 'ACCEPTED', raw: { runtimeRevision: 'obsolete-runtime' } },
         snapshot: {
           automation: { enabled: false },
@@ -607,7 +767,7 @@ describe('DesktopConsoleService operational wagers', () => {
       await service.injectEvent(openWindow('D001'));
       await waitFor(() => requestOperationalWager.mock.calls.length > 0);
 
-      // Then: fixed keepalive uses the controlled live path, while EV pair automation stays disarmed.
+      // Then: fixed keepalive uses the controlled live path, while EV pair automation can remain armed.
       expect(requestOperationalWager).toHaveBeenCalledWith(expect.objectContaining({
         mode: 'live',
         wager: expect.objectContaining({
@@ -623,8 +783,60 @@ describe('DesktopConsoleService operational wagers', () => {
           source: 'keepalive',
         }),
       }));
-      expect(service.snapshot().snapshot.tables.D001?.projection.autoBetStatus).toBe('DISARMED');
+      expect(service.snapshot().snapshot.tables.D001?.projection.autoBetStatus).toBe('ARMED');
       expect(service.snapshot().runtime.reasons).not.toContain('physical-shoe-baseline-unknown');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('sends keepalive on Pragmatic tables through the same request path as manual bets', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    const requestOperationalWager = vi.spyOn(bridge, 'requestOperationalWager')
+      .mockImplementation(async (request: OperationalWagerExecutionRequest) => ({
+        receiptId: `receipt-${request.wager.wagerId}`,
+        wagerId: request.wager.wagerId,
+        tableId: request.wager.tableId,
+        shoeId: request.wager.shoeId,
+        handId: request.wager.handId,
+        market: request.wager.market,
+        amount: request.wager.amount,
+        source: request.wager.source,
+        status: 'ACCEPTED',
+        createdAt: '2026-08-25T00:00:02.000Z',
+      }));
+
+    try {
+      service['browserBridge'] = bridge;
+      authenticateBridge(bridge);
+      await service.updateMonitorTableIds(['bc281koreanch281']);
+      service['liveFeeds'].set('bc281koreanch281', freshFeed('bc281koreanch281'));
+      service['liveApprovals'].approve('bc281koreanch281');
+      service['liveRoomIdsByTable'].set('bc281koreanch281', 'dafabet-pragmatic');
+      await service.injectEvent({
+        ...physicalShoe('bc281koreanch281'),
+        baseline: 'unknown-monitor-session',
+      });
+      await service.setAutomationEnabled(true);
+      await service.injectEvent(openWindow('bc281koreanch281'));
+      await waitFor(() => requestOperationalWager.mock.calls.length > 0);
+
+      expect(requestOperationalWager).toHaveBeenCalledWith(expect.objectContaining({
+        mode: 'live',
+        wager: expect.objectContaining({
+          tableId: 'bc281koreanch281',
+          source: 'keepalive',
+        }),
+      }));
+      expect(service.snapshot().operationalWagers).toContainEqual(expect.objectContaining({
+        status: 'ACCEPTED',
+        wager: expect.objectContaining({
+          tableId: 'bc281koreanch281',
+          source: 'keepalive',
+        }),
+      }));
     } finally {
       await service.close();
     }

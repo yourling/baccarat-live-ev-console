@@ -14,7 +14,7 @@ import {
   sha256,
   stableStringify,
 } from '@baccarat/contracts';
-import type { OperationalWagerRecord } from './operational-wager.js';
+import { operationalReceiptCommitStarted, type OperationalWagerRecord } from './operational-wager.js';
 import { replayEvents } from './projection.js';
 
 type EventRow = {
@@ -396,7 +396,10 @@ export class LedgerConflictError extends Error {
 
 export type AppendEventResult = 'appended' | 'duplicate';
 
-const SCHEMA_VERSION = '4';
+const SCHEMA_VERSION = '5';
+const MONITOR_HISTORY_HANDS_PER_TABLE = 12;
+const MONITOR_WINDOW_EVENT_TYPES = "('bettingWindowOpened','bettingWindowClosed')";
+const MONITOR_TRANSIENT_EVENT_TYPES = "('connectionLost','connectionRestored','autoArmChanged','autoDisarmChanged')";
 
 // allow: SIZE_OK — SQLite schema, atomic persistence, and read projections share one transaction boundary.
 export class SqliteLedger {
@@ -447,10 +450,9 @@ export class SqliteLedger {
         payload TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
-      CREATE UNIQUE INDEX IF NOT EXISTS uq_decisions_window
-        ON decisions(table_id, shoe_id, hand_id, market, event_id);
       CREATE INDEX IF NOT EXISTS idx_decisions_table_created ON decisions(table_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_decisions_created ON decisions(created_at);
+      CREATE INDEX IF NOT EXISTS idx_events_table_type ON events(table_id, type);
       CREATE TABLE IF NOT EXISTS receipts (
         receipt_id TEXT PRIMARY KEY,
         intent_id TEXT NOT NULL UNIQUE,
@@ -504,7 +506,7 @@ export class SqliteLedger {
       this.db.prepare('INSERT INTO ledger_meta (key, value) VALUES (?, ?)').run('schema_version', SCHEMA_VERSION);
     } else if (row.value === SCHEMA_VERSION) {
       // 当前版本,无需迁移
-    } else if (row.value === '1' || row.value === '2' || row.value === '3') {
+    } else if (row.value === '1' || row.value === '2' || row.value === '3' || row.value === '4') {
       if (row.value === '1') this.rebuildReservationsTable();
       this.db.prepare('UPDATE ledger_meta SET value = ? WHERE key = ?').run(SCHEMA_VERSION, 'schema_version');
     } else {
@@ -512,6 +514,7 @@ export class SqliteLedger {
     }
     // 兜底:极早期未写版本号的库也可能带旧的全局唯一约束;该函数幂等,非旧形态时为空操作。
     this.rebuildReservationsTable();
+    this.rebuildDecisionWindowIndex();
     this.db.exec(`
       DROP INDEX IF EXISTS uq_reservations_active;
       CREATE UNIQUE INDEX IF NOT EXISTS uq_reservations_active
@@ -527,6 +530,18 @@ export class SqliteLedger {
       CREATE INDEX IF NOT EXISTS idx_reservations_status ON reservations(table_id, status);
       CREATE INDEX IF NOT EXISTS idx_reservations_table_created ON reservations(table_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_reservations_created ON reservations(created_at);
+    `);
+  }
+
+  private rebuildDecisionWindowIndex(): void {
+    this.db.exec(`
+      DELETE FROM decisions
+      WHERE rowid NOT IN (
+        SELECT MAX(rowid) FROM decisions GROUP BY table_id, shoe_id, hand_id, market
+      );
+      DROP INDEX IF EXISTS uq_decisions_window;
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_decisions_hand_market
+        ON decisions(table_id, shoe_id, hand_id, market);
     `);
   }
 
@@ -830,8 +845,7 @@ export class SqliteLedger {
       && existing.receipt !== undefined
       && typeof existing.receipt.raw === 'object'
       && existing.receipt.raw !== null
-      && Reflect.get(existing.receipt.raw, 'commitStarted') === true
-      && Reflect.get(existing.receipt.raw, 'commitPoint') === 'confirmBet';
+      && operationalReceiptCommitStarted(existing.receipt.raw);
     const unknownReceipt = existing.status === 'UNKNOWN' && existing.receipt?.status === 'UNKNOWN';
     if (!unknownReceipt && !committedExecution) {
       throw new LedgerConflictError(`operational wager ${wagerId} is not a reconcilable committed execution`);
@@ -1262,15 +1276,29 @@ export class SqliteLedger {
 
   saveDecision(decision: DecisionSnapshot): boolean {
     const payload = stableStringify(decision);
-    const existing = this.db.prepare('SELECT payload FROM decisions WHERE snapshot_id = ?').get(decision.snapshotId) as { payload: string } | undefined;
+    const existing = this.db.prepare(
+      'SELECT snapshot_id, payload FROM decisions WHERE table_id = ? AND shoe_id = ? AND hand_id = ? AND market = ?',
+    ).get(decision.tableId, decision.shoeId, decision.handId, decision.market) as
+      | { snapshot_id: string; payload: string }
+      | undefined;
     if (existing) {
-      if (existing.payload !== payload) {
-        throw new LedgerConflictError(`decision snapshot ${decision.snapshotId} already exists with a different payload`);
-      }
-      return false;
+      if (existing.payload === payload) return false;
+      this.db.prepare(`
+        UPDATE decisions
+        SET snapshot_id = ?, model_revision = ?, event_id = ?, payload = ?, created_at = ?
+        WHERE snapshot_id = ?
+      `).run(
+        decision.snapshotId,
+        decision.modelRevision,
+        decision.eventId ?? null,
+        payload,
+        decision.createdAt,
+        existing.snapshot_id,
+      );
+      return true;
     }
     const result = this.db.prepare(`
-      INSERT OR IGNORE INTO decisions
+      INSERT INTO decisions
         (snapshot_id, table_id, shoe_id, hand_id, market, model_revision, event_id, payload, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
@@ -1285,6 +1313,119 @@ export class SqliteLedger {
       decision.createdAt,
     );
     return result.changes > 0;
+  }
+
+  listHandCards(tableId: string, handId: string): {
+    playerCards: Array<{ rank: string }>;
+    bankerCards: Array<{ rank: string }>;
+  } {
+    const rows = this.db.prepare(`
+      SELECT payload FROM events
+      WHERE table_id = ? AND type = 'cardObserved' AND json_extract(payload, '$.handId') = ?
+      ORDER BY id ASC
+    `).all(tableId, handId) as { payload: string }[];
+    const playerCards: Array<{ rank: string }> = [];
+    const bankerCards: Array<{ rank: string }> = [];
+    for (const row of rows) {
+      const event = JSON.parse(row.payload) as Extract<NormalizedEvent, { type: 'cardObserved' }>;
+      if (event.position === 'player' && playerCards.length < 3) playerCards.push(event.card);
+      if (event.position === 'banker' && bankerCards.length < 3) bankerCards.push(event.card);
+    }
+    return { playerCards, bankerCards };
+  }
+
+  pruneMonitorHistory(
+    keepHandsPerTable = MONITOR_HISTORY_HANDS_PER_TABLE,
+    tableId?: string,
+  ): void {
+    const keepCount = Math.max(1, Math.trunc(keepHandsPerTable));
+    const tableRows = tableId === undefined
+      ? this.db.prepare('SELECT DISTINCT table_id AS tableId FROM events').all() as Array<{ tableId: string }>
+      : [{ tableId }];
+    const reservedRows = this.db.prepare(
+      "SELECT table_id AS tableId, hand_id AS handId FROM reservations WHERE status IN ('RESERVED', 'UNKNOWN')",
+    ).all() as Array<{ tableId: string; handId: string }>;
+    const reservedByTable = new Map<string, Set<string>>();
+    for (const row of reservedRows) {
+      const hands = reservedByTable.get(row.tableId) ?? new Set<string>();
+      hands.add(row.handId);
+      reservedByTable.set(row.tableId, hands);
+    }
+
+    const pruneTable = this.db.transaction((tableId: string) => {
+      const hands = this.db.prepare(`
+        SELECT json_extract(payload, '$.handId') AS handId, MAX(id) AS lastId
+        FROM events
+        WHERE table_id = ? AND json_extract(payload, '$.handId') IS NOT NULL
+        GROUP BY handId
+        ORDER BY lastId DESC
+      `).all(tableId) as Array<{ handId: string; lastId: number }>;
+      const keep = new Set<string>();
+      for (const hand of hands.slice(0, keepCount)) {
+        if (typeof hand.handId === 'string' && hand.handId.length > 0) keep.add(hand.handId);
+      }
+      for (const handId of reservedByTable.get(tableId) ?? []) keep.add(handId);
+      const latestShoe = this.db.prepare(`
+        SELECT json_extract(payload, '$.shoeId') AS shoeId
+        FROM events
+        WHERE table_id = ? AND type = 'newShoeSignal'
+        ORDER BY id DESC
+        LIMIT 1
+      `).get(tableId) as { shoeId: string | null } | undefined;
+
+      if (keep.size > 0) {
+        const placeholders = [...keep].map(() => '?').join(',');
+        this.db.prepare(`
+          DELETE FROM events
+          WHERE table_id = ?
+            AND type IN ${MONITOR_WINDOW_EVENT_TYPES}
+            AND (
+              json_extract(payload, '$.handId') IS NULL
+              OR json_extract(payload, '$.handId') NOT IN (${placeholders})
+            )
+        `).run(tableId, ...keep);
+        this.db.prepare(`
+          DELETE FROM decisions
+          WHERE table_id = ?
+            AND hand_id NOT IN (${placeholders})
+        `).run(tableId, ...keep);
+      }
+
+      if (typeof latestShoe?.shoeId === 'string' && latestShoe.shoeId.length > 0) {
+        this.db.prepare(`
+          DELETE FROM events
+          WHERE table_id = ?
+            AND type != 'newShoeSignal'
+            AND json_extract(payload, '$.shoeId') IS NOT NULL
+            AND json_extract(payload, '$.shoeId') != ?
+        `).run(tableId, latestShoe.shoeId);
+      }
+
+      this.db.prepare(`
+        DELETE FROM events
+        WHERE table_id = ?
+          AND type = 'newShoeSignal'
+          AND id NOT IN (
+            SELECT MAX(id) FROM events WHERE table_id = ? AND type = 'newShoeSignal'
+          )
+      `).run(tableId, tableId);
+
+      this.db.prepare(`
+        DELETE FROM events
+        WHERE table_id = ?
+          AND type IN ${MONITOR_TRANSIENT_EVENT_TYPES}
+          AND id NOT IN (
+            SELECT id FROM (
+              SELECT id FROM events
+              WHERE table_id = ? AND type IN ${MONITOR_TRANSIENT_EVENT_TYPES}
+              ORDER BY id DESC
+              LIMIT 8
+            )
+          )
+      `).run(tableId, tableId);
+    });
+
+    for (const row of tableRows) pruneTable(row.tableId);
   }
 
   listDecisions(tableId?: string): DecisionSnapshot[] {

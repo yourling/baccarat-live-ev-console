@@ -23,6 +23,34 @@ function accepted(command: ControlledOperationalWagerCommand) {
 }
 
 describe('OperationalWagerCoordinator keepalive activation', () => {
+  it('excludes native-dialog tables from wager-based keepalive', async () => {
+    const ledger = new SqliteLedger(':memory:');
+    const placeOperationalWager = vi.fn(async (command: ControlledOperationalWagerCommand) =>
+      accepted(command));
+    const coordinator = new OperationalWagerCoordinator({
+      ledger,
+      actor: () => ({ placeOperationalWager }),
+      monitorTableIds: () => ['bc281koreanch281', 'D001'],
+      keepaliveTableIds: () => ['D001'],
+      serialize: async operation => await operation(),
+    });
+
+    try {
+      await coordinator.updateKeepalive({
+        enabled: true,
+        intervalMinutes: 10,
+        market: 'banker',
+        amount: 20,
+      }, BASE_TIME);
+
+      expect(placeOperationalWager).toHaveBeenCalledTimes(1);
+      expect(coordinator.getKeepaliveState().lastTableId).toBe('D001');
+    } finally {
+      coordinator.close();
+      ledger.close();
+    }
+  });
+
   it('checks immediately and retries when the next betting window becomes eligible', async () => {
     const ledger = new SqliteLedger(':memory:');
     let open = false;

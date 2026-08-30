@@ -20,18 +20,25 @@ import type {
   DesktopKeepaliveState,
   DesktopRecordPage,
   DesktopRecordQuery,
+  DesktopRuntimeIncident,
   LedgerPageRow,
+  MonitorTableCandidate,
   ReceiptRow,
   TableActorSnapshot,
 } from '../api-types';
-import { resolveVisibleHandCards } from './hand-cards';
 import {
   planExecutionModeChange,
   type ExecutionMode,
 } from './execution-mode';
 import { useConfirmationDialog } from './confirmation-dialog';
-import { OperationalWagerControls } from './operational-wager-controls';
+import {
+  OperationalWagerControls,
+  bettingPhaseLabel,
+  useNow,
+} from './operational-wager-controls';
 import { KeepaliveSettings } from './keepalive-settings';
+import { resolveVisibleHandCards } from './hand-cards';
+import { selectPragmaticMonitorTableIds } from './monitor-table-selection';
 import { decisionHandExplanation, planRecordViewChange, recordKindForView, recordTabCount, type ConsoleView } from './record-view';
 import './styles.css';
 
@@ -212,6 +219,8 @@ export function App() {
   const [reconcilingReservationId, setReconcilingReservationId] = useState<string | null>(null);
   const [selectedMonitorTableId, setSelectedMonitorTableId] = useState<string | null>(null);
   const [pendingLiveExecutionTableId, setPendingLiveExecutionTableId] = useState<string | null>(null);
+  const [alertCenterOpen, setAlertCenterOpen] = useState(false);
+  const [acknowledgingIncidentId, setAcknowledgingIncidentId] = useState<string | null>(null);
   const timerRef = useRef<number | null>(null);
   const recordRequestSequenceRef = useRef(0);
   const snapshotSequenceRef = useRef(0);
@@ -250,9 +259,11 @@ export function App() {
     return isCurrentMutation;
   }, []);
 
+  const refreshBusyRef = useRef(false);
   const refresh = useCallback(async () => {
-    if (!window.desktop) return;
+    if (!window.desktop || refreshBusyRef.current) return;
     const request = beginSnapshotRequest();
+    refreshBusyRef.current = true;
     try {
       const nextSnapshot = await window.desktop.snapshot({
         includeHistory: false,
@@ -268,6 +279,8 @@ export function App() {
     } catch (e) {
       if (!canApplySnapshot(request)) return;
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      refreshBusyRef.current = false;
     }
   }, [beginSnapshotRequest, canApplySnapshot, view, tableFilter, startTime, endTime]);
 
@@ -331,11 +344,12 @@ export function App() {
 
   useEffect(() => {
     void refresh();
-    timerRef.current = window.setInterval(() => void refresh(), 2_000);
+    const intervalMs = view === 'monitor' ? 300 : 2_000;
+    timerRef.current = window.setInterval(() => void refresh(), intervalMs);
     return () => {
       if (timerRef.current !== null) window.clearInterval(timerRef.current);
     };
-  }, [refresh]);
+  }, [refresh, view]);
 
   useEffect(() => {
     if (snapshot) setDemoSpeed(snapshot.demoSpeed);
@@ -411,15 +425,23 @@ export function App() {
     });
   }, [snapshot]);
   const tableMap = useMemo(() => new Map(tables.map(table => [table.tableId, table])), [tables]);
+  const monitorMetadata = useMemo(() => new Map(
+    (snapshot?.tableMetadata ?? snapshot?.monitorCandidates ?? []).map(candidate => [candidate.tableId, candidate]),
+  ), [snapshot?.tableMetadata, snapshot?.monitorCandidates]);
+  const tableLabel = useCallback(
+    (tableId: string) => monitorMetadata.get(tableId)?.displayName ?? tableName(tableId),
+    [monitorMetadata],
+  );
   const monitoredTableIds = new Set(snapshot?.monitorTableIds ?? []);
   const monitorCandidates = (snapshot?.monitorCandidates ?? []).filter(candidate => !monitoredTableIds.has(candidate.tableId));
   const selectedMonitorTable = selectedMonitorTableId === null ? undefined : tableMap.get(selectedMonitorTableId);
   const automationEnabled = snapshot?.automation.enabled ?? false;
+  const monitorNow = useNow(250);
   const visibleTables = useMemo(() => {
     if (view === 'monitor') return tables;
     return tables.filter(table => {
       const projection = table.projection;
-      const queryMatch = !query || [table.tableId, projection.shoeId, projection.currentHandId ?? '']
+      const queryMatch = !query || [table.tableId, tableLabel(table.tableId), projection.shoeId, projection.currentHandId ?? '']
         .some(value => value.toLowerCase().includes(query.toLowerCase()));
       return (tableFilter === 'all' || table.tableId === tableFilter)
         && (statusFilter === 'all' || projection.status === statusFilter)
@@ -427,7 +449,7 @@ export function App() {
         && (autoBetFilter === 'all' || projection.autoBetStatus === autoBetFilter)
         && queryMatch;
     });
-  }, [tables, view, tableFilter, query, statusFilter, connectionFilter, autoBetFilter]);
+  }, [tables, view, tableFilter, query, statusFilter, connectionFilter, autoBetFilter, tableLabel]);
 
   const persistMonitorTableIds = useCallback(async (tableIds: readonly string[]): Promise<DesktopConsoleSnapshot | null> => {
     if (!window.desktop) return null;
@@ -552,8 +574,8 @@ export function App() {
   }, [page, activePageCount]);
 
   const risk = snapshot?.snapshot.riskState;
-  const runtimeAlertCount = snapshot?.runtime.incidents.filter(incident => incident.active).length ?? 0;
-  const alertCount = tables.reduce((total, table) => total + tableAlerts(table).length, runtimeAlertCount);
+  const alertCount = snapshot?.runtime.incidents.filter(incident =>
+    incident.active && incident.acknowledgedAt === undefined).length ?? 0;
   const eligibleCount = new Set(
     (snapshot?.decisions ?? [])
       .filter(isCurrentlyEligible)
@@ -716,6 +738,32 @@ export function App() {
     }
   }
 
+  async function acknowledgeRuntimeIncident(incidentId: string) {
+    if (!window.desktop) return;
+    setAcknowledgingIncidentId(incidentId);
+    setError(null);
+    try {
+      setSnapshot(await window.desktop.acknowledgeRuntimeIncident(incidentId));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAcknowledgingIncidentId(null);
+    }
+  }
+
+  async function acknowledgeAllRuntimeIncidents() {
+    if (!window.desktop) return;
+    setAcknowledgingIncidentId('all');
+    setError(null);
+    try {
+      setSnapshot(await window.desktop.acknowledgeAllRuntimeIncidents());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAcknowledgingIncidentId(null);
+    }
+  }
+
   function requestExecutionModeChange(tableId: string, mode: ExecutionMode) {
     switch (planExecutionModeChange(mode).kind) {
       case 'apply-shadow':
@@ -820,13 +868,28 @@ export function App() {
       <section className="summary-bar" aria-label="运行摘要">
         <SummaryItem label="监控牌桌" value={String(tables.length)} />
         <SummaryItem label="可下注判断" value={String(eligibleCount)} tone={eligibleCount > 0 ? 'good' : undefined} />
-        <SummaryItem label="告警" value={String(alertCount)} tone={alertCount > 0 ? 'warning' : 'good'} />
+        <SummaryItem
+          label="告警"
+          value={String(alertCount)}
+          tone={alertCount > 0 ? 'warning' : 'good'}
+          onClick={() => setAlertCenterOpen(true)}
+        />
         <SummaryItem label="预留敞口" value={risk ? formatAmount(risk.reservedExposure) : '-'} />
         <SummaryItem label="全局当日净盈亏" value={risk ? formatSignedAmount(-risk.dayLoss) : '-'} tone={risk && risk.dayLoss > 0 ? 'danger' : undefined} />
         <span className={cx('summary-connection', snapshot?.isOpen ? 'summary-connection--good' : 'summary-connection--muted')}>
           <span className="status-dot" aria-hidden="true" />{snapshot?.isOpen ? '账本已连接' : '账本未连接'}
         </span>
       </section>
+
+      {alertCenterOpen && snapshot && (
+        <AlertCenter
+          incidents={snapshot.runtime.incidents}
+          acknowledgingIncidentId={acknowledgingIncidentId}
+          onAcknowledge={incidentId => void acknowledgeRuntimeIncident(incidentId)}
+          onAcknowledgeAll={() => void acknowledgeAllRuntimeIncidents()}
+          onClose={() => setAlertCenterOpen(false)}
+        />
+      )}
 
       <nav className="view-tabs" aria-label="数据视图">
         <TabButton active={view === 'overview'} onClick={() => changeView('overview')} label="总览" count={overview.rows.length} />
@@ -843,7 +906,7 @@ export function App() {
           <FilterControl label="牌桌">
             <select value={tableFilter} onChange={event => setTableFilter(event.target.value)}>
               <option value="all">全部牌桌</option>
-              {tables.map(table => <option value={table.tableId} key={table.tableId}>{tableName(table.tableId)}</option>)}
+              {tables.map(table => <option value={table.tableId} key={table.tableId}>{tableLabel(table.tableId)}</option>)}
             </select>
           </FilterControl>
           <FilterControl label="牌靴 / 牌局">
@@ -887,30 +950,55 @@ export function App() {
 
       {recordLoading && recordKind && <div className="notice notice--info">正在从账本加载当前页…</div>}
 
-      {view === 'overview' && <><OverviewPanel stats={overviewTotals} rows={pagedOverviewRows} incomePoints={overview.incomePoints} /><Pagination page={page} pageSize={pageSize} totalItems={visibleOverviewRows.length} onPageChange={setPage} onPageSizeChange={size => { setPageSize(size); setPage(1); }} /></>}
+      {view === 'overview' && <><OverviewPanel stats={overviewTotals} rows={pagedOverviewRows} incomePoints={overview.incomePoints} tableLabel={tableLabel} /><Pagination page={page} pageSize={pageSize} totalItems={visibleOverviewRows.length} onPageChange={setPage} onPageSizeChange={size => { setPageSize(size); setPage(1); }} /></>}
 
       {view === 'monitor' && (
         <main>
           {visibleTables.length > 0 ? (
-            <div className="monitor-card-grid">
-              {visibleTables.map(table => (
-                <TableMonitorRow
-                  key={table.tableId}
-                  actor={table}
-                  events={snapshot?.events ?? []}
-                  runtime={snapshot?.runtime.tables[table.tableId]}
-                  onSnapshot={setSnapshot}
-                  onOpenSettings={() => setSelectedMonitorTableId(table.tableId)}
-                  dragging={draggedTableId === table.tableId}
-                  dropPlacement={monitorDropTarget?.tableId === table.tableId ? monitorDropTarget.placement : undefined}
-                  dragDisabled={monitorTableSaving}
-                  onDragStart={event => handleMonitorDragStart(event, table.tableId)}
-                  onDragOver={event => handleMonitorDragOver(event, table.tableId)}
-                  onDrop={event => handleMonitorDrop(event, table.tableId)}
-                  onDragEnd={handleMonitorDragEnd}
-                />
-              ))}
-            </div>
+            <section className="record-section monitor-section">
+              <div className="table-scroll">
+                <table className="record-table monitor-table">
+                  <thead>
+                    <tr>
+                      <th>牌桌</th>
+                      <th>状态</th>
+                      <th>局号</th>
+                      <th>开盘</th>
+                      <th>连接</th>
+                      <th>自动</th>
+                      <th>剩余</th>
+                      <th>对子 EV</th>
+                      <th>闲</th>
+                      <th>庄</th>
+                      <th>下注</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visibleTables.map(table => (
+                      <TableMonitorRow
+                        key={table.tableId}
+                        actor={table}
+                        metadata={monitorMetadata.get(table.tableId)}
+                        runtime={snapshot?.runtime.tables[table.tableId]}
+                        events={snapshot?.events ?? []}
+                        onSnapshot={setSnapshot}
+                        onOpenSettings={() => setSelectedMonitorTableId(table.tableId)}
+                        onRemove={() => void removeMonitorTable(table.tableId)}
+                        dragging={draggedTableId === table.tableId}
+                        dropPlacement={monitorDropTarget?.tableId === table.tableId ? monitorDropTarget.placement : undefined}
+                        dragDisabled={monitorTableSaving}
+                        onDragStart={event => handleMonitorDragStart(event, table.tableId)}
+                        onDragOver={event => handleMonitorDragOver(event, table.tableId)}
+                        onDrop={event => handleMonitorDrop(event, table.tableId)}
+                        onDragEnd={handleMonitorDragEnd}
+                        now={monitorNow}
+                      />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
           ) : (
             <EmptyState title="没有符合条件的牌桌" detail={tables.length === 0 ? '点击“开始持续模拟”创建可查看的模拟牌桌。' : '请调整筛选条件。'} />
           )}
@@ -925,7 +1013,10 @@ export function App() {
           <div className="monitor-candidates__list">
             {monitorCandidates.map(candidate => (
               <div className="monitor-candidate" key={candidate.roomId + ':' + candidate.tableId}>
-                <div><strong>{candidate.tableId}</strong><span>{candidate.roomName ?? candidate.roomId}</span></div>
+                <div>
+                  <strong>{candidate.displayName ?? candidate.tableId}</strong>
+                  <span>{candidate.displayName ? candidate.tableId : candidate.roomName ?? candidate.roomId}</span>
+                </div>
                 <button className="button button--small button--primary" onClick={() => void addMonitorCandidate(candidate.tableId)}>加入监控</button>
               </div>
             ))}
@@ -956,16 +1047,17 @@ export function App() {
           onDeckInputChange={value => setDeckInputs(previous => ({ ...previous, [selectedMonitorTable.tableId]: value }))}
           onCorrectDecks={() => void correctDecks(selectedMonitorTable.tableId)}
           onRemove={() => void removeMonitorTable(selectedMonitorTable.tableId)}
+          tableLabel={tableLabel}
         />
       )}
 
       {view === 'decisions' && recordPage?.kind === 'decisions' && (
-        <><DecisionTable decisions={recordDecisions} totalCount={recordTotal} tables={tableMap} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>
+        <><DecisionTable decisions={recordDecisions} totalCount={recordTotal} tables={tableMap} tableLabel={tableLabel} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>
       )}
 
-      {view === 'events' && recordPage?.kind === 'events' && <><EventTable events={recordEvents} totalCount={recordTotal} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
+      {view === 'events' && recordPage?.kind === 'events' && <><EventTable events={recordEvents} totalCount={recordTotal} tableLabel={tableLabel} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
 
-      {view === 'ledger' && recordPage?.kind === 'ledger' && <><BetLedgerView rows={recordLedgerRows} totalCount={recordTotal} reconcilingReservationId={reconcilingReservationId} onReconcile={reconcileUnknownOperationalWager} onSettle={settlePendingOperationalWager} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
+      {view === 'ledger' && recordPage?.kind === 'ledger' && <><BetLedgerView rows={recordLedgerRows} totalCount={recordTotal} reconcilingReservationId={reconcilingReservationId} tableLabel={tableLabel} onReconcile={reconcileUnknownOperationalWager} onSettle={settlePendingOperationalWager} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
 
       {view === 'settings' && (
         <SystemSettingsView
@@ -973,6 +1065,7 @@ export function App() {
           onSpeedChange={changeDemoSpeed}
           tables={tables}
           monitorTableIds={snapshot?.monitorTableIds ?? []}
+          monitorCandidates={snapshot?.monitorCandidates ?? []}
           keepalive={snapshot?.keepalive}
           riskLimits={snapshot?.snapshot.riskLimits}
           onSnapshot={setSnapshot}
@@ -987,10 +1080,12 @@ export function App() {
 
 function TableMonitorRow(props: {
   actor: TableActorSnapshot;
-  events: NormalizedEvent[];
+  metadata?: MonitorTableCandidate;
   runtime?: DesktopConsoleSnapshot['runtime']['tables'][string];
+  events: readonly NormalizedEvent[];
   onSnapshot: (snapshot: DesktopConsoleSnapshot) => void;
   onOpenSettings: () => void;
+  onRemove: () => void;
   dragging: boolean;
   dropPlacement?: MonitorDropTarget['placement'];
   dragDisabled: boolean;
@@ -998,16 +1093,10 @@ function TableMonitorRow(props: {
   onDragOver: (event: DragEvent<HTMLElement>) => void;
   onDrop: (event: DragEvent<HTMLElement>) => void;
   onDragEnd: () => void;
+  now: number;
 }) {
   const { actor } = props;
   const projection = actor.projection;
-  const displayedCards = resolveVisibleHandCards(
-    props.events,
-    actor.tableId,
-    projection.shoeId,
-    projection.currentHandId,
-  );
-  const shownHandPrefix = displayedCards.source === 'previous-settled' ? '上局 ' : '';
   const physicalShoeKnown = projection.shoeId.length > 0 && projection.shoeBaseline === 'physical-shoe';
   const pair = physicalShoeKnown
     ? combinePairEvaluations(
@@ -1016,68 +1105,93 @@ function TableMonitorRow(props: {
     )
     : null;
   const alerts = tableAlerts(actor);
+  const displayName = props.metadata?.displayName ?? tableName(actor.tableId);
+  const displayedRoundId = projection.currentHandId ?? props.metadata?.roundId;
+  const displayedGameCount = props.metadata?.gameCount;
+  const bettingPhase = bettingPhaseLabel(actor, props.now);
+  const windowOpen = bettingPhase.open;
+  const handCards = resolveVisibleHandCards(
+    props.events,
+    actor.tableId,
+    projection.shoeId || null,
+    displayedRoundId ?? projection.currentHandId ?? null,
+  );
+  const bettingLabel = bettingPhase.text;
 
   return (
-    <article
+    <tr
       className={cx(
-        'monitor-card',
-        alerts.length > 0 && 'monitor-card--alert',
-        props.dragging && 'monitor-card--dragging',
-        props.dropPlacement && `monitor-card--drop-${props.dropPlacement}`,
+        'monitor-table__row',
+        windowOpen && 'monitor-table__row--open',
+        alerts.length > 0 && 'monitor-table__row--alert',
+        props.dragging && 'monitor-table__row--dragging',
+        props.dropPlacement && `monitor-table__row--drop-${props.dropPlacement}`,
       )}
       onDragOver={props.onDragOver}
       onDrop={props.onDrop}
       onClick={props.onOpenSettings}
       onKeyDown={event => { if (event.target !== event.currentTarget) return; if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); props.onOpenSettings(); } }}
-      role="button"
       tabIndex={0}
     >
-      <div className="monitor-row__summary">
-        <div className="monitor-row__identity">
-          <div className="monitor-row__heading">
-            <span
-              className="monitor-row__drag-handle"
-              draggable={!props.dragDisabled}
-              onClick={event => event.stopPropagation()}
-              onDragStart={props.onDragStart}
-              onDragEnd={props.onDragEnd}
-              title={props.dragDisabled ? '正在保存牌桌顺序' : '按住并拖动以调整牌桌顺序'}
-              aria-label="拖动调整牌桌顺序"
-            >::</span>
-            <div className="monitor-row__name">{tableName(actor.tableId)}</div>
-            <Badge label={STATUS_LABELS[projection.status]} tone={statusTone(projection.status)} />
+      <td data-label="牌桌">
+        <div className="monitor-table__identity">
+          <span
+            className="monitor-row__drag-handle"
+            draggable={!props.dragDisabled}
+            onClick={event => event.stopPropagation()}
+            onDragStart={props.onDragStart}
+            onDragEnd={props.onDragEnd}
+            title={props.dragDisabled ? '正在保存牌桌顺序' : '按住并拖动以调整牌桌顺序'}
+            aria-label="拖动调整牌桌顺序"
+          >::</span>
+          <div className="monitor-table__identity-text">
+            <strong className="monitor-table__name" title={displayName}>{displayName}</strong>
+            {alerts.length > 0 && <span className="alert-label">{alerts.join(' · ')}</span>}
           </div>
-          <div className="monitor-row__round-id" title={projection.currentHandId ?? '等待协议局号'}>
-            <span>局号</span><strong>{projection.currentHandId ?? '等待协议局号'}</strong>
-          </div>
-          <div className="monitor-row__subline" title={projection.shoeId}>
-            {physicalShoeKnown
-              ? `牌靴 ${shortId(projection.shoeId)} · 本会话序号：${projection.handNumber > 0 ? `第 ${projection.handNumber} 局` : '未知'}`
-              : `监控会话 ${shortId(projection.shoeId)} · 本会话序号：${projection.handNumber > 0 ? `第 ${projection.handNumber} 局` : '未知'}`}
-          </div>
-          {alerts.length > 0 && <div className="badge-line"><span className="alert-label">{alerts.join(' · ')}</span></div>}
         </div>
-        <div className="monitor-row__cards">
-          <HandCards label={shownHandPrefix + "闲"} cards={displayedCards.player} />
-          <HandCards label={shownHandPrefix + "庄"} cards={displayedCards.banker} />
+      </td>
+      <td data-label="状态"><Badge label={STATUS_LABELS[projection.status]} tone={statusTone(projection.status)} /></td>
+      <td data-label="局号">
+        <div className="monitor-table__round" title={displayedRoundId ?? '等待局号'}>
+          <strong>{displayedRoundId ?? '等待局号'}</strong>
+          <span className="muted">#{displayedGameCount ?? '?'}</span>
         </div>
-        <div className="monitor-row__probability">
-          <PairCompact evaluation={pair} />
-        </div>
-        <div className="monitor-row__state">
-          <div><span>剩余牌</span><strong>{physicalShoeKnown ? `${projection.remainingTotal} 张` : '未知'}</strong></div>
-          <div><span>自动</span><strong>{shortAutoBetLabel(projection.autoBetStatus)}</strong></div>
-          <div><span>连接</span><strong>{CONNECTION_LABELS[projection.connectionStatus]}</strong></div>
-        </div>
-      </div>
-      <OperationalWagerControls
-        actor={actor}
-        runtimeBlockedReason={props.runtime?.approved && !props.runtime.active
-          ? `无人值守执行已阻断：${props.runtime.reasons.map(runtimeReasonLabel).join('、')}`
-          : undefined}
-        onSnapshot={props.onSnapshot}
-      />
-    </article>
+      </td>
+      <td data-label="开盘">
+        <strong className={windowOpen ? 'text--good' : undefined}>{bettingLabel}</strong>
+      </td>
+      <td data-label="连接">
+        <strong className={projection.connectionStatus === 'CONNECTED' ? undefined : 'text--danger'}>
+          {CONNECTION_LABELS[projection.connectionStatus]}
+        </strong>
+      </td>
+      <td data-label="自动"><strong>{shortAutoBetLabel(projection.autoBetStatus)}</strong></td>
+      <td data-label="剩余"><strong>{physicalShoeKnown ? `${projection.remainingTotal} 张` : '未知'}</strong></td>
+      <td data-label="对子 EV">
+        {pair
+          ? <><strong className={evTone(pair.evMean)}>{formatSignedPercent(pair.evMean)}</strong><span className="muted"> P {formatPercent(pair.pMean)}</span></>
+          : <span className="muted" title="等待物理牌靴">待牌靴</span>}
+      </td>
+      <td data-label="闲"><MonitorHandCards cards={handCards.player} previous={handCards.source === 'previous-settled'} /></td>
+      <td data-label="庄"><MonitorHandCards cards={handCards.banker} previous={handCards.source === 'previous-settled'} /></td>
+      <td data-label="下注">
+        <OperationalWagerControls
+          actor={actor}
+          metadata={props.metadata}
+          runtimeBlockedReason={manualOperationalRuntimeBlockReason(props.runtime)}
+          onSnapshot={props.onSnapshot}
+          compact
+          now={props.now}
+        />
+      </td>
+      <td data-label="操作">
+        <button
+          className="button button--small button--danger-ghost"
+          type="button"
+          onClick={event => { event.stopPropagation(); props.onRemove(); }}
+        >移除</button>
+      </td>
+    </tr>
   );
 }
 
@@ -1097,6 +1211,7 @@ function MonitorTableSettingsDialog(props: {
   onDeckInputChange: (value: string) => void;
   onCorrectDecks: () => void;
   onRemove: () => void;
+  tableLabel: (tableId: string) => string;
 }) {
   const { actor } = props;
   const physicalShoeKnown = actor.projection.shoeId.length > 0 && actor.projection.shoeBaseline === 'physical-shoe';
@@ -1105,7 +1220,7 @@ function MonitorTableSettingsDialog(props: {
     <div className="monitor-settings-overlay" role="presentation" onClick={props.onClose}>
       <section className="monitor-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="monitor-settings-title" onClick={event => event.stopPropagation()}>
         <header className="monitor-settings-dialog__header">
-          <h2 id="monitor-settings-title">{tableName(actor.tableId)}</h2>
+          <h2 id="monitor-settings-title">{props.tableLabel(actor.tableId)}</h2>
           <button className="button button--small button--ghost" onClick={props.onClose}>关闭</button>
         </header>
         <section className="monitor-settings-dialog__autobet">
@@ -1121,17 +1236,7 @@ function MonitorTableSettingsDialog(props: {
           <div className="settings-fields settings-fields--risk">
             <label>
               <span>执行模式</span>
-              <select
-                value={props.liveApproved ? 'live' : 'shadow'}
-                disabled={actor.executionMode === 'simulated'}
-                onChange={event => {
-                  const mode = event.target.value;
-                  if (mode === 'shadow' || mode === 'live') props.onExecutionModeChange(mode);
-                }}
-              >
-                <option value="shadow">模拟执行</option>
-                <option value="live">启用真实下注（仅 Dafabet）</option>
-              </select>
+              <strong>真实下注</strong>
             </label>
           </div>
           {props.liveModeConfirmationOpen && (
@@ -1165,26 +1270,6 @@ function MonitorTableSettingsDialog(props: {
   );
 }
 
-function HandCards({ label, cards, large = false }: { label: string; cards: readonly Card[]; large?: boolean }) {
-  return (
-    <div className={cx('hand-cards', large && 'hand-cards--large')}>
-      <span className="hand-cards__label">{label}</span>
-      <div className="hand-cards__list">
-        {cards.length > 0 ? cards.map((card, index) => <CardChip card={card} key={card.rank + '-' + index + '-' + (card.suit ?? '')} />) : <span className="card-placeholder">未识别</span>}
-      </div>
-    </div>
-  );
-}
-
-function CardChip({ card }: { card: Card }) {
-  const suit = normalizeSuit(card.suit);
-  return (
-    <span className={cx('card-chip', 'card-chip--' + suit.tone, !card.suit && 'card-chip--unknown')} title={card.suit ? suit.label : '花色未知'}>
-      <span>{card.rank}</span><span>{suit.glyph}</span>
-    </span>
-  );
-}
-
 function combinePairEvaluations(first: MarketEvaluation | null, second: MarketEvaluation | null): MarketEvaluation | null {
   if (first === null) return second;
   if (second === null) return first;
@@ -1196,13 +1281,18 @@ function combinePairEvaluations(first: MarketEvaluation | null, second: MarketEv
   };
 }
 
-function PairCompact({ evaluation }: { evaluation: MarketEvaluation | null }) {
+function MonitorHandCards({ cards, previous }: { cards: readonly Card[]; previous: boolean }) {
+  if (cards.length === 0) return <span className="muted">—</span>;
   return (
-    <div className="compact-market compact-market--pair">
-      <div className="compact-market__label">对子 EV</div>
-      {evaluation
-        ? <><strong className={evTone(evaluation.evMean)}>{formatSignedPercent(evaluation.evMean)}</strong><span>P {formatPercent(evaluation.pMean)}</span></>
-        : <span className="muted">等待物理牌靴</span>}
+    <div className={cx('hand-cards__list', previous && 'monitor-hand--previous')} title={previous ? '上一局' : undefined}>
+      {cards.map((card, index) => {
+        const suit = normalizeSuit(card.suit);
+        return (
+          <span className={cx('card-chip', `card-chip--${suit.tone}`)} key={`${card.rank}${card.suit ?? ''}:${index}`}>
+            {card.rank}{suit.glyph}
+          </span>
+        );
+      })}
     </div>
   );
 }
@@ -1269,7 +1359,7 @@ function RemainingInventory({ projection }: { projection: ShoeStateProjection })
   );
 }
 
-function DecisionTable({ decisions, totalCount }: { decisions: DecisionHandRecord[]; totalCount: number; tables: Map<string, TableActorSnapshot> }) {
+function DecisionTable({ decisions, totalCount, tableLabel }: { decisions: DecisionHandRecord[]; totalCount: number; tables: Map<string, TableActorSnapshot>; tableLabel: (tableId: string) => string }) {
   if (decisions.length === 0) return <EmptyState title="暂无决策记录" detail="" />;
   return (
     <section className="record-section">
@@ -1280,7 +1370,7 @@ function DecisionTable({ decisions, totalCount }: { decisions: DecisionHandRecor
           <tbody>{decisions.map(decision => {
             return <tr key={`${decision.tableId}|${decision.shoeId}|${decision.handId}`}>
               <td data-label="时间">{formatTime(decision.createdAt)}</td>
-              <td data-label="牌桌 / 牌局"><strong>{tableName(decision.tableId)}</strong><br /><span className="muted" title={`${decision.shoeId} / ${decision.handId}`}>{shortId(decision.shoeId)} / {shortId(decision.handId)}</span></td>
+              <td data-label="牌桌 / 牌局"><strong>{tableLabel(decision.tableId)}</strong><br /><span className="muted" title={`${decision.shoeId} / ${decision.handId}`}>{shortId(decision.shoeId)} / {shortId(decision.handId)}</span></td>
               <td data-label="策略">{decisionChoiceLabel(decision)}</td>
               <td data-label="概率均值">{formatPercent(decision.pMean)}</td>
               <td data-label="概率下界">{formatPercent(decision.pLower)}</td>
@@ -1296,7 +1386,7 @@ function DecisionTable({ decisions, totalCount }: { decisions: DecisionHandRecor
   );
 }
 
-function EventTable({ events, totalCount }: { events: NormalizedEvent[]; totalCount: number }) {
+function EventTable({ events, totalCount, tableLabel }: { events: NormalizedEvent[]; totalCount: number; tableLabel: (tableId: string) => string }) {
   if (events.length === 0) return <EmptyState title="暂无事件记录" detail="" />;
   return (
     <section className="record-section">
@@ -1306,7 +1396,7 @@ function EventTable({ events, totalCount }: { events: NormalizedEvent[]; totalCo
           <thead><tr><th>时间</th><th>牌桌</th><th>牌靴 / 牌局</th><th>事件</th><th>详情</th></tr></thead>
           <tbody>{events.map(event => <tr key={event.eventId}>
             <td data-label="时间">{formatTime(event.timestamp)}</td>
-            <td data-label="牌桌">{tableName(event.tableId)}</td>
+            <td data-label="牌桌">{tableLabel(event.tableId)}</td>
             <td data-label="牌靴 / 牌局"><span title={eventShoeId(event)}>{shortId(eventShoeId(event))}</span><br /><span className="muted">{shortId(eventHandId(event))}</span></td>
             <td data-label="事件"><Badge label={EVENT_LABELS[event.type]} tone={event.type === 'connectionLost' || event.type === 'shoeInvalidated' ? 'danger' : 'neutral'} /></td>
             <td data-label="详情">{eventDescription(event)}</td>
@@ -1319,7 +1409,7 @@ function EventTable({ events, totalCount }: { events: NormalizedEvent[]; totalCo
 
 
 
-function OverviewPanel({ stats, rows, incomePoints }: { stats: OverviewStats; rows: OverviewTableRow[]; incomePoints: IncomePoint[] }) {
+function OverviewPanel({ stats, rows, incomePoints, tableLabel }: { stats: OverviewStats; rows: OverviewTableRow[]; incomePoints: IncomePoint[]; tableLabel: (tableId: string) => string }) {
   return (
     <section className="overview-section">
       <div className="record-heading"><h2>总览</h2></div>
@@ -1335,7 +1425,7 @@ function OverviewPanel({ stats, rows, incomePoints }: { stats: OverviewStats; ro
         <table className="record-table overview-table record-table--overview">
           <thead><tr><th>牌桌</th><th>监控局数</th><th>下注次数</th><th>下注金额</th><th>期望盈利</th><th>实际盈利</th></tr></thead>
           <tbody>{rows.map(row => <tr key={row.tableId}>
-            <td data-label="牌桌"><strong>{tableName(row.tableId)}</strong></td>
+            <td data-label="牌桌"><strong>{tableLabel(row.tableId)}</strong></td>
             <td data-label="监控局数">{row.hands}</td>
             <td data-label="下注次数">{row.bets}</td>
             <td data-label="下注金额">{formatAmount(row.amount)}</td>
@@ -1458,8 +1548,7 @@ function canReconcileOperationalWager(row: BetLedgerRow): boolean {
     && operationalWager?.reservationId === row.reservation.reservationId
     && typeof raw === 'object'
     && raw !== null
-    && Reflect.get(raw, 'commitStarted') === true
-    && Reflect.get(raw, 'commitPoint') === 'confirmBet';
+    && Reflect.get(raw, 'commitStarted') === true;
 }
 
 function canSettlePendingOperationalWager(row: BetLedgerRow): boolean {
@@ -1480,6 +1569,7 @@ function BetLedgerView(props: {
   rows: BetLedgerRow[];
   totalCount: number;
   reconcilingReservationId: string | null;
+  tableLabel: (tableId: string) => string;
   onReconcile: (row: BetLedgerRow) => Promise<void>;
   onSettle: (row: BetLedgerRow, outcome: 'WIN' | 'LOSS' | 'PUSH') => Promise<void>;
 }) {
@@ -1497,7 +1587,7 @@ function BetLedgerView(props: {
               <tbody>{props.rows.map(row => (
                 <tr key={row.reservation.reservationId}>
                   <td data-label="时间">{formatTime(row.createdAt)}</td>
-                  <td data-label="牌桌 / 牌局"><strong>{tableName(row.reservation.tableId)}</strong><br /><span className="muted" title={row.reservation.handId}>{shortId(row.reservation.handId)}</span></td>
+                  <td data-label="牌桌 / 牌局"><strong>{props.tableLabel(row.reservation.tableId)}</strong><br /><span className="muted" title={row.reservation.handId}>{shortId(row.reservation.handId)}</span></td>
                   <td data-label="下注对象">{MARKET_LABELS[row.reservation.market]}</td>
                   <td data-label="下注时 EV" className={row.decision ? evTone(row.decision.evMean) : 'text--muted'}>{row.decision ? formatSignedPercent(row.decision.evMean) : '-'}</td>
                   <td data-label="下注金额">{formatAmount(row.reservation.amount)}</td>
@@ -1555,6 +1645,7 @@ function SystemSettingsView(props: {
   onSpeedChange: (speed: number) => Promise<void>;
   tables: TableActorSnapshot[];
   monitorTableIds: readonly string[];
+  monitorCandidates: readonly MonitorTableCandidate[];
   keepalive?: DesktopKeepaliveState;
   riskLimits?: RiskLimits;
   onSnapshot: (snapshot: DesktopConsoleSnapshot) => void;
@@ -1573,7 +1664,7 @@ function SystemSettingsView(props: {
           </label>
         </div>
       </div>
-      <MonitorTableSettings tableIds={props.monitorTableIds} onSave={props.onSaveMonitorTables} onError={props.onError} />
+      <MonitorTableSettings tableIds={props.monitorTableIds} candidates={props.monitorCandidates} onSave={props.onSaveMonitorTables} onError={props.onError} />
       {props.keepalive && <KeepaliveSettings state={props.keepalive} onSnapshot={props.onSnapshot} onError={props.onError} />}
       <UnifiedBetSettings tableIds={props.monitorTableIds} tables={props.tables} riskLimits={props.riskLimits} onSnapshot={props.onSnapshot} onError={props.onError} />
     </section>
@@ -1582,12 +1673,14 @@ function SystemSettingsView(props: {
 
 function MonitorTableSettings(props: {
   tableIds: readonly string[];
+  candidates: readonly MonitorTableCandidate[];
   onSave: (tableIds: readonly string[]) => Promise<DesktopConsoleSnapshot | null>;
   onError: (error: string | null) => void;
 }) {
   const [draft, setDraft] = useState(props.tableIds.join(', '));
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const pragmaticTableIds = selectPragmaticMonitorTableIds(props.candidates);
 
   useEffect(() => {
     if (!dirty) setDraft(props.tableIds.join(', '));
@@ -1597,11 +1690,16 @@ function MonitorTableSettings(props: {
     if (!window.desktop) return;
     const requestedTableIds = draft
       .split(/[,，\s]+/)
-      .map(tableId => tableId.trim().toUpperCase())
+      .map(tableId => {
+        const trimmed = tableId.trim();
+        return /^[A-Z]{1,4}\d{2,6}$/i.test(trimmed) ? trimmed.toUpperCase() : trimmed.toLowerCase();
+      })
       .filter(tableId => tableId.length > 0);
-    const invalidTableId = requestedTableIds.find(tableId => !/^[A-Z]{1,4}\d{2,6}$/.test(tableId));
+    const invalidTableId = requestedTableIds.find(
+      tableId => !/^[A-Z]{1,4}\d{2,6}$/.test(tableId) && !/^[a-z0-9]{8,32}$/.test(tableId),
+    );
     if (invalidTableId !== undefined) {
-      props.onError(`牌桌号格式无效：${invalidTableId}。例如 D055、D065。`);
+      props.onError(`牌桌号格式无效：${invalidTableId}。例如 D055 或 bc281koreanch281。`);
       return;
     }
     setSaving(true);
@@ -1618,10 +1716,36 @@ function MonitorTableSettings(props: {
     }
   }
 
+  async function loadPragmaticTables() {
+    if (pragmaticTableIds.length === 0) return;
+    setSaving(true);
+    props.onError(null);
+    try {
+      const updated = await props.onSave([...new Set([...props.tableIds, ...pragmaticTableIds])]);
+      if (updated === null) return;
+      setDraft(updated.monitorTableIds.join(', '));
+      setDirty(false);
+    } catch (error) {
+      props.onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <section className="monitor-table-config" aria-labelledby="monitor-table-config-title">
       <div className="record-heading">
         <h2 id="monitor-table-config-title">监控牌桌</h2>
+        <span className="record-count">已发现 {props.candidates.filter(candidate => candidate.roomId === 'dafabet-pragmatic').length} · 已监控 {props.tableIds.length}</span>
+      </div>
+      <div className="monitor-table-config__batch-actions">
+        <button
+          className="button button--small button--ghost"
+          onClick={() => void loadPragmaticTables()}
+          disabled={saving || pragmaticTableIds.length === 0}
+        >
+          加入全部已发现桌（{pragmaticTableIds.length}）
+        </button>
       </div>
       <div className="monitor-table-config__fields">
         <label htmlFor="monitor-table-ids">
@@ -1631,7 +1755,7 @@ function MonitorTableSettings(props: {
             type="text"
             value={draft}
             onChange={event => { setDraft(event.target.value); setDirty(true); }}
-            placeholder="D055, D056, D057, D065"
+            placeholder="D055, bc281koreanch281"
             disabled={saving}
           />
         </label>
@@ -1943,8 +2067,83 @@ function Pagination(props: { page: number; pageSize: number; totalItems: number;
   </div>;
 }
 
-function SummaryItem({ label, value, tone }: { label: string; value: string; tone?: 'good' | 'warning' | 'danger' }) {
-  return <div className="summary-item"><span>{label}</span><strong className={tone ? 'text--' + tone : undefined}>{value}</strong></div>;
+function AlertCenter(props: {
+  incidents: readonly DesktopRuntimeIncident[];
+  acknowledgingIncidentId: string | null;
+  onAcknowledge: (incidentId: string) => void;
+  onAcknowledgeAll: () => void;
+  onClose: () => void;
+}) {
+  const pendingCount = props.incidents.filter(incident =>
+    incident.active && incident.acknowledgedAt === undefined).length;
+  return (
+    <div className="alert-center-overlay" role="presentation" onMouseDown={event => {
+      if (event.target === event.currentTarget) props.onClose();
+    }}>
+      <section className="alert-center" role="dialog" aria-modal="true" aria-labelledby="alert-center-title">
+        <header className="alert-center__header">
+          <div>
+            <h2 id="alert-center-title">告警事件</h2>
+            <span>{pendingCount} 条未确认 · {props.incidents.length} 条记录</span>
+          </div>
+          <div className="alert-center__actions">
+            <button
+              className="button button--small button--secondary"
+              type="button"
+              disabled={pendingCount === 0 || props.acknowledgingIncidentId !== null}
+              onClick={props.onAcknowledgeAll}
+            >消除全部提示</button>
+            <button className="button button--small button--ghost" type="button" onClick={props.onClose}>关闭</button>
+          </div>
+        </header>
+        <div className="alert-center__list">
+          {props.incidents.length === 0 && <div className="empty-state">暂无告警事件</div>}
+          {props.incidents.map(incident => {
+            const pending = incident.active && incident.acknowledgedAt === undefined;
+            return (
+              <article className={cx('alert-event', pending && 'alert-event--pending')} key={incident.incidentId}>
+                <div className="alert-event__heading">
+                  <strong>{runtimeIncidentCodeLabel(incident.code)}</strong>
+                  <Badge label={incident.severity === 'blocked' ? '阻断' : '降级'} tone={incident.severity === 'blocked' ? 'danger' : 'warning'} />
+                  <Badge
+                    label={pending ? '未确认' : incident.active ? '已确认' : '已恢复'}
+                    tone={pending ? 'warning' : incident.active ? 'neutral' : 'good'}
+                  />
+                </div>
+                <p>{incident.message}</p>
+                <div className="alert-event__meta">
+                  <span>牌桌 {incident.tableId ?? '全局'}</span>
+                  <span>首次 {formatDateTime(incident.firstOccurredAt)}</span>
+                  <span>最近 {formatDateTime(incident.lastOccurredAt)}</span>
+                  <span>{incident.occurrences} 次</span>
+                </div>
+                {pending && (
+                  <button
+                    className="button button--small button--secondary alert-event__dismiss"
+                    type="button"
+                    disabled={props.acknowledgingIncidentId !== null}
+                    onClick={() => props.onAcknowledge(incident.incidentId)}
+                  >消除提示</button>
+                )}
+              </article>
+            );
+          })}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function SummaryItem(props: {
+  label: string;
+  value: string;
+  tone?: 'good' | 'warning' | 'danger';
+  onClick?: () => void;
+}) {
+  const content = <><span>{props.label}</span><strong className={props.tone ? 'text--' + props.tone : undefined}>{props.value}</strong></>;
+  return props.onClick
+    ? <button className="summary-item summary-item--action" type="button" onClick={props.onClick} aria-label={`查看${props.label}`}>{content}</button>
+    : <div className="summary-item">{content}</div>;
 }
 
 function FilterControl({ label, children }: { label: string; children: ReactNode }) {
@@ -2068,6 +2267,31 @@ function tableAlerts(actor: TableActorSnapshot): string[] {
   return alerts;
 }
 
+function operationalRuntimeBlockReason(
+  runtime: DesktopConsoleSnapshot['runtime']['tables'][string] | undefined,
+): string | undefined {
+  if (runtime === undefined) return '运行状态未就绪';
+  if (!runtime.active) return runtime.reasons.length > 0
+    ? `实盘执行未就绪：${runtime.reasons.map(runtimeReasonLabel).join('、')}`
+    : '实盘执行未激活';
+  return runtime.reasons.length > 0
+    ? `实盘执行已阻断：${runtime.reasons.map(runtimeReasonLabel).join('、')}`
+    : undefined;
+}
+
+function manualOperationalRuntimeBlockReason(
+  runtime: DesktopConsoleSnapshot['runtime']['tables'][string] | undefined,
+): string | undefined {
+  if (runtime === undefined) return '运行状态未就绪';
+  const reasons = runtime.reasons.filter(reason =>
+    reason !== 'physical-shoe-baseline-unknown'
+    && reason !== 'unknown-execution-pending'
+    && reason !== 'settlement-gap');
+  return reasons.length > 0
+    ? `手动下注未就绪：${reasons.map(runtimeReasonLabel).join('、')}`
+    : undefined;
+}
+
 function runtimeReasonLabel(reason: string): string {
   const labels: Record<string, string> = {
     'live-not-approved': '未批准实盘',
@@ -2083,6 +2307,21 @@ function runtimeReasonLabel(reason: string): string {
     'settlement-gap': '存在跨局未结算预留',
   };
   return labels[reason] ?? reason;
+}
+
+function runtimeIncidentCodeLabel(code: DesktopRuntimeIncident['code']): string {
+  const labels: Record<DesktopRuntimeIncident['code'], string> = {
+    'bridge-auth-failed': '浏览器桥认证失败',
+    'bridge-disconnected': '浏览器桥断开',
+    'continuity-invalidated': '牌桌连续性失效',
+    'table-feed-stale': '牌桌数据过期',
+    'session-recovery-exhausted': '会话恢复失败',
+    'unknown-execution': '下注结果未知',
+    'settlement-gap': '结算缺口',
+    'scheduler-failure': '调度失败',
+    'monitor-failure': '监控失败',
+  };
+  return labels[code];
 }
 
 function decisionChoiceLabel(decision: DecisionHandRecord): string {
@@ -2224,6 +2463,17 @@ function formatSignedAmount(value: number): string {
 function formatTime(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.valueOf()) ? value : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? value : date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
 }
 
 function cx(...values: Array<string | false | null | undefined>): string {

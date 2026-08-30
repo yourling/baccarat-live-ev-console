@@ -97,6 +97,21 @@ describe('risk manager', () => {
     expect(r.reason).toContain('global-exposure-cap');
   });
 
+  it('does not let UNKNOWN reservations consume new exposure or concurrency capacity', () => {
+    const m = new RiskManager();
+    const tightLimits = { ...limits, defaultExposureCap: 10, maxConcurrentExecutions: 1 };
+    const first = m.tryReserve(intent('s1', 'h1', 'bankerPair', 10), profile, tightLimits);
+    expect(first.ok).toBe(true);
+    expect(m.markUnknown(first.reservation!.reservationId, 'platform-acknowledgement-unknown')).toBe(true);
+
+    const duplicate = m.tryReserve(intent('s1', 'h1', 'bankerPair', 10), profile, tightLimits);
+    expect(duplicate.ok).toBe(false);
+    expect(duplicate.reason).toContain('duplicate');
+
+    const nextHand = m.tryReserve(intent('s1', 'h2', 'bankerPair', 10), profile, tightLimits);
+    expect(nextHand.ok).toBe(true);
+  });
+
   it('shrinks when policy is shrink, but skips below table min', () => {
     const m = new RiskManager();
     const capLimits = { ...limits, defaultExposureCap: 15, insufficientBehavior: 'shrink' as const };
@@ -313,6 +328,30 @@ describe('risk manager', () => {
     expect(restartedManager.getState().pendingExecutions).toBe(1);
     expect(restartedManager.tryReserve(intent(), profile, limits).reason).toBe('duplicate:already-reserved');
     ledger.close();
+  });
+
+  it('settles a pair reservation after cards-only settlement left it unknown', () => {
+    const m = new RiskManager();
+    const reserved = m.tryReserve(intent(), profile, limits);
+    expect(reserved.ok).toBe(true);
+    const first = m.settleHand('t1', 's1', 'h1', {
+      playerCards: [{ rank: '4' }, { rank: '4' }],
+      bankerCards: [{ rank: '8' }, { rank: '6' }],
+    });
+    expect(first[0]?.status).toBe('UNKNOWN');
+    expect(first[0]?.releaseReason).toBe('hand-settled-without-authoritative-outcome');
+
+    const second = m.settleHand('t1', 's1', 'h1', {
+      outcomes: { bankerPair: false, playerPair: true },
+      playerCards: [{ rank: '4' }, { rank: '4' }],
+      bankerCards: [{ rank: '8' }, { rank: '6' }],
+    });
+    expect(second[0]).toMatchObject({ status: 'SETTLED', realizedPnl: -10 });
+    expect(m.getState()).toMatchObject({
+      reservedExposure: 0,
+      pendingExecutions: 0,
+      executedToday: 10,
+    });
   });
 
   it('does not invent pnl for an ambiguous hand settlement', () => {

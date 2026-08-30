@@ -98,6 +98,38 @@ describe('unattended runtime supervisor', () => {
     }));
   });
 
+  it('acknowledges alert presentation without resolving the blocker and reopens it on recurrence', () => {
+    const storage = new MemoryConfigStore();
+    let now = new Date('2026-08-27T01:00:00.000Z');
+    const incidents = new RuntimeIncidentStore(storage, { now: () => now });
+    const created = incidents.record({
+      code: 'unknown-execution',
+      severity: 'blocked',
+      tableId: 'D055',
+      message: 'platform acknowledgement unknown',
+    });
+
+    now = new Date('2026-08-27T01:01:00.000Z');
+    expect(incidents.acknowledge(created.incidentId)).toBe(true);
+    expect(incidents.hasActive('unknown-execution', 'D055')).toBe(true);
+    expect(incidents.list()[0]).toEqual(expect.objectContaining({
+      active: true,
+      acknowledgedAt: '2026-08-27T01:01:00.000Z',
+    }));
+
+    now = new Date('2026-08-27T01:02:00.000Z');
+    incidents.record({
+      code: 'unknown-execution',
+      severity: 'blocked',
+      tableId: 'D055',
+      message: 'platform acknowledgement still unknown',
+    });
+    const recurrent = incidents.list()[0]!;
+    expect(recurrent.active).toBe(true);
+    expect(recurrent.occurrences).toBe(2);
+    expect(recurrent).not.toHaveProperty('acknowledgedAt');
+  });
+
   it('requires bridge identity, a fresh connected feed, a physical shoe, and complete accounting', () => {
     const reasons = evaluateLiveExecutionReadiness({
       approved: true,
@@ -126,7 +158,6 @@ describe('unattended runtime supervisor', () => {
       'table-feed-stale',
       'physical-shoe-baseline-unknown',
       'table-connection-not-restored',
-      'unknown-execution-pending',
       'settlement-gap',
     ]);
   });

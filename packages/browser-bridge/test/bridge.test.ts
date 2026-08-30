@@ -9,6 +9,7 @@ import {
   BUNDLED_BROWSER_EXTENSION_TOKEN,
   BrowserBridgeServer,
   MSTROM_BET_RUNTIME_REVISION,
+  PRAGMATIC_BET_RUNTIME_REVISION,
   redactBridgeDiagnostic,
   type BrowserBridgeRuntimeEvent,
 } from '../src/index.js';
@@ -60,7 +61,9 @@ function betRequest(mode: BetExecutionRequest['mode'] = 'simulated'): BetExecuti
   };
 }
 
-function operationalWagerRequest(): OperationalWagerExecutionRequest {
+function operationalWagerRequest(
+  overrides: Partial<OperationalWagerExecutionRequest['wager']> = {},
+): OperationalWagerExecutionRequest {
   return {
     mode: 'live',
     wager: {
@@ -72,6 +75,7 @@ function operationalWagerRequest(): OperationalWagerExecutionRequest {
       amount: 20,
       source: 'keepalive',
       createdAt: '2026-08-25T00:00:00.000Z',
+      ...overrides,
     },
   };
 }
@@ -381,7 +385,7 @@ describe('browser bridge server', () => {
     await server.close();
   });
 
-  it('fails closed when an operational receipt comes from an obsolete bet runtime', async () => {
+  it('accepts a live operational wager from the same Pragmatic runtime family', async () => {
     const server = new BrowserBridgeServer({ port: 0 });
     const port = await server.start();
     const client = extensionClient(port);
@@ -389,8 +393,62 @@ describe('browser bridge server', () => {
       client.once('open', resolve);
       client.once('error', reject);
     });
+    const request = operationalWagerRequest({
+      tableId: 'tobcbaccaragen92',
+      handId: '17260818724',
+      source: 'manual',
+    });
+    const priorPragmaticRevision = PRAGMATIC_BET_RUNTIME_REVISION.replace(/\.\d+$/, '.9');
     client.on('message', data => {
       const message = JSON.parse(data.toString()) as { readonly kind?: string; readonly requestId?: string };
+      if (message.kind !== 'betRequest' || message.requestId === undefined) return;
+      client.send(JSON.stringify({
+        kind: 'betResult',
+        requestId: message.requestId,
+        receipt: {
+          receiptId: 'pragmatic-operational-receipt-1',
+          wagerId: request.wager.wagerId,
+          tableId: request.wager.tableId,
+          shoeId: request.wager.shoeId,
+          handId: request.wager.handId,
+          market: request.wager.market,
+          amount: request.wager.amount,
+          source: request.wager.source,
+          status: 'ACCEPTED',
+          createdAt: '2026-08-25T00:00:01.000Z',
+          raw: { runtimeRevision: priorPragmaticRevision },
+        },
+      }));
+    });
+
+    try {
+      await expect(server.requestOperationalWager(request)).resolves.toEqual(expect.objectContaining({
+        receiptId: 'pragmatic-operational-receipt-1',
+        tableId: 'tobcbaccaragen92',
+        status: 'ACCEPTED',
+        raw: expect.objectContaining({ runtimeRevision: priorPragmaticRevision }),
+      }));
+    } finally {
+      client.close();
+      await server.close();
+    }
+  });
+
+  it('fails closed without restarting the browser when an operational receipt comes from an incompatible bet runtime', async () => {
+    const server = new BrowserBridgeServer({ port: 0 });
+    const port = await server.start();
+    const client = extensionClient(port);
+    await new Promise<void>((resolve, reject) => {
+      client.once('open', resolve);
+      client.once('error', reject);
+    });
+    let reloadCommands = 0;
+    client.on('message', data => {
+      const message = JSON.parse(data.toString()) as { readonly kind?: string; readonly name?: string; readonly requestId?: string };
+      if (message.kind === 'command' && message.name === 'reloadExtension') {
+        reloadCommands += 1;
+        return;
+      }
       if (message.kind !== 'betRequest' || message.requestId === undefined) return;
       client.send(JSON.stringify({
         kind: 'betResult',
@@ -406,7 +464,7 @@ describe('browser bridge server', () => {
           source: 'keepalive',
           status: 'REJECTED',
           createdAt: '2026-08-25T00:00:01.000Z',
-          raw: { commitStarted: true, runtimeRevision: 'obsolete-runtime' },
+          raw: { commitStarted: true, runtimeRevision: 'incompatible-runtime' },
         },
       }));
     });
@@ -420,6 +478,8 @@ describe('browser bridge server', () => {
           raw: expect.objectContaining({ commitStarted: true }),
         }),
       });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(reloadCommands).toBe(0);
     } finally {
       client.close();
       await server.close();
@@ -545,6 +605,12 @@ describe('browser bridge server', () => {
       ok: false,
       latencyMs: expect.any(Number),
     });
+
+    const noteObservation = Reflect.get(feed, 'noteObservation');
+    if (typeof noteObservation !== 'function') throw new Error('observation hook unavailable');
+    Reflect.apply(noteObservation, feed, []);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(feed.health().state).toBe('CONNECTED');
   });
 
   it('fails closed when protocol frames continue but runtime card state stops', async () => {
@@ -908,6 +974,59 @@ describe('browser bridge server', () => {
         receipt: keepaliveReceipt,
       }, socket);
       await expect(keepalive).resolves.toEqual(keepaliveReceipt);
+    } finally {
+      bridgeSockets(server).delete(socket);
+      await server.close();
+    }
+  });
+
+  it('serializes different Pragmatic tables through the shared multitable UI', async () => {
+    const server = new BrowserBridgeServer({ betTimeoutMs: 1_000 });
+    const requestIds: string[] = [];
+    const socket: TestSocket = {
+      send(data: string): void {
+        const message: unknown = JSON.parse(data);
+        if (typeof message !== 'object' || message === null || Array.isArray(message)) return;
+        if (Reflect.get(message, 'kind') !== 'betRequest') return;
+        const requestId = Reflect.get(message, 'requestId');
+        if (typeof requestId === 'string') requestIds.push(requestId);
+      },
+    };
+    bridgeSockets(server).add(socket);
+    const firstRequest: BetExecutionRequest = {
+      ...betRequest('live'),
+      intent: { ...betRequest('live').intent, intentId: 'pragmatic-1', tableId: 'speedbca14gesbc1' },
+    };
+    const secondRequest: BetExecutionRequest = {
+      ...betRequest('live'),
+      intent: { ...betRequest('live').intent, intentId: 'pragmatic-2', tableId: 'tobcbaccaragen92' },
+    };
+
+    try {
+      const first = server.requestBet(firstRequest);
+      const second = server.requestBet(secondRequest);
+
+      await Promise.resolve();
+      expect(requestIds).toHaveLength(1);
+      const firstRequestId = requestIds[0];
+      if (firstRequestId === undefined) throw new Error('first Pragmatic request id missing');
+      ingestFromSocket(server, {
+        kind: 'betResult',
+        requestId: firstRequestId,
+        receipt: { ...acceptedLiveReceipt, intentId: 'pragmatic-1' },
+      }, socket);
+      await expect(first).resolves.toEqual(expect.objectContaining({ intentId: 'pragmatic-1' }));
+
+      await Promise.resolve();
+      expect(requestIds).toHaveLength(2);
+      const secondRequestId = requestIds[1];
+      if (secondRequestId === undefined) throw new Error('second Pragmatic request id missing');
+      ingestFromSocket(server, {
+        kind: 'betResult',
+        requestId: secondRequestId,
+        receipt: { ...acceptedLiveReceipt, intentId: 'pragmatic-2' },
+      }, socket);
+      await expect(second).resolves.toEqual(expect.objectContaining({ intentId: 'pragmatic-2' }));
     } finally {
       bridgeSockets(server).delete(socket);
       await server.close();

@@ -8,11 +8,18 @@ const DEFAULT_BRIDGE_TOKEN = 'd63a1a9d927e268d5b3d0ac2450836c0fa90de2e55398ccb73
 const DEFAULT_BRIDGE_URL = `ws://127.0.0.1:17890/?token=${DEFAULT_BRIDGE_TOKEN}`;
 const CDP_MIN_INTERVAL_MS = 60 * 1000;
 const EXTENSION_RELOAD_DELAY_MS = 1000;
+const BRIDGE_RECONNECT_ALARM = 'baccarat-bridge-reconnect';
 const DAFABET_BACCARAT_POPUP_URL = 'https://www.dafabet.net/sc/live-dealer/popup-launch/live-baccarat-pa';
-const GAME_TAB_URL_PATTERN = /^https?:\/\/(?:[a-z0-9-]+\.)*(?:dafabet\.(?:net|com)|df888evo\.com|egcvi\.com|mstrom-uno\.com|673ing\.com)(?::\d+)?(?:[/?#]|$)/i;
+const DAFABET_PRAGMATIC_POPUP_PATH = '/live-dealer/popup-launch/jeju-speed-baccarat';
+const DAFABET_POPUP_QUERY = 'https://www.dafabet.net/*/live-dealer/popup-launch/*';
+const GAME_TAB_URL_PATTERN = /^https?:\/\/(?:[a-z0-9-]+\.)*(?:dafabet\.(?:net|com)|df888evo\.com|egcvi\.com|mstrom-uno\.com|673ing\.com|vbgames88\.com|pragmaticplaylive\.net)(?::\d+)?(?:[/?#]|$)/i;
 const MSTROM_FRAME_HOST_PATTERN = /(^|\.)(?:mstrom-uno|673ing)\.com$/i;
 const MSTROM_BET_RUNTIME_REVISION = 'mstrom-bet-runtime/2026-08-28.1';
+const PRAGMATIC_FRAME_HOST_PATTERN = /(^|\.)client\.pragmaticplaylive\.net$/i;
+const PRAGMATIC_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
+const PRAGMATIC_BET_RUNTIME_REVISION = 'pragmatic-bet-runtime/2026-08-30.21';
 const betRequests = new Map();
+const pragmaticProtocolWindows = new Map();
 let liveBetSessionEnabled = false;
 const BRIDGE_SESSION_ID = [
   'bridge',
@@ -20,9 +27,117 @@ const BRIDGE_SESSION_ID = [
   Math.random().toString(36).slice(2, 12),
 ].join('-');
 let bridgeMessageSeq = 0;
+let pragmaticBetInputBusy = false;
+
+function notePragmaticOutboundSend(message) {
+  if (
+    !message
+    || message.kind !== 'networkCapture'
+    || message.direction !== 'send'
+    || typeof message.source !== 'string'
+    || !message.source.startsWith('baccarat-bridge-pragmatic-')
+  ) return;
+  const data = String(message.data || '');
+  if (data.length < 8) return;
+  if (!/bet|betcode|"bc"|stake|amount|amt/i.test(data)) return;
+  if (/<lpbet[\s>]/i.test(data) || /\buId="/.test(data)) {
+    const uId = (data.match(/\buId="([^"]+)"/) || [])[1];
+    const gm = (data.match(/\bgm="([^"]+)"/) || [])[1];
+    try {
+      void chrome.storage.local.set({
+        ...( /<lpbet[\s>]/i.test(data) ? { pragmaticLpBetTemplate: data.slice(0, 4000) } : {}),
+        ...(uId ? { pragmaticLpBetUserId: uId } : {}),
+        ...(gm ? { pragmaticLpBetGm: gm } : {}),
+      });
+    } catch (_) {}
+  }
+  send({
+    kind: 'sessionAction',
+    action: 'pragmatic-outbound-send',
+    url: String(message.url || ''),
+    frame: 'iframe',
+    detail: `${message.source}:${data.slice(0, 800)}`,
+    timestamp: new Date().toISOString(),
+  });
+}
+
+function ingestPragmaticProtocolWindow(message) {
+  if (
+    !message
+    || message.kind !== 'networkCapture'
+    || message.source !== 'baccarat-bridge-pragmatic-ws'
+    || message.encoding !== 'text'
+    || message.direction === 'send'
+    || typeof message.data !== 'string'
+  ) return;
+  let root;
+  try {
+    root = JSON.parse(message.data);
+  } catch (_) {
+    return;
+  }
+  if (!root || typeof root !== 'object' || Array.isArray(root)) return;
+  const kinds = ['game', 'timer', 'betsopen', 'betsclosingsoon', 'betsclosed', 'startDealing', 'gameresult'];
+  const kind = kinds.find(candidate => root[candidate] && typeof root[candidate] === 'object');
+  if (!kind) return;
+  const record = root[kind];
+  const tableId = String(record.table || record.tableId || '').toLowerCase();
+  if (!PRAGMATIC_TABLE_ID_PATTERN.test(tableId)) return;
+  const seq = Number(record.seq);
+  const previous = pragmaticProtocolWindows.get(tableId) || {
+    tableId,
+    lastSeq: -1,
+  };
+  const now = Date.now();
+  const roundId = String(record.game || record.id || record.gameId || '');
+  const isNewRound = Boolean(roundId) && roundId !== previous.roundId;
+  const windowKind = kind === 'timer' || kind === 'betsopen';
+  const staleSeq = Number.isFinite(seq) && seq <= previous.lastSeq;
+  const allowLowerSeqWindow = windowKind
+    && (isNewRound || (previous.bettingOpen !== false && (!roundId || roundId === previous.roundId)));
+  if (staleSeq && !allowLowerSeqWindow) return;
+  if (Number.isFinite(seq) && !staleSeq) previous.lastSeq = seq;
+  if (isNewRound) {
+    previous.roundId = roundId;
+    previous.bettingOpen = undefined;
+    previous.countdown = undefined;
+    previous.countdownAt = undefined;
+  }
+  if (kind === 'timer') {
+    const countdown = Number(record.value);
+    if (Number.isFinite(countdown)) {
+      previous.countdown = countdown;
+      previous.countdownAt = now;
+      if (countdown >= 1) previous.bettingOpen = true;
+      if (countdown === 0) previous.bettingOpen = false;
+    }
+  } else if (kind === 'betsopen') {
+    previous.bettingOpen = true;
+  } else if (kind === 'betsclosed' || kind === 'startDealing' || kind === 'gameresult') {
+    previous.bettingOpen = false;
+  }
+  previous.updatedAt = now;
+  pragmaticProtocolWindows.set(tableId, previous);
+}
+
+function pragmaticProtocolWindow(tableId) {
+  const state = pragmaticProtocolWindows.get(String(tableId || '').toLowerCase());
+  if (
+    !state
+    || state.bettingOpen !== true
+    || typeof state.roundId !== 'string'
+    || !Number.isFinite(state.countdown)
+    || !Number.isFinite(state.countdownAt)
+    || Date.now() - state.countdownAt > 5000
+  ) return null;
+  const capturedAt = Date.now();
+  const countdown = Math.floor(state.countdown - Math.max(0, capturedAt - state.countdownAt) / 1000);
+  return countdown >= 3 ? { roundId: state.roundId, countdown, capturedAt } : null;
+}
 
 if (typeof importScripts === 'function') {
   importScripts('mstrom-bet-runtime.js');
+  importScripts('pragmatic-bet-runtime.js');
 }
 
 function isGameTabUrl(url) {
@@ -52,16 +167,23 @@ let cdpBusy = false;
 let lastCdpActivityAt = 0;
 let cdpAttachedTabId = null;
 let lastCdpUrl = '';
+const pragmaticCdpTabs = new Set();
+const pragmaticCdpSocketUrls = new Map();
+const pragmaticCdpSeenResponses = new Set();
+const pragmaticCdpResponseCandidates = new Map();
+const pragmaticCdpStreams = new Map();
 
 async function loadFlags() {
   const stored = await chrome.storage.local.get({
     bridgeUrl: DEFAULT_BRIDGE_URL,
     autoKeeper: false,
     trustedKeepalive: false,
+    liveBetEnabled: false,
     cdpClickPoint: null,
   });
   autoKeeperEnabled = !!stored.autoKeeper;
   trustedKeepaliveEnabled = !!stored.trustedKeepalive;
+  liveBetSessionEnabled = !!stored.liveBetEnabled;
   cdpClickPoint = stored.cdpClickPoint && typeof stored.cdpClickPoint.xp === 'number'
     ? { xp: stored.cdpClickPoint.xp, yp: stored.cdpClickPoint.yp }
     : null;
@@ -179,6 +301,20 @@ function exactDafabetBaccaratPopup(url) {
   }
 }
 
+function exactDafabetPragmaticPopup(url) {
+  try {
+    const parsed = new URL(String(url || ''));
+    return parsed.hostname === 'www.dafabet.net'
+      && parsed.pathname.replace(/^\/[a-z-]+/i, '').replace(/\/+$/, '') === DAFABET_PRAGMATIC_POPUP_PATH;
+  } catch (_) {
+    return false;
+  }
+}
+
+function exactSupportedBaccaratPopup(url) {
+  return exactDafabetBaccaratPopup(url) || exactDafabetPragmaticPopup(url);
+}
+
 function betErrorMessage(error) {
   if (error && typeof error === 'object' && typeof error.message === 'string') {
     return error.message.slice(0, 500);
@@ -186,13 +322,17 @@ function betErrorMessage(error) {
   return String(error || 'unknown live bet error').slice(0, 500);
 }
 
-function unknownBetReceipt(request, requestId, reason) {
+function unknownBetReceipt(request, requestId, reason, platform = 'mstrom', rawDetails = {}) {
+  const runtimeRevision = platform === 'pragmatic'
+    ? PRAGMATIC_BET_RUNTIME_REVISION
+    : MSTROM_BET_RUNTIME_REVISION;
+  const receiptPrefix = platform === 'pragmatic' ? 'pragmatic-bridge' : 'mstrom-bridge';
   const wager = request && request.wager ? request.wager : null;
   if (wager && typeof wager === 'object') {
     const tableId = typeof wager.tableId === 'string' ? wager.tableId : '';
     const handId = typeof wager.handId === 'string' ? wager.handId : '';
     return {
-      receiptId: `mstrom-bridge-operational-unknown-${requestId}-${Date.now()}`,
+      receiptId: `${receiptPrefix}-operational-unknown-${requestId}-${Date.now()}`,
       wagerId: typeof wager.wagerId === 'string' ? wager.wagerId : '',
       tableId,
       shoeId: typeof wager.shoeId === 'string' ? wager.shoeId : '',
@@ -201,15 +341,16 @@ function unknownBetReceipt(request, requestId, reason) {
       amount: wager.amount,
       source: wager.source,
       status: 'UNKNOWN',
-      externalRef: `mstrom:${tableId}:${handId}`,
+      externalRef: `${platform}:${tableId}:${handId}`,
       createdAt: new Date().toISOString(),
       raw: {
-        runtimeRevision: MSTROM_BET_RUNTIME_REVISION,
+        runtimeRevision,
         reason,
         commitPoint: 'confirmBet',
         commitStarted: true,
         tableId,
         handId,
+        ...rawDetails,
       },
     };
   }
@@ -217,33 +358,38 @@ function unknownBetReceipt(request, requestId, reason) {
   const tableId = typeof intent.tableId === 'string' ? intent.tableId : '';
   const handId = typeof intent.handId === 'string' ? intent.handId : '';
   return {
-    receiptId: `mstrom-bridge-unknown-${requestId}-${Date.now()}`,
+    receiptId: `${receiptPrefix}-unknown-${requestId}-${Date.now()}`,
     intentId: String(intent.intentId || ''),
     reservationId: String(request && request.reservationId || ''),
     status: 'UNKNOWN',
     amount: intent.amount,
     market: intent.market,
     mode: 'live',
-    externalRef: `mstrom:${tableId}:${handId}`,
+    externalRef: `${platform}:${tableId}:${handId}`,
     createdAt: new Date().toISOString(),
     raw: {
-      runtimeRevision: MSTROM_BET_RUNTIME_REVISION,
+      runtimeRevision,
       reason,
       commitPoint: 'confirmBet',
       commitStarted: true,
       tableId,
       handId,
+      ...rawDetails,
     },
   };
 }
 
-function precommitRejectedBetReceipt(request, requestId, reason) {
+function precommitRejectedBetReceipt(request, requestId, reason, platform = 'mstrom') {
+  const runtimeRevision = platform === 'pragmatic'
+    ? PRAGMATIC_BET_RUNTIME_REVISION
+    : MSTROM_BET_RUNTIME_REVISION;
+  const receiptPrefix = platform === 'pragmatic' ? 'pragmatic-bridge' : 'mstrom-bridge';
   const wager = request && request.wager ? request.wager : null;
   if (wager && typeof wager === 'object') {
     const tableId = typeof wager.tableId === 'string' ? wager.tableId : '';
     const handId = typeof wager.handId === 'string' ? wager.handId : '';
     return {
-      receiptId: `mstrom-bridge-operational-rejected-${requestId}-${Date.now()}`,
+      receiptId: `${receiptPrefix}-operational-rejected-${requestId}-${Date.now()}`,
       wagerId: typeof wager.wagerId === 'string' ? wager.wagerId : '',
       tableId,
       shoeId: typeof wager.shoeId === 'string' ? wager.shoeId : '',
@@ -252,10 +398,10 @@ function precommitRejectedBetReceipt(request, requestId, reason) {
       amount: wager.amount,
       source: wager.source,
       status: 'REJECTED',
-      externalRef: `mstrom:${tableId}:${handId}`,
+      externalRef: `${platform}:${tableId}:${handId}`,
       createdAt: new Date().toISOString(),
       raw: {
-        runtimeRevision: MSTROM_BET_RUNTIME_REVISION,
+        runtimeRevision,
         reason,
         commitPoint: 'preflight',
         commitStarted: false,
@@ -268,17 +414,17 @@ function precommitRejectedBetReceipt(request, requestId, reason) {
   const tableId = typeof intent.tableId === 'string' ? intent.tableId : '';
   const handId = typeof intent.handId === 'string' ? intent.handId : '';
   return {
-    receiptId: `mstrom-bridge-rejected-${requestId}-${Date.now()}`,
+    receiptId: `${receiptPrefix}-rejected-${requestId}-${Date.now()}`,
     intentId: String(intent.intentId || ''),
     reservationId: String(request && request.reservationId || ''),
     status: 'REJECTED',
     amount: intent.amount,
     market: intent.market,
     mode: 'live',
-    externalRef: `mstrom:${tableId}:${handId}`,
+    externalRef: `${platform}:${tableId}:${handId}`,
     createdAt: new Date().toISOString(),
     raw: {
-      runtimeRevision: MSTROM_BET_RUNTIME_REVISION,
+      runtimeRevision,
       reason,
       commitPoint: 'preflight',
       commitStarted: false,
@@ -306,10 +452,15 @@ function validateLiveBetMessage(message) {
     : wager && typeof wager === 'object'
       ? wager.tableId
       : null;
-  if (typeof tableId !== 'string' || !/^[A-Z]\d{3}$/.test(tableId)) {
+  const platform = typeof tableId === 'string' && /^[A-Z]\d{3}$/.test(tableId)
+    ? 'mstrom'
+    : typeof tableId === 'string' && PRAGMATIC_TABLE_ID_PATTERN.test(tableId)
+      ? 'pragmatic'
+      : null;
+  if (platform === null) {
     throw new Error('invalid Dafabet table id');
   }
-  return { requestId: message.requestId, request, tableId };
+  return { requestId: message.requestId, request, tableId, platform };
 }
 
 async function executeUniqueMstromBet(message, generation) {
@@ -388,6 +539,554 @@ async function executeUniqueMstromBet(message, generation) {
     );
   }
   return receipt;
+}
+
+async function preparePragmaticTable(tabId, tableId, market) {
+  const protocolWindow = pragmaticProtocolWindow(tableId);
+  return await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    world: 'MAIN',
+    args: [tableId, protocolWindow, market ?? null],
+    func: async (targetTableId, protocolBettingWindow, targetMarket) => {
+      const frameUrl = String(location.href || '');
+      if (!/(^|\.)client\.pragmaticplaylive\.net$/i.test(location.hostname)) {
+        return { status: 'skipped', frameUrl };
+      }
+      if (location.pathname !== '/desktop/multibaccarat/') {
+        return { status: 'not-multitable', frameUrl };
+      }
+      delete globalThis.__baccaratPragmaticPreparedTable;
+      const targetId = `TileHeight-${targetTableId}`;
+      let root = document.getElementById(targetId);
+      if (!root) {
+        const scrollables = [document.scrollingElement, ...document.querySelectorAll('*')]
+          .filter((element, index, values) => element
+            && values.indexOf(element) === index
+            && (
+              Number(element.scrollHeight) > Number(element.clientHeight) + 80
+              || Number(element.scrollWidth) > Number(element.clientWidth) + 80
+            ))
+          .sort((left, right) => {
+            const leftRange = Math.max(
+              Number(left.scrollHeight) - Number(left.clientHeight),
+              Number(left.scrollWidth) - Number(left.clientWidth),
+            );
+            const rightRange = Math.max(
+              Number(right.scrollHeight) - Number(right.clientHeight),
+              Number(right.scrollWidth) - Number(right.clientWidth),
+            );
+            return rightRange - leftRange;
+          })
+          .slice(0, 8);
+        let scanSteps = 0;
+        for (const scrollable of scrollables) {
+          const originalTop = Number(scrollable.scrollTop) || 0;
+          const originalLeft = Number(scrollable.scrollLeft) || 0;
+          const verticalMax = Math.max(0, Number(scrollable.scrollHeight) - Number(scrollable.clientHeight));
+          const horizontalMax = Math.max(0, Number(scrollable.scrollWidth) - Number(scrollable.clientWidth));
+          const verticalStep = Math.max(240, Math.floor(Number(scrollable.clientHeight) * 0.8));
+          const horizontalStep = Math.max(240, Math.floor(Number(scrollable.clientWidth) * 0.8));
+          const positions = [];
+          for (let top = 0; top <= verticalMax && positions.length < 24; top += verticalStep) {
+            positions.push([Math.min(top, verticalMax), originalLeft]);
+          }
+          for (let left = 0; left <= horizontalMax && positions.length < 32; left += horizontalStep) {
+            positions.push([originalTop, Math.min(left, horizontalMax)]);
+          }
+          for (const [top, left] of positions) {
+            try {
+              if (typeof scrollable.scrollTo === 'function') scrollable.scrollTo({ top, left, behavior: 'instant' });
+              else {
+                scrollable.scrollTop = top;
+                scrollable.scrollLeft = left;
+              }
+            } catch (_) {
+              continue;
+            }
+            scanSteps += 1;
+            await new Promise(resolve => setTimeout(resolve, 80));
+            root = document.getElementById(targetId);
+            if (root || scanSteps >= 64) break;
+          }
+          if (root || scanSteps >= 64) break;
+          try {
+            scrollable.scrollTop = originalTop;
+            scrollable.scrollLeft = originalLeft;
+          } catch (_) {}
+        }
+        if (!root) {
+          const tableIds = Array.from(document.querySelectorAll('[id^="TileHeight-"]'))
+            .map(element => String(element.id || '').slice('TileHeight-'.length))
+            .filter(Boolean)
+            .slice(0, 80);
+          return { status: 'not-found-after-scroll', frameUrl, scanSteps, tableIds };
+        }
+      }
+      try {
+        root.scrollIntoView({ block: 'center', inline: 'center' });
+      } catch (_) {
+        return { status: 'scroll-failed', frameUrl };
+      }
+      await new Promise(resolve => setTimeout(resolve, 250));
+      const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+      const roundIdentity = clean(root.textContent);
+      const roundId = (roundIdentity.match(/(?:ID|局号|游戏编号|牌局)\s*[:：#]?\s*(\d{8,20})/i) || [])[1] || '';
+      const effectiveRoundId = roundId || String(protocolBettingWindow?.roundId || '');
+      const timer = root.querySelector('[data-testid^="timer-countdown-"]');
+      const domCountdown = Number(clean(timer?.textContent));
+      const protocolCountdown = protocolBettingWindow
+        && Number.isFinite(protocolBettingWindow.countdown)
+        && Number.isFinite(protocolBettingWindow.capturedAt)
+        ? Math.floor(
+          protocolBettingWindow.countdown
+          - Math.max(0, Date.now() - protocolBettingWindow.capturedAt) / 1000
+        )
+        : Number.NaN;
+      const countdownCandidates = [
+        timer && Number.isFinite(domCountdown) ? domCountdown : Number.NaN,
+        protocolCountdown,
+      ].filter(Number.isFinite);
+      const countdown = countdownCandidates.length > 0 ? Math.min(...countdownCandidates) : Number.NaN;
+      const countdownAt = Date.now();
+      if (!Number.isFinite(countdown) || countdown < 1) {
+        return { status: 'betting-window-closed', frameUrl, roundId: effectiveRoundId, domRoundId: roundId };
+      }
+      const videoIcon = root.querySelector('[data-testid="icon-Video"]');
+      const activator = videoIcon?.closest?.('button, [role="button"], a') || videoIcon?.parentElement;
+      if (!activator || activator.querySelector?.('[data-betcode]') || activator.hasAttribute?.('data-betcode')) {
+        return { status: 'activation-control-missing', frameUrl };
+      }
+      try {
+        activator.click();
+      } catch (_) {
+        return { status: 'activation-failed', frameUrl };
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const visible = element => {
+        if (!element || element.disabled === true) return false;
+        try {
+          const rect = element.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        } catch (_) {
+          return true;
+        }
+      };
+      const marketCodes = { player: '0', banker: '1', playerPair: '3', bankerPair: '4' };
+      const requiredMarkets = typeof targetMarket === 'string' && marketCodes[targetMarket]
+        ? [targetMarket]
+        : Object.keys(marketCodes);
+      const marketControls = {};
+      const marketCounts = {};
+      for (const [market, code] of Object.entries(marketCodes)) {
+        const candidates = Array.from(document.querySelectorAll(`[data-betcode="${code}"]`))
+          .filter(element => visible(element) && !element.closest?.('[id^="TileHeight-"]'));
+        marketCounts[market] = candidates.length;
+        if (candidates.length === 1) marketControls[market] = candidates[0];
+      }
+      if (!requiredMarkets.every(market => marketControls[market])) {
+        return { status: 'shared-market-controls-ambiguous', frameUrl, roundId: effectiveRoundId, domRoundId: roundId, marketCounts };
+      }
+      globalThis.__baccaratPragmaticPreparedTable = {
+        tableId: targetTableId,
+        roundId: effectiveRoundId,
+        countdown,
+        countdownAt,
+        preparedAt: Date.now(),
+        marketControls,
+      };
+      return { status: 'activated', frameUrl, roundId: effectiveRoundId, domRoundId: roundId, countdown };
+    },
+  });
+}
+
+function selectPragmaticReadyFrame(probes, tableId) {
+  const ready = probes.filter(entry => {
+    const result = entry && entry.result;
+    return result
+      && result.status === 'ready'
+      && result.tableId === tableId
+      && result.runtimeRevision === PRAGMATIC_BET_RUNTIME_REVISION
+      && PRAGMATIC_FRAME_HOST_PATTERN.test(String(result.host || ''))
+      && Number.isInteger(entry.frameId);
+  });
+  const candidates = probes.filter(entry => {
+    const result = entry && entry.result;
+    return result
+      && result.tableId === tableId
+      && result.status !== 'not-found'
+      && result.routingAuthority !== 'none'
+      && result.runtimeRevision === PRAGMATIC_BET_RUNTIME_REVISION
+      && PRAGMATIC_FRAME_HOST_PATTERN.test(String(result.host || ''))
+      && Number.isInteger(entry.frameId);
+  });
+  const authorityOrder = ['prepared-multitable', 'dedicated-referrer'];
+  for (const authority of authorityOrder) {
+    const authoritative = ready.filter(entry => entry.result.routingAuthority === authority);
+    if (authoritative.length > 0) {
+      return {
+        ready,
+        selected: authoritative.length === 1 ? authoritative[0] : null,
+        authority,
+        conflictCount: authoritative.length,
+      };
+    }
+  }
+  for (const authority of authorityOrder) {
+    const authoritative = candidates.filter(entry => entry.result.routingAuthority === authority);
+    if (authoritative.length > 0) {
+      return {
+        ready,
+        selected: authoritative.length === 1 ? authoritative[0] : null,
+        authority: `${authority}-fallback`,
+        conflictCount: authoritative.length,
+      };
+    }
+  }
+  if (ready.length === 0 && candidates.length === 1) {
+    return {
+      ready,
+      selected: candidates[0],
+      authority: String(candidates[0].result.routingAuthority || 'unique-frame-fallback'),
+      conflictCount: candidates.length,
+    };
+  }
+  return {
+    ready,
+    selected: ready.length === 1 ? ready[0] : null,
+    authority: ready.length === 1 ? String(ready[0].result.routingAuthority || 'unique-ready') : 'unique-ready',
+    conflictCount: ready.length || candidates.length,
+  };
+}
+
+function pragmaticPhaseReceipt(result) {
+  return result
+    && typeof result === 'object'
+    && ['ACCEPTED', 'REJECTED', 'UNKNOWN'].includes(result.status)
+    ? result
+    : null;
+}
+
+function pragmaticPhaseReason(result, fallback) {
+  const raw = result && typeof result === 'object' ? result.raw : null;
+  return raw && typeof raw === 'object' && typeof raw.reason === 'string'
+    ? raw.reason
+    : fallback;
+}
+
+async function executePragmaticBetPhase(tabId, frameId, request, command) {
+  const executions = await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [frameId] },
+    world: 'MAIN',
+    args: [request, command],
+    func: globalThis.executePragmaticBetOneShot,
+  });
+  return executions.length === 1 ? executions[0].result : null;
+}
+
+async function resolvePragmaticTopPoint(tabId, frameId, point) {
+  if (
+    !point
+    || typeof point !== 'object'
+    || ![point.x, point.y, point.width, point.height, point.viewportWidth, point.viewportHeight]
+      .every(Number.isFinite)
+  ) throw new Error('invalid trusted click point');
+  if (frameId === 0) return point;
+  const token = `bet-frame-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  let timeoutId;
+  try {
+    const translated = await Promise.race([
+      chrome.tabs.sendMessage(tabId, { kind: 'resolveBetFrameRect', token, rect: point }, { frameId }),
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error('trusted click frame coordinate timeout')), 3500);
+      }),
+    ]);
+    if (
+      !translated
+      || typeof translated !== 'object'
+      || ![translated.x, translated.y, translated.width, translated.height].every(Number.isFinite)
+    ) throw new Error('trusted click frame coordinate unavailable');
+    return translated;
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
+}
+
+async function dispatchPragmaticTrustedClick(tabId, point) {
+  if (cdpBusy) throw new Error('trusted input channel busy');
+  cdpBusy = true;
+  let pressed = false;
+  try {
+    if (!(await ensureCdpAttached(tabId))) throw new Error('browser debugger attach rejected');
+    const x = Math.round(point.x);
+    const y = Math.round(point.y);
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+      type: 'mouseMoved', x, y, button: 'none', pointerType: 'mouse',
+    });
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+      type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1, pointerType: 'mouse',
+    });
+    pressed = true;
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+      type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1, pointerType: 'mouse',
+    });
+    return { x, y };
+  } catch (error) {
+    const failure = new Error(betErrorMessage(error));
+    failure.pressDispatched = pressed;
+    throw failure;
+  } finally {
+    cdpBusy = false;
+  }
+}
+
+async function executeUniquePragmaticBet(message, generation) {
+  const parsed = validateLiveBetMessage(message);
+  const expectedHandId = String(parsed.request.intent?.handId || parsed.request.wager?.handId || '');
+  let tabId;
+  let frameId;
+  let requestResult = null;
+  try {
+    assertLiveBetSession(generation);
+    const tabs = await chrome.tabs.query({
+      url: [DAFABET_POPUP_QUERY],
+    });
+    assertLiveBetSession(generation);
+    const targets = tabs.filter(tab => tab.id && exactDafabetPragmaticPopup(tab.url));
+    if (targets.length !== 1) {
+      throw new Error(`expected exactly one Dafabet Pragmatic popup tab, found ${targets.length}`);
+    }
+    tabId = targets[0].id;
+    const requestedMarket = parsed.request.intent?.market || parsed.request.wager?.market || '';
+    const channelStatus = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: 'MAIN',
+      func: () => {
+        const channel = globalThis.__baccaratPragmaticBetChannel;
+        return channel && typeof channel.status === 'function'
+          ? channel.status()
+          : { hasUser: false, hasSocket: false };
+      },
+    });
+    const readyChannel = channelStatus.find(entry =>
+      entry && entry.result && entry.result.hasSocket === true && entry.result.hasUser === true)
+      || channelStatus.find(entry => entry && entry.result && entry.result.hasSocket === true);
+    const requestHits = readyChannel && Number.isInteger(readyChannel.frameId)
+      ? await chrome.scripting.executeScript({
+        target: { tabId, frameIds: [readyChannel.frameId] },
+        world: 'MAIN',
+        args: [parsed.request, { phase: 'request', expectedRoundId: expectedHandId }],
+        func: globalThis.executePragmaticBetOneShot,
+      })
+      : [];
+    const requestHit = requestHits.find(entry =>
+      entry && entry.result && (
+        entry.result.phase === 'requested' || entry.result.status === 'ACCEPTED'
+      ));
+    if (requestHit) {
+      frameId = requestHit.frameId;
+      requestResult = requestHit.result;
+    } else {
+      const requestMiss = requestHits.find(entry =>
+        entry && entry.result && entry.result.phase === 'request-unavailable'
+        && entry.result.reason !== 'bet-request-channel-unavailable');
+      if (requestMiss) {
+        frameId = requestMiss.frameId;
+        requestResult = requestMiss.result;
+      } else {
+    const preparations = await preparePragmaticTable(tabId, parsed.tableId, requestedMarket);
+    const multitableResults = preparations.filter(entry =>
+      String(entry?.result?.frameUrl || '').includes('/desktop/multibaccarat/'));
+    if (multitableResults.length > 0) {
+      const activated = multitableResults.filter(entry =>
+        entry?.result?.status === 'activated');
+      if (activated.length !== 1) {
+        const statuses = multitableResults.map(entry => String(entry?.result?.status || 'missing')).join(',');
+        const rounds = multitableResults.map(entry => String(entry?.result?.roundId || '')).join(',');
+        throw new Error(`Pragmatic target table preparation failed: ${statuses}; rounds=${rounds}; requestHand=${expectedHandId}`);
+      }
+    }
+    assertLiveBetSession(generation);
+    const probes = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: 'MAIN',
+      args: [parsed.tableId, requestedMarket],
+      func: globalThis.probePragmaticBetTable,
+    });
+    assertLiveBetSession(generation);
+    const selection = selectPragmaticReadyFrame(probes, parsed.tableId);
+    if (!selection.selected) {
+      throw new Error(
+        `expected one authoritative ready Pragmatic frame for ${parsed.tableId}, `
+        + `found ${selection.ready.length} ready and ${selection.conflictCount} at ${selection.authority}`,
+      );
+    }
+    frameId = selection.selected.frameId;
+      }
+    }
+  } catch (error) {
+    return precommitRejectedBetReceipt(
+      parsed.request,
+      parsed.requestId,
+      `precommit-routing-failed:${betErrorMessage(error)}`,
+      'pragmatic',
+    );
+  }
+
+  if (pragmaticBetInputBusy) {
+    return precommitRejectedBetReceipt(
+      parsed.request,
+      parsed.requestId,
+      'trusted-input-channel-busy',
+      'pragmatic',
+    );
+  }
+  pragmaticBetInputBusy = true;
+  let commitStarted = false;
+  let committedAmount = 0;
+  const selectedChips = [];
+  const unknownAfterCommit = (reason, details = {}) => unknownBetReceipt(
+    parsed.request,
+    parsed.requestId,
+    reason,
+    'pragmatic',
+    {
+      commitPoint: 'market-click',
+      committedAmount,
+      selectedChips: [...selectedChips],
+      trustedInput: true,
+      ...details,
+    },
+  );
+  try {
+    assertLiveBetSession(generation);
+    const requestSent = requestResult && (
+      requestResult.phase === 'requested'
+      || requestResult.raw?.reason === 'lpbet-sent'
+      || requestResult.raw?.requestSent === true
+    );
+    if (requestSent) {
+      commitStarted = true;
+      committedAmount = Number(parsed.request.wager?.amount || parsed.request.intent?.amount || 0);
+      selectedChips.push('default');
+      const beforeTotal = Number(
+        requestResult.beforeTotal ?? (requestResult.raw && requestResult.raw.beforeTotal),
+      );
+      const observed = await executePragmaticBetPhase(tabId, frameId, parsed.request, {
+        phase: 'observe',
+        beforeTotal,
+        beforeTotalObserved: requestResult.beforeTotalObserved === true
+          || Boolean(requestResult.raw && requestResult.raw.beforeTotalObserved === true),
+        expectedTotal: beforeTotal + committedAmount,
+        expectedRoundId: expectedHandId,
+        selectedChips,
+        final: true,
+      });
+      const observedReceipt = pragmaticPhaseReceipt(observed);
+      if (observedReceipt) {
+        return observedReceipt.status === 'REJECTED'
+          ? unknownAfterCommit(`post-submit-rejected:${pragmaticPhaseReason(observedReceipt, 'unexpected-rejection')}`)
+          : observedReceipt;
+      }
+      if (
+        !observed
+        || observed.phase !== 'observed'
+        || observed.runtimeRevision !== PRAGMATIC_BET_RUNTIME_REVISION
+      ) return unknownAfterCommit('platform-acknowledgement-invalid');
+      return unknownAfterCommit('platform-acknowledgement-missing-final-receipt');
+    }
+    if (requestResult && requestResult.phase === 'request-unavailable') {
+      return precommitRejectedBetReceipt(
+        parsed.request,
+        parsed.requestId,
+        `request-unavailable:${String(requestResult.reason || 'bet-request-channel-unavailable')}`,
+        'pragmatic',
+      );
+    }
+    const prepared = await executePragmaticBetPhase(tabId, frameId, parsed.request, { phase: 'prepare' });
+    const preparedReceipt = pragmaticPhaseReceipt(prepared);
+    if (preparedReceipt) return preparedReceipt;
+    if (
+      !prepared
+      || prepared.phase !== 'prepared'
+      || prepared.runtimeRevision !== PRAGMATIC_BET_RUNTIME_REVISION
+    ) {
+      throw new Error('trusted bet preflight returned an invalid plan');
+    }
+    const beforeTotal = Number(prepared.beforeTotal);
+    const expectedRoundId = String(prepared.currentRoundId || '');
+    const committedStake = Number(prepared.amount);
+    if (!Number.isFinite(committedStake) || committedStake <= 0) {
+      throw new Error('trusted bet preflight returned an invalid amount');
+    }
+    assertLiveBetSession(generation);
+    const marketTarget = await executePragmaticBetPhase(tabId, frameId, parsed.request, {
+      phase: 'target',
+      action: 'market',
+      expectedRoundId,
+    });
+    const marketReceipt = pragmaticPhaseReceipt(marketTarget);
+    if (marketReceipt) return marketReceipt;
+    if (!marketTarget || marketTarget.phase !== 'target' || marketTarget.action !== 'market') {
+      throw new Error('trusted market target unavailable');
+    }
+    const marketPoint = await resolvePragmaticTopPoint(tabId, frameId, marketTarget.point);
+    try {
+      await dispatchPragmaticTrustedClick(tabId, marketPoint);
+      commitStarted = true;
+      committedAmount = committedStake;
+      selectedChips.push('default');
+    } catch (error) {
+      if (error && typeof error === 'object' && error.pressDispatched === true) {
+        commitStarted = true;
+        return unknownAfterCommit(`trusted-market-click-failed:${betErrorMessage(error)}`, {
+          marketPressDispatched: true,
+        });
+      }
+      throw error;
+    }
+    if (!isLiveBetSessionCurrent(generation)) {
+      return unknownAfterCommit('bridge-disconnected-after-market-click');
+    }
+    const observed = await executePragmaticBetPhase(tabId, frameId, parsed.request, {
+      phase: 'observe',
+      beforeTotal,
+      beforeTotalObserved: prepared.beforeTotalObserved === true,
+      expectedTotal: beforeTotal + committedAmount,
+      expectedRoundId,
+      selectedChips,
+      final: true,
+    });
+    const observedReceipt = pragmaticPhaseReceipt(observed);
+    if (observedReceipt) {
+      return observedReceipt.status === 'REJECTED'
+        ? unknownAfterCommit(`post-submit-rejected:${pragmaticPhaseReason(observedReceipt, 'unexpected-rejection')}`)
+        : observedReceipt;
+    }
+    if (
+      !observed
+      || observed.phase !== 'observed'
+      || observed.runtimeRevision !== PRAGMATIC_BET_RUNTIME_REVISION
+    ) return unknownAfterCommit('platform-acknowledgement-invalid');
+    return unknownAfterCommit('platform-acknowledgement-missing-final-receipt');
+  } catch (error) {
+    return commitStarted
+      ? unknownAfterCommit(`trusted-submit-failed:${betErrorMessage(error)}`)
+      : precommitRejectedBetReceipt(
+        parsed.request,
+        parsed.requestId,
+        `trusted-precommit-failed:${betErrorMessage(error)}`,
+        'pragmatic',
+      );
+  } finally {
+    pragmaticBetInputBusy = false;
+  }
+}
+
+async function executeUniqueLiveBet(message, generation) {
+  const parsed = validateLiveBetMessage(message);
+  return parsed.platform === 'pragmatic'
+    ? executeUniquePragmaticBet(message, generation)
+    : executeUniqueMstromBet(message, generation);
 }
 
 async function probeMstromBetReadiness(tableIds, generation) {
@@ -499,26 +1198,197 @@ async function probeMstromBetReadiness(tableIds, generation) {
   }
 }
 
+async function probePragmaticBetReadiness(tableIds, generation) {
+  const requestedTableIds = Array.from(new Set(
+    (Array.isArray(tableIds) ? tableIds : [])
+      .filter(tableId => typeof tableId === 'string' && PRAGMATIC_TABLE_ID_PATTERN.test(tableId))
+      .map(tableId => tableId.toLowerCase()),
+  ));
+  if (requestedTableIds.length === 0) return;
+
+  const tabs = await chrome.tabs.query({ url: [DAFABET_POPUP_QUERY] });
+  if (generation !== activeSocketGeneration) return;
+  const targets = tabs.filter(tab => tab.id && exactDafabetPragmaticPopup(tab.url));
+  if (targets.length !== 1) {
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: 'allFrames',
+      detail: `probeBetReadiness:pragmatic-popup-count=${targets.length}`,
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+
+  for (const tableId of requestedTableIds) {
+    let probes;
+    let preparationSummary = '';
+    try {
+      const preparations = await preparePragmaticTable(targets[0].id, tableId);
+      preparationSummary = preparations
+        .filter(entry => entry && entry.result && entry.result.status !== 'skipped')
+        .map(entry => [
+          `id=${Number.isInteger(entry.frameId) ? entry.frameId : ''}`,
+          `status=${String(entry.result.status || '')}`,
+          `round=${String(entry.result.roundId || '')}`,
+          `countdown=${Number.isFinite(entry.result.countdown) ? entry.result.countdown : ''}`,
+          `tables=${Array.isArray(entry.result.tableIds) ? entry.result.tableIds.join(',') : ''}`,
+        ].join(','))
+        .join('|');
+      if (generation !== activeSocketGeneration) return;
+      probes = await chrome.scripting.executeScript({
+        target: { tabId: targets[0].id, allFrames: true },
+        world: 'MAIN',
+        args: [tableId],
+        func: globalThis.probePragmaticBetTable,
+      });
+    } catch (error) {
+      send({
+        kind: 'sessionAction',
+        action: 'command-executed',
+        url: '',
+        frame: 'allFrames',
+        detail: `probeBetReadiness:${tableId}:probe-failed=${betErrorMessage(error)}`,
+        timestamp: new Date().toISOString(),
+      });
+      continue;
+    }
+    if (generation !== activeSocketGeneration) return;
+    const candidates = probes.filter(entry => {
+      const result = entry && entry.result;
+      return result
+        && result.status !== 'not-found'
+        && result.tableId === tableId
+        && result.runtimeRevision === PRAGMATIC_BET_RUNTIME_REVISION
+        && PRAGMATIC_FRAME_HOST_PATTERN.test(String(result.host || ''));
+    });
+    const selection = selectPragmaticReadyFrame(probes, tableId);
+    const result = selection.selected
+      ? selection.selected.result
+      : candidates.length === 1
+        ? candidates[0].result
+        : null;
+    const markets = result && Array.isArray(result.markets) ? result.markets.join(',') : '';
+    const chips = result && Array.isArray(result.supportedChips) ? result.supportedChips.join(',') : '';
+    const frameDiagnostics = probes.filter(entry => {
+      const frameResult = entry && entry.result;
+      return frameResult && (
+        PRAGMATIC_FRAME_HOST_PATTERN.test(String(frameResult.host || ''))
+        || String(frameResult.runtimeRevision || '').startsWith('pragmatic-bet-runtime/')
+      );
+    }).map(entry => {
+      const frameResult = entry.result || {};
+      return [
+        `id=${Number.isInteger(entry.frameId) ? entry.frameId : ''}`,
+        `status=${String(frameResult.status || '')}`,
+        `revision=${String(frameResult.runtimeRevision || '')}`,
+        `table=${String(frameResult.tableId || '')}`,
+        `authority=${String(frameResult.routingAuthority || '')}`,
+        `path=${String(frameResult.framePath || '')}`,
+        `round=${String(frameResult.roundId || '')}`,
+        `countdown=${Number.isFinite(frameResult.countdown) ? frameResult.countdown : ''}`,
+      ].join(',');
+    }).join('|');
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: 'allFrames',
+      detail: [
+        `probeBetReadiness:${tableId}`,
+        `candidates=${candidates.length}`,
+        `status=${result && typeof result.status === 'string' ? result.status : ''}`,
+        `readyCandidates=${selection.ready.length}`,
+        `authority=${selection.authority}`,
+        `roundId=${result && typeof result.roundId === 'string' ? result.roundId : ''}`,
+        `roots=${result && Number.isInteger(result.rootCandidateCount) ? result.rootCandidateCount : ''}`,
+        `rootId=${result && typeof result.rootId === 'string' ? result.rootId : ''}`,
+        `rootClass=${result && typeof result.rootClass === 'string' ? result.rootClass : ''}`,
+        `controls=${result && Array.isArray(result.rootControls)
+          ? encodeURIComponent(JSON.stringify(result.rootControls)).slice(0, 2500)
+          : ''}`,
+        `pageMarkets=${result && Array.isArray(result.pageMarketControls)
+          ? encodeURIComponent(JSON.stringify(result.pageMarketControls)).slice(0, 3500)
+          : ''}`,
+        `pageTimers=${result && Array.isArray(result.pageRoundTimers)
+          ? encodeURIComponent(JSON.stringify(result.pageRoundTimers)).slice(0, 9000)
+          : ''}`,
+        `rootVisible=${result && result.rootVisible === true}`,
+        `timer=${result && typeof result.timerTestId === 'string' ? result.timerTestId : ''}`,
+        `countdown=${result && Number.isFinite(result.countdown) ? result.countdown : ''}`,
+        `markets=${markets}`,
+        `chips=${chips}`,
+        `marketTargets=${result && result.marketTargets
+          ? encodeURIComponent(JSON.stringify(result.marketTargets)).slice(0, 12000)
+          : ''}`,
+        `chipControls=${result && Array.isArray(result.chipControls)
+          ? encodeURIComponent(JSON.stringify(result.chipControls)).slice(0, 10000)
+          : ''}`,
+        `walletControls=${result && Array.isArray(result.walletControls)
+          ? encodeURIComponent(JSON.stringify(result.walletControls)).slice(0, 8000)
+          : ''}`,
+        `prepare=${preparationSummary}`,
+        `frames=${frameDiagnostics}`,
+      ].join(':'),
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+
+async function probeLiveBetReadiness(tableIds, generation) {
+  const requestedTableIds = Array.isArray(tableIds) ? tableIds : [];
+  const mstromTableIds = requestedTableIds.filter(
+    tableId => typeof tableId === 'string' && /^[A-Z]\d{3}$/.test(tableId),
+  );
+  const pragmaticTableIds = requestedTableIds.filter(
+    tableId => typeof tableId === 'string' && PRAGMATIC_TABLE_ID_PATTERN.test(tableId),
+  );
+  if (mstromTableIds.length === 0 && pragmaticTableIds.length === 0) {
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: 'allFrames',
+      detail: 'probeBetReadiness:no-valid-table',
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+  if (mstromTableIds.length > 0) await probeMstromBetReadiness(mstromTableIds, generation);
+  if (pragmaticTableIds.length > 0) await probePragmaticBetReadiness(pragmaticTableIds, generation);
+}
+
 function handleBetRequest(message, generation) {
   const requestId = message && typeof message.requestId === 'string'
     ? message.requestId
     : '';
   if (requestId && betRequests.has(requestId)) return betRequests.get(requestId);
 
-  const operation = executeUniqueMstromBet(message, generation)
+  const operation = Promise.resolve()
+    .then(() => executeUniqueLiveBet(message, generation))
     .then(receipt => {
       if (
         receipt
         && typeof receipt === 'object'
         && receipt.status !== 'UNKNOWN'
         && receipt.raw
-        && receipt.raw.commitPoint === 'confirmBet'
+        && receipt.raw.commitStarted === true
         && !isLiveBetSessionCurrent(generation)
       ) {
+        const receiptTableId = message.request && message.request.intent
+          ? message.request.intent.tableId
+          : message.request && message.request.wager
+            ? message.request.wager.tableId
+            : '';
+        const platform = PRAGMATIC_TABLE_ID_PATTERN.test(String(receiptTableId || ''))
+          ? 'pragmatic'
+          : 'mstrom';
         receipt = unknownBetReceipt(
           message.request,
           requestId,
           'bridge-disconnected-after-commit-point',
+          platform,
         );
       }
       sendBetResult({ kind: 'betResult', requestId, receipt }, generation);
@@ -547,6 +1417,15 @@ function scheduleReconnect() {
   }, reconnectDelay);
   reconnectDelay = Math.min(reconnectDelay * 2, 15000);
 }
+
+function ensureBridgeReconnectAlarm() {
+  if (!chrome.alarms?.create) return;
+  chrome.alarms.create(BRIDGE_RECONNECT_ALARM, { periodInMinutes: 0.5 });
+}
+
+chrome.alarms?.onAlarm?.addListener(alarm => {
+  if (alarm?.name === BRIDGE_RECONNECT_ALARM) void connect();
+});
 
 const OUTBOX_LIMIT = 500;
 const outbox = [];
@@ -687,6 +1566,10 @@ async function replayRuntimeStateInGameFrames() {
             host,
             hook: typeof replay === 'function' ? 'present' : 'missing',
             replay: replayState,
+            pragmaticNetworkHook: globalThis.__baccaratPragmaticNetworkHookInstalled === true,
+            webSocketName: typeof globalThis.WebSocket === 'function'
+              ? String(globalThis.WebSocket.name || '').slice(0, 80)
+              : '',
             ...(error ? { error } : {}),
             ...(diagnostics === null ? {} : { diagnostics }),
           };
@@ -711,6 +1594,87 @@ async function replayRuntimeStateInGameFrames() {
 /** 远程指令:由桥接服务/观察者经 WebSocket 下发,免去打开 SW 控制台。 */
 async function handleRemoteCommand(name, tableIds = [], generation) {
   if (generation !== activeSocketGeneration) return;
+  if (name === 'startPragmaticNetworkCapture') {
+    const tabs = await chrome.tabs.query({ url: [DAFABET_POPUP_QUERY] });
+    const targets = tabs.filter(tab => tab.id && exactDafabetPragmaticPopup(tab.url));
+    let enabled = false;
+    if (targets.length === 1 && await ensureCdpAttached(targets[0].id)) {
+      await chrome.debugger.sendCommand({ tabId: targets[0].id }, 'Network.enable', {
+        maxTotalBufferSize: 10_000_000,
+        maxResourceBufferSize: 2_000_000,
+        maxPostDataSize: 0,
+      });
+      await chrome.debugger.sendCommand({ tabId: targets[0].id }, 'Target.setAutoAttach', {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true,
+        filter: [
+          { type: 'iframe', exclude: false },
+          { type: 'worker', exclude: false },
+          { type: 'shared_worker', exclude: false },
+          { type: 'service_worker', exclude: false },
+        ],
+      });
+      pragmaticCdpTabs.add(targets[0].id);
+      enabled = true;
+    }
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: '',
+      detail: `startPragmaticNetworkCapture:enabled=${enabled}:targets=${targets.length}`,
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+  if (name === 'stopPragmaticNetworkCapture') {
+    for (const tabId of pragmaticCdpTabs) {
+      pragmaticCdpTabs.delete(tabId);
+      for (const key of pragmaticCdpSocketUrls.keys()) {
+        if (key.startsWith(`${tabId}:`)) pragmaticCdpSocketUrls.delete(key);
+      }
+      for (const key of pragmaticCdpSeenResponses) {
+        if (key.startsWith(`${tabId}:`)) pragmaticCdpSeenResponses.delete(key);
+      }
+      for (const key of pragmaticCdpResponseCandidates.keys()) {
+        if (key.startsWith(`${tabId}:`)) pragmaticCdpResponseCandidates.delete(key);
+      }
+      for (const key of pragmaticCdpStreams.keys()) {
+        if (key.startsWith(`${tabId}:`)) pragmaticCdpStreams.delete(key);
+      }
+      try {
+        if (cdpAttachedTabId === tabId) {
+          await chrome.debugger.detach({ tabId });
+          cdpAttachedTabId = null;
+        }
+      } catch (_) {}
+    }
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: '',
+      detail: 'stopPragmaticNetworkCapture:disabled',
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+  if (name === 'probeExtensionManifest') {
+    const manifest = chrome.runtime.getManifest();
+    const contentScripts = Array.isArray(manifest.content_scripts) ? manifest.content_scripts : [];
+    const pragmaticNetworkRegistered = contentScripts.some(entry =>
+      Array.isArray(entry.js) && entry.js.includes('pragmatic-network-hook.js'));
+    send({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      url: '',
+      frame: '',
+      detail: `probeExtensionManifest:pragmaticNetwork=${pragmaticNetworkRegistered}:scripts=${contentScripts.length}`,
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
   if (name === 'liveOn' || name === 'liveOff') {
     const enabled = name === 'liveOn';
     liveBetSessionEnabled = enabled;
@@ -744,13 +1708,11 @@ async function handleRemoteCommand(name, tableIds = [], generation) {
     // reloading so a stale page cannot retain authorization across recovery.
     liveBetSessionEnabled = false;
     await chrome.storage.local.set({ liveBetEnabled: false });
-    const tabs = await chrome.tabs.query({
-      url: [`${DAFABET_BACCARAT_POPUP_URL}*`],
-    });
+    const tabs = await chrome.tabs.query({ url: [DAFABET_POPUP_QUERY] });
     if (generation !== activeSocketGeneration) return;
     let reloaded = 0;
     for (const tab of tabs) {
-      if (!tab.id || !exactDafabetBaccaratPopup(tab.url)) continue;
+      if (!tab.id || !exactSupportedBaccaratPopup(tab.url)) continue;
       try {
         await chrome.tabs.reload(tab.id, { bypassCache: true });
         reloaded += 1;
@@ -773,7 +1735,7 @@ async function handleRemoteCommand(name, tableIds = [], generation) {
     return;
   }
   if (name === 'probeBetReadiness') {
-    await probeMstromBetReadiness(tableIds, generation);
+    await probeLiveBetReadiness(tableIds, generation);
     return;
   }
   if (name === 'replayRuntimeState') {
@@ -835,8 +1797,10 @@ async function handleRemoteCommand(name, tableIds = [], generation) {
  */
 async function openActiveGameTabInMultiplay(tableIds = []) {
   try {
-    const tabs = await chrome.tabs.query({ active: true });
-    const tab = tabs.find(candidate => {
+    const tabs = await chrome.tabs.query({});
+    const tab = tabs.find(candidate => candidate.active && exactDafabetPragmaticPopup(candidate.url))
+      || tabs.find(candidate => exactDafabetPragmaticPopup(candidate.url))
+      || tabs.find(candidate => {
       const url = String(candidate && candidate.url ? candidate.url : '');
       return /popup-launch\/live-baccarat/i.test(url);
     }) || tabs.find(candidate => isGameTabUrl(candidate && candidate.url));
@@ -858,6 +1822,47 @@ async function openActiveGameTabInMultiplay(tableIds = []) {
       args: [tableIds],
       func: requestedTableIds => {
         const frameUrl = String(location.href || '');
+        if (/(^|\.)client\.pragmaticplaylive\.net$/i.test(location.hostname)) {
+          if (location.pathname === '/desktop/multibaccarat/') {
+            return { status: 'opened', frameUrl, state: 'pragmatic-already-open' };
+          }
+          if (location.pathname === '/desktop/baccarat/') {
+            // This is Pragmatic's own sibling route. Changing only pathname keeps
+            // the authenticated launch query and never touches a betting control.
+            location.pathname = '/desktop/multibaccarat/';
+            return { status: 'opened', frameUrl, state: 'pragmatic-direct-route' };
+          }
+          const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+          const roots = [document];
+          const controls = [];
+          for (let rootIndex = 0; rootIndex < roots.length && rootIndex < 200; rootIndex += 1) {
+            const root = roots[rootIndex];
+            try {
+              controls.push(...root.querySelectorAll('a[href], button, [role="button"]'));
+              for (const element of root.querySelectorAll('*')) {
+                if (element.shadowRoot) roots.push(element.shadowRoot);
+              }
+            } catch (_) {}
+          }
+          const control = controls.find(element => {
+            const href = String(element.getAttribute && element.getAttribute('href') || '');
+            const text = clean(element.textContent || element.getAttribute?.('aria-label'));
+            const exactTarget = /\/desktop\/multibaccarat\//i.test(href)
+              || /^(?:多桌|多台|多桌百家乐|multi\s*(?:table|baccarat|play))$/i.test(text);
+            if (!exactTarget || element.disabled === true) return false;
+            try {
+              const rect = element.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0;
+            } catch (_) {
+              return true;
+            }
+          });
+          if (control && typeof control.click === 'function') {
+            control.click();
+            return { status: 'opened', frameUrl, state: 'pragmatic-native-control' };
+          }
+          return { status: 'not-ready', frameUrl, state: `pragmatic-control-missing:${location.pathname}` };
+        }
         if (!/(^|\.)(?:mstrom-uno|673ing)\.com$/i.test(location.hostname)) {
           return { status: 'skipped', frameUrl };
         }
@@ -1034,6 +2039,188 @@ async function ensureCdpAttached(tabId) {
     return false;
   }
 }
+
+chrome.debugger.onEvent?.addListener((source, method, params) => {
+  const tabId = source && source.tabId;
+  if (!Number.isInteger(tabId) || !pragmaticCdpTabs.has(tabId)) return;
+  if (method === 'Target.attachedToTarget') {
+    const sessionId = params && typeof params.sessionId === 'string' ? params.sessionId : '';
+    if (!sessionId) return;
+    void chrome.debugger.sendCommand({ tabId, sessionId }, 'Network.enable', {
+      maxTotalBufferSize: 10_000_000,
+      maxResourceBufferSize: 2_000_000,
+      maxPostDataSize: 0,
+    }).catch(() => {});
+    return;
+  }
+  const requestId = params && typeof params.requestId === 'string' ? params.requestId : '';
+  const sessionId = source && typeof source.sessionId === 'string' ? source.sessionId : 'root';
+  const key = `${tabId}:${sessionId}:${requestId}`;
+  const debuggee = sessionId === 'root' ? { tabId } : { tabId, sessionId };
+  if (method === 'Network.webSocketCreated') {
+    const url = params && typeof params.url === 'string' ? params.url : '';
+    if (requestId && url) pragmaticCdpSocketUrls.set(key, url);
+    send({
+      kind: 'networkCapture',
+      source: 'baccarat-bridge-pragmatic-cdp-socket',
+      url,
+      direction: 'recv',
+      encoding: 'text',
+      data: JSON.stringify({ event: 'created', requestIdLength: requestId.length, childSession: sessionId !== 'root' }),
+    });
+    return;
+  }
+  if (method === 'Network.webSocketClosed') {
+    const url = pragmaticCdpSocketUrls.get(key) || '';
+    pragmaticCdpSocketUrls.delete(key);
+    send({
+      kind: 'networkCapture',
+      source: 'baccarat-bridge-pragmatic-cdp-socket',
+      url,
+      direction: 'recv',
+      encoding: 'text',
+      data: JSON.stringify({ event: 'closed' }),
+    });
+    return;
+  }
+  if (method === 'Network.webSocketFrameReceived') {
+    const response = params && params.response;
+    const payload = response && typeof response.payloadData === 'string' ? response.payloadData : '';
+    if (!payload) return;
+    send({
+      kind: 'networkCapture',
+      source: 'baccarat-bridge-pragmatic-cdp-ws',
+      url: pragmaticCdpSocketUrls.get(key) || '',
+      direction: 'recv',
+      encoding: response.opcode === 2 ? 'base64' : 'text',
+      data: payload.slice(0, 120000),
+    });
+    return;
+  }
+  if (method === 'Network.responseReceived') {
+    const response = params && params.response;
+    const type = params && typeof params.type === 'string' ? params.type : '';
+    if (['Image', 'Media', 'Font', 'Stylesheet', 'Script'].includes(type)) return;
+    const url = response && typeof response.url === 'string' ? response.url : '';
+    if (!url || url.startsWith('data:') || url.startsWith('blob:')) return;
+    const responseKey = `${tabId}:${sessionId}:${type}:${url.split('?')[0]}`;
+    if (pragmaticCdpSeenResponses.has(responseKey)) return;
+    pragmaticCdpSeenResponses.add(responseKey);
+    send({
+      kind: 'networkCapture',
+      source: 'baccarat-bridge-pragmatic-cdp-response',
+      url,
+      direction: 'recv',
+      encoding: 'text',
+      data: JSON.stringify({
+        type,
+        mimeType: response && typeof response.mimeType === 'string' ? response.mimeType.slice(0, 80) : '',
+        status: response && Number.isFinite(response.status) ? response.status : 0,
+        childSession: sessionId !== 'root',
+      }),
+    });
+    const candidate = ['XHR', 'Fetch', 'EventSource', 'Other'].includes(type)
+      && /pragmaticplaylive|vbgames88|zavjcswh\.biz|\.ecs\.[a-z0-9-]+\.on\.aws/i.test(url);
+    if (candidate && requestId) {
+      pragmaticCdpResponseCandidates.set(key, { url, type });
+      void chrome.debugger.sendCommand(debuggee, 'Network.streamResourceContent', { requestId })
+        .then(result => {
+          pragmaticCdpStreams.set(key, { url, type });
+          const buffered = result && typeof result.bufferedData === 'string' ? result.bufferedData : '';
+          if (buffered) sendPragmaticCdpBody(url, buffered, true, type, 'buffered');
+        })
+        .catch(() => {});
+    }
+    return;
+  }
+  if (method === 'Network.dataReceived') {
+    const stream = pragmaticCdpStreams.get(key);
+    const data = params && typeof params.data === 'string' ? params.data : '';
+    if (stream && data) sendPragmaticCdpBody(stream.url, data, true, stream.type, 'stream');
+    return;
+  }
+  if (method === 'Network.loadingFinished') {
+    const candidate = pragmaticCdpResponseCandidates.get(key);
+    pragmaticCdpResponseCandidates.delete(key);
+    pragmaticCdpStreams.delete(key);
+    if (!candidate || !requestId) return;
+    void chrome.debugger.sendCommand(debuggee, 'Network.getResponseBody', { requestId })
+      .then(result => {
+        const body = result && typeof result.body === 'string' ? result.body : '';
+        if (body) sendPragmaticCdpBody(candidate.url, body, result.base64Encoded === true, candidate.type, 'complete');
+      })
+      .catch(() => {});
+    return;
+  }
+  if (method === 'Network.loadingFailed') {
+    pragmaticCdpResponseCandidates.delete(key);
+    pragmaticCdpStreams.delete(key);
+    return;
+  }
+  if (method === 'Network.eventSourceMessageReceived') {
+    const data = params && typeof params.data === 'string' ? params.data : '';
+    if (!data) return;
+    send({
+      kind: 'networkCapture',
+      source: 'baccarat-bridge-pragmatic-cdp-sse',
+      url: '',
+      direction: 'recv',
+      encoding: 'text',
+      data: data.slice(0, 120000),
+    });
+  }
+});
+
+function sendPragmaticCdpBody(url, payload, base64Encoded, resourceType, phase) {
+  let encoding = base64Encoded ? 'base64' : 'text';
+  let data = payload;
+  if (base64Encoded) {
+    try {
+      const binary = atob(payload);
+      const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+      const text = new TextDecoder().decode(bytes);
+      const sample = text.slice(0, 4000);
+      const printable = sample.length > 0
+        && Array.from(sample).filter(character => character === '\n'
+          || character === '\r'
+          || character === '\t'
+          || character.charCodeAt(0) >= 32).length / sample.length > 0.9;
+      if (printable) {
+        encoding = 'text';
+        data = text;
+      }
+    } catch (_) {}
+  }
+  send({
+    kind: 'networkCapture',
+    source: 'baccarat-bridge-pragmatic-cdp-body',
+    url,
+    direction: 'recv',
+    encoding,
+    data: String(data || '').slice(0, 120000),
+    resourceType,
+    phase,
+  });
+}
+
+chrome.debugger.onDetach?.addListener(source => {
+  const tabId = source && source.tabId;
+  if (!Number.isInteger(tabId)) return;
+  pragmaticCdpTabs.delete(tabId);
+  if (cdpAttachedTabId === tabId) cdpAttachedTabId = null;
+  for (const key of pragmaticCdpSocketUrls.keys()) {
+    if (key.startsWith(`${tabId}:`)) pragmaticCdpSocketUrls.delete(key);
+  }
+  for (const key of pragmaticCdpSeenResponses) {
+    if (key.startsWith(`${tabId}:`)) pragmaticCdpSeenResponses.delete(key);
+  }
+  for (const key of pragmaticCdpResponseCandidates.keys()) {
+    if (key.startsWith(`${tabId}:`)) pragmaticCdpResponseCandidates.delete(key);
+  }
+  for (const key of pragmaticCdpStreams.keys()) {
+    if (key.startsWith(`${tabId}:`)) pragmaticCdpStreams.delete(key);
+  }
+});
 
 /** 向顶层内容脚本询问游戏 iframe 的视口位置(CDP 点击需要页面绝对坐标)。 */
 function getIframeRectFromTopFrame(tabId) {
@@ -1224,6 +2411,9 @@ let lastTabReloadAt = 0;
 
 chrome.runtime.onMessage.addListener((message, sender, _sendResponse) => {
   if (!message || typeof message.kind !== 'string' || !isTrustedGameSender(sender)) return;
+  if (!socket || socket.readyState > WebSocket.OPEN) void connect();
+  ingestPragmaticProtocolWindow(message);
+  notePragmaticOutboundSend(message);
   send(message);
   const senderTabId = sender && sender.tab ? sender.tab.id : null;
   if (message.kind === 'keepalive') {
@@ -1276,6 +2466,7 @@ chrome.runtime.onMessage.addListener((message, sender, _sendResponse) => {
 
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete' || !isGameTabUrl(tab.url)) return;
+  void connect();
   // document_start 的 hook 可能早于 document_idle relay 发出首个状态；
   // load complete 后强制 replay 会清除其去重缓存并重新发出当前四桌快照。
   void replayRuntimeStateInGameFrames();
@@ -1324,15 +2515,18 @@ async function reloadPendingGameTabs() {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
+  ensureBridgeReconnectAlarm();
   void loadFlags();
   connect();
 });
 
 chrome.runtime.onStartup.addListener(() => {
+  ensureBridgeReconnectAlarm();
   void loadFlags();
   connect();
 });
 
 void loadFlags();
 void reloadPendingGameTabs();
+ensureBridgeReconnectAlarm();
 connect();

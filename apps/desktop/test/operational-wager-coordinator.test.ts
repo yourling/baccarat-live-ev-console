@@ -127,7 +127,7 @@ describe('OperationalWagerCoordinator', () => {
 
       expect(calls).toEqual(['D001', 'D002']);
       expect(coordinator.getKeepaliveState()).toMatchObject({
-        enabled: false,
+        enabled: true,
         lastStatus: 'UNKNOWN',
         lastTableId: 'D002',
         lastReason: 'platform-acknowledgement-unknown',
@@ -140,7 +140,7 @@ describe('OperationalWagerCoordinator', () => {
         serialize: async operation => await operation(),
       });
       expect(replacement.getKeepaliveState()).toMatchObject({
-        enabled: false,
+        enabled: true,
         lastStatus: 'UNKNOWN',
         lastTableId: 'D002',
       });

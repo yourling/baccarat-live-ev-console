@@ -38,6 +38,7 @@ export interface ControlledOperationalWagerCommand {
   readonly market: OperationalWagerMarket;
   readonly amount: number;
   readonly source: OperationalWagerSource;
+  readonly handId?: string;
   readonly createdAt?: string;
 }
 
@@ -66,7 +67,6 @@ export interface ControlledOperationalWagerContext {
   readonly terms?: OperationalWagerTerms;
   readonly canExecuteAutomaticBets: () => boolean;
   readonly requestTimeoutMs: number;
-  readonly disarmOnUnknown: (reason: string) => Promise<void>;
 }
 
 export async function executeControlledOperationalWager(
@@ -80,33 +80,34 @@ export async function executeControlledOperationalWager(
   });
   if (!isOperationalWagerMarket(command.market)) return rejected('unsupported-market');
   if (!Number.isFinite(command.amount) || command.amount <= 0) return rejected('invalid-amount');
-  if (context.riskManager.hasUnknownReservations()) return rejected('unknown-execution-pending');
   if (command.source === 'keepalive' && !context.canExecuteAutomaticBets()) {
     return rejected('global-automation-disabled');
   }
-  if (command.source === 'keepalive' && context.executionMode !== 'live') {
+  if (context.executionMode !== 'live') {
     return rejected('live-execution-required');
   }
 
   const projection = context.projection;
-  const isManualSimulation = command.source === 'manual' && context.executionMode !== 'live';
-  if (!isManualSimulation) {
-    if (command.source !== 'keepalive' && projection.shoeBaseline !== 'physical-shoe') {
-      return rejected('physical-shoe-required');
-    }
-    if (projection.connectionStatus !== 'CONNECTED') return rejected('connected-required');
-    if (projection.status !== 'BETTING_WINDOW') return rejected('betting-window-required');
-    if (projection.sealed) return rejected('shoe-sealed');
-    if (!projection.currentHandId) return rejected('current-hand-required');
-    if (command.source === 'manual' && projection.autoBetStatus === 'ARMED') {
-      return rejected('auto-bet-armed');
-    }
-    if (context.executor === null) return rejected('browser-bridge-unavailable');
+  const manualHandId = command.source === 'manual' && typeof command.handId === 'string' && command.handId.trim().length > 0
+    ? command.handId.trim()
+    : undefined;
+  if (projection.connectionStatus !== 'CONNECTED') return rejected('connected-required');
+  if (projection.status !== 'BETTING_WINDOW') return rejected('betting-window-required');
+  if (projection.sealed) return rejected('shoe-sealed');
+  if (command.source !== 'manual' && !projection.currentHandId) return rejected('current-hand-required');
+  if (command.source === 'manual' && !manualHandId && !projection.currentHandId) {
+    return rejected('current-hand-required');
   }
+  if (context.executor === null) return rejected('browser-bridge-unavailable');
 
   const wagerId = newId('opw');
   const shoeId = projection.shoeId || `manual-test-shoe-${wagerId}`;
-  const handId = projection.currentHandId || `manual-test-${wagerId}`;
+  const liveHandId = projection.currentHandId && projection.currentHandId.length > 0
+    ? projection.currentHandId
+    : undefined;
+  const handId = command.source === 'manual'
+    ? (projection.status === 'BETTING_WINDOW' && liveHandId ? liveHandId : manualHandId ?? liveHandId ?? `manual-test-${wagerId}`)
+    : liveHandId ?? `manual-test-${wagerId}`;
   if (context.ledger.hasOperationalWager(
     context.tableId,
     shoeId,
@@ -144,12 +145,6 @@ export async function executeControlledOperationalWager(
     createdAt: command.createdAt ?? new Date().toISOString(),
   };
 
-  if (isManualSimulation) {
-    const reason = `${context.executionMode}-simulated`;
-    context.riskManager.release(reservation.reservationId, false, reason);
-    return saveResult(context.ledger, wager, reservation.reservationId, 'ACCEPTED', reason);
-  }
-
   const request: OperationalWagerExecutionRequest = { mode: 'live', wager };
   let receipt: OperationalWagerReceipt | null;
   try {
@@ -176,7 +171,6 @@ export async function executeControlledOperationalWager(
       reason,
       matchingReceipt,
     );
-    await context.disarmOnUnknown(reason);
     return result;
   }
   if (receipt === null) {
@@ -189,7 +183,6 @@ export async function executeControlledOperationalWager(
       'UNKNOWN',
       reason,
     );
-    await context.disarmOnUnknown(reason);
     return result;
   }
   if (!receiptMatchesWager(receipt, wager)) {
@@ -202,7 +195,6 @@ export async function executeControlledOperationalWager(
       'UNKNOWN',
       reason,
     );
-    await context.disarmOnUnknown(reason);
     return result;
   }
 
@@ -229,13 +221,13 @@ export async function executeControlledOperationalWager(
         reason,
         receipt,
       );
-      await context.disarmOnUnknown(reason);
       return result;
     }
+    const reason = receiptReason(receipt) ?? 'receipt-rejected';
     context.riskManager.release(
       reservation.reservationId,
       false,
-      'receipt-rejected',
+      reason,
       receipt.receiptId,
     );
     return saveResult(
@@ -243,7 +235,7 @@ export async function executeControlledOperationalWager(
       wager,
       reservation.reservationId,
       'REJECTED',
-      undefined,
+      reason,
       receipt,
     );
   }
@@ -258,7 +250,6 @@ export async function executeControlledOperationalWager(
     reason,
     receipt,
   );
-  await context.disarmOnUnknown(reason);
   return result;
 }
 
@@ -297,6 +288,13 @@ function saveResult(
   };
 }
 
+function receiptReason(receipt: OperationalWagerReceipt): string | undefined {
+  const raw = receipt.raw;
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const reason = Reflect.get(raw, 'reason');
+  return typeof reason === 'string' && reason.trim().length > 0 ? reason.trim() : undefined;
+}
+
 function receiptMatchesWager(
   receipt: OperationalWagerReceipt,
   wager: OperationalWagerRecord['wager'],
@@ -326,6 +324,16 @@ function operationalReceiptFromError(error: unknown): OperationalWagerReceipt | 
 }
 
 function bridgeRequestErrorReason(error: unknown): string {
+  if (typeof error === 'object' && error !== null) {
+    const name = Reflect.get(error, 'name');
+    const message = Reflect.get(error, 'message');
+    if (
+      name === 'OperationalWagerRuntimeRevisionError'
+      || (typeof message === 'string' && message.includes('runtime revision mismatch'))
+    ) {
+      return 'browser-extension-bet-runtime-outdated';
+    }
+  }
   const raw = error instanceof Error ? error.message : String(error ?? '');
   const message = raw.replace(/\s+/g, ' ').trim().slice(0, 300);
   return message.length === 0 ? 'bridge-request-error' : `bridge-request-error:${message}`;

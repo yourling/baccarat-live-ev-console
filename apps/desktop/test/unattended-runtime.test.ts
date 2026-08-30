@@ -77,6 +77,47 @@ function authenticateBridge(bridge: BrowserBridgeServer): void {
 }
 
 describe('DesktopConsoleService unattended runtime', () => {
+  it('clears records without marking a live connected feed as disconnected or stale', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      await service.updateMonitorTableIds(['D055']);
+      const bridge = new BrowserBridgeServer();
+      authenticateBridge(bridge);
+      service['browserBridge'] = bridge;
+      service['liveFeeds'].set('D055', freshFeed('D055'));
+      await service.injectEvent(physicalShoe('D055'));
+      service['runtimeObservedTableIds'].clear();
+      const cleared = await service.clearMonitorData();
+      expect(cleared.runtime.tables.D055?.reasons ?? []).not.toContain('table-feed-disconnected');
+      expect(cleared.runtime.tables.D055?.reasons ?? []).not.toContain('table-feed-stale');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('acknowledges an alert without resolving its runtime blocker', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'baccarat-runtime-alert-'));
+    const service = new DesktopConsoleService(join(directory, 'console.sqlite'));
+    try {
+      const incident = service['runtimeIncidents'].record({
+        code: 'unknown-execution',
+        severity: 'blocked',
+        message: 'platform acknowledgement unknown',
+      });
+
+      const acknowledged = service.acknowledgeRuntimeIncident(incident.incidentId);
+      expect(acknowledged.runtime.status).toBe('blocked');
+      expect(acknowledged.runtime.incidents).toContainEqual(expect.objectContaining({
+        incidentId: incident.incidentId,
+        active: true,
+        acknowledgedAt: expect.any(String),
+      }));
+    } finally {
+      await service.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('keeps operational keepalive disabled after a browser recovery revokes the execution gate', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'baccarat-runtime-card-stale-'));
     const service = new DesktopConsoleService(join(directory, 'console.sqlite'));
@@ -120,7 +161,7 @@ describe('DesktopConsoleService unattended runtime', () => {
 
       const restarted = new DesktopConsoleService(dbPath);
       try {
-        expect(restarted.snapshot().snapshot.tables.D055?.executionMode).toBe('shadow');
+        expect(restarted.snapshot().snapshot.tables.D055?.executionMode).toBe('live');
         expect(restarted.snapshot().runtime.approvedLiveTableIds).toEqual(['D055']);
         expect(restarted.snapshot().runtime.tables.D055?.reasons).toContain('bridge-not-running');
 
@@ -191,12 +232,12 @@ describe('DesktopConsoleService unattended runtime', () => {
       const restarted = new DesktopConsoleService(dbPath);
       try {
         const snapshot = restarted.snapshot();
-        expect(snapshot.snapshot.tables.D055?.executionMode).toBe('shadow');
+        expect(snapshot.snapshot.tables.D055?.executionMode).toBe('live');
         expect(snapshot.runtime.executionReady).toBe(false);
-        expect(snapshot.runtime.tables.D055?.reasons).toContain('unknown-execution-pending');
+        expect(snapshot.runtime.tables.D055?.reasons).not.toContain('unknown-execution-pending');
         expect(snapshot.runtime.incidents).toContainEqual(expect.objectContaining({
           code: 'unknown-execution',
-          severity: 'blocked',
+          severity: 'degraded',
           tableId: 'D055',
           active: true,
         }));
@@ -421,7 +462,7 @@ describe('DesktopConsoleService unattended runtime', () => {
 
         expect(restarted.snapshot().runtime.tables.D055?.reasons)
           .toContain('table-connection-not-restored');
-        expect(restarted.snapshot().snapshot.tables.D055?.executionMode).toBe('shadow');
+        expect(restarted.snapshot().snapshot.tables.D055?.executionMode).toBe('live');
 
         await restarted.injectEvent({
           ...physicalShoe('D055', restarted['ledger'].nextSourceSeq('D055')),

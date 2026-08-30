@@ -1,4 +1,8 @@
-import { SimulatedAdapter, type BrowserAdapter } from '@baccarat/adapter-contract';
+import {
+  SimulatedAdapter,
+  type BrowserAdapter,
+  type OperationalWagerSource,
+} from '@baccarat/adapter-contract';
 import {
   EVENT_SCHEMA_VERSION,
   defaultProfile,
@@ -10,7 +14,12 @@ import {
   type RiskLimits,
   type TableProfile,
 } from '@baccarat/contracts';
-import { SqliteLedger, type MonitorSummary, type MonitorSummaryOptions } from '@baccarat/ledger-state';
+import {
+  SqliteLedger,
+  operationalReceiptCommitStarted,
+  type MonitorSummary,
+  type MonitorSummaryOptions,
+} from '@baccarat/ledger-state';
 import {
   Orchestrator,
   STANDARD_COMMISSION_BACCARAT_TERMS,
@@ -23,6 +32,7 @@ import {
   BUNDLED_BROWSER_EXTENSION_ID,
   BUNDLED_BROWSER_EXTENSION_TOKEN,
   BrowserBridgeServer,
+  isCompleteBaccaratHand,
   type BrowserBridgeRuntimeEvent,
 } from '@baccarat/browser-bridge';
 import {
@@ -62,12 +72,29 @@ import {
 
 const DEFAULT_APPROVED_LIVE_TABLE_IDS = ['D066', 'D067', 'D056', 'D057'] as const;
 const MONITOR_TABLE_CONFIG_KEY = 'desktop:monitor-tables:v1';
-const MONITOR_TABLE_ID_PATTERN = /^[A-Z]{1,4}\d{2,6}$/;
+const TABLE_METADATA_CONFIG_KEY = 'desktop:table-metadata:v1';
+const LEGACY_MONITOR_TABLE_ID_PATTERN = /^[A-Z]{1,4}\d{2,6}$/i;
+const PRAGMATIC_MONITOR_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
+const DISCONNECTED_MONITOR_REMOVAL_MS = 15_000;
 const MAX_LIVE_FEED_STALENESS_MS = 45_000;
 const LIVE_MONITOR_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000] as const;
 
 type MonitorTableConfig = {
   readonly tableIds: readonly string[];
+};
+
+type StoredTableMetadata = {
+  readonly tableId: string;
+  readonly roomId: string;
+  readonly updatedAt: string;
+  readonly roomName?: string;
+  readonly displayName?: string;
+  readonly roundId?: string;
+  readonly gameCount?: number;
+};
+
+type TableMetadataConfig = {
+  readonly tables: readonly StoredTableMetadata[];
 };
 
 interface OneShotLiveBetActor {
@@ -93,8 +120,14 @@ function normalizeMonitorTableIds(tableIds: readonly string[], allowEmpty = fals
   const normalized: string[] = [];
   const seen = new Set<string>();
   for (const rawTableId of tableIds) {
-    const tableId = rawTableId.trim().toUpperCase();
-    if (!MONITOR_TABLE_ID_PATTERN.test(tableId)) {
+    const trimmed = rawTableId.trim();
+    const tableId = LEGACY_MONITOR_TABLE_ID_PATTERN.test(trimmed)
+      ? trimmed.toUpperCase()
+      : trimmed.toLowerCase();
+    if (
+      !LEGACY_MONITOR_TABLE_ID_PATTERN.test(tableId)
+      && !PRAGMATIC_MONITOR_TABLE_ID_PATTERN.test(tableId)
+    ) {
       throw new RangeError(`invalid monitor table id: ${rawTableId}`);
     }
     if (!seen.has(tableId)) {
@@ -121,6 +154,71 @@ function monitorTableIdsFromConfig(value: unknown): string[] | null {
   }
 }
 
+function normalizeOptionalMonitorTableId(tableId: string): string | undefined {
+  try {
+    return normalizeMonitorTableIds([tableId], true)[0];
+  } catch {
+    return undefined;
+  }
+}
+
+function tableMetadataFromConfig(value: unknown): Map<string, StoredTableMetadata> {
+  const result = new Map<string, StoredTableMetadata>();
+  if (typeof value !== 'object' || value === null) return result;
+  const tables = Reflect.get(value, 'tables');
+  if (!Array.isArray(tables)) return result;
+  for (const entry of tables) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const tableId = Reflect.get(entry, 'tableId');
+    const roomId = Reflect.get(entry, 'roomId');
+    const updatedAt = Reflect.get(entry, 'updatedAt');
+    if (typeof tableId !== 'string' || typeof roomId !== 'string' || typeof updatedAt !== 'string') continue;
+    const normalized = normalizeOptionalMonitorTableId(tableId);
+    if (normalized === undefined) continue;
+    result.set(normalized, {
+      tableId: normalized,
+      roomId,
+      updatedAt,
+      ...optionalString(entry, 'roomName'),
+      ...optionalString(entry, 'displayName'),
+      ...optionalString(entry, 'roundId'),
+      ...optionalNumber(entry, 'gameCount'),
+    });
+  }
+  return result;
+}
+
+function optionalString(value: object, field: string): Record<string, string> {
+  const raw = Reflect.get(value, field);
+  return typeof raw === 'string' && raw.trim().length > 0 ? { [field]: raw.trim() } : {};
+}
+
+function optionalNumber(value: object, field: string): Record<string, number> {
+  const raw = Reflect.get(value, field);
+  return typeof raw === 'number' && Number.isFinite(raw) ? { [field]: raw } : {};
+}
+
+function sameTableMetadata(left: StoredTableMetadata | undefined, right: StoredTableMetadata): boolean {
+  return left !== undefined
+    && left.tableId === right.tableId
+    && left.roomId === right.roomId
+    && left.roomName === right.roomName
+    && left.displayName === right.displayName
+    && left.roundId === right.roundId
+    && left.gameCount === right.gameCount;
+}
+
+function discoveredMonitorTableIds(rooms: readonly RoomDescriptor[]): Set<string> {
+  const tableIds = new Set<string>();
+  for (const room of rooms) {
+    for (const table of room.tables) {
+      const tableId = normalizeOptionalMonitorTableId(table.tableId);
+      if (tableId !== undefined) tableIds.add(tableId);
+    }
+  }
+  return tableIds;
+}
+
 function defaultMonitorTableIds(): string[] {
   const rawTableIds = String(process.env.BACCARAT_LIVE_TABLES || DEFAULT_APPROVED_LIVE_TABLE_IDS.join(','))
     .split(',')
@@ -142,6 +240,7 @@ export interface DesktopConsoleSnapshot extends Omit<ApiDesktopConsoleSnapshot, 
   snapshot: OrchestratorSnapshot;
   monitorTableIds: readonly string[];
   monitorCandidates: readonly MonitorTableCandidate[];
+  tableMetadata: readonly MonitorTableCandidate[];
   recordCounts: DesktopRecordCounts;
   events: NormalizedEvent[];
   decisions: ReturnType<SqliteLedger['listDecisions']>;
@@ -182,8 +281,11 @@ export class DesktopConsoleService {
   private demoError?: string;
   private browserBridge?: BrowserBridgeServer;
   private browserBridgePort = 0;
-  private liveExecutionMode: ExecutionMode = 'shadow';
+  private liveExecutionMode: ExecutionMode = 'live';
   private readonly liveFeeds = new Map<string, TableExport>();
+  private readonly liveRoomIdsByTable = new Map<string, string>();
+  private readonly tableMetadata: Map<string, StoredTableMetadata>;
+  private readonly disconnectedMonitorRemovalTimers = new Map<string, NodeJS.Timeout>();
   private readonly runtimeObservedTableIds = new Set<string>();
   private readonly liveAuthorizationSources = new Map<string, 'manual' | 'unattended'>();
   private persistentLiveGateEnabled = false;
@@ -195,7 +297,9 @@ export class DesktopConsoleService {
   private executionStateOperation: Promise<void> = Promise.resolve();
   private cachedRecordCounts?: DesktopRecordCounts;
   private cachedSummary?: MonitorSummary;
+  private readonly lastHistoryPruneAt = new Map<string, number>();
   private closing = false;
+  private suppressDiscoveredMonitorAutoAdd = false;
   /** The transient allowlist used only while a serialized live transition is being validated. */
   private pendingMonitorTableIds?: readonly string[];
   /** Operator-managed, persisted ordered selection; mutation is the configuration operation. */
@@ -206,12 +310,12 @@ export class DesktopConsoleService {
     this.ledger.repairPrecommitUnknownOperationalReservations();
     const repairedAcceptedReservations = this.ledger
       .restoreInvalidlyExpiredAcceptedOperationalReservations();
-    const defaultExecutor = new SimulatedAdapter({ events: [] });
-    this.currentExecutor = defaultExecutor;
+    this.ledger.pruneMonitorHistory();
+    this.currentExecutor = null;
     this.orchestrator = new Orchestrator({
       ledger: this.ledger,
       riskLimits: defaultConsoleLimits(),
-      executor: defaultExecutor,
+      executor: null,
       operationalWagerTerms: STANDARD_COMMISSION_BACCARAT_TERMS,
       canExecuteAutomaticBets: tableId => this.canExecuteAutomaticBets(tableId),
       onBettingWindowOpened: () => {
@@ -235,19 +339,41 @@ export class DesktopConsoleService {
         );
       }
     }
+    for (const reservation of this.orchestrator.getReservations()) {
+      if (
+        reservation.status !== 'UNKNOWN'
+        || reservation.releaseReason !== 'hand-settled-without-authoritative-outcome'
+      ) continue;
+      const settlement = this.ledger.getHandSettlement(
+        reservation.tableId,
+        reservation.shoeId,
+        reservation.handId,
+      );
+      if (!settlement) continue;
+      this.orchestrator.recoverAcceptedHandSettlement(
+        reservation.tableId,
+        reservation.shoeId,
+        reservation.handId,
+        settlement,
+      );
+    }
+    this.recoverCommittedUnknownSettlements();
     const persistedLiveTableIds = Object.values(this.orchestrator.listTableConfigs())
       .filter(config => config.executionMode === 'live')
       .map(config => config.profile.tableId);
     this.liveApprovals = new LiveApprovalStore(this.ledger, persistedLiveTableIds);
     this.runtimeIncidents = new RuntimeIncidentStore(this.ledger);
+    this.tableMetadata = tableMetadataFromConfig(
+      this.ledger.getConfig<unknown>(TABLE_METADATA_CONFIG_KEY),
+    );
     this.monitorTableIds = this.loadMonitorTableIds();
-    this.liveApprovals.retain(this.monitorTableIds);
+    this.syncLiveApprovalsToMonitorTables();
     this.operationalWagers = new OperationalWagerCoordinator({
       ledger: this.ledger,
       actor: tableId => this.orchestrator.getActor(tableId),
       monitorTableIds: () => this.monitorTableIds,
       serialize: async operation => await this.enqueueExecutionStateOperation(operation),
-      runtimeBlockReason: tableId => this.operationalWagerRuntimeBlockReason(tableId),
+      runtimeBlockReason: (tableId, source) => this.operationalWagerRuntimeBlockReason(tableId, source),
       onError: error => this.recordLiveMonitorError(error, 'scheduler-failure', 'degraded'),
     });
     this.normalizeEvFloor();
@@ -257,18 +383,120 @@ export class DesktopConsoleService {
 
   private loadMonitorTableIds(): string[] {
     const configured = monitorTableIdsFromConfig(this.ledger.getConfig<unknown>(MONITOR_TABLE_CONFIG_KEY));
+    if (configured !== null && configured.length > 0) return configured;
+    const restored = [...this.tableMetadata.keys()].filter(tableId =>
+      normalizeOptionalMonitorTableId(tableId) !== undefined,
+    );
+    if (restored.length > 0) {
+      this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: restored });
+      return restored;
+    }
     if (configured !== null) return configured;
     const defaults = defaultMonitorTableIds();
     this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: defaults });
     return defaults;
   }
 
-  private ensureMonitorActors(tableIds: readonly string[]): void {
-    for (const tableId of tableIds) {
-      if (!this.orchestrator.getActor(tableId)) {
-        this.orchestrator.registerTable(defaultProfile(tableId), 'shadow', 100);
+  private syncLiveApprovalsToMonitorTables(): void {
+    this.liveApprovals.retain(this.monitorTableIds);
+    for (const tableId of this.monitorTableIds) this.liveApprovals.approve(tableId);
+  }
+
+  private refreshTableMetadataFromRooms(rooms: readonly RoomDescriptor[]): void {
+    let changed = false;
+    const updatedAt = new Date().toISOString();
+    for (const room of rooms) {
+      for (const table of room.tables) {
+        const tableId = normalizeOptionalMonitorTableId(table.tableId);
+        if (tableId === undefined) continue;
+        const existing = this.tableMetadata.get(tableId);
+        const next: StoredTableMetadata = {
+          tableId,
+          roomId: room.roomId,
+          updatedAt,
+          ...(existing?.roomName === undefined ? {} : { roomName: existing.roomName }),
+          ...(existing?.displayName === undefined ? {} : { displayName: existing.displayName }),
+          ...(existing?.roundId === undefined ? {} : { roundId: existing.roundId }),
+          ...(existing?.gameCount === undefined ? {} : { gameCount: existing.gameCount }),
+          ...(room.displayName === undefined ? {} : { roomName: room.displayName }),
+          ...(table.displayName === undefined ? {} : { displayName: table.displayName }),
+          ...(table.roundId === undefined ? {} : { roundId: table.roundId }),
+          ...(table.gameCount === undefined ? {} : { gameCount: table.gameCount }),
+        };
+        if (!sameTableMetadata(existing, next)) {
+          this.tableMetadata.set(tableId, next);
+          changed = true;
+        }
       }
     }
+    if (changed) this.persistTableMetadata();
+  }
+
+  private persistTableMetadata(): void {
+    this.ledger.setConfig<TableMetadataConfig>(TABLE_METADATA_CONFIG_KEY, {
+      tables: [...this.tableMetadata.values()],
+    });
+  }
+
+  private autoAddDiscoveredMonitorTables(rooms: readonly RoomDescriptor[]): void {
+    const existing = new Set(this.monitorTableIds);
+    const added: string[] = [];
+    for (const room of rooms) {
+      for (const table of room.tables) {
+        const tableId = normalizeOptionalMonitorTableId(table.tableId);
+        if (tableId === undefined || existing.has(tableId)) continue;
+        existing.add(tableId);
+        added.push(tableId);
+      }
+    }
+    if (added.length === 0) return;
+    const inheritedSettings = this.currentUnifiedTableSettings();
+    const nextTableIds = [...this.monitorTableIds, ...added];
+    this.ensureMonitorActors(nextTableIds, inheritedSettings);
+    this.monitorTableIds = nextTableIds;
+    this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
+    this.syncLiveApprovalsToMonitorTables();
+    this.browserBridge?.setSelectedTableIds(nextTableIds);
+  }
+
+  private ensureMonitorActors(
+    tableIds: readonly string[],
+    inheritedSettings?: Pick<TableSettingsUpdate, 'minEV' | 'betTiers' | 'defaultBetAmount'>,
+  ): void {
+    for (const tableId of tableIds) {
+      if (!this.orchestrator.getActor(tableId)) {
+        const profile = defaultProfile(tableId);
+        this.orchestrator.registerTable(
+          inheritedSettings === undefined
+            ? profile
+            : {
+                ...profile,
+                minEV: inheritedSettings.minEV,
+                betTiers: inheritedSettings.betTiers.map(tier => ({ ...tier })),
+              },
+          'live',
+          inheritedSettings?.defaultBetAmount ?? 100,
+        );
+      } else if (this.orchestrator.getActor(tableId)?.snapshot().executionMode !== 'live') {
+        this.orchestrator.updateTableExecutionMode(tableId, 'live');
+      }
+    }
+  }
+
+  private currentUnifiedTableSettings(): Pick<
+    TableSettingsUpdate,
+    'minEV' | 'betTiers' | 'defaultBetAmount'
+  > | undefined {
+    for (const tableId of this.monitorTableIds) {
+      const table = this.orchestrator.getActor(tableId)?.snapshot();
+      if (table === undefined) continue;
+      return {
+        minEV: table.profile.minEV,
+        betTiers: (table.profile.betTiers ?? []).map(tier => ({ ...tier })),
+        defaultBetAmount: table.defaultBetAmount,
+      };
+    }
+    return undefined;
   }
 
   private normalizeEvFloor(): void {
@@ -285,15 +513,11 @@ export class DesktopConsoleService {
 
   private async initializeFailClosedRuntime(): Promise<void> {
     for (const actor of this.orchestrator.listActors()) {
-      const approved = this.liveApprovals.has(actor.tableId);
-      if (actor.snapshot().executionMode === 'live' || approved) {
-        actor.setExecutionMode('shadow');
+      if (this.monitorTableIds.includes(actor.tableId) && actor.snapshot().executionMode !== 'live') {
+        this.orchestrator.updateTableExecutionMode(actor.tableId, 'live');
       }
       const projection = actor.getProjection();
-      if (projection.autoBetStatus === 'ARMED' && approved) {
-        await actor.setAutoBet(false, projection.shoeId || undefined);
-      }
-      if (approved && projection.shoeId && projection.connectionStatus !== 'DISCONNECTED') {
+      if (this.monitorTableIds.includes(actor.tableId) && projection.shoeId && projection.connectionStatus !== 'DISCONNECTED') {
         await this.orchestrator.enqueue(actor.tableId, {
           type: 'connectionLost',
           eventId: newId('evt'),
@@ -307,22 +531,13 @@ export class DesktopConsoleService {
       }
     }
     this.liveAuthorizationSources.clear();
-    this.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
+    this.setOrchestratorExecutor(null);
     this.setOperationalWagerExecutor(false);
   }
 
-  private canExecuteAutomaticBets(tableId: string): boolean {
+  private canExecuteAutomaticBets(_tableId: string): boolean {
     if (!this.operationalWagers.getKeepaliveState().enabled) return false;
-    if (this.liveApprovals.has(tableId) && !this.liveAuthorizationSources.has(tableId)) return false;
-    const actor = this.orchestrator.getActor(tableId);
-    if (actor?.snapshot().executionMode !== 'live') return true;
-    return this.liveAuthorizationSources.has(tableId)
-      && !this.hasUnknownExecution();
-  }
-
-  private hasUnknownExecution(tableId?: string): boolean {
-    return this.orchestrator.getReservations(tableId)
-      .some(reservation => reservation.status === 'UNKNOWN');
+    return true;
   }
 
   private hasSettlementGap(tableId: string): boolean {
@@ -361,9 +576,6 @@ export class DesktopConsoleService {
         })
         .map(reservation => reservation.tableId),
     );
-    if (unknownTableIds.size > 0) {
-      this.operationalWagers.disableKeepaliveImmediately();
-    }
     const knownTableIds = new Set([
       ...this.monitorTableIds,
       ...this.liveApprovals.list(),
@@ -374,7 +586,7 @@ export class DesktopConsoleService {
       if (unknownTableIds.has(tableId)) {
         this.ensureRuntimeIncident({
           code: 'unknown-execution',
-          severity: 'blocked',
+          severity: 'degraded',
           tableId,
           message: `Unresolved execution result retains exposure for ${tableId}`,
         });
@@ -390,6 +602,49 @@ export class DesktopConsoleService {
         });
       } else if (this.orchestrator.getActor(tableId)) {
         this.runtimeIncidents.resolve('settlement-gap', tableId);
+      }
+    }
+  }
+
+  private maybePruneMonitorHistory(tableId: string): void {
+    const now = Date.now();
+    const previous = this.lastHistoryPruneAt.get(tableId) ?? 0;
+    if (now - previous < 15_000) return;
+    this.lastHistoryPruneAt.set(tableId, now);
+    this.ledger.pruneMonitorHistory(undefined, tableId);
+  }
+
+  private trySettleReservedOperationalHand(
+    tableId: string,
+    _shoeId: string,
+    handId?: string,
+  ): void {
+    const reserved = this.orchestrator.getReservations(tableId).filter(reservation =>
+      (
+        reservation.status === 'RESERVED'
+        || (
+          reservation.status === 'UNKNOWN'
+          && reservation.releaseReason === 'hand-settled-without-authoritative-outcome'
+        )
+      )
+      && (handId === undefined || reservation.handId === handId));
+    if (reserved.length === 0) return;
+    const handIds = [...new Set(reserved.map(reservation => reservation.handId))];
+    for (const targetHandId of handIds) {
+      const { playerCards, bankerCards } = this.ledger.listHandCards(tableId, targetHandId);
+      if (!isCompleteBaccaratHand(playerCards, bankerCards)) continue;
+      const outcomes = pairOutcomesFromCards(playerCards, bankerCards);
+      for (const reservation of reserved.filter(candidate => candidate.handId === targetHandId)) {
+        this.orchestrator.recoverAcceptedHandSettlement(
+          tableId,
+          reservation.shoeId,
+          targetHandId,
+          {
+            playerCards,
+            bankerCards,
+            ...(outcomes === undefined ? {} : { outcomes }),
+          },
+        );
       }
     }
   }
@@ -441,7 +696,7 @@ export class DesktopConsoleService {
 
   private liveTableReasons(
     tableId: string,
-    approved = this.liveApprovals.has(tableId),
+    approved = true,
   ): LiveExecutionBlockReason[] {
     const actor = this.orchestrator.getActor(tableId);
     if (!actor) return ['table-feed-missing', 'physical-shoe-baseline-unknown', 'table-connection-not-restored'];
@@ -457,24 +712,59 @@ export class DesktopConsoleService {
       ...(health === undefined ? {} : {
         feed: {
           state: health.state,
-          stalenessMs: this.runtimeObservedTableIds.has(tableId)
-            ? health.stalenessMs
-            : undefined,
+          stalenessMs: health.stalenessMs,
         },
       }),
       maxFeedStalenessMs: MAX_LIVE_FEED_STALENESS_MS,
       projection: actor.getProjection(),
-      hasUnknownExecution: this.hasUnknownExecution(),
+      hasUnknownExecution: false,
       hasSettlementGap: this.hasSettlementGap(tableId),
     });
   }
 
-  private operationalWagerRuntimeBlockReason(tableId: string): string | undefined {
+  private recoverCommittedUnknownSettlements(): void {
+    const records = this.ledger.listOperationalWagersTail(200);
+    for (const reservation of this.orchestrator.getReservations()) {
+      if (reservation.status !== 'UNKNOWN') continue;
+      const record = records.find(candidate => candidate.reservationId === reservation.reservationId);
+      if (record === undefined || record.status !== 'UNKNOWN') continue;
+      if (record.receipt?.status !== 'UNKNOWN') continue;
+      if (!operationalReceiptCommitStarted(record.receipt?.raw)) continue;
+      const settlement = this.ledger.getHandSettlement(
+        reservation.tableId,
+        reservation.shoeId,
+        reservation.handId,
+      );
+      if (!settlement) continue;
+      try {
+        this.orchestrator.settleUnknownReservation(
+          reservation.reservationId,
+          {
+            outcomes: settlement.outcomes,
+            playerCards: settlement.playerCards,
+            bankerCards: settlement.bankerCards,
+          },
+          'committed-hand-settled',
+        );
+      } catch {
+        continue;
+      }
+      if (record.reconciliation !== undefined) continue;
+      this.ledger.reconcileOperationalWager(record.wager.wagerId, {
+        status: 'ACCEPTED',
+        reason: 'committed-hand-settled',
+        reconciledAt: new Date().toISOString(),
+      });
+    }
+  }
+
+  private operationalWagerRuntimeBlockReason(
+    tableId: string,
+    source?: OperationalWagerSource,
+  ): string | undefined {
+    if (source === 'manual') return undefined;
     const actor = this.orchestrator.getActor(tableId);
     if (actor?.snapshot().executionMode !== 'live') return undefined;
-    if (!this.liveApprovals.has(tableId) || !this.liveAuthorizationSources.has(tableId)) {
-      return 'unattended-runtime-blocked:live-authorization-missing';
-    }
     const reasons = this.keepaliveTableReasons(tableId);
     return reasons.length === 0
       ? undefined
@@ -487,19 +777,24 @@ export class DesktopConsoleService {
       && reason !== 'settlement-gap');
   }
 
+  private manualLiveTableReasons(tableId: string, approved = true): LiveExecutionBlockReason[] {
+    return this.liveTableReasons(tableId, approved).filter(reason =>
+      reason !== 'physical-shoe-baseline-unknown');
+  }
+
   private runtimeSnapshot(): DesktopRuntimeState {
     this.refreshAccountingIncidents();
     const bridge = this.bridgeRuntimeStatus();
-    const approvedLiveTableIds = this.liveApprovals.list();
+    const approvedLiveTableIds = [...this.monitorTableIds];
     const tables: DesktopRuntimeState['tables'] = Object.fromEntries(
       this.monitorTableIds.map(tableId => {
         const feedHealth = this.liveFeeds.get(tableId)?.health();
         const actor = this.orchestrator.getActor(tableId);
         return [tableId, {
-          approved: this.liveApprovals.has(tableId),
+          approved: true,
           active: actor?.snapshot().executionMode === 'live'
             && this.liveAuthorizationSources.has(tableId),
-          reasons: this.liveApprovals.has(tableId) ? this.keepaliveTableReasons(tableId) : [],
+          reasons: this.keepaliveTableReasons(tableId),
           ...(feedHealth === undefined ? {} : {
             feedState: feedHealth.state,
             ...(feedHealth.stalenessMs === undefined ? {} : { feedStalenessMs: feedHealth.stalenessMs }),
@@ -509,19 +804,25 @@ export class DesktopConsoleService {
     );
     const activeLiveTableIds = approvedLiveTableIds.filter(tableId =>
       tables[tableId]?.active === true);
+    const readyLiveTableIds = approvedLiveTableIds.filter(tableId =>
+      tables[tableId]?.active === true && tables[tableId]?.reasons.length === 0);
     const reasons = [...new Set(
       approvedLiveTableIds.flatMap(tableId => tables[tableId]?.reasons ?? []),
     )];
     const incidents = this.runtimeIncidents.list();
     const activeIncidents = incidents.filter(incident => incident.active);
-    const blocked = reasons.length > 0
-      || activeIncidents.some(incident => incident.severity === 'blocked');
-    const degraded = activeIncidents.some(incident => incident.severity === 'degraded');
+    const globallyBlocked = activeIncidents.some(incident =>
+      incident.severity === 'blocked'
+      && incident.tableId === undefined);
+    const allApprovedTablesUnavailable = approvedLiveTableIds.length > 0
+      && readyLiveTableIds.length === 0
+      && (reasons.length > 0 || activeIncidents.some(incident => incident.severity === 'blocked'));
+    const blocked = globallyBlocked || allApprovedTablesUnavailable;
+    const degraded = activeIncidents.length > 0
+      || (readyLiveTableIds.length > 0 && readyLiveTableIds.length < approvedLiveTableIds.length);
     return {
       status: blocked ? 'blocked' : degraded ? 'degraded' : 'healthy',
-      executionReady: approvedLiveTableIds.length > 0
-        && activeLiveTableIds.length === approvedLiveTableIds.length
-        && reasons.length === 0,
+      executionReady: !globallyBlocked && readyLiveTableIds.length > 0,
       monitorActive: this.liveMonitorActivated,
       approvedLiveTableIds,
       activeLiveTableIds,
@@ -543,16 +844,15 @@ export class DesktopConsoleService {
     await this.startupFailCloseTask;
     this.refreshAccountingIncidents();
     const selectedTableIds = this.currentMonitorTableIds();
-    const approvedTableIds = this.liveApprovals.list()
+    const approvedTableIds = this.monitorTableIds
       .filter(tableId => selectedTableIds.includes(tableId));
     for (const tableId of approvedTableIds) {
       const actor = this.orchestrator.getActor(tableId);
       if (!actor) continue;
       const reasons = this.keepaliveTableReasons(tableId);
       const authorization = this.liveAuthorizationSources.get(tableId);
-      const accountingBlocked = reasons.includes('unknown-execution-pending');
       if (reasons.length > 0) {
-        if (authorization === 'unattended' || accountingBlocked) {
+        if (authorization === 'unattended') {
           await this.resetMonitorExecutionState(tableId);
         }
         continue;
@@ -574,7 +874,7 @@ export class DesktopConsoleService {
       actor.snapshot().executionMode === 'live'
       && this.liveAuthorizationSources.has(actor.tableId));
     if (!hasActiveLiveTable) {
-      this.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
+      this.setOrchestratorExecutor(null);
       this.setOperationalWagerExecutor(false);
       try {
         await this.setPersistentLiveGate(false);
@@ -642,15 +942,15 @@ export class DesktopConsoleService {
           await this.failCloseLiveExecution(this.liveApprovals.list());
           return;
         case 'table-disconnected':
-          this.operationalWagers.disableKeepaliveImmediately();
           this.runtimeObservedTableIds.delete(event.tableId);
           this.ensureRuntimeIncident({
-            code: event.reason === 'table-feed-stale' ? 'table-feed-stale' : 'bridge-disconnected',
+            code: event.reason === 'table-feed-stale' ? 'table-feed-stale' : 'monitor-failure',
             severity: 'blocked',
             tableId: event.tableId,
             message: event.reason,
           });
           await this.failCloseLiveExecution([event.tableId]);
+          this.scheduleDisconnectedMonitorRemoval(event.tableId, event.reason);
           return;
         case 'session-recovery-exhausted':
           this.operationalWagers.disableKeepaliveImmediately();
@@ -714,9 +1014,6 @@ export class DesktopConsoleService {
   }
 
   private async enqueueMonitorEvent(event: NormalizedEvent): Promise<void> {
-    if (event.type === 'connectionLost') {
-      this.operationalWagers.disableKeepaliveImmediately();
-    }
     if (
       event.type === 'newShoeSignal'
       || event.type === 'cardObserved'
@@ -726,12 +1023,38 @@ export class DesktopConsoleService {
       || event.type === 'redCardSeen'
       || event.type === 'shoeInvalidated'
     ) {
+      this.cancelDisconnectedMonitorRemoval(event.tableId);
       this.runtimeObservedTableIds.add(event.tableId);
+      this.runtimeIncidents.resolve('table-feed-stale', event.tableId);
+      this.runtimeIncidents.resolve('monitor-failure', event.tableId);
+      this.runtimeIncidents.resolve('bridge-disconnected', event.tableId);
+    }
+    if (event.type === 'connectionRestored') {
+      this.cancelDisconnectedMonitorRemoval(event.tableId);
+      this.runtimeIncidents.resolve('table-feed-stale', event.tableId);
+      this.runtimeIncidents.resolve('monitor-failure', event.tableId);
+      this.runtimeIncidents.resolve('bridge-disconnected', event.tableId);
     }
     if (event.type === 'bettingWindowOpened') this.detectSettlementGap(event);
     await this.orchestrator.enqueue(event.tableId, event);
-    this.refreshAccountingIncidents();
-    if (event.type === 'handSettled') this.resolveSettlementGapIfCleared(event.tableId);
+    if (
+      event.type === 'handSettled'
+      || event.type === 'betReceipt'
+      || event.type === 'connectionLost'
+      || event.type === 'connectionRestored'
+    ) {
+      this.refreshAccountingIncidents();
+    }
+    if (event.type === 'cardObserved' || event.type === 'handSettled') {
+      this.trySettleReservedOperationalHand(event.tableId, event.shoeId, event.handId);
+    }
+    if (event.type === 'bettingWindowOpened') {
+      this.trySettleReservedOperationalHand(event.tableId, event.shoeId);
+    }
+    if (event.type === 'handSettled') {
+      this.resolveSettlementGapIfCleared(event.tableId);
+      this.maybePruneMonitorHistory(event.tableId);
+    }
     if (
       event.type === 'newShoeSignal'
       || event.type === 'connectionRestored'
@@ -739,7 +1062,13 @@ export class DesktopConsoleService {
     ) {
       await this.rearmPairAutomation(event.tableId);
     }
-    await this.reconcileUnattendedExecution();
+    if (
+      event.type === 'bettingWindowOpened'
+      || event.type === 'connectionLost'
+      || event.type === 'connectionRestored'
+    ) {
+      await this.reconcileUnattendedExecution();
+    }
   }
 
   private async reconcilePairAutomation(enabled: boolean): Promise<void> {
@@ -759,12 +1088,10 @@ export class DesktopConsoleService {
 
   private async rearmPairAutomation(tableId: string): Promise<void> {
     if (!this.operationalWagers.getKeepaliveState().enabled || !this.monitorTableIds.includes(tableId)) return;
-    if (this.liveApprovals.has(tableId) && !this.liveAuthorizationSources.has(tableId)) return;
     const actor = this.orchestrator.getActor(tableId);
     if (!actor) return;
     const projection = actor.getProjection();
     const canArm = projection.autoBetStatus === 'DISARMED'
-      && projection.shoeBaseline === 'physical-shoe'
       && projection.connectionStatus === 'CONNECTED'
       && !projection.sealed
       && (projection.status === 'TRACKING'
@@ -798,8 +1125,8 @@ export class DesktopConsoleService {
     if (!actor) return;
 
     const state = actor.snapshot();
-    if (state.executionMode !== 'shadow') {
-      actor.setExecutionMode('shadow');
+    if (state.executionMode !== 'live') {
+      actor.setExecutionMode('live');
     }
     this.liveAuthorizationSources.delete(tableId);
     if (state.projection.autoBetStatus === 'ARMED') {
@@ -817,8 +1144,8 @@ export class DesktopConsoleService {
         && this.liveAuthorizationSources.has(actor.tableId));
     if (hasLiveTable) return;
 
-    this.liveExecutionMode = 'shadow';
-    this.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
+    this.liveExecutionMode = 'live';
+    this.setOrchestratorExecutor(null);
     this.setOperationalWagerExecutor(false);
     try {
       await this.setPersistentLiveGate(false);
@@ -828,8 +1155,13 @@ export class DesktopConsoleService {
   }
 
   private async stopLiveFeed(tableId: string, feed: TableExport): Promise<void> {
-    if (this.liveFeeds.get(tableId) === feed) this.liveFeeds.delete(tableId);
+    this.cancelDisconnectedMonitorRemoval(tableId);
+    if (this.liveFeeds.get(tableId) === feed) {
+      this.liveFeeds.delete(tableId);
+      this.liveRoomIdsByTable.delete(tableId);
+    }
     this.runtimeObservedTableIds.delete(tableId);
+    this.resolveTransientTableIncidents(tableId);
     await this.failCloseLiveExecution([tableId]);
     try {
       await feed.stop();
@@ -849,6 +1181,7 @@ export class DesktopConsoleService {
     feed: TableExport,
   ): Promise<MonitorFeedTransitionStopResult> {
     if (this.liveFeeds.get(tableId) !== feed) return { kind: 'not-current' };
+    this.cancelDisconnectedMonitorRemoval(tableId);
     try {
       await this.failCloseLiveExecution([tableId]);
     } catch (error) {
@@ -859,9 +1192,58 @@ export class DesktopConsoleService {
     } catch (error) {
       return { kind: 'failed', error };
     }
-    if (this.liveFeeds.get(tableId) === feed) this.liveFeeds.delete(tableId);
+    if (this.liveFeeds.get(tableId) === feed) {
+      this.liveFeeds.delete(tableId);
+      this.liveRoomIdsByTable.delete(tableId);
+    }
     this.runtimeObservedTableIds.delete(tableId);
+    this.resolveTransientTableIncidents(tableId);
     return { kind: 'stopped' };
+  }
+
+  private cancelDisconnectedMonitorRemoval(tableId: string): void {
+    const timer = this.disconnectedMonitorRemovalTimers.get(tableId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.disconnectedMonitorRemovalTimers.delete(tableId);
+  }
+
+  private scheduleDisconnectedMonitorRemoval(tableId: string, reason?: string): void {
+    if (this.closing || !this.monitorTableIds.includes(tableId)) return;
+    if (this.disconnectedMonitorRemovalTimers.has(tableId)) return;
+    const delayMs = reason === 'table-feed-stale' ? 0 : DISCONNECTED_MONITOR_REMOVAL_MS;
+    const timer = setTimeout(() => {
+      this.disconnectedMonitorRemovalTimers.delete(tableId);
+      void this.enqueueLiveMonitorOperation(async () => {
+        await this.removeDisconnectedMonitorTable(tableId);
+      }).catch(error => this.recordLiveMonitorError(error, 'monitor-failure', 'degraded', tableId));
+    }, delayMs);
+    timer.unref?.();
+    this.disconnectedMonitorRemovalTimers.set(tableId, timer);
+  }
+
+  private async removeDisconnectedMonitorTable(tableId: string): Promise<void> {
+    if (!this.monitorTableIds.includes(tableId)) return;
+    const feed = this.liveFeeds.get(tableId);
+    const health = feed?.health();
+    const shouldRemove = feed === undefined
+      || health?.state === 'DISCONNECTED'
+      || (typeof health?.stalenessMs === 'number' && health.stalenessMs >= DISCONNECTED_MONITOR_REMOVAL_MS);
+    if (!shouldRemove) return;
+
+    if (feed !== undefined) await this.stopLiveFeed(tableId, feed);
+    await this.failCloseLiveExecution([tableId]);
+    const nextTableIds = this.monitorTableIds.filter(candidate => candidate !== tableId);
+    this.monitorTableIds = nextTableIds;
+    this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
+    this.syncLiveApprovalsToMonitorTables();
+    this.browserBridge?.setSelectedTableIds(nextTableIds);
+  }
+
+  private resolveTransientTableIncidents(tableId: string): void {
+    this.runtimeIncidents.resolve('table-feed-stale', tableId);
+    this.runtimeIncidents.resolve('monitor-failure', tableId);
+    this.runtimeIncidents.resolve('bridge-disconnected', tableId);
   }
 
   async startBrowserBridge(port = 17890): Promise<{ port: number }> {
@@ -897,6 +1279,7 @@ export class DesktopConsoleService {
     this.browserBridge = undefined;
     this.browserBridgePort = 0;
     this.liveAuthorizationSources.clear();
+    this.setOrchestratorExecutor(null);
     this.setOperationalWagerExecutor(false);
   }
 
@@ -911,20 +1294,17 @@ export class DesktopConsoleService {
     };
   }
 
-  async startLiveRoomMonitor(port = 17890, executionMode: ExecutionMode = 'shadow'): Promise<{ port: number }> {
-    return this.enqueueExecutionStateOperation(() => this.startLiveRoomMonitorInner(port, executionMode));
+  async startLiveRoomMonitor(port = 17890, _executionMode: ExecutionMode = 'live'): Promise<{ port: number }> {
+    return this.enqueueExecutionStateOperation(() => this.startLiveRoomMonitorInner(port));
   }
 
-  private async startLiveRoomMonitorInner(port: number, executionMode: ExecutionMode): Promise<{ port: number }> {
-    if (executionMode === 'live') {
-      throw new Error('live monitor startup requires persisted per-table approval');
-    }
+  private async startLiveRoomMonitorInner(port: number): Promise<{ port: number }> {
     await this.startupFailCloseTask;
     const startsNewMonitorSession = !this.liveMonitorActivated;
     this.liveMonitorActivated = true;
-    this.liveExecutionMode = executionMode === 'simulated' ? 'simulated' : 'shadow';
+    this.liveExecutionMode = 'live';
     this.ensureMonitorActors(this.monitorTableIds);
-    this.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
+    this.setOrchestratorExecutor(null);
     this.setOperationalWagerExecutor(false);
     const started = await this.startBrowserBridge(port);
     if (startsNewMonitorSession) {
@@ -985,6 +1365,8 @@ export class DesktopConsoleService {
       clearTimeout(this.liveRoomTimer);
       this.liveRoomTimer = undefined;
     }
+    for (const timer of this.disconnectedMonitorRemovalTimers.values()) clearTimeout(timer);
+    this.disconnectedMonitorRemovalTimers.clear();
     this.liveMonitorActivated = false;
     this.liveMonitorRetryAttempt = 0;
     this.runtimeObservedTableIds.clear();
@@ -998,8 +1380,8 @@ export class DesktopConsoleService {
       for (const [tableId, feed] of feedEntries) {
         await this.stopLiveFeed(tableId, feed);
       }
-      this.liveExecutionMode = 'shadow';
-      this.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
+      this.liveExecutionMode = 'live';
+      this.setOrchestratorExecutor(null);
       this.setOperationalWagerExecutor(false);
     });
   }
@@ -1011,15 +1393,35 @@ export class DesktopConsoleService {
   private async attachLiveTablesInner(): Promise<void> {
     const browserBridge = this.browserBridge;
     if (!browserBridge) return;
-    // A bridge with neither a configured whitelist nor an explicit page selection
-    // must not turn every discovered lobby room into a monitored actor.
+    const discoveredRooms = browserBridge.getDiscoveredRooms();
+    this.refreshTableMetadataFromRooms(discoveredRooms);
+    if (this.liveMonitorActivated && !this.suppressDiscoveredMonitorAutoAdd) {
+      this.autoAddDiscoveredMonitorTables(discoveredRooms);
+    }
     if (
-      !browserBridge.hasRuntimeTableSelection()
+      this.monitorTableIds.length === 0
+      && !browserBridge.hasRuntimeTableSelection()
       && !browserBridge.hasConfiguredTableSelection()
     ) return;
 
-    const selectedTableIds = new Set(this.currentMonitorTableIds());
     const rooms = await browserBridge.discoverRooms();
+    this.refreshTableMetadataFromRooms(rooms);
+    if (this.liveMonitorActivated && !this.suppressDiscoveredMonitorAutoAdd) {
+      this.autoAddDiscoveredMonitorTables(rooms);
+    }
+    const discoveredTableIds = discoveredMonitorTableIds([...discoveredRooms, ...rooms]);
+    const discoveryReliable = browserBridge.getExtensionStatus().authenticated
+      && discoveredTableIds.size > 0;
+    for (const tableId of this.monitorTableIds) {
+      if (discoveredTableIds.has(tableId) || this.liveFeeds.has(tableId)) {
+        this.cancelDisconnectedMonitorRemoval(tableId);
+      } else if (discoveryReliable) {
+        this.scheduleDisconnectedMonitorRemoval(tableId, 'table-not-discovered');
+      } else {
+        this.cancelDisconnectedMonitorRemoval(tableId);
+      }
+    }
+    const selectedTableIds = new Set(this.currentMonitorTableIds());
     for (const room of rooms) {
       for (const table of room.tables) {
         // The service is the final allowlist boundary; never rely solely on a bridge cache.
@@ -1028,9 +1430,11 @@ export class DesktopConsoleService {
         if (!this.orchestrator.getActor(table.tableId)) {
           this.orchestrator.registerTable(table.profile, this.liveExecutionMode, 100);
         }
+        this.cancelDisconnectedMonitorRemoval(table.tableId);
         await this.resetMonitorExecutionState(table.tableId);
 
         const feed = browserBridge.openTable(room.roomId, table.tableId);
+        this.liveRoomIdsByTable.set(table.tableId, room.roomId);
         this.liveFeeds.set(table.tableId, feed);
         try {
           await feed.start({
@@ -1059,6 +1463,7 @@ export class DesktopConsoleService {
                   });
                 }
                 await this.failCloseLiveExecution([tableId]);
+                this.scheduleDisconnectedMonitorRemoval(tableId, reason);
                 const sourceSeq = this.nextMonitorSourceSeq(tableId);
                 await this.enqueueMonitorEvent({
                   type: 'connectionLost',
@@ -1074,6 +1479,7 @@ export class DesktopConsoleService {
             },
             onRestored: async (tableId, proof) => {
               if (!this.isCurrentLiveFeed(tableId, feed)) return;
+              this.cancelDisconnectedMonitorRemoval(tableId);
               const sourceSeq = this.nextMonitorSourceSeq(tableId);
               await this.enqueueMonitorEvent({
                 type: 'connectionRestored',
@@ -1092,7 +1498,10 @@ export class DesktopConsoleService {
             continue;
           }
         } catch (error) {
-          if (this.liveFeeds.get(table.tableId) === feed) this.liveFeeds.delete(table.tableId);
+          if (this.liveFeeds.get(table.tableId) === feed) {
+            this.liveFeeds.delete(table.tableId);
+            this.liveRoomIdsByTable.delete(table.tableId);
+          }
           this.runtimeObservedTableIds.delete(table.tableId);
           try {
             await feed.stop();
@@ -1114,16 +1523,63 @@ export class DesktopConsoleService {
     const candidates = new Map<string, MonitorTableCandidate>();
     for (const room of discovered) {
       for (const table of room.tables) {
-        if (!candidates.has(table.tableId)) {
-          candidates.set(table.tableId, {
-            roomId: room.roomId,
-            ...(room.displayName === undefined ? {} : { roomName: room.displayName }),
-            tableId: table.tableId,
-          });
-        }
+        const previous = candidates.get(table.tableId);
+        candidates.set(table.tableId, {
+          roomId: previous?.roomId ?? room.roomId,
+          tableId: table.tableId,
+          ...(previous?.roomName !== undefined || room.displayName !== undefined
+            ? { roomName: room.displayName ?? previous?.roomName ?? '' }
+            : {}),
+          ...(previous?.displayName !== undefined || table.displayName !== undefined
+            ? { displayName: table.displayName ?? previous?.displayName ?? '' }
+            : {}),
+          ...(previous?.roundId !== undefined || table.roundId !== undefined
+            ? { roundId: table.roundId ?? previous?.roundId ?? '' }
+            : {}),
+          ...(previous?.gameCount !== undefined || table.gameCount !== undefined
+            ? { gameCount: table.gameCount ?? previous?.gameCount ?? 0 }
+            : {}),
+        });
       }
     }
     return [...candidates.values()];
+  }
+
+  private tableMetadataSnapshot(monitorCandidates: readonly MonitorTableCandidate[]): MonitorTableCandidate[] {
+    const metadata = new Map<string, MonitorTableCandidate>(
+      monitorCandidates.map(candidate => [candidate.tableId, candidate]),
+    );
+    for (const table of this.tableMetadata.values()) {
+      const previous = metadata.get(table.tableId);
+      if (previous !== undefined) {
+        metadata.set(table.tableId, {
+          roomId: previous.roomId,
+          tableId: previous.tableId,
+          ...(previous.roomName !== undefined || table.roomName !== undefined
+            ? { roomName: previous.roomName ?? table.roomName ?? '' }
+            : {}),
+          ...(previous.displayName !== undefined || table.displayName !== undefined
+            ? { displayName: previous.displayName ?? table.displayName ?? '' }
+            : {}),
+          ...(previous.roundId !== undefined || table.roundId !== undefined
+            ? { roundId: previous.roundId ?? table.roundId ?? '' }
+            : {}),
+          ...(previous.gameCount !== undefined || table.gameCount !== undefined
+            ? { gameCount: previous.gameCount ?? table.gameCount ?? 0 }
+            : {}),
+        });
+        continue;
+      }
+      metadata.set(table.tableId, {
+        roomId: table.roomId,
+        ...(table.roomName === undefined ? {} : { roomName: table.roomName }),
+        tableId: table.tableId,
+        ...(table.displayName === undefined ? {} : { displayName: table.displayName }),
+        ...(table.roundId === undefined ? {} : { roundId: table.roundId }),
+        ...(table.gameCount === undefined ? {} : { gameCount: table.gameCount }),
+      });
+    }
+    return [...metadata.values()];
   }
 
   private recordCounts(tableIds: readonly string[] | undefined): DesktopRecordCounts {
@@ -1137,12 +1593,11 @@ export class DesktopConsoleService {
 
   private displayedTableIds(fullSnapshot: OrchestratorSnapshot): string[] {
     if (!this.liveMonitorActivated) return Object.keys(fullSnapshot.tables);
-    const simulatedTableIds = this.demoRunning
-      ? Object.values(fullSnapshot.tables)
-        .filter(table => table.executionMode === 'simulated')
-        .map(table => table.tableId)
+    const demoTableIds = this.demoRunning
+      ? Object.keys(fullSnapshot.tables)
+        .filter(tableId => !this.monitorTableIds.includes(tableId))
       : [];
-    return [...this.monitorTableIds, ...simulatedTableIds.filter(tableId => !this.monitorTableIds.includes(tableId))];
+    return [...this.monitorTableIds, ...demoTableIds];
   }
 
   snapshot(options: DesktopSnapshotOptions = {}): DesktopConsoleSnapshot {
@@ -1166,6 +1621,7 @@ export class DesktopConsoleService {
     const receipts = includeHistory ? this.ledger.listReceipts() : this.ledger.listReceiptsTail();
     const reservations = includeHistory ? this.orchestrator.getReservations() : this.orchestrator.getReservations().slice(-200);
     const monitorCandidates = this.monitorCandidates();
+    const tableMetadata = this.tableMetadataSnapshot(monitorCandidates);
     const scopedTableIds = usingLiveMonitor ? displayedTableIds : undefined;
     const recordCounts = options.includeRecordCounts === false && this.cachedRecordCounts !== undefined
       ? this.cachedRecordCounts
@@ -1182,6 +1638,7 @@ export class DesktopConsoleService {
       snapshot,
       monitorTableIds: [...this.monitorTableIds],
       monitorCandidates,
+      tableMetadata,
       recordCounts,
       keepalive,
       automation: { enabled: keepalive.enabled },
@@ -1303,6 +1760,8 @@ export class DesktopConsoleService {
       };
       const monitor = new ShadowRoomMonitor({ rooms: [room] });
       const feeds: TableExport[] = [];
+      const previousExecutor = this.currentExecutor;
+      this.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
       try {
         const rooms = await monitor.discoverRooms();
         for (const table of rooms[0].tables) {
@@ -1352,6 +1811,7 @@ export class DesktopConsoleService {
         await this.orchestrator.flush();
       } finally {
         await monitor.close();
+        this.setOrchestratorExecutor(previousExecutor);
       }
       return this.snapshot();
     }
@@ -1412,9 +1872,10 @@ export class DesktopConsoleService {
   private async updateMonitorTableIdsInner(nextTableIds: readonly string[]): Promise<DesktopConsoleSnapshot> {
     const previousTableIds = [...this.monitorTableIds];
     const nextTableIdSet = new Set(nextTableIds);
+    const inheritedSettings = this.currentUnifiedTableSettings();
     this.pendingMonitorTableIds = [...nextTableIds];
     try {
-      this.ensureMonitorActors(nextTableIds);
+      this.ensureMonitorActors(nextTableIds, inheritedSettings);
       const outgoingFeeds = [...this.liveFeeds].filter(([tableId]) => !nextTableIdSet.has(tableId));
       await this.failCloseLiveExecution(outgoingFeeds.map(([tableId]) => tableId));
 
@@ -1435,7 +1896,7 @@ export class DesktopConsoleService {
       await this.attachLiveTablesInner();
       this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
       this.monitorTableIds = [...nextTableIds];
-      this.liveApprovals.retain(nextTableIds);
+      this.syncLiveApprovalsToMonitorTables();
       this.pendingMonitorTableIds = undefined;
       return this.snapshot();
     } catch (error) {
@@ -1449,8 +1910,15 @@ export class DesktopConsoleService {
           await this.stopLiveFeed(tableId, feed);
         }
         this.browserBridge?.setSelectedTableIds(previousTableIds);
-        await this.attachLiveTablesInner();
+        this.monitorTableIds = previousTableIds;
+        this.suppressDiscoveredMonitorAutoAdd = true;
+        try {
+          await this.attachLiveTablesInner();
+        } finally {
+          this.suppressDiscoveredMonitorAutoAdd = false;
+        }
         this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: previousTableIds });
+        this.syncLiveApprovalsToMonitorTables();
       } catch (rollbackError) {
         this.recordLiveMonitorError(rollbackError);
       }
@@ -1460,10 +1928,10 @@ export class DesktopConsoleService {
 
   async registerTable(
     profile: TableProfile,
-    executionMode: 'shadow' | 'simulated' | 'live',
+    _executionMode: 'shadow' | 'simulated' | 'live',
     defaultBetAmount: number,
   ): Promise<DesktopConsoleSnapshot> {
-    this.orchestrator.registerTable({ ...profile, minEV: Math.max(0, profile.minEV) }, executionMode, defaultBetAmount);
+    this.orchestrator.registerTable({ ...profile, minEV: Math.max(0, profile.minEV) }, 'live', defaultBetAmount);
     return this.snapshot();
   }
 
@@ -1487,62 +1955,32 @@ export class DesktopConsoleService {
       if (armed && !this.operationalWagers.getKeepaliveState().enabled) {
         throw new Error('global automation is disabled');
       }
-      if (armed && this.liveApprovals.has(tableId) && !this.liveAuthorizationSources.has(tableId)) {
-        throw new Error(`live execution is blocked for ${tableId}: ${this.liveTableReasons(tableId).join(', ')}`);
-      }
-      if (armed && this.hasUnknownExecution()) {
-        throw new Error('unresolved UNKNOWN execution blocks automatic betting');
-      }
-      if (armed && this.hasSettlementGap(tableId)) {
-        throw new Error(`unresolved settlement gap blocks automatic betting for ${tableId}`);
-      }
       await actor.setAutoBet(armed, shoeId);
       return this.snapshot();
     });
   }
 
-  async setExecutionMode(tableId: string, mode: 'shadow' | 'live'): Promise<DesktopConsoleSnapshot> {
+  async setExecutionMode(tableId: string, _mode: 'shadow' | 'live'): Promise<DesktopConsoleSnapshot> {
     return this.enqueueExecutionStateOperation(async () => {
       await this.startupFailCloseTask;
       const actor = this.orchestrator.getActor(tableId);
       if (!actor) throw new Error(`unknown table ${tableId}`);
+      this.orchestrator.updateTableExecutionMode(tableId, 'live');
+      this.liveApprovals.approve(tableId);
       const bridge = this.browserBridge;
-      if (mode === 'live' && !bridge) {
+      if (!bridge) {
         throw new Error('browser bridge is not running');
-      }
-      if (mode === 'live') {
-        const reasons = this.liveTableReasons(tableId, true);
-        if (reasons.length > 0) {
-          throw new Error(`live execution is blocked for ${tableId}: ${reasons.join(', ')}`);
-        }
       }
 
       const shoeId = actor.getProjection().shoeId || undefined;
       await actor.setAutoBet(false, shoeId);
 
-      if (mode === 'live') {
-        await this.setPersistentLiveGate(true);
-        this.setOrchestratorExecutor({
-          requestBet: request => bridge!.requestBet(request),
-        });
-        this.setOperationalWagerExecutor(true);
-        this.orchestrator.updateTableExecutionMode(tableId, 'live');
-        this.liveApprovals.approve(tableId);
-        this.liveAuthorizationSources.set(tableId, 'manual');
-        return this.snapshot();
-      }
-
-      this.liveApprovals.revoke(tableId);
-      this.liveAuthorizationSources.delete(tableId);
-      this.orchestrator.updateTableExecutionMode(tableId, 'shadow');
-      const hasLiveTable = this.orchestrator.listActors()
-        .some(candidate => candidate.snapshot().executionMode === 'live'
-          && this.liveAuthorizationSources.has(candidate.tableId));
-      if (!hasLiveTable) {
-        await this.setPersistentLiveGate(false);
-        this.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
-        this.setOperationalWagerExecutor(false);
-      }
+      await this.setPersistentLiveGate(true);
+      this.setOrchestratorExecutor({
+        requestBet: request => bridge.requestBet(request),
+      });
+      this.setOperationalWagerExecutor(true);
+      this.liveAuthorizationSources.set(tableId, 'manual');
       return this.snapshot();
     });
   }
@@ -1551,11 +1989,20 @@ export class DesktopConsoleService {
     readonly tableId: string;
     readonly market: 'banker' | 'player' | 'bankerPair' | 'playerPair';
     readonly amount: number;
+    readonly handId?: string;
   }): Promise<OperationalWagerResult & { readonly snapshot: DesktopConsoleSnapshot }> {
+    await this.startupFailCloseTask;
+    const actor = this.orchestrator.getActor(input.tableId);
+    const bridge = this.browserBridge;
+    if (actor && bridge) {
+      this.orchestrator.updateTableExecutionMode(input.tableId, 'live');
+      await this.setPersistentLiveGate(true);
+      this.setOperationalWagerExecutor(true);
+      this.liveAuthorizationSources.set(input.tableId, 'manual');
+    }
     const result = await this.operationalWagers.executeManual(input);
     if (result.status === 'UNKNOWN') {
       this.refreshAccountingIncidents();
-      await this.enqueueExecutionStateOperation(() => this.failCloseLiveExecution(this.liveApprovals.list()));
     }
     return { ...result, snapshot: this.snapshot() };
   }
@@ -1588,8 +2035,7 @@ export class DesktopConsoleService {
       const receiptRaw = receipt.raw;
       const commitStarted = typeof receiptRaw === 'object'
         && receiptRaw !== null
-        && Reflect.get(receiptRaw, 'commitStarted') === true
-        && Reflect.get(receiptRaw, 'commitPoint') === 'confirmBet';
+        && Reflect.get(receiptRaw, 'commitStarted') === true;
       const unknownExecution = record.status === 'UNKNOWN'
         && commitStarted;
       const committedRejectedExecution = record.status === 'REJECTED'
@@ -1615,7 +2061,7 @@ export class DesktopConsoleService {
         throw new Error('platform receipt does not match the operational wager');
       }
       if (!commitStarted) {
-        throw new Error('platform receipt has no proof that confirmBet started');
+        throw new Error('platform receipt has no proof that the bet was submitted');
       }
 
       const settlement = this.ledger.getHandSettlement(
@@ -1637,7 +2083,10 @@ export class DesktopConsoleService {
         record.reconciliation !== undefined
         && (
           record.reconciliation.status !== 'ACCEPTED'
-          || record.reconciliation.reason !== 'operator-confirmed-platform-accepted'
+          || (
+            record.reconciliation.reason !== 'operator-confirmed-platform-accepted'
+            && record.reconciliation.reason !== 'committed-hand-settled'
+          )
         )
       ) {
         throw new Error('operational wager has an invalid reconciliation audit');
@@ -1771,9 +2220,6 @@ export class DesktopConsoleService {
     if (!enabled) this.operationalWagers.disableKeepaliveImmediately();
     return await this.enqueueExecutionStateOperation(async () => {
       await this.startupFailCloseTask;
-      if (enabled && this.hasUnknownExecution()) {
-        throw new Error('unresolved UNKNOWN execution blocks automation');
-      }
       const current = this.operationalWagers.getKeepaliveState();
       await this.applyKeepaliveSettings({
         enabled,
@@ -1784,6 +2230,18 @@ export class DesktopConsoleService {
       await this.reconcileUnattendedExecution();
       return this.snapshot();
     });
+  }
+
+  acknowledgeRuntimeIncident(incidentId: string): DesktopConsoleSnapshot {
+    const normalized = incidentId.trim();
+    if (normalized.length === 0) throw new TypeError('incident id must not be empty');
+    this.runtimeIncidents.acknowledge(normalized);
+    return this.snapshot();
+  }
+
+  acknowledgeAllRuntimeIncidents(): DesktopConsoleSnapshot {
+    this.runtimeIncidents.acknowledgeAllActive();
+    return this.snapshot();
   }
 
   async executeOneShotLiveBet(input: OneShotLiveBetCommand): Promise<OneShotLiveBetResult> {
@@ -1814,37 +2272,22 @@ export class DesktopConsoleService {
     if (!hasOneShotLiveBetActor(actor)) {
       throw new Error('table actor does not support one-shot live bets');
     }
+    this.orchestrator.updateTableExecutionMode(command.tableId, 'live');
 
     const bridge = this.browserBridge;
     if (!bridge) throw new Error('browser bridge is not running');
-    const readinessReasons = this.liveTableReasons(command.tableId, true);
-    if (readinessReasons.length > 0) {
-      throw new Error(`one-shot live bet is blocked for ${command.tableId}: ${readinessReasons.join(', ')}`);
-    }
-
-    const persistentLiveTableId = this.liveApprovals.list()[0]
-      ?? this.orchestrator.listActors()
-        .find(candidate => candidate.snapshot().executionMode === 'live')?.tableId;
-    if (persistentLiveTableId) {
-      throw new Error(`persistent live execution mode is active for table ${persistentLiveTableId}`);
-    }
-
-    const armedTable = this.orchestrator.listActors()
-      .find(candidate => candidate.getProjection().autoBetStatus === 'ARMED');
-    if (armedTable) {
-      throw new Error(`automatic betting is armed for table ${armedTable.tableId}`);
-    }
 
     const executor: Pick<BrowserAdapter, 'requestBet'> = {
       requestBet: request => bridge.requestBet(request),
     };
     const previousExecutor = this.currentExecutor;
+    const gateWasAlreadyEnabled = this.persistentLiveGateEnabled;
     actor.setExecutor(executor);
     let result: OneShotBetResult;
     try {
       result = await (async (): Promise<OneShotBetResult> => {
         try {
-          bridge.setLiveBetEnabled(true);
+          if (!gateWasAlreadyEnabled) bridge.setLiveBetEnabled(true);
           return await actor.placeOneShotBet({
             shoeId: command.shoeId,
             handId: command.handId,
@@ -1852,7 +2295,7 @@ export class DesktopConsoleService {
             amount: command.amount,
           });
         } finally {
-          bridge.setLiveBetEnabled(false);
+          if (!gateWasAlreadyEnabled) bridge.setLiveBetEnabled(false);
         }
       })();
     } finally {
@@ -1861,7 +2304,6 @@ export class DesktopConsoleService {
 
     if (result.status === 'UNKNOWN') {
       this.refreshAccountingIncidents();
-      await this.failCloseLiveExecution(this.liveApprovals.list());
     }
 
     const snapshot = this.snapshot();
@@ -1904,6 +2346,18 @@ export class DesktopConsoleService {
   async clearMonitorData(): Promise<DesktopConsoleSnapshot> {
     await this.stopDemo();
     await this.orchestrator.clearMonitorData();
+    this.cachedRecordCounts = undefined;
+    this.cachedSummary = undefined;
+    this.runtimeIncidents.resolveAll('table-feed-stale');
+    this.runtimeIncidents.resolveAll('monitor-failure');
+    this.runtimeIncidents.resolveAll('settlement-gap');
+    this.runtimeIncidents.resolveAll('unknown-execution');
+    for (const tableId of this.monitorTableIds) {
+      this.cancelDisconnectedMonitorRemoval(tableId);
+      if (this.liveFeeds.get(tableId)?.health().state === 'CONNECTED') {
+        this.runtimeObservedTableIds.add(tableId);
+      }
+    }
     if (this.liveMonitorActivated) this.ensureMonitorActors(this.monitorTableIds);
     this.lastSeed = undefined;
     this.demoError = undefined;
@@ -1921,6 +2375,17 @@ export class DesktopConsoleService {
       await this.orchestrator.close();
     });
   }
+}
+
+function pairOutcomesFromCards(
+  playerCards: readonly { rank: string }[],
+  bankerCards: readonly { rank: string }[],
+): { bankerPair: boolean; playerPair: boolean } | undefined {
+  if (playerCards.length < 2 || bankerCards.length < 2) return undefined;
+  return {
+    playerPair: playerCards[0]!.rank === playerCards[1]!.rank,
+    bankerPair: bankerCards[0]!.rank === bankerCards[1]!.rank,
+  };
 }
 
 function assertNeverOneShotBetResult(value: never): never {

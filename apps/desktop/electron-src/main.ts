@@ -92,6 +92,12 @@ function registerIpc(): void {
     if (typeof enabled !== 'boolean') throw new TypeError('automation enabled must be boolean');
     return getService().setAutomationEnabled(enabled);
   });
+  ipcMain.handle('console:acknowledge-runtime-incident', (_event, incidentId: unknown) => {
+    if (typeof incidentId !== 'string') throw new TypeError('incident id must be a string');
+    return getService().acknowledgeRuntimeIncident(incidentId);
+  });
+  ipcMain.handle('console:acknowledge-all-runtime-incidents', () =>
+    getService().acknowledgeAllRuntimeIncidents());
   ipcMain.handle('console:confirm-physical-shoe', (_event, tableId: string) =>
     getService().confirmPhysicalShoe(tableId));
   ipcMain.handle('console:manual-correction', (_event, tableId: string, correction, shoeId?: string) =>
@@ -106,7 +112,7 @@ function registerIpc(): void {
     getService().updateMonitorTableIds(tableIds));
   ipcMain.handle('console:clear-monitor-data', () => getService().clearMonitorData());
   ipcMain.handle('console:start-live-monitor', (_event, port?: number, executionMode?: 'shadow' | 'simulated' | 'live') =>
-    getService().startLiveRoomMonitor(port ?? 17890, executionMode ?? 'shadow'));
+    getService().startLiveRoomMonitor(port ?? 17890, executionMode ?? 'live'));
   ipcMain.handle('console:stop-live-monitor', () => getService().stopLiveRoomMonitor());
   ipcMain.handle('console:browser-bridge-status', () => getService().browserBridgeStatus());
 }

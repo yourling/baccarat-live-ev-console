@@ -248,6 +248,37 @@ describe('ledger replay', () => {
     led.close();
   });
 
+  it('does not consume inventory twice for a replayed card on the same hand', () => {
+    const profile = defaultProfile('t1');
+    const events: NormalizedEvent[] = [
+      ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile: { ...profile, autoConfirmNewShoe: true } }, 1),
+      ev({ type: 'cardObserved', shoeId: 'shoe-1', handId: 'h1', card: { rank: 'Q', suit: 'S' }, position: 'player' }, 2),
+      ev({ type: 'cardObserved', shoeId: 'shoe-1', handId: 'h1', card: { rank: '9', suit: 'H' }, position: 'player' }, 3),
+      ev({ type: 'cardObserved', shoeId: 'shoe-1', handId: 'h1', card: { rank: 'Q', suit: 'S' }, position: 'player' }, 4),
+    ];
+    const state = replayEvents(events).get('t1');
+    expect(state?.seenCards).toEqual([
+      { rank: 'Q', suit: 'S' },
+      { rank: '9', suit: 'H' },
+    ]);
+    expect(state?.remainingTotal).toBe(414);
+  });
+
+  it('counts two same-rank copies with different raw shoe ids', () => {
+    const profile = defaultProfile('t1');
+    const events: NormalizedEvent[] = [
+      ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile: { ...profile, autoConfirmNewShoe: true } }, 1),
+      ev({ type: 'cardObserved', shoeId: 'shoe-1', handId: 'h1', card: { rank: '5', suit: 'D', raw: '5D3' }, position: 'player' }, 2),
+      ev({ type: 'cardObserved', shoeId: 'shoe-1', handId: 'h1', card: { rank: '5', suit: 'D', raw: '5D4' }, position: 'player' }, 3),
+    ];
+    const state = replayEvents(events).get('t1');
+    expect(state?.seenCards).toEqual([
+      { rank: '5', suit: 'D', raw: '5D3' },
+      { rank: '5', suit: 'D', raw: '5D4' },
+    ]);
+    expect(state?.remainingTotal).toBe(414);
+  });
+
   it('counts the first physical-shoe hand when the betting window opens before cards arrive', () => {
     // Given: the live protocol opens the betting window before reporting the first card.
     const profile = defaultProfile('t1');
@@ -281,7 +312,7 @@ describe('ledger replay', () => {
     expect(state?.handNumber).toBe(1);
   });
 
-  it('counts an unknown-monitor-session hand without arming auto-bet', () => {
+  it('counts an unknown-monitor-session hand and honors auto-bet arming', () => {
     // Given: monitoring attaches mid-shoe and receives a live betting window.
     const profile = defaultProfile('t1');
     const events: NormalizedEvent[] = [
@@ -292,11 +323,11 @@ describe('ledger replay', () => {
     // When: the attach stream is projected.
     const state = replayEvents(events).get('t1');
 
-    // Then: the session-local sequence advances while execution remains fail-closed.
+    // Then: the session-local sequence advances and automatic real betting can remain armed.
     expect(state).toMatchObject({
       handNumber: 1,
       shoeBaseline: 'unknown-monitor-session',
-      autoBetStatus: 'DISARMED',
+      autoBetStatus: 'ARMED',
     });
   });
 
@@ -315,6 +346,64 @@ describe('ledger replay', () => {
 
     // Then: the stale hand neither increments nor replaces the current hand.
     expect(state).toMatchObject({ handNumber: 2, currentHandId: 'h2', status: 'TRACKING' });
+  });
+
+  it('records betting-window close time from the opened event', () => {
+    const profile = defaultProfile('t1');
+    const events: NormalizedEvent[] = [
+      ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile: { ...profile, autoConfirmNewShoe: true } }, 1),
+      ev({
+        type: 'bettingWindowOpened',
+        shoeId: 'shoe-1',
+        handId: 'h1',
+        market: 'bankerPair',
+        closesAt: '2026-08-30T06:58:18.000Z',
+      }, 2),
+    ];
+
+    const state = replayEvents(events).get('t1');
+
+    expect(state).toMatchObject({
+      status: 'BETTING_WINDOW',
+      currentHandId: 'h1',
+      bettingWindowClosesAt: '2026-08-30T06:58:18.000Z',
+    });
+  });
+
+  it('reopens the current betting window after a close if no cards have been seen', () => {
+    const profile = defaultProfile('t1');
+    const events: NormalizedEvent[] = [
+      ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile: { ...profile, autoConfirmNewShoe: true } }, 1),
+      ev({ type: 'bettingWindowOpened', shoeId: 'shoe-1', handId: 'h1', market: 'bankerPair' }, 2),
+      ev({ type: 'bettingWindowClosed', shoeId: 'shoe-1', handId: 'h1', market: 'bankerPair' }, 3),
+      ev({ type: 'bettingWindowOpened', shoeId: 'shoe-1', handId: 'h1', market: 'bankerPair' }, 4),
+    ];
+
+    const state = replayEvents(events).get('t1');
+
+    expect(state).toMatchObject({
+      currentHandId: 'h1',
+      status: 'BETTING_WINDOW',
+      currentHandHasCards: false,
+    });
+  });
+
+  it('does not reopen a betting window after the current hand has cards', () => {
+    const profile = defaultProfile('t1');
+    const events: NormalizedEvent[] = [
+      ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile: { ...profile, autoConfirmNewShoe: true } }, 1),
+      ev({ type: 'bettingWindowOpened', shoeId: 'shoe-1', handId: 'h1', market: 'bankerPair' }, 2),
+      ev({ type: 'cardObserved', shoeId: 'shoe-1', handId: 'h1', card: { rank: 'A' } }, 3),
+      ev({ type: 'bettingWindowOpened', shoeId: 'shoe-1', handId: 'h1', market: 'bankerPair' }, 4),
+    ];
+
+    const state = replayEvents(events).get('t1');
+
+    expect(state).toMatchObject({
+      currentHandId: 'h1',
+      status: 'TRACKING',
+      currentHandHasCards: true,
+    });
   });
 
   it('red card seals shoe only after current hand settled', () => {
@@ -592,10 +681,10 @@ describe('projection state machine hardening', () => {
     const events: NormalizedEvent[] = [
       ev({ type: 'newShoeSignal', shoeId: 's1', profile: { ...profile, autoConfirmNewShoe: true, numberOfDecks: 1 } }, 1),
       ev({ type: 'cardObserved', shoeId: 's1', handId: 'h1', card: { rank: 'A' } }, 2),
-      ev({ type: 'cardObserved', shoeId: 's1', handId: 'h1', card: { rank: 'A' } }, 3),
-      ev({ type: 'cardObserved', shoeId: 's1', handId: 'h1', card: { rank: 'A' } }, 4),
-      ev({ type: 'cardObserved', shoeId: 's1', handId: 'h1', card: { rank: 'A' } }, 5),
-      ev({ type: 'cardObserved', shoeId: 's1', handId: 'h1', card: { rank: 'A' } }, 6),
+      ev({ type: 'cardObserved', shoeId: 's1', handId: 'h2', card: { rank: 'A' } }, 3),
+      ev({ type: 'cardObserved', shoeId: 's1', handId: 'h3', card: { rank: 'A' } }, 4),
+      ev({ type: 'cardObserved', shoeId: 's1', handId: 'h4', card: { rank: 'A' } }, 5),
+      ev({ type: 'cardObserved', shoeId: 's1', handId: 'h5', card: { rank: 'A' } }, 6),
     ];
     expect(() => replayEvents(events)).toThrowError(ProjectionError);
   });
@@ -1303,6 +1392,104 @@ describe('decision hand records', () => {
       outcomes: { bankerPair: false, playerPair: false },
     });
     expect(ledgerOutcome).toBe(false);
+    ledger.close();
+  });
+});
+
+describe('monitor history retention', () => {
+  it('keeps recent and reserved hands then drops older monitor events', () => {
+    const ledger = new SqliteLedger();
+    const profile = { ...defaultProfile('t1'), autoConfirmNewShoe: true };
+    ledger.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'shoe-1', profile }, 1));
+    let seq = 2;
+    for (const handId of ['h1', 'h2', 'h3', 'h4']) {
+      ledger.appendEvent(ev({
+        type: 'bettingWindowOpened', shoeId: 'shoe-1', handId, market: 'bankerPair',
+      }, seq++));
+      ledger.appendEvent(ev({
+        type: 'cardObserved', shoeId: 'shoe-1', handId, card: { rank: 'A' }, position: 'player',
+      }, seq++));
+      ledger.appendEvent(ev({
+        type: 'cardObserved', shoeId: 'shoe-1', handId, card: { rank: 'K' }, position: 'banker',
+      }, seq++));
+      ledger.appendEvent(ev({
+        type: 'handSettled',
+        shoeId: 'shoe-1',
+        handId,
+        playerCards: [{ rank: 'A' }, { rank: 'K' }],
+        bankerCards: [{ rank: 'Q' }, { rank: 'Q' }],
+      }, seq++));
+      ledger.saveDecision(decision(`d-${handId}`, handId, 'bankerPair', false, `2026-08-24T01:00:0${seq}.000Z`));
+    }
+    ledger.saveReservation({
+      reservationId: 'rsv-h1',
+      intentId: 'int-h1',
+      tableId: 't1',
+      shoeId: 'shoe-1',
+      handId: 'h1',
+      market: 'player',
+      executionSource: 'manual',
+      amount: 10,
+      maxLoss: 10,
+      maxProfit: 9.5,
+      status: 'RESERVED',
+      createdAt: baseTime,
+    });
+
+    ledger.pruneMonitorHistory(2);
+
+    const events = ledger.listEvents('t1');
+    const cardHands = [...new Set(events.flatMap(event =>
+      event.type === 'cardObserved' && typeof event.handId === 'string' ? [event.handId] : []))];
+    const windowHands = [...new Set(events.flatMap(event =>
+      event.type === 'bettingWindowOpened' && typeof event.handId === 'string' ? [event.handId] : []))];
+    expect(cardHands.sort()).toEqual(['h1', 'h2', 'h3', 'h4']);
+    expect(windowHands.sort()).toEqual(['h1', 'h3', 'h4']);
+    expect(ledger.listDecisions('t1').map(row => row.handId).sort()).toEqual(['h1', 'h3', 'h4']);
+    expect(ledger.listHandCards('t1', 'h2')).toEqual({
+      playerCards: [expect.objectContaining({ rank: 'A' })],
+      bankerCards: [expect.objectContaining({ rank: 'K' })],
+    });
+    expect(ledger.listHandCards('t1', 'h4')).toEqual({
+      playerCards: [expect.objectContaining({ rank: 'A' })],
+      bankerCards: [expect.objectContaining({ rank: 'K' })],
+    });
+    ledger.close();
+  });
+
+  it('drops previous-shoe cards while keeping the current shoe inventory', () => {
+    const ledger = new SqliteLedger();
+    const profile = { ...defaultProfile('t1'), autoConfirmNewShoe: true };
+    ledger.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'shoe-old', profile }, 1));
+    ledger.appendEvent(ev({
+      type: 'cardObserved', shoeId: 'shoe-old', handId: 'old-h', card: { rank: '2' }, position: 'player',
+    }, 2));
+    ledger.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'shoe-new', profile }, 3));
+    ledger.appendEvent(ev({
+      type: 'cardObserved', shoeId: 'shoe-new', handId: 'new-h', card: { rank: 'A' }, position: 'player',
+    }, 4));
+
+    ledger.pruneMonitorHistory(2);
+
+    const events = ledger.listEvents('t1');
+    expect(events).toEqual([
+      expect.objectContaining({ type: 'newShoeSignal', shoeId: 'shoe-new' }),
+      expect.objectContaining({ type: 'cardObserved', handId: 'new-h' }),
+    ]);
+    expect(ledger.listHandCards('t1', 'new-h').playerCards).toEqual([
+      expect.objectContaining({ rank: 'A' }),
+    ]);
+    expect(ledger.listHandCards('t1', 'old-h').playerCards).toEqual([]);
+    ledger.close();
+  });
+
+  it('replaces the previous decision for the same hand market', () => {
+    const ledger = new SqliteLedger();
+    expect(ledger.saveDecision(decision('d1', 'h1', 'bankerPair', false, '2026-08-24T01:00:00.000Z'))).toBe(true);
+    expect(ledger.saveDecision(decision('d2', 'h1', 'bankerPair', true, '2026-08-24T01:00:01.000Z'))).toBe(true);
+    expect(ledger.listDecisions('t1')).toEqual([
+      expect.objectContaining({ snapshotId: 'd2', eligible: true }),
+    ]);
     ledger.close();
   });
 });

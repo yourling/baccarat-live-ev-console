@@ -586,6 +586,50 @@ describe('mstrom runtime-state hook', () => {
     expect(allowed).toBe(true);
   });
 
+  it('allows the content relay on Pragmatic game and portal frames', () => {
+    const pragmaticExpression = contentRelaySource.match(/const PRAGMATIC_PAGE = (.+);/)?.[1];
+    const gamePageExpression = contentRelaySource.match(/const GAME_PAGE = (.+);/)?.[1];
+    if (pragmaticExpression === undefined || gamePageExpression === undefined) {
+      throw new Error('content relay Pragmatic expressions were not found');
+    }
+    for (const hostname of [
+      'client.pragmaticplaylive.net',
+      'prod.vbgames88.com',
+      'q5f2m3bd.zavjcswh.biz',
+    ]) {
+      const allowed = vm.runInNewContext(
+        `(() => { const PRAGMATIC_PAGE = ${pragmaticExpression}; return Boolean(${gamePageExpression}); })()`,
+        { location: { hostname } },
+      );
+      expect(allowed, hostname).toBe(true);
+    }
+  });
+
+  it('disables generic extension keepalive on a Pragmatic popup container', () => {
+    const functionSource = contentRelaySource.match(
+      /function isPragmaticGameContainer\(\) \{[\s\S]*?\n  \}/,
+    )?.[0];
+    if (functionSource === undefined) {
+      throw new Error('Pragmatic keepalive platform guard was not found');
+    }
+    const isPragmatic = vm.runInNewContext(
+      `(() => { ${functionSource}; return isPragmaticGameContainer(); })()`,
+      {
+        location: {
+          hostname: 'www.dafabet.net',
+          pathname: '/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+          href: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+        },
+        document: { querySelectorAll: () => [] },
+        URL,
+        Array,
+      },
+    );
+
+    expect(isPragmatic).toBe(true);
+    expect(contentRelaySource).toContain('if (isPragmaticGameContainer()) return;');
+  });
+
   it('does not enable the content relay on a lookalike evolution host', () => {
     const gamePageExpression = contentRelaySource.match(/const GAME_PAGE = (.+);/)?.[1];
     if (gamePageExpression === undefined) {

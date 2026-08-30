@@ -10,6 +10,9 @@ export type BridgeExecutionReceipt = BetReceipt | OperationalWagerReceipt;
 
 export interface BridgeTableDescriptor {
   tableId: string;
+  displayName?: string;
+  roundId?: string;
+  gameCount?: number;
   profile?: Partial<TableProfile>;
   monitorUrl?: string;
 }

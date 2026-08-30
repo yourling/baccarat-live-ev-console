@@ -51,6 +51,16 @@ function liveReceipt(request: BetExecutionRequest, status: 'ACCEPTED' | 'REJECTE
   };
 }
 
+function acceptingLiveExecutor() {
+  let count = 0;
+  return {
+    requestBet: async (request: BetExecutionRequest) => {
+      count += 1;
+      return liveReceipt(request, 'ACCEPTED', `live-accepted-${count}`);
+    },
+  };
+}
+
 describe('orchestrator table actor', () => {
   it('places one exact live bet without changing persistent mode or arming auto bet', async () => {
     const { ledger, riskLimits } = makeContext();
@@ -92,7 +102,7 @@ describe('orchestrator table actor', () => {
     expect(requests[0]?.intent.amount).toBe(20.50);
     expect(requests[0]?.intent.idempotencyKey).toBe('t1:s1:h1:bankerPair:20.5:one-shot');
     expect(requests[0]?.intent.decisionSnapshotId).toBe('one-shot:t1:s1:h1:bankerPair:20.5');
-    expect(actor.snapshot().executionMode).toBe('shadow');
+    expect(actor.snapshot().executionMode).toBe('live');
     expect(actor.getProjection().autoBetStatus).toBe('DISARMED');
     expect(ledger.listReceipts('t1')).toEqual([
       expect.objectContaining({
@@ -117,14 +127,14 @@ describe('orchestrator table actor', () => {
     ledger.close();
   });
 
-  it('rejects one-shot betting until a physical shoe baseline is known', async () => {
+  it('allows one-shot manual betting before a physical shoe baseline is known', async () => {
     const { ledger, riskLimits } = makeContext();
-    const profile = simProfile();
+    const profile = { ...simProfile(), autoBetArmedByDefault: false };
     let requestCount = 0;
     const executor = {
       requestBet: async (request: BetExecutionRequest) => {
         requestCount += 1;
-        return liveReceipt(request, 'ACCEPTED', 'should-not-execute');
+        return liveReceipt(request, 'ACCEPTED', 'live-unknown-baseline');
       },
     };
     const orchestrator = new Orchestrator({ ledger, riskLimits, executor });
@@ -155,23 +165,36 @@ describe('orchestrator table actor', () => {
       amount: 20,
     });
 
-    expect(result).toEqual({
-      status: 'REJECTED',
-      reason: 'physical-shoe-required',
-    });
-    expect(requestCount).toBe(0);
-    expect(ledger.listReservations('t1')).toHaveLength(0);
+    expect(result).toEqual(expect.objectContaining({
+      status: 'ACCEPTED',
+      receipt: expect.objectContaining({
+        receiptId: 'live-unknown-baseline',
+        status: 'ACCEPTED',
+      }),
+    }));
+    expect(requestCount).toBe(1);
+    expect(ledger.listReservations('t1')).toContainEqual(expect.objectContaining({
+      tableId: 't1',
+      shoeId: 's1',
+      handId: 'h1',
+      market: 'bankerPair',
+      status: 'RESERVED',
+    }));
     ledger.close();
   });
 
-  it('requires a connected table, exact current hand, and a non-armed auto-bet state', async () => {
+  it('allows one-shot manual betting through stale local connection and hand state', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile: TableProfile = {
       ...simProfile(),
       autoBetArmedByDefault: false,
     };
+    let requestCount = 0;
     const executor = {
-      requestBet: async (request: BetExecutionRequest) => liveReceipt(request, 'ACCEPTED', 'should-not-execute'),
+      requestBet: async (request: BetExecutionRequest) => {
+        requestCount += 1;
+        return liveReceipt(request, 'ACCEPTED', `manual-stale-${requestCount}`);
+      },
     };
     const orchestrator = new Orchestrator({ ledger, riskLimits, executor });
     const actor = orchestrator.registerTable(profile, 'shadow', 10);
@@ -216,10 +239,7 @@ describe('orchestrator table actor', () => {
       market: 'bankerPair',
       amount: 20,
     });
-    expect(disconnected).toEqual({
-      status: 'REJECTED',
-      reason: 'connected-required',
-    });
+    expect(disconnected).toEqual(expect.objectContaining({ status: 'ACCEPTED' }));
 
     await orchestrator.enqueue('t1', connectionRestored);
     await orchestrator.enqueue('t1', secondHandWindow);
@@ -227,25 +247,23 @@ describe('orchestrator table actor', () => {
 
     const wrongHand = await actor.placeOneShotBet({
       shoeId: 's1',
-      handId: 'h1',
+      handId: 'h-stale-local',
       market: 'bankerPair',
       amount: 20,
     });
-    expect(wrongHand).toEqual({
-      status: 'REJECTED',
-      reason: 'current-hand-mismatch',
-    });
+    expect(wrongHand).toEqual(expect.objectContaining({ status: 'ACCEPTED' }));
+    expect(requestCount).toBe(2);
     ledger.close();
   });
 
-  it('rejects an armed auto-bet table without changing its mode', async () => {
+  it('allows one-shot manual betting while automatic betting is armed', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile: TableProfile = {
       ...simProfile(),
       autoBetArmedByDefault: false,
     };
     const executor = {
-      requestBet: async (request: BetExecutionRequest) => liveReceipt(request, 'ACCEPTED', 'should-not-execute'),
+      requestBet: async (request: BetExecutionRequest) => liveReceipt(request, 'ACCEPTED', 'manual-while-armed'),
     };
     const orchestrator = new Orchestrator({ ledger, riskLimits, executor });
     const actor = orchestrator.registerTable(profile, 'shadow', 10);
@@ -265,12 +283,22 @@ describe('orchestrator table actor', () => {
       amount: 20,
     });
 
-    expect(result).toEqual({
-      status: 'REJECTED',
-      reason: 'auto-bet-armed',
-    });
-    expect(actor.snapshot().executionMode).toBe('shadow');
-    expect(ledger.listReservations('t1')).toHaveLength(0);
+    expect(result).toEqual(expect.objectContaining({
+      status: 'ACCEPTED',
+      receipt: expect.objectContaining({
+        receiptId: 'manual-while-armed',
+        status: 'ACCEPTED',
+      }),
+    }));
+    expect(actor.snapshot().executionMode).toBe('live');
+    expect(ledger.listReservations('t1')).toContainEqual(expect.objectContaining({
+      tableId: 't1',
+      shoeId: 's1',
+      handId: 'h1',
+      market: 'bankerPair',
+      status: 'RESERVED',
+      receiptId: 'manual-while-armed',
+    }));
     ledger.close();
   });
 
@@ -451,9 +479,14 @@ describe('orchestrator table actor', () => {
 
   it('shadow mode records decisions but does not call executor or create receipts', async () => {
     const { ledger, riskLimits } = makeContext();
-    const profile: TableProfile = { ...defaultProfile('t1'), autoConfirmNewShoe: true, minEV: 0, limits: { minBet: 1, maxBet: 1000 } };
-    const adapter = new SimulatedAdapter({ events: [] });
-    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: adapter });
+    const profile: TableProfile = {
+      ...defaultProfile('t1'),
+      autoConfirmNewShoe: true,
+      autoBetArmedByDefault: true,
+      minEV: 0,
+      limits: { minBet: 1, maxBet: 1000 },
+    };
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: acceptingLiveExecutor() });
     const actor = orchestrator.registerTable(profile, 'shadow', 10);
 
     const events = new FixtureBuilder('t1')
@@ -545,7 +578,7 @@ describe('orchestrator table actor', () => {
     ledger.close();
   });
 
-  it('simulated mode calls executor, persists receipt and keeps reservation until settlement', async () => {
+  it('live mode calls executor, persists receipt and keeps reservation until settlement', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile = simProfile();
     const stream = new FixtureBuilder('t1')
@@ -554,15 +587,14 @@ describe('orchestrator table actor', () => {
       .closeWindow('s1', 'h1', 'bankerPair')
       .settle('s1', 'h1', [{ rank: 'A' }, { rank: 'A' }], [{ rank: 'K' }, { rank: 'Q' }], { bankerPair: true, playerPair: false })
       .build();
-    const adapter = new SimulatedAdapter({ events: stream });
-    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: adapter });
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: acceptingLiveExecutor() });
     const actor = orchestrator.registerTable(profile, 'simulated', 10);
 
     await Promise.all(stream.map(e => orchestrator.enqueue('t1', e)));
     await actor.flush();
     const receipts = ledger.listReceipts('t1');
     expect(receipts.length).toBe(1);
-    expect(receipts[0].receipt.status).toBe('SIMULATED');
+    expect(receipts[0].receipt.status).toBe('ACCEPTED');
     const reservations = orchestrator.getReservations('t1');
     expect(reservations).toHaveLength(1);
     expect(reservations[0]?.status).toBe('SETTLED');
@@ -571,7 +603,7 @@ describe('orchestrator table actor', () => {
     ledger.close();
   });
 
-  it('executes banker-pair and player-pair windows independently in sequence', async () => {
+  it('audits both pair windows but executes at most one automatic wager per hand', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile = simProfile();
     const stream = new FixtureBuilder('t1')
@@ -582,15 +614,16 @@ describe('orchestrator table actor', () => {
       .closeWindow('s1', 'h1', 'playerPair')
       .settle('s1', 'h1', [{ rank: 'A' }, { rank: 'A' }], [{ rank: 'K' }, { rank: 'Q' }], { bankerPair: false, playerPair: true })
       .build();
-    const adapter = new SimulatedAdapter({ events: stream });
-    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: adapter });
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: acceptingLiveExecutor() });
     const actor = orchestrator.registerTable(profile, 'simulated', 10);
 
     await Promise.all(stream.map(event => orchestrator.enqueue('t1', event)));
     await actor.flush();
 
-    expect(ledger.listReceipts('t1').map(row => row.receipt.market)).toEqual(['bankerPair', 'playerPair']);
-    expect(orchestrator.getReservations('t1').map(row => row.status)).toEqual(['SETTLED', 'SETTLED']);
+    expect(ledger.listReceipts('t1').map(row => row.receipt.market)).toEqual(['bankerPair']);
+    expect(ledger.listDecisions('t1').map(row => row.market)).toEqual(['bankerPair', 'playerPair']);
+    expect(orchestrator.getReservations('t1')).toHaveLength(1);
+    expect(orchestrator.getReservations('t1').map(row => row.status)).toEqual(['SETTLED']);
     expect(orchestrator.getRiskState().reservedExposure).toBe(0);
     ledger.close();
   });
@@ -691,13 +724,13 @@ describe('orchestrator table actor', () => {
     await Promise.all(stream.map(event => orchestrator.enqueue('t1', event)));
     await actor.flush();
 
-    // Then: no outcome is invented and automatic betting stops until the operator re-arms it.
+    // Then: no outcome is invented and automatic betting stays armed for the next eligible window.
     expect(orchestrator.getReservations('t1')[0]).toEqual(expect.objectContaining({
       status: 'UNKNOWN',
       releaseReason: 'platform-acknowledgement-unknown',
       receiptId: 'unknown-receipt',
     }));
-    expect(actor.getProjection().autoBetStatus).toBe('DISARMED');
+    expect(actor.getProjection().autoBetStatus).toBe('ARMED');
     expect(orchestrator.getRiskState().reservedExposure).toBe(10);
     expect(orchestrator.getRiskState().pendingExecutions).toBe(1);
 
@@ -726,7 +759,7 @@ describe('orchestrator table actor', () => {
     ledger.close();
   });
 
-  it('treats an executor timeout as unknown and disarms automatic betting', async () => {
+  it('treats an executor timeout as unknown without disarming automatic betting', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile = simProfile();
     const actor = new TableActor({
@@ -749,7 +782,7 @@ describe('orchestrator table actor', () => {
     await actor.flush();
 
     expect(ledger.listReceipts('t1')[0]?.receipt.status).toBe('UNKNOWN');
-    expect(actor.getProjection().autoBetStatus).toBe('DISARMED');
+    expect(actor.getProjection().autoBetStatus).toBe('ARMED');
     expect(actor.snapshot().executionMode).toBe('live');
     expect(actor.getProjection().connectionStatus).toBe('CONNECTED');
     ledger.close();
@@ -779,13 +812,12 @@ describe('orchestrator table actor', () => {
       .openWindow('s1', 'h1', 'bankerPair')
       .openWindow('s1', 'h1', 'bankerPair')
       .build();
-    const adapter = new SimulatedAdapter({ events: stream });
-    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: adapter });
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: acceptingLiveExecutor() });
     const actor = orchestrator.registerTable(profile, 'simulated', 10);
     await Promise.all(stream.map(e => orchestrator.enqueue('t1', e)));
     await actor.flush();
     expect(ledger.listReceipts('t1').length).toBe(1);
-    expect(ledger.listDecisions('t1').length).toBe(2);
+    expect(ledger.listDecisions('t1').length).toBe(1);
     ledger.close();
   });
 
@@ -800,13 +832,12 @@ describe('orchestrator table actor', () => {
       .newShoe('s1', profile)
       .openWindow('s1', 'h1', 'bankerPair')
       .build();
-    const adapter = new SimulatedAdapter({ events: [] });
-    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: adapter });
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: acceptingLiveExecutor() });
     const actor = orchestrator.registerTable(profile, 'simulated', 10);
     await Promise.all(stream.map(e => orchestrator.enqueue('t1', e)));
     await actor.flush();
     expect(ledger.listReceipts('t1').length).toBe(0);
-    expect(ledger.listDecisions('t1').length).toBe(1);
+    expect(ledger.listDecisions('t1').length).toBe(0);
 
     await actor.setAutoBet(true, 's1');
     const window: NormalizedEvent = {
@@ -858,14 +889,13 @@ describe('orchestrator table actor', () => {
       .closeWindow('s1', 'h1', 'bankerPair')
       .settle('s1', 'h1', [{ rank: 'A' }, { rank: 'A' }], [{ rank: 'K' }, { rank: 'Q' }], { bankerPair: true, playerPair: false })
       .build();
-    const adapter = new SimulatedAdapter({ events: stream });
-    const orch1 = new Orchestrator({ ledger, riskLimits, executor: adapter });
+    const orch1 = new Orchestrator({ ledger, riskLimits, executor: acceptingLiveExecutor() });
     orch1.registerTable(profile, 'simulated', 10);
     await Promise.all(stream.map(e => orch1.enqueue('t1', e)));
     await orch1.flush();
     expect(ledger.listReceipts('t1').length).toBe(1);
 
-    const orch2 = new Orchestrator({ ledger, riskLimits, executor: new SimulatedAdapter({ events: [] }) });
+    const orch2 = new Orchestrator({ ledger, riskLimits, executor: acceptingLiveExecutor() });
     const restored = orch2.getActor('t1');
     expect(restored).toBeInstanceOf(TableActor);
     expect(orch2.getRiskState().executedToday).toBe(10);
@@ -891,8 +921,7 @@ describe('orchestrator table actor', () => {
       betTiers: [{ minEV: 0, amount: 10 }, { minEV: 0.5, amount: 50 }],
       betStrategy: { type: 'fixed', market: 'bankerPair' },
     };
-    const adapter = new SimulatedAdapter({ events: [] });
-    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: adapter });
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: acceptingLiveExecutor() });
     const actor = orchestrator.registerTable(profile, 'simulated', 10);
     const stream = new FixtureBuilder('t1').newShoe('s1', profile).openWindow('s1', 'h1', 'bankerPair').build();
     await Promise.all(stream.map(event => orchestrator.enqueue('t1', event)));
@@ -925,8 +954,7 @@ describe('orchestrator table actor', () => {
       .newShoe('s1', profile)
       .openWindow('s1', 'h1', 'bankerPair')
       .build();
-    const adapter = new SimulatedAdapter({ events: [] });
-    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: adapter });
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: acceptingLiveExecutor() });
     const actor = orchestrator.registerTable(profile, 'simulated', 10);
     await Promise.all(stream.map(e => orchestrator.enqueue('t1', e)));
     await actor.flush();
@@ -947,8 +975,7 @@ describe('orchestrator table actor', () => {
       .openWindow('s1', 'h2', 'bankerPair')   // 非当前轮替市场 → 跳过
       .openWindow('s1', 'h2', 'playerPair')   // 命中轮替 → 下注,轮替回 bankerPair
       .build();
-    const adapter = new SimulatedAdapter({ events: [] });
-    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: adapter });
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: acceptingLiveExecutor() });
     const actor = orchestrator.registerTable(profile, 'simulated', 10);
     await Promise.all(stream.map(e => orchestrator.enqueue('t1', e)));
     await actor.flush();
@@ -995,13 +1022,19 @@ describe('orchestrator table actor', () => {
 });
 
 
-describe('unknown monitor-session baseline safety', () => {
-  it('records a non-eligible decision and never creates an execution intent before physical shoe baseline is known', async () => {
+describe('unknown monitor-session baseline execution', () => {
+  it('allows automatic execution before a physical shoe baseline is known', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile = simProfile();
-    const adapter = new SimulatedAdapter({ events: [] });
-    const orchestrator = new Orchestrator({ ledger, riskLimits, executor: adapter });
-    const actor = orchestrator.registerTable(profile, 'simulated', 10);
+    const requests: BetExecutionRequest[] = [];
+    const executor = {
+      requestBet: async (request: BetExecutionRequest) => {
+        requests.push(request);
+        return liveReceipt(request, 'ACCEPTED', 'live-unknown-baseline-auto');
+      },
+    };
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor });
+    const actor = orchestrator.registerTable(profile, 'live', 10);
     const fixture = new FixtureBuilder('t1')
       .newShoe('monitor-session-t1', profile)
       .openWindow('monitor-session-t1', 'h1', 'bankerPair')
@@ -1015,11 +1048,22 @@ describe('unknown monitor-session baseline safety', () => {
     await orchestrator.enqueue('t1', fixture[1]!);
     await actor.flush();
 
-    expect(ledger.listReceipts('t1')).toHaveLength(0);
+    expect(requests).toHaveLength(1);
+    expect(ledger.listReceipts('t1')).toEqual([
+      expect.objectContaining({
+        shoeId: 'monitor-session-t1',
+        handId: 'h1',
+        market: 'bankerPair',
+        receipt: expect.objectContaining({
+          receiptId: 'live-unknown-baseline-auto',
+          status: 'ACCEPTED',
+        }),
+      }),
+    ]);
     expect(ledger.listDecisions('t1')).toEqual([
       expect.objectContaining({
-        eligible: false,
-        reason: expect.stringContaining('physical-shoe-baseline-unknown'),
+        eligible: true,
+        reason: expect.stringContaining('evLower='),
       }),
     ]);
     ledger.close();

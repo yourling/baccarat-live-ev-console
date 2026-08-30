@@ -15,20 +15,18 @@
   font-weight: 700;
 }
 
-.operational-wager-controls__amount input {
+.operational-wager-controls__amount strong {
+  display: flex;
+  align-items: center;
   min-width: 0;
   height: 32px;
   padding: 0 var(--space-2);
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border-default);
   border-radius: 4px;
-  outline: none;
   background: var(--surface-field);
   color: var(--text-primary);
   font-size: 12px;
-}
-
-.operational-wager-controls__amount input:focus {
-  border-color: var(--focus-ring);
+  font-weight: 700;
 }
 
 .operational-wager-controls__buttons {
@@ -53,6 +51,32 @@
 
 .operational-wager-controls__result span {
   color: var(--status-warning);
+}
+
+.operational-wager-controls--compact {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 4px;
+  min-width: 188px;
+  padding: 0;
+  border: 0;
+  align-items: start;
+}
+
+.operational-wager-controls--compact .operational-wager-controls__amount {
+  display: none;
+}
+
+.operational-wager-controls--compact .operational-wager-controls__buttons {
+  grid-template-columns: repeat(4, minmax(36px, 1fr));
+}
+
+.operational-wager-controls--compact .operational-wager-controls__result {
+  grid-column: 1;
+  min-height: 14px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 @media (max-width: 680px) {

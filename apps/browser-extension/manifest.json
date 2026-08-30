@@ -7,6 +7,7 @@
   "permissions": [
     "storage",
     "tabs",
+    "alarms",
     "debugger",
     "scripting"
   ],
@@ -16,12 +17,50 @@
     "https://*.df888evo.com/*",
     "https://*.egcvi.com/*",
     "https://*.mstrom-uno.com/*",
-    "https://*.673ing.com/*"
+    "https://*.673ing.com/*",
+    "https://*.vbgames88.com/*",
+    "https://*.zavjcswh.biz/*",
+    "https://*.pragmaticplaylive.net/*"
   ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
+    {
+      "matches": [
+        "https://client.pragmaticplaylive.net/*",
+        "https://*.vbgames88.com/*",
+        "https://*.zavjcswh.biz/*"
+      ],
+      "js": [
+        "pragmatic-network-hook.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://client.pragmaticplaylive.net/*",
+        "https://*.vbgames88.com/*",
+        "https://*.zavjcswh.biz/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://client.pragmaticplaylive.net/*"
+      ],
+      "js": [
+        "pragmatic-dom-hook.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    },
     {
       "matches": [
         "https://*.dafabet.net/*",

@@ -50,8 +50,12 @@ export interface OperationalWagerRecord {
 
 export interface OperationalWagerReconciliation {
   readonly status: 'ACCEPTED';
-  readonly reason: 'operator-confirmed-platform-accepted';
+  readonly reason: 'operator-confirmed-platform-accepted' | 'committed-hand-settled';
   readonly reconciledAt: string;
+}
+
+export function operationalReceiptCommitStarted(raw: unknown): boolean {
+  return typeof raw === 'object' && raw !== null && Reflect.get(raw, 'commitStarted') === true;
 }
 
 export interface OperationalWagerSettlement {

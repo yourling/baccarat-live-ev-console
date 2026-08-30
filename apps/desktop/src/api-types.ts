@@ -125,6 +125,7 @@ export interface DesktopOperationalWagerCommand {
   readonly tableId: string;
   readonly market: OperationalWagerMarket;
   readonly amount: number;
+  readonly handId?: string;
 }
 
 export interface DesktopUnknownWagerReconciliationCommand {
@@ -191,6 +192,7 @@ export interface DesktopRuntimeIncident {
   readonly lastOccurredAt: string;
   readonly occurrences: number;
   readonly active: boolean;
+  readonly acknowledgedAt?: string;
   readonly resolvedAt?: string;
 }
 
@@ -232,7 +234,11 @@ export function parseDesktopOperationalWagerCommand(value: unknown): DesktopOper
   if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
     throw new TypeError('operational wager amount must be a positive finite number');
   }
-  return { tableId, market, amount };
+  const handId = Reflect.get(value, 'handId');
+  if (handId !== undefined && (typeof handId !== 'string' || handId.trim() !== handId || handId.length === 0)) {
+    throw new TypeError('handId must be a non-empty trimmed string when provided');
+  }
+  return { tableId, market, amount, ...(handId === undefined ? {} : { handId }) };
 }
 
 export function parseDesktopUnknownWagerReconciliationCommand(
@@ -323,6 +329,9 @@ export interface MonitorTableCandidate {
   roomId: string;
   roomName?: string;
   tableId: string;
+  displayName?: string;
+  roundId?: string;
+  gameCount?: number;
 }
 
 export interface DesktopRecordCounts {
@@ -338,6 +347,7 @@ export interface DesktopConsoleSnapshot {
   snapshot: OrchestratorSnapshot;
   monitorTableIds: readonly string[];
   monitorCandidates: readonly MonitorTableCandidate[];
+  tableMetadata: readonly MonitorTableCandidate[];
   recordCounts: DesktopRecordCounts;
   keepalive: DesktopKeepaliveState;
   automation: DesktopAutomationState;

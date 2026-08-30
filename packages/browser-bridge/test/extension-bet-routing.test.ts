@@ -5,6 +5,8 @@ import {
   flushAsyncWork,
   installedContentScripts,
   liveRequest,
+  pragmaticLiveRequest,
+  pragmaticOperationalRequest,
   sentMessages,
 } from './extension-bet-harness.js';
 
@@ -36,6 +38,337 @@ describe('extension background live bet routing', () => {
       bridgeSeq: expect.any(Number),
     }));
     expect(Number.isSafeInteger(betResults[0]?.['bridgeSeq'])).toBe(true);
+  });
+
+  it('rejects a pragmatic wager when shared-panel preparation does not activate', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+      pragmaticPrepareResult: {
+        status: 'activation-control-missing',
+        frameUrl: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/',
+        roundId: '16385991210',
+      },
+    });
+
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticOperationalRequest()) });
+    for (let tick = 0; tick < 4; tick += 1) await flushAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot')
+        && Array.isArray(injection.target?.frameIds),
+    )).toBe(false);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      receipt: expect.objectContaining({
+        status: 'REJECTED',
+        raw: expect.objectContaining({
+          commitStarted: false,
+          reason: expect.stringContaining('Pragmatic target table preparation failed: activation-control-missing'),
+        }),
+      }),
+    }));
+  });
+
+  it('routes one request to the unique matching Pragmatic frame', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+    });
+
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest()) });
+    await flushAsyncWork();
+    await flushAsyncWork();
+
+    const execution = harness.executeScript.mock.calls.find(
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot')
+        && Array.isArray(injection.target?.frameIds),
+    );
+    expect(execution?.[0].target).toEqual({ tabId: 42, frameIds: [11] });
+    expect(execution?.[0].world).toBe('MAIN');
+    const inputEvents = harness.chrome.debugger.sendCommand.mock.calls
+      .filter(([, method]) => method === 'Input.dispatchMouseEvent')
+      .map(([, , params]) => params?.type);
+    expect(inputEvents).toEqual([
+      'mouseMoved', 'mousePressed', 'mouseReleased',
+    ]);
+    expect(harness.sendMessage).toHaveBeenCalledTimes(1);
+    expect(harness.sendMessage).toHaveBeenCalledWith(
+      42,
+      expect.objectContaining({ kind: 'resolveBetFrameRect' }),
+      { frameId: 11 },
+    );
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      requestId: 'pragmatic-request-1',
+      receipt: harness.pragmaticReceipt,
+    }));
+  });
+
+  it('uses the same trusted-input path for a manual Pragmatic wager', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+    });
+
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticOperationalRequest()) });
+    for (let tick = 0; tick < 4; tick += 1) await flushAsyncWork();
+
+    expect(harness.chrome.debugger.sendCommand.mock.calls.filter(
+      ([, method]) => method === 'Input.dispatchMouseEvent',
+    )).toHaveLength(3);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      requestId: 'pragmatic-operational-request-1',
+      receipt: expect.objectContaining({
+        wagerId: 'pragmatic-wager-1',
+        status: 'ACCEPTED',
+        raw: expect.objectContaining({ trustedInput: true }),
+      }),
+    }));
+  });
+
+  it('does not click the market when the page window has already closed', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+      pragmaticPhaseResult: command => command['phase'] === 'target' && command['action'] === 'market'
+        ? {
+          receiptId: 'pragmatic-window-closed',
+          intentId: 'pragmatic-intent-1',
+          reservationId: 'pragmatic-reservation-1',
+          status: 'REJECTED',
+          amount: 10,
+          market: 'bankerPair',
+          mode: 'live',
+          raw: {
+            runtimeRevision: 'pragmatic-bet-runtime/2026-08-30.21',
+            reason: 'betting-window-closed',
+            commitPoint: 'preflight',
+            commitStarted: false,
+          },
+        }
+        : undefined,
+    });
+
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest()) });
+    for (let tick = 0; tick < 4; tick += 1) await flushAsyncWork();
+
+    const inputEvents = harness.chrome.debugger.sendCommand.mock.calls
+      .filter(([, method]) => method === 'Input.dispatchMouseEvent')
+      .map(([, , params]) => params?.type);
+    expect(inputEvents).toEqual([]);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      receipt: expect.objectContaining({
+        status: 'REJECTED',
+        raw: expect.objectContaining({ reason: 'betting-window-closed', commitStarted: false }),
+      }),
+    }));
+  });
+
+  it('returns UNKNOWN when a trusted market press succeeds but release fails', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+    });
+    let presses = 0;
+    harness.chrome.debugger.sendCommand.mockImplementation(async (_source, method, params) => {
+      if (method !== 'Input.dispatchMouseEvent') return undefined;
+      if (params?.type === 'mousePressed') presses += 1;
+      if (params?.type === 'mouseReleased' && presses === 1) throw new Error('release failed');
+      return undefined;
+    });
+
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest()) });
+    for (let tick = 0; tick < 4; tick += 1) await flushAsyncWork();
+
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      receipt: expect.objectContaining({
+        status: 'UNKNOWN',
+        raw: expect.objectContaining({
+          commitPoint: 'market-click',
+          commitStarted: true,
+          marketPressDispatched: true,
+          trustedInput: true,
+        }),
+      }),
+    }));
+  });
+
+  it('routes Pragmatic execution even when the protocol round cache is stale', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+      pragmaticProtocolRoundId: '1726000000',
+    });
+
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest()) });
+    await flushAsyncWork();
+    await flushAsyncWork();
+
+    const execution = harness.executeScript.mock.calls.find(
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot')
+        && Array.isArray(injection.target?.frameIds),
+    );
+    expect(execution?.[0].target).toEqual({ tabId: 42, frameIds: [11] });
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      requestId: 'pragmatic-request-1',
+      receipt: harness.pragmaticReceipt,
+    }));
+  });
+
+  it('routes Pragmatic execution even when the prepared round differs from the request hand', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+      pragmaticProtocolRoundId: '1726000000',
+    });
+    const request = pragmaticLiveRequest();
+    request.request.intent.handId = '1726999999';
+
+    harness.socket.emit('message', { data: JSON.stringify(request) });
+    await flushAsyncWork();
+    await flushAsyncWork();
+
+    const execution = harness.executeScript.mock.calls.find(
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot')
+        && Array.isArray(injection.target?.frameIds),
+    );
+    expect(execution?.[0].target).toEqual({ tabId: 42, frameIds: [11] });
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      requestId: 'pragmatic-request-1',
+      receipt: harness.pragmaticReceipt,
+    }));
+  });
+
+  it('rejects a Pragmatic request when two frames claim the same table', async () => {
+    const ready = {
+      status: 'ready',
+      runtimeRevision: 'pragmatic-bet-runtime/2026-08-30.21',
+      host: 'client.pragmaticplaylive.net',
+      tableId: 'bc281koreanch281',
+    };
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+      probeResults: [
+        { frameId: 11, result: ready },
+        { frameId: 12, result: ready },
+      ],
+    });
+
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest()) });
+    await flushAsyncWork();
+    await flushAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot')
+        && Array.isArray(injection.target?.frameIds),
+    )).toBe(false);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      receipt: expect.objectContaining({
+        status: 'REJECTED',
+        receiptId: expect.stringMatching(/^pragmatic-bridge-/),
+        raw: expect.objectContaining({ commitStarted: false }),
+      }),
+    }));
+  });
+
+  it('prefers the freshly prepared multitable frame over a duplicate dedicated frame', async () => {
+    const common = {
+      status: 'ready',
+      runtimeRevision: 'pragmatic-bet-runtime/2026-08-30.21',
+      host: 'client.pragmaticplaylive.net',
+      tableId: 'bc281koreanch281',
+    };
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+      probeResults: [
+        {
+          frameId: 11,
+          result: {
+            ...common,
+            framePath: '/desktop/multibaccarat/',
+            routingAuthority: 'prepared-multitable',
+          },
+        },
+        {
+          frameId: 12,
+          result: {
+            ...common,
+            framePath: '/desktop/baccarat/',
+            routingAuthority: 'dedicated-referrer',
+          },
+        },
+      ],
+    });
+
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest()) });
+    await flushAsyncWork();
+    await flushAsyncWork();
+
+    const execution = harness.executeScript.mock.calls.find(
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot')
+        && Array.isArray(injection.target?.frameIds),
+    );
+    expect(execution?.[0].target).toEqual({ tabId: 42, frameIds: [11] });
+  });
+
+  it('routes a Pragmatic request to the frame even when the readiness probe reports closed', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+      probeResults: [{
+        frameId: 11,
+        result: {
+          status: 'closed',
+          runtimeRevision: 'pragmatic-bet-runtime/2026-08-30.21',
+          host: 'client.pragmaticplaylive.net',
+          tableId: 'bc281koreanch281',
+        },
+      }],
+    });
+
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest()) });
+    await flushAsyncWork();
+    await flushAsyncWork();
+
+    const execution = harness.executeScript.mock.calls.find(
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot')
+        && Array.isArray(injection.target?.frameIds),
+    );
+    expect(execution?.[0].target).toEqual({ tabId: 42, frameIds: [11] });
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      requestId: 'pragmatic-request-1',
+      receipt: harness.pragmaticReceipt,
+    }));
   });
 
   it('returns a precommit rejection when more than one exact Dafabet popup tab exists', async () => {
@@ -195,9 +528,30 @@ describe('extension background live bet routing', () => {
     }));
   });
 
-  it('does not inspect or execute frames without liveOn in the current worker session', async () => {
+  it('restores the live gate from storage after the worker reloads', async () => {
     const harness = await createHarness({
       liveBetEnabled: true,
+      armCurrentSession: false,
+    });
+
+    harness.socket.emit('message', { data: JSON.stringify(liveRequest()) });
+    await flushAsyncWork();
+    await flushAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes('executeMstromBetOneShot'),
+    )).toBe(true);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      receipt: expect.objectContaining({
+        status: 'ACCEPTED',
+      }),
+    }));
+  });
+
+  it('does not inspect or execute frames when the persisted live gate is disabled', async () => {
+    const harness = await createHarness({
+      liveBetEnabled: false,
       armCurrentSession: false,
     });
 
@@ -276,8 +630,11 @@ describe('extension background live bet routing', () => {
 
     // When: its host permissions and content-script matches are inspected.
     expect(serializedManifest).not.toContain('<all_urls>');
+    expect(serializedManifest).toContain('"alarms"');
 
     // Then: the current mstrom game host remains explicitly covered.
     expect(serializedManifest).toContain('https://*.mstrom-uno.com/*');
+    expect(serializedManifest).toContain('https://*.pragmaticplaylive.net/*');
+    expect(installedContentScripts()).toContain('pragmatic-dom-hook.js');
   });
 });

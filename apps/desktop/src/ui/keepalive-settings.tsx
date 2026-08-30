@@ -60,6 +60,7 @@ export function KeepaliveSettings(props: {
         <h2>自动投注保活策略</h2>
         <span className="record-count">{keepaliveStatus(props.state)}</span>
       </div>
+      <p className="muted">保存间隔和金额后，还须点顶部「开启自动投注」才会按开盘窗口下保活注。Pragmatic 牌桌走与手动下注相同的请求通道。</p>
       <div className="settings-fields keepalive-settings__fields">
         <label>
           <span>间隔（分钟）</span>
@@ -128,7 +129,7 @@ function draftFor(state: DesktopKeepaliveState): KeepaliveDraft {
 
 function keepaliveStatus(state: DesktopKeepaliveState): string {
   if (state.running) return '执行中';
-  return state.enabled ? '已开启' : '已关闭';
+  return state.enabled ? '已开启' : '已保存，未开启';
 }
 
 function formatTimestamp(value: string | undefined): string {

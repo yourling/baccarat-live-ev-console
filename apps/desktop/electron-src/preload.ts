@@ -38,6 +38,10 @@ const api = {
   updateKeepaliveSettings: (settings: DesktopKeepaliveStrategySettings) =>
     ipcRenderer.invoke('console:update-keepalive-settings', settings),
   setAutomationEnabled: (enabled: boolean) => ipcRenderer.invoke('console:set-automation-enabled', enabled),
+  acknowledgeRuntimeIncident: (incidentId: string) =>
+    ipcRenderer.invoke('console:acknowledge-runtime-incident', incidentId),
+  acknowledgeAllRuntimeIncidents: () =>
+    ipcRenderer.invoke('console:acknowledge-all-runtime-incidents'),
   confirmPhysicalShoe: (tableId: string) => ipcRenderer.invoke('console:confirm-physical-shoe', tableId),
   applyManualCorrection: (tableId: string, correction: ManualCorrection, shoeId?: string) =>
     ipcRenderer.invoke('console:manual-correction', tableId, correction, shoeId),

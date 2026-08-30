@@ -212,6 +212,8 @@ export class RiskManager {
     const tableLoss = this.state.tableLosses[intent.tableId] ?? 0;
     const shoeKey = shoeLossKey(intent.tableId, intent.shoeId);
     const shoeLoss = this.state.shoeLosses[shoeKey] ?? 0;
+    const reservedExposureForLimits = this.openReservedExposure();
+    const pendingExecutionsForLimits = this.openReservedExecutions();
 
     if (limits.perTableLossLimit > 0 && tableLoss + needs(amount) > limits.perTableLossLimit) {
       if (!shrink) return { ok: false, reason: 'per-table-loss-limit', reminder: 'risk-limits-unconfigured-or-insufficient' };
@@ -225,11 +227,11 @@ export class RiskManager {
       if (!shrink) return { ok: false, reason: 'per-day-loss-limit', reminder: 'risk-limits-unconfigured-or-insufficient' };
       amount = Math.min(amount, capAmount(Math.max(0, limits.perDayLossLimit - this.state.dayLoss)));
     }
-    if (limits.defaultExposureCap > 0 && this.state.reservedExposure + needs(amount) > limits.defaultExposureCap) {
+    if (limits.defaultExposureCap > 0 && reservedExposureForLimits + needs(amount) > limits.defaultExposureCap) {
       if (!shrink) return { ok: false, reason: 'global-exposure-cap', reminder: 'risk-limits-unconfigured-or-insufficient' };
-      amount = Math.min(amount, capAmount(Math.max(0, limits.defaultExposureCap - this.state.reservedExposure)));
+      amount = Math.min(amount, capAmount(Math.max(0, limits.defaultExposureCap - reservedExposureForLimits)));
     }
-    if (limits.maxConcurrentExecutions > 0 && this.state.pendingExecutions + 1 > limits.maxConcurrentExecutions) {
+    if (limits.maxConcurrentExecutions > 0 && pendingExecutionsForLimits + 1 > limits.maxConcurrentExecutions) {
       return { ok: false, reason: 'max-concurrent-executions', reminder: 'risk-limits-unconfigured-or-insufficient' };
     }
     if (amount > maxBet) {
@@ -298,6 +300,22 @@ export class RiskManager {
     nextState.pendingExecutions = clampNonNegative(nextState.pendingExecutions - 1);
     this.commitReservationUpdate(updated, nextState);
     return true;
+  }
+
+  private openReservedExposure(): number {
+    let exposure = 0;
+    for (const reservation of this.reservations.values()) {
+      if (reservation.status === 'RESERVED') exposure += reservation.maxLoss;
+    }
+    return exposure;
+  }
+
+  private openReservedExecutions(): number {
+    let count = 0;
+    for (const reservation of this.reservations.values()) {
+      if (reservation.status === 'RESERVED') count += 1;
+    }
+    return count;
   }
 
   markUnknown(reservationId: string, reason: string, receiptId?: string): boolean {
@@ -445,7 +463,16 @@ export class RiskManager {
   ): RiskReservation[] {
     this.rollDayIfNeeded();
     const matches = this.snapshot().filter(
-      r => r.status === 'RESERVED' && r.tableId === tableId && r.shoeId === shoeId && r.handId === handId,
+      r => (
+        r.status === 'RESERVED'
+        || (
+          r.status === 'UNKNOWN'
+          && r.releaseReason === 'hand-settled-without-authoritative-outcome'
+        )
+      )
+      && r.tableId === tableId
+      && r.shoeId === shoeId
+      && r.handId === handId,
     );
     if (matches.length === 0) return [];
 

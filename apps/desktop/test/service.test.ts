@@ -300,25 +300,33 @@ describe('desktop console demo sessions', () => {
     }
   });
 
-  it('starts global automation after verification but requires explicit re-enable after disconnect', async () => {
+  it('keeps global automation active when one table disconnects and rearms it after recovery', async () => {
     const service = new DesktopConsoleService(':memory:');
     try {
-      await service.updateMonitorTableIds(['D055']);
+      await service.updateMonitorTableIds(['D055', 'D066']);
       await service.injectEvent(monitorShoeEvent('D055', 'd055-attached', 'unknown-monitor-session'));
+      await service.injectEvent(monitorShoeEvent('D066', 'd066-attached', 'unknown-monitor-session'));
 
       const started = await service.setAutomationEnabled(true);
 
       expect(started.automation).toEqual({ enabled: true });
       expect(started.keepalive.enabled).toBe(true);
-      expect(started.snapshot.tables.D055?.projection.autoBetStatus).toBe('DISARMED');
+      expect(started.snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
+      expect(started.snapshot.tables.D066?.projection.autoBetStatus).toBe('ARMED');
 
       await service.injectEvent({
         ...monitorShoeEvent('D055', 'd055-verified', 'physical-shoe'),
         shoeId: 'd055-verified-shoe',
         sourceSeq: 2,
       });
+      await service.injectEvent({
+        ...monitorShoeEvent('D066', 'd066-verified', 'physical-shoe'),
+        shoeId: 'd066-verified-shoe',
+        sourceSeq: 2,
+      });
 
       expect(service.snapshot().snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
+      expect(service.snapshot().snapshot.tables.D066?.projection.autoBetStatus).toBe('ARMED');
 
       await service.injectEvent({
         type: 'connectionLost',
@@ -329,6 +337,10 @@ describe('desktop console demo sessions', () => {
         source: 'room-monitor',
         schemaVersion: EVENT_SCHEMA_VERSION,
       });
+      const isolated = service.snapshot();
+      expect(isolated.keepalive.enabled).toBe(true);
+      expect(isolated.snapshot.tables.D066?.projection.autoBetStatus).toBe('ARMED');
+
       await service.injectEvent({
         type: 'connectionRestored',
         eventId: 'd055-restored',
@@ -341,12 +353,9 @@ describe('desktop console demo sessions', () => {
       });
 
       const recovered = service.snapshot();
-      expect(recovered.keepalive.enabled).toBe(false);
-      expect(recovered.snapshot.tables.D055?.projection.autoBetStatus).toBe('DISARMED');
-
-      const restarted = await service.setAutomationEnabled(true);
-      expect(restarted.keepalive.enabled).toBe(true);
-      expect(restarted.snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
+      expect(recovered.keepalive.enabled).toBe(true);
+      expect(recovered.snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
+      expect(recovered.snapshot.tables.D066?.projection.autoBetStatus).toBe('ARMED');
 
       const stopped = await service.setAutomationEnabled(false);
 
@@ -662,12 +671,12 @@ describe('desktop console demo sessions', () => {
 
       await service.updateMonitorTableIds([]);
 
-      expect(actor.snapshot().executionMode).toBe('shadow');
+      expect(actor.snapshot().executionMode).toBe('live');
       expect(actor.getProjection().autoBetStatus).toBe('DISARMED');
 
       await service.updateMonitorTableIds(['D055']);
 
-      expect(actor.snapshot().executionMode).toBe('shadow');
+      expect(actor.snapshot().executionMode).toBe('live');
       expect(actor.getProjection().autoBetStatus).toBe('DISARMED');
     } finally {
       discoverRooms.mockRestore();
@@ -714,7 +723,7 @@ describe('desktop console demo sessions', () => {
 
       await service.stopLiveRoomMonitor();
 
-      expect(actor.snapshot().executionMode).toBe('shadow');
+      expect(actor.snapshot().executionMode).toBe('live');
       expect(actor.getProjection().autoBetStatus).toBe('DISARMED');
     } finally {
       discoverRooms.mockRestore();
@@ -801,7 +810,7 @@ describe('desktop console demo sessions', () => {
 
       expect(updated.demoError).toBe('synthetic stop failure after stale callback');
       expect(updated.monitorTableIds).toEqual(['D055']);
-      expect(actor.snapshot().executionMode).toBe('shadow');
+      expect(actor.snapshot().executionMode).toBe('live');
       expect(actor.getProjection().autoBetStatus).toBe('DISARMED');
       expect(requestBet).not.toHaveBeenCalled();
       expect(setLiveBetEnabled).toHaveBeenLastCalledWith(false);
@@ -872,7 +881,7 @@ describe('desktop console demo sessions', () => {
       const transition = service.updateMonitorTableIds([]);
       await stopStarted;
 
-      expect(actor.snapshot().executionMode).toBe('shadow');
+      expect(actor.snapshot().executionMode).toBe('live');
       expect(actor.getProjection().autoBetStatus).toBe('DISARMED');
       expect(setLiveBetEnabled).toHaveBeenLastCalledWith(false);
 
@@ -947,7 +956,7 @@ describe('desktop console demo sessions', () => {
       const stopping = service.stopLiveRoomMonitor();
       await stopStarted;
 
-      expect(actor.snapshot().executionMode).toBe('shadow');
+      expect(actor.snapshot().executionMode).toBe('live');
       expect(actor.getProjection().autoBetStatus).toBe('DISARMED');
       expect(setLiveBetEnabled).toHaveBeenLastCalledWith(false);
 
@@ -1000,7 +1009,7 @@ describe('desktop console demo sessions', () => {
 
       await service.updateMonitorTableIds(['D055']);
 
-      expect(actor.snapshot().executionMode).toBe('shadow');
+      expect(actor.snapshot().executionMode).toBe('live');
       expect(actor.getProjection().autoBetStatus).toBe('DISARMED');
     } finally {
       discoverRooms.mockRestore();
@@ -1159,10 +1168,10 @@ describe('desktop console demo sessions', () => {
       const shadow = await service.setExecutionMode('D055', 'shadow');
 
       // Then: the extension gate and actor mode move together, while auto bet remains stopped.
-      expect(setLiveBetEnabled.mock.calls).toEqual([[true], [false]]);
+      expect(setLiveBetEnabled.mock.calls).toEqual([[true]]);
       expect(live.snapshot.tables.D055?.executionMode).toBe('live');
       expect(live.snapshot.tables.D055?.projection.autoBetStatus).toBe('DISARMED');
-      expect(shadow.snapshot.tables.D055?.executionMode).toBe('shadow');
+      expect(shadow.snapshot.tables.D055?.executionMode).toBe('live');
     } finally {
       setLiveBetEnabled.mockRestore();
       await service.close();
@@ -1177,7 +1186,7 @@ describe('desktop console demo sessions', () => {
 
       // When / Then: live mode is rejected and the table remains shadow.
       await expect(service.setExecutionMode('D055', 'live')).rejects.toThrow(/bridge/i);
-      expect(service.snapshot().snapshot.tables.D055?.executionMode).toBe('shadow');
+      expect(service.snapshot().snapshot.tables.D055?.executionMode).toBe('live');
     } finally {
       await service.close();
     }
@@ -1208,9 +1217,63 @@ describe('desktop console demo sessions', () => {
       expect(requestBet).toHaveBeenCalledWith(expect.objectContaining({ mode: 'live' }));
       expect(liveGateCalls).toEqual([true, false]);
       expect(result.receipt).toEqual(receipt);
-      expect(result.snapshot.snapshot.tables.D055?.executionMode).toBe('shadow');
+      expect(result.snapshot.snapshot.tables.D055?.executionMode).toBe('live');
       expect(setExecutor.mock.calls).toHaveLength(2);
       expect(setExecutor.mock.calls[1]?.[0]).toBe(originalExecutor);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('allows a one-shot live bet before a physical shoe baseline is known', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const tableId = 'D055';
+    const handId = 'GD055-midshoe-1';
+    const command = oneShotCommand({
+      tableId,
+      shoeId: `monitor-session-${tableId}`,
+      handId,
+    });
+    const bridge = new BrowserBridgeServer();
+    const liveGateCalls: boolean[] = [];
+    vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(enabled => {
+      liveGateCalls.push(enabled);
+    });
+    authenticateLiveBridge(bridge);
+    const requestBet = vi.spyOn(bridge, 'requestBet')
+      .mockImplementation(async request => ({
+        receiptId: 'one-shot-midshoe-receipt',
+        intentId: request.intent.intentId,
+        reservationId: request.reservationId ?? '',
+        status: 'ACCEPTED',
+        amount: request.intent.amount,
+        market: request.intent.market,
+        mode: 'live',
+        createdAt: '2026-08-24T00:00:01.000Z',
+      }));
+
+    try {
+      service['browserBridge'] = bridge;
+      await selectMonitorTable(service, tableId);
+      service['liveFeeds'].set(tableId, freshLiveFeed(tableId));
+      await service.injectEvent(monitorShoeEvent(tableId, 'monitor-session-start'));
+      await service.injectEvent(openedPlatformRound(tableId, 'open-midshoe', handId));
+
+      const result = await service.executeOneShotLiveBet(command);
+
+      expect(result.status).toBe('ACCEPTED');
+      expect(requestBet).toHaveBeenCalledTimes(1);
+      expect(requestBet).toHaveBeenCalledWith(expect.objectContaining({
+        mode: 'live',
+        intent: expect.objectContaining({
+          tableId,
+          shoeId: `monitor-session-${tableId}`,
+          handId,
+        }),
+      }));
+      expect(liveGateCalls).toContain(true);
+      expect(result.snapshot.snapshot.tables[tableId]?.projection.shoeBaseline)
+        .toBe('unknown-monitor-session');
     } finally {
       await service.close();
     }
@@ -1289,13 +1352,13 @@ describe('desktop console demo sessions', () => {
     const receipt = oneShotReceipt(command);
     installOneShotActor(service, command, receipt, async _request => ({
       status: 'REJECTED',
-      reason: 'physical-shoe-required',
+      reason: 'executor-required',
     }));
     const { liveGateCalls, requestBet } = installFakeBridge(service, receipt);
 
     try {
       await expect(service.executeOneShotLiveBet(command))
-        .rejects.toThrow('one-shot live bet rejected locally: physical-shoe-required');
+        .rejects.toThrow('one-shot live bet rejected locally: executor-required');
       expect(requestBet).not.toHaveBeenCalled();
       expect(liveGateCalls).toEqual([true, false]);
     } finally {
@@ -1338,7 +1401,7 @@ describe('desktop console demo sessions', () => {
     }
   });
 
-  it('blocks one-shot live bets when runtime readiness is lost', async () => {
+  it('allows one-shot live bets when local runtime readiness is stale', async () => {
     const service = new DesktopConsoleService(':memory:');
     const command = oneShotCommand();
     await selectMonitorTable(service, command.tableId);
@@ -1348,16 +1411,17 @@ describe('desktop console demo sessions', () => {
     liveReadiness.mockReturnValue(['table-feed-stale']);
 
     try {
-      await expect(service.executeOneShotLiveBet(command)).rejects.toThrow(/table-feed-stale/i);
-      expect(liveGateCalls).toEqual([]);
-      expect(requestBet).not.toHaveBeenCalled();
+      const result = await service.executeOneShotLiveBet(command);
+      expect(result.status).toBe('ACCEPTED');
+      expect(liveGateCalls).toEqual([true, false]);
+      expect(requestBet).toHaveBeenCalledTimes(1);
     } finally {
       liveReadiness.mockRestore();
       await service.close();
     }
   });
 
-  it('rejects one-shot live bets while any registered table has persistent live mode', async () => {
+  it('allows one-shot live bets while another table has persistent live mode', async () => {
     const service = new DesktopConsoleService(':memory:');
     const command = oneShotCommand();
     await selectMonitorTable(service, command.tableId);
@@ -1367,15 +1431,16 @@ describe('desktop console demo sessions', () => {
     const { liveGateCalls, requestBet } = installFakeBridge(service, receipt);
 
     try {
-      await expect(service.executeOneShotLiveBet(command)).rejects.toThrow(/persistent live/i);
-      expect(liveGateCalls).toEqual([]);
-      expect(requestBet).not.toHaveBeenCalled();
+      const result = await service.executeOneShotLiveBet(command);
+      expect(result.status).toBe('ACCEPTED');
+      expect(liveGateCalls).toEqual([true, false]);
+      expect(requestBet).toHaveBeenCalledTimes(1);
     } finally {
       await service.close();
     }
   });
 
-  it('rejects one-shot live bets while any registered table remains auto-bet armed', async () => {
+  it('allows one-shot live bets while any registered table remains auto-bet armed', async () => {
     const service = new DesktopConsoleService(':memory:');
     const command = oneShotCommand();
     await selectMonitorTable(service, command.tableId);
@@ -1389,9 +1454,10 @@ describe('desktop console demo sessions', () => {
     const { liveGateCalls, requestBet } = installFakeBridge(service, receipt);
 
     try {
-      await expect(service.executeOneShotLiveBet(command)).rejects.toThrow(/armed/i);
-      expect(liveGateCalls).toEqual([]);
-      expect(requestBet).not.toHaveBeenCalled();
+      const result = await service.executeOneShotLiveBet(command);
+      expect(result.status).toBe('ACCEPTED');
+      expect(liveGateCalls).toEqual([true, false]);
+      expect(requestBet).toHaveBeenCalledTimes(1);
     } finally {
       await service.close();
     }
@@ -1488,27 +1554,23 @@ describe('desktop console demo sessions', () => {
     const { liveGateCalls, liveReadiness } = installFakeBridge(service, receipt);
     const actor = service['orchestrator'].getActor(command.tableId);
     if (!actor) throw new Error('one-shot test actor was not registered');
-    const setAutoBetCall = vi.spyOn(actor, 'setAutoBet');
     const updateExecutionMode = vi.spyOn(service['orchestrator'], 'updateTableExecutionMode');
 
     try {
-      await service.setAutomationEnabled(true);
       const oneShot = service.executeOneShotLiveBet(command);
       await started;
 
-      const autoBet = service.setAutoBet(command.tableId, true, command.shoeId);
       const mode = service.setExecutionMode(command.tableId, 'live');
 
-      expect(setAutoBetCall).not.toHaveBeenCalled();
-      expect(updateExecutionMode).not.toHaveBeenCalled();
+      expect(updateExecutionMode).toHaveBeenCalledTimes(1);
       expect(liveGateCalls).toEqual([true]);
 
       release();
       await oneShot;
-      await autoBet;
       await mode;
 
       expect(liveGateCalls).toEqual([true, false, true]);
+      expect(updateExecutionMode).toHaveBeenCalledTimes(2);
       expect(service.snapshot().snapshot.tables.D055?.executionMode).toBe('live');
     } finally {
       liveReadiness.mockRestore();
@@ -1611,6 +1673,58 @@ describe('desktop console demo sessions', () => {
       await service.close();
     }
   });
+  it('attaches forty discovered Pragmatic tables as independent feeds and actors', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const tableIds = Array.from({ length: 40 }, (_, index) =>
+      `pragmatictable${String(index + 1).padStart(2, '0')}`);
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['D066']);
+      await service.updateAllTableSettings({
+        minEV: 0.1,
+        defaultBetAmount: 20,
+        betTiers: [
+          { minEV: 0.2, amount: 40 },
+          { minEV: 0.3, amount: 60 },
+        ],
+      });
+      service['liveMonitorActivated'] = true;
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: tableIds.map(tableId => ({ tableId })),
+        },
+      });
+
+      const snapshot = await service.updateMonitorTableIds(tableIds);
+
+      expect(snapshot.monitorTableIds).toEqual(tableIds);
+      expect(Object.keys(snapshot.snapshot.tables)).toEqual(tableIds);
+      expect(service['liveFeeds'].size).toBe(40);
+      expect(new Set(service['liveRoomIdsByTable'].values())).toEqual(new Set(['dafabet-pragmatic']));
+      expect(Object.values(snapshot.snapshot.tables)).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          defaultBetAmount: 20,
+          profile: expect.objectContaining({
+            minEV: 0.1,
+            betTiers: [
+              { minEV: 0.2, amount: 40 },
+              { minEV: 0.3, amount: 60 },
+            ],
+          }),
+        }),
+      ]));
+      expect(Object.values(snapshot.snapshot.tables).every(table =>
+        table.defaultBetAmount === 20
+        && table.profile.minEV === 0.1
+        && table.profile.betTiers?.length === 2)).toBe(true);
+    } finally {
+      await service.close();
+    }
+  });
   it('retains approved live actors while the page transiently reports no visible table', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer({ selectedTableIds: ['D055'] });
@@ -1639,6 +1753,12 @@ describe('desktop console demo sessions', () => {
     try {
       await service.runDemo(42);
       await service.updateTableSettings('table-1', { minEV: 0.05, defaultBetAmount: 25, betTiers: [], monitorUrl: '窗口-1' });
+      service['runtimeIncidents'].record({
+        code: 'table-feed-stale',
+        severity: 'blocked',
+        tableId: 'table-1',
+        message: 'table-feed-stale',
+      });
       const cleared = await service.clearMonitorData();
       expect(cleared.events).toHaveLength(0);
       expect(cleared.decisions).toHaveLength(0);
@@ -1646,8 +1766,67 @@ describe('desktop console demo sessions', () => {
       expect(cleared.reservations).toHaveLength(0);
       expect(cleared.snapshot.tables['table-1']?.profile.minEV).toBe(0.05);
       expect(cleared.snapshot.tables['table-1']?.profile.monitorUrl).toBe('窗口-1');
+      expect(cleared.runtime.incidents.some(incident =>
+        incident.active && incident.code === 'table-feed-stale')).toBe(false);
     } finally {
       await service.close();
+    }
+  });
+
+  it('preserves and refreshes discovered table display names after records are cleared', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'baccarat-table-metadata-'));
+    const dbPath = join(directory, 'console.sqlite');
+    const service = new DesktopConsoleService(dbPath);
+    let closed = false;
+    try {
+      const bridge = new BrowserBridgeServer();
+      service['browserBridge'] = bridge;
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'tobcbaccaragen92', displayName: 'Speed Baccarat 92' }],
+        },
+      });
+
+      await service['attachLiveTables']();
+      const beforeClear = service.snapshot();
+      expect(beforeClear.tableMetadata).toEqual(expect.arrayContaining([
+        expect.objectContaining({ tableId: 'tobcbaccaragen92', displayName: 'Speed Baccarat 92' }),
+      ]));
+
+      const cleared = await service.clearMonitorData();
+      expect(cleared.tableMetadata).toEqual(expect.arrayContaining([
+        expect.objectContaining({ tableId: 'tobcbaccaragen92', displayName: 'Speed Baccarat 92' }),
+      ]));
+
+      bridge.ingestClientMessage({
+        kind: 'roomUpdated',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'tobcbaccaragen92', displayName: 'Speed Baccarat 92 VIP' }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(service.snapshot().tableMetadata).toEqual(expect.arrayContaining([
+        expect.objectContaining({ tableId: 'tobcbaccaragen92', displayName: 'Speed Baccarat 92 VIP' }),
+      ]));
+
+      await service.close();
+      closed = true;
+      const restarted = new DesktopConsoleService(dbPath);
+      try {
+        expect(restarted.snapshot().tableMetadata).toEqual(expect.arrayContaining([
+          expect.objectContaining({ tableId: 'tobcbaccaragen92', displayName: 'Speed Baccarat 92 VIP' }),
+        ]));
+      } finally {
+        await restarted.close();
+      }
+    } finally {
+      if (!closed) await service.close();
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 
@@ -1736,22 +1915,41 @@ describe('desktop console demo sessions', () => {
     }
   });
 
-  it('does not attach a discovered table outside the configured monitorTableIds', async () => {
+  it('automatically adds and attaches a newly discovered monitor table', async () => {
     const service = new DesktopConsoleService(':memory:');
+    const feed = {
+      tableId: 'P001',
+      start: async () => undefined,
+      stop: async () => undefined,
+      flush: async () => undefined,
+      keepAlive: async () => ({ ok: true }),
+      health: () => ({
+        tableId: 'P001',
+        state: 'CONNECTED',
+        lastAckedSeq: 0,
+        lastEmittedSeq: 0,
+        bufferDepth: 0,
+        reconnectCount: 0,
+      }),
+    } satisfies TableExport;
     const discoverRooms = vi.spyOn(BrowserBridgeServer.prototype, 'discoverRooms').mockResolvedValue([{
       roomId: 'room-with-unselected-table',
       tables: [{ tableId: 'P001', profile: defaultProfile('P001') }],
     }]);
+    const openTable = vi.spyOn(BrowserBridgeServer.prototype, 'openTable').mockReturnValue(feed);
     try {
       await service.updateMonitorTableIds(['D055']);
 
       await expect(service.startLiveRoomMonitor(0)).resolves.toEqual(expect.objectContaining({ port: expect.any(Number) }));
 
       const current = service.snapshot();
-      expect(current.snapshot.tables.P001).toBeUndefined();
+      expect(current.monitorTableIds).toEqual(['D055', 'P001']);
+      expect(current.snapshot.tables.P001).toBeDefined();
       expect(current.snapshot.tables.D055).toBeDefined();
+      expect(openTable).toHaveBeenCalledWith('room-with-unselected-table', 'P001');
     } finally {
       discoverRooms.mockRestore();
+      openTable.mockRestore();
       await service.close();
     }
   });
@@ -1874,6 +2072,116 @@ describe('desktop console demo sessions', () => {
       discoverRooms.mockRestore();
       openTable.mockRestore();
       await service.close();
+    }
+  });
+
+  it('removes a monitored table after it remains disconnected for fifteen seconds', async () => {
+    vi.useFakeTimers();
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const stop = vi.fn(async () => undefined);
+    const feed = {
+      tableId: 'D055',
+      start: async () => undefined,
+      stop,
+      flush: async () => undefined,
+      keepAlive: async () => ({ ok: false, error: 'disconnected' }),
+      health: () => ({
+        tableId: 'D055',
+        state: 'DISCONNECTED',
+        lastAckedSeq: 0,
+        lastEmittedSeq: 0,
+        bufferDepth: 0,
+        reconnectCount: 1,
+        stalenessMs: 15_000,
+      }),
+    } satisfies TableExport;
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['D055']);
+      service['liveFeeds'].set('D055', feed);
+
+      service['scheduleDisconnectedMonitorRemoval']('D055', 'synthetic disconnect');
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(service.snapshot().monitorTableIds).toEqual(['D055']);
+      expect(stop).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await service['liveMonitorOperation'];
+
+      expect(service.snapshot().monitorTableIds).toEqual([]);
+      expect(service['liveFeeds'].has('D055')).toBe(false);
+      expect(stop).toHaveBeenCalledTimes(1);
+    } finally {
+      await service.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps configured monitor tables while live discovery is still empty', async () => {
+    vi.useFakeTimers();
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['D055']);
+      service['liveMonitorActivated'] = true;
+
+      await service['attachLiveTables']();
+      await vi.advanceTimersByTimeAsync(15_000);
+      await service['liveMonitorOperation'];
+
+      expect(service.snapshot().monitorTableIds).toEqual(['D055']);
+      expect(service['disconnectedMonitorRemovalTimers'].size).toBe(0);
+    } finally {
+      await service.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it('restores an emptied monitor list from persisted table metadata', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'baccarat-monitor-restore-'));
+    const dbPath = join(directory, 'console.sqlite');
+    const first = new DesktopConsoleService(dbPath);
+    let closed = false;
+    try {
+      const bridge = new BrowserBridgeServer();
+      first['browserBridge'] = bridge;
+      first['liveMonitorActivated'] = true;
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [
+            { tableId: 'tobcbaccaragen92', displayName: '粤语极速百家乐' },
+            { tableId: 'speedbca14gesbc1', displayName: 'PATTAYA 泰语极速百家乐' },
+          ],
+        },
+      });
+      await first['attachLiveTables']();
+      await first.updateMonitorTableIds([]);
+      expect(first.snapshot().monitorTableIds).toEqual([]);
+      expect(first.snapshot().tableMetadata.map(table => table.tableId)).toEqual([
+        'tobcbaccaragen92',
+        'speedbca14gesbc1',
+      ]);
+
+      await first.close();
+      closed = true;
+
+      const restarted = new DesktopConsoleService(dbPath);
+      try {
+        expect(restarted.snapshot().monitorTableIds).toEqual([
+          'tobcbaccaragen92',
+          'speedbca14gesbc1',
+        ]);
+      } finally {
+        await restarted.close();
+      }
+    } finally {
+      if (!closed) await first.close();
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 
@@ -2148,10 +2456,10 @@ describe('desktop console demo sessions', () => {
     }
   });
 
-  it('includes simulated record pages only while a live-monitor demo is running', async () => {
+  it('includes non-monitor demo record pages only while a live-monitor demo is running', async () => {
     const service = new DesktopConsoleService(':memory:');
     try {
-      // Given: live monitoring and a simulated demo table with persisted data.
+      // Given: live monitoring and a demo table with persisted data.
       await service.updateMonitorTableIds(['D055']);
       await service.startLiveRoomMonitor(0);
       await service.registerTable(defaultProfile('P001'), 'simulated', 100);
@@ -2161,7 +2469,7 @@ describe('desktop console demo sessions', () => {
       service['demoRunning'] = true;
       const running = service.queryRecords({ kind: 'events', page: 1, pageSize: 20 });
 
-      // Then: its simulated records appear in the paginated live-console view.
+      // Then: demo-running snapshots include the demo table without depending on execution mode.
       expect(running.total).toBe(1);
       expect(running.events?.map(event => event.tableId)).toEqual(['P001']);
 

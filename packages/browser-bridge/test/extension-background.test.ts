@@ -6,6 +6,7 @@ import {
   FakeWebSocket as BetHarnessWebSocket,
   flushAsyncWork as flushBetHarnessAsyncWork,
   liveRequest,
+  pragmaticLiveRequest,
   sentMessages,
 } from './extension-bet-harness.js';
 
@@ -65,6 +66,14 @@ function isMstromFinalInjection(value: unknown): boolean {
     || source.includes('executeMstromBetOneShot');
 }
 
+function isPragmaticProbeInjection(value: unknown): boolean {
+  return String(value).includes('probePragmaticBetTable');
+}
+
+function isPragmaticFinalInjection(value: unknown): boolean {
+  return String(value).includes('executePragmaticBetOneShot');
+}
+
 describe('extension background multitable command', () => {
   it('revokes the live gate before reloading a frozen baccarat popup', async () => {
     const harness = await createHarness();
@@ -100,6 +109,32 @@ describe('extension background multitable command', () => {
           reason: expect.stringContaining('live betting is disabled'),
         }),
       }),
+    }));
+  });
+
+  it('reloads the Pragmatic Jeju popup without treating unrelated popup games as baccarat', async () => {
+    const harness = await createHarness({
+      tabs: [
+        { id: 42, url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat' },
+        { id: 43, url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/another-game' },
+      ],
+    });
+
+    harness.socket.emit('message', {
+      data: JSON.stringify({
+        kind: 'command',
+        name: 'reloadGameTabs',
+        tableIds: ['bc281koreanch281'],
+      }),
+    });
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    expect(harness.chrome.tabs.reload).toHaveBeenCalledOnce();
+    expect(harness.chrome.tabs.reload).toHaveBeenCalledWith(42, { bypassCache: true });
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'sessionAction',
+      detail: 'reloadGameTabs:reloaded=1:tables=1',
     }));
   });
 
@@ -194,6 +229,46 @@ describe('extension background multitable command', () => {
     });
     expect(aliasResult).toEqual(expect.objectContaining({ status: 'opened', state: 'store' }));
     expect(openMultiplayPage).toHaveBeenCalledWith({ fromEntry: 'MultiTab' });
+    const pragmaticClick = vi.fn();
+    const pragmaticControl = {
+      disabled: false,
+      textContent: '多桌',
+      getAttribute: (name: string) => name === 'href' ? '' : null,
+      getBoundingClientRect: () => ({ width: 80, height: 32 }),
+      click: pragmaticClick,
+    };
+    const pragmaticResult = vm.runInNewContext(`(${String(options.func)})()`, {
+      location: {
+        hostname: 'client.pragmaticplaylive.net',
+        pathname: '/desktop/launcher/',
+        href: 'https://client.pragmaticplaylive.net/desktop/launcher/',
+      },
+      document: {
+        querySelectorAll: (selector: string) => selector.includes('button') ? [pragmaticControl] : [],
+      },
+      String,
+    });
+    expect(pragmaticResult).toEqual(expect.objectContaining({
+      status: 'opened',
+      state: 'pragmatic-native-control',
+    }));
+    expect(pragmaticClick).toHaveBeenCalledTimes(1);
+    const pragmaticSingleLocation = {
+      hostname: 'client.pragmaticplaylive.net',
+      pathname: '/desktop/baccarat/',
+      href: 'https://client.pragmaticplaylive.net/desktop/baccarat/?table_id=bc281koreanch281&token=redacted',
+    };
+    const pragmaticRouteResult = vm.runInNewContext(`(${String(options.func)})()`, {
+      location: pragmaticSingleLocation,
+      document: { querySelectorAll: () => [] },
+      String,
+    });
+    expect(pragmaticRouteResult).toEqual(expect.objectContaining({
+      status: 'opened',
+      state: 'pragmatic-direct-route',
+    }));
+    expect(pragmaticSingleLocation.pathname).toBe('/desktop/multibaccarat/');
+    expect(pragmaticSingleLocation.href).toContain('table_id=bc281koreanch281');
     expect(storageSet).not.toHaveBeenCalledWith({ liveBetEnabled: true });
     expect(storageSet).not.toHaveBeenCalledWith({ liveBetEnabled: false });
     expect(socket.sent.map(message => JSON.parse(message))).toContainEqual(expect.objectContaining({
@@ -509,6 +584,104 @@ describe('extension background multitable command', () => {
     }));
   });
 
+  it('reports Pragmatic readiness without executing a wager', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+    });
+
+    harness.socket.emit('message', {
+      data: JSON.stringify({
+        kind: 'command',
+        name: 'probeBetReadiness',
+        tableIds: [pragmaticLiveRequest().request.intent.tableId],
+      }),
+    });
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => isPragmaticProbeInjection(injection.func),
+    )).toBe(true);
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes('scrollIntoView'),
+    )).toBe(true);
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes('icon-Video'),
+    )).toBe(true);
+    const preparation = harness.executeScript.mock.calls.find(
+      ([injection]) => String(injection.func).includes('icon-Video'),
+    );
+    expect(preparation?.[0].args?.[2]).toBeNull();
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => isPragmaticFinalInjection(injection.func),
+    )).toBe(false);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'sessionAction',
+      action: 'command-executed',
+      detail: expect.stringContaining(
+        'probeBetReadiness:bc281koreanch281:candidates=1:status=ready:readyCandidates=1:authority=unique-ready:roundId=1726012345',
+      ),
+    }));
+  });
+
+  it('maintains a fresh per-table Pragmatic protocol betting window', async () => {
+    const harness = await createHarness();
+    const capture = (data: unknown) => vm.runInContext(
+      `ingestPragmaticProtocolWindow(${JSON.stringify({
+        kind: 'networkCapture',
+        source: 'baccarat-bridge-pragmatic-ws',
+        direction: 'recv',
+        encoding: 'text',
+        data: JSON.stringify(data),
+      })})`,
+      harness.context,
+    );
+
+    capture({ game: { table: 'tobcbaccaragen92', game: '17260578524', seq: 1 } });
+    capture({ betsopen: { table: 'tobcbaccaragen92', game: '17260578524', seq: 2 } });
+    capture({ timer: { table: 'tobcbaccaragen92', game: '17260578524', value: 9, seq: 3 } });
+
+    expect(vm.runInContext(
+      `pragmaticProtocolWindow('tobcbaccaragen92')`,
+      harness.context,
+    )).toEqual(expect.objectContaining({
+      roundId: '17260578524',
+    }));
+    capture({ betsclosed: { table: 'tobcbaccaragen92', game: '17260578524', seq: 4 } });
+    expect(vm.runInContext(
+      `pragmaticProtocolWindow('tobcbaccaragen92')`,
+      harness.context,
+    )).toBeNull();
+  });
+
+  it('keeps a Pragmatic protocol betting window when a dedicated-socket seq is lower than the shared stream', async () => {
+    const harness = await createHarness();
+    const capture = (data: unknown) => vm.runInContext(
+      `ingestPragmaticProtocolWindow(${JSON.stringify({
+        kind: 'networkCapture',
+        source: 'baccarat-bridge-pragmatic-ws',
+        direction: 'recv',
+        encoding: 'text',
+        data: JSON.stringify(data),
+      })})`,
+      harness.context,
+    );
+
+    capture({ game: { table: 'bc281koreanch281', game: '16392002810', seq: 12500 } });
+    capture({ betsopen: { table: 'bc281koreanch281', game: '16392002810', seq: 105 } });
+    capture({ timer: { table: 'bc281koreanch281', game: '16392002810', value: 9, seq: 106 } });
+
+    expect(vm.runInContext(
+      `pragmaticProtocolWindow('bc281koreanch281')`,
+      harness.context,
+    )).toEqual(expect.objectContaining({
+      roundId: '16392002810',
+    }));
+  });
+
   it('reports safe frame structure when no target bet store is found', async () => {
     const harness = await createHarness({
       probeResults: [{
@@ -771,6 +944,21 @@ describe('extension background live bet gate', () => {
     expect(harness.executeScript.mock.calls.some(
       ([injection]) => isMstromFinalInjection(injection.func),
     )).toBe(false);
+  });
+
+  it('reconnects from the persistent alarm after the service-worker timer is lost', async () => {
+    const harness = await createHarness();
+
+    harness.socket.close();
+    const alarmListener = harness.chrome.alarms.onAlarm.addListener.mock.calls
+      .map(([listener]) => listener as (alarm: { readonly name: string }) => void)
+      .find(listener => String(listener).includes('BRIDGE_RECONNECT_ALARM'));
+    expect(alarmListener).toBeDefined();
+
+    alarmListener?.({ name: 'baccarat-bridge-reconnect' });
+    await flushBetHarnessAsyncWork();
+
+    expect(BetHarnessWebSocket.instances).toHaveLength(2);
   });
 
   it('does not restore the live bet gate when the bridge reconnects', async () => {

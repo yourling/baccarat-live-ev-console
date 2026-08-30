@@ -26,7 +26,8 @@
   const CLICK_REPORT_INTERVAL_MS = 5 * 60 * 1000;
 
   // 只在游戏相关页面上工作:其他页面(控制台/搜索引擎/追踪器)不采集、不保活、不发心跳。
-  const GAME_PAGE = /(?:^|\.)(?:dafabet\.(?:net|com)|df888evo\.com|egcvi\.com|mstrom-uno\.com|673ing\.com)$/i.test(location.hostname);
+  const PRAGMATIC_PAGE = /(?:^|\.)(?:pragmaticplaylive\.net|vbgames88\.com|zavjcswh\.biz)$/i.test(location.hostname);
+  const GAME_PAGE = /(?:^|\.)(?:pragmaticplaylive\.net|vbgames88\.com|zavjcswh\.biz|dafabet\.(?:net|com)|df888evo\.com|egcvi\.com|mstrom-uno\.com|673ing\.com)$/i.test(location.hostname);
 
   const knownRooms = new Map();
   let diagnosticSent = false;
@@ -42,6 +43,8 @@
   let lastHealthyAt = Date.now();
   let lastClickReportAt = 0;
   let betInFlight = 0;
+  const betFrameRectResponses = new Map();
+  const betFrameRectChildren = new Map();
 
   function frameKind() {
     return window.top === window ? 'top' : 'iframe';
@@ -214,6 +217,7 @@
 
   function keepAliveTick() {
     try {
+      if (isPragmaticGameContainer()) return;
       jitterDomActivity();
       sendBeaconRequest();
       clickKeepAliveTarget(document);
@@ -398,6 +402,17 @@
     }, delay);
   }
 
+  function isPragmaticGameContainer() {
+    if (/(^|\.)client\.pragmaticplaylive\.net$/i.test(location.hostname)) return true;
+    if (/\/live-dealer\/popup-launch\/jeju-speed-baccarat(?:[/?#]|$)/i.test(location.pathname)) return true;
+    try {
+      return Array.from(document.querySelectorAll('iframe[src]')).some(frame =>
+        /(?:^|\.)pragmaticplaylive\.net$/i.test(new URL(frame.src, location.href).hostname));
+    } catch (_) {
+      return false;
+    }
+  }
+
   function clearSupervisoryRecovery() {
     if (supervisoryRecoveryTimer) {
       clearTimeout(supervisoryRecoveryTimer);
@@ -554,10 +569,14 @@
       || data.source === 'baccarat-bridge-jsonparse'
       || data.source === 'baccarat-bridge-runtime-state'
       || data.source === 'baccarat-bridge-runtime-selection'
-      || data.source === 'baccarat-bridge-worker-message';
+      || data.source === 'baccarat-bridge-worker-message'
+      || data.source.startsWith('baccarat-bridge-pragmatic-');
     if (!isRealtimeSocket && !/evoad\.df888evo\.com|evolution|evo|mstrom-uno|673ing\.com/i.test(url)) return;
     // 解析器需要完整 JSON:游戏数据消息的传输截断上限放宽到 120KB。
-    const limit = data.source === 'baccarat-bridge-jsonparse' || data.source === 'baccarat-bridge-decrypt'
+    const limit = data.source === 'baccarat-bridge-jsonparse'
+      || data.source === 'baccarat-bridge-decrypt'
+      || data.source === 'baccarat-bridge-pragmatic-ws'
+      || data.source.startsWith('baccarat-bridge-pragmatic-')
       ? 120000
       : 8000;
     sendToBackground({
@@ -569,6 +588,23 @@
       data: String(data.data || '').slice(0, limit),
     });
   });
+
+  if (PRAGMATIC_PAGE) {
+    window.postMessage({ source: 'baccarat-bridge-pragmatic-network-ready' }, '*');
+    try {
+      void chrome.storage.local.get(
+        ['pragmaticLpBetTemplate', 'pragmaticLpBetUserId', 'pragmaticLpBetGm'],
+        items => {
+          window.postMessage({
+            source: 'baccarat-bridge-pragmatic-restore-bet-template',
+            template: items && items.pragmaticLpBetTemplate,
+            uId: items && items.pragmaticLpBetUserId,
+            gm: items && items.pragmaticLpBetGm,
+          }, '*');
+        },
+      );
+    } catch (_) {}
+  }
 
   // MAIN world 上报的 WebSocket 断开:静默掉线的可观测信号。
   window.addEventListener('message', event => {
@@ -583,6 +619,110 @@
     if (message && message.kind === 'armCalibration') {
       armCalibrationCapture();
     }
+  });
+
+  function validBetFrameRect(value) {
+    return value
+      && typeof value === 'object'
+      && [value.x, value.y, value.width, value.height, value.viewportWidth, value.viewportHeight]
+        .every(Number.isFinite)
+      && value.width > 0
+      && value.height > 0
+      && value.viewportWidth > 0
+      && value.viewportHeight > 0;
+  }
+
+  function relayBetFrameRect(token, value) {
+    if (window.top === window) return false;
+    window.parent.postMessage({
+      source: 'baccarat-bridge-bet-frame-rect',
+      kind: 'request',
+      token,
+      rect: value,
+    }, '*');
+    return true;
+  }
+
+  // CDP receives coordinates in the top-level viewport. Relay a target frame's
+  // local point through every iframe owner so nested, cross-origin games remain exact.
+  window.addEventListener('message', event => {
+    const data = event.data;
+    if (
+      !data
+      || data.source !== 'baccarat-bridge-bet-frame-rect'
+      || typeof data.token !== 'string'
+      || !/^[a-z0-9-]{12,100}$/i.test(data.token)
+    ) return;
+    if (data.kind === 'response') {
+      const child = betFrameRectChildren.get(data.token);
+      if (child) {
+        betFrameRectChildren.delete(data.token);
+        child.postMessage(data, '*');
+        return;
+      }
+      const sendResponse = betFrameRectResponses.get(data.token);
+      if (!sendResponse) return;
+      betFrameRectResponses.delete(data.token);
+      sendResponse(data.rect || null);
+      return;
+    }
+    if (data.kind !== 'request' || !validBetFrameRect(data.rect)) return;
+    const owner = Array.from(document.querySelectorAll('iframe')).find(
+      frame => frame.contentWindow === event.source,
+    );
+    if (!owner) return;
+    const ownerRect = owner.getBoundingClientRect();
+    const ownerScaleX = owner.offsetWidth > 0 ? ownerRect.width / owner.offsetWidth : 1;
+    const ownerScaleY = owner.offsetHeight > 0 ? ownerRect.height / owner.offsetHeight : 1;
+    const contentLeft = ownerRect.left + Number(owner.clientLeft || 0) * ownerScaleX;
+    const contentTop = ownerRect.top + Number(owner.clientTop || 0) * ownerScaleY;
+    const contentWidth = Math.max(1, Number(owner.clientWidth || ownerRect.width) * ownerScaleX);
+    const contentHeight = Math.max(1, Number(owner.clientHeight || ownerRect.height) * ownerScaleY);
+    const childScaleX = contentWidth / data.rect.viewportWidth;
+    const childScaleY = contentHeight / data.rect.viewportHeight;
+    const translated = {
+      ...data.rect,
+      x: contentLeft + data.rect.x * childScaleX,
+      y: contentTop + data.rect.y * childScaleY,
+      width: data.rect.width * childScaleX,
+      height: data.rect.height * childScaleY,
+      viewportWidth: window.innerWidth || document.documentElement.clientWidth || contentWidth,
+      viewportHeight: window.innerHeight || document.documentElement.clientHeight || contentHeight,
+    };
+    betFrameRectChildren.set(data.token, event.source);
+    setTimeout(() => betFrameRectChildren.delete(data.token), 5000);
+    if (window.top === window) {
+      event.source.postMessage({
+        source: 'baccarat-bridge-bet-frame-rect',
+        kind: 'response',
+        token: data.token,
+        rect: translated,
+      }, '*');
+      betFrameRectChildren.delete(data.token);
+      return;
+    }
+    relayBetFrameRect(data.token, translated);
+  });
+
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (!message || message.kind !== 'resolveBetFrameRect') return;
+    if (typeof message.token !== 'string' || !validBetFrameRect(message.rect)) {
+      sendResponse(null);
+      return;
+    }
+    if (window.top === window) {
+      sendResponse(message.rect);
+      return;
+    }
+    betFrameRectResponses.set(message.token, sendResponse);
+    setTimeout(() => {
+      const pending = betFrameRectResponses.get(message.token);
+      if (!pending) return;
+      betFrameRectResponses.delete(message.token);
+      pending(null);
+    }, 5000);
+    relayBetFrameRect(message.token, message.rect);
+    return true;
   });
 
   // 后台询问游戏 iframe 在顶层页面里的位置(用于合成 CDP 可信点击的绝对坐标)。
