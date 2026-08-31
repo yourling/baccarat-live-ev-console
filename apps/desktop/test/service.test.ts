@@ -156,7 +156,7 @@ function monitorShoeEvent(
     tableId,
     timestamp: '2026-08-23T11:00:00.000Z',
     sourceSeq: 1,
-    source: 'mstrom-protocol',
+    source: 'pragmatic-runtime',
     schemaVersion: EVENT_SCHEMA_VERSION,
     shoeId: `monitor-session-${tableId}`,
     baseline,
@@ -171,7 +171,7 @@ function openedPlatformRound(tableId: string, eventId: string, handId: string): 
     tableId,
     timestamp: '2026-08-23T11:00:01.000Z',
     sourceSeq: 2,
-    source: 'mstrom-protocol',
+    source: 'pragmatic-runtime',
     schemaVersion: EVENT_SCHEMA_VERSION,
     shoeId: `monitor-session-${tableId}`,
     handId,
@@ -212,21 +212,21 @@ describe('desktop console demo sessions', () => {
   });
 
   // Contract: trim and uppercase IDs, keep first occurrence, reject blanks, and preserve order.
-  it('exposes the current ordered Dafabet multiview fallback tables', async () => {
+  it('exposes the current ordered Pragmatic monitor fallback tables', async () => {
     const service = new DesktopConsoleService(':memory:');
     try {
-      expect(service.snapshot().monitorTableIds).toEqual(['D066', 'D067', 'D056', 'D057']);
+      expect(service.snapshot().monitorTableIds).toEqual(['bc281koreanch281', 'tobcbaccaragen92', 'speedbca14gesbc1', 'h22z8qhp17sa0vkh']);
     } finally {
       await service.close();
     }
   });
 
-  it('uses the Dafabet multiview fallback for a fresh monitor session', async () => {
+  it('uses the Pragmatic monitor fallback for a fresh monitor session', async () => {
     const previous = process.env.BACCARAT_LIVE_TABLES;
     delete process.env.BACCARAT_LIVE_TABLES;
     const service = new DesktopConsoleService(':memory:');
     try {
-      expect(service.snapshot().monitorTableIds).toEqual(['D066', 'D067', 'D056', 'D057']);
+      expect(service.snapshot().monitorTableIds).toEqual(['bc281koreanch281', 'tobcbaccaragen92', 'speedbca14gesbc1', 'h22z8qhp17sa0vkh']);
     } finally {
       await service.close();
       if (previous === undefined) {
@@ -1734,7 +1734,7 @@ describe('desktop console demo sessions', () => {
       bridge.ingestClientMessage({
         kind: 'networkCapture',
         source: 'baccarat-bridge-runtime-selection',
-        url: 'https://gci.agad.mstrom-uno.com/pc/pcv1/index.jsp?',
+        url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/',
         direction: 'recv',
         encoding: 'text',
         data: JSON.stringify({ tableIds: [] }),

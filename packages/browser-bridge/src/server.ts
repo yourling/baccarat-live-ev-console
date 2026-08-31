@@ -34,11 +34,6 @@ import type {
   BridgeRoomDescriptor,
   BridgeServerMessage,
 } from './protocol.js';
-import { EvolutionBaccaratParser } from './evolution.js';
-import { MstromProtocolEventParser } from './mstrom-protocol-events.js';
-import { parseMstromFrame } from './mstrom-protocol.js';
-import { MstromRuntimeParser } from './mstrom-runtime.js';
-import { MstromShoeSessionRegistry } from './mstrom-shoe-session.js';
 import { PragmaticRuntimeParser } from './pragmatic-runtime.js';
 import {
   PragmaticProtocolState,
@@ -49,9 +44,7 @@ import {
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-export const MSTROM_BET_RUNTIME_REVISION = 'mstrom-bet-runtime/2026-08-28.1';
 export const PRAGMATIC_BET_RUNTIME_REVISION = 'pragmatic-bet-runtime/2026-08-30.14';
-const MSTROM_BET_RUNTIME_FAMILY = 'mstrom-bet-runtime/';
 const PRAGMATIC_BET_RUNTIME_FAMILY = 'pragmatic-bet-runtime/';
 
 export class OperationalWagerRuntimeRevisionError extends Error {
@@ -180,7 +173,7 @@ const PRAGMATIC_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
 const PRAGMATIC_EXECUTION_LANE = 'pragmatic:shared-multitable-ui';
 
 /** 观察广播允许透传的网络捕获域名(游戏/聊天/会话通道,不含视频流)。 */
-const OBSERVABLE_NETWORK_PATTERN = /df888evo|evolution|evo|mstrom-uno|673ing|pragmaticplaylive|mdvuz|e9p1/i;
+const OBSERVABLE_NETWORK_PATTERN = /pragmaticplaylive|mdvuz|e9p1|vbgames88|zavjcswh|dafabet\.net/i;
 
 const LIVE_EXTENSION_CONNECTION_ERROR =
   'live bet execution requires exactly one browser extension connection with an authenticated extension sequence';
@@ -475,8 +468,8 @@ function pragmaticGameStateObservation(value: unknown): Record<string, unknown> 
 
 function pragmaticCaptureDir(): string {
   return process.cwd().endsWith('desktop')
-    ? join(process.cwd(), '..', '..', '.tmp-mstrom')
-    : join(process.cwd(), '.tmp-mstrom');
+    ? join(process.cwd(), '..', '..', '.tmp-pragmatic')
+    : join(process.cwd(), '.tmp-pragmatic');
 }
 
 function pragmaticGameresultCapturePath(): string {
@@ -904,12 +897,8 @@ export class BrowserBridgeServer implements RoomMonitor {
   private exports = new Map<string, BridgeTableExport>();
   private pendingBets = new Map<string, PendingBet>();
   private readonly tableExecutionTails = new Map<string, Promise<void>>();
-  private readonly evolutionParser = new EvolutionBaccaratParser();
   private pragmaticParser = new PragmaticRuntimeParser();
   private readonly pragmaticProtocol = new PragmaticProtocolState();
-  private readonly mstromShoeSessions = new Map<string, MstromShoeSessionRegistry>();
-  private readonly mstromProtocolParsers = new Map<string, MstromProtocolEventParser>();
-  private readonly mstromRuntimeParsers = new Map<string, MstromRuntimeParser>();
   private readonly parsedSourceSeqByTable = new Map<string, number>();
   private readonly parsedEventIds = new Set<string>();
   private readonly protocolObservationStartedAt = new Map<string, number>();
@@ -1111,9 +1100,6 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.clearStalePageReloadTimer();
     this.staleTableIds.clear();
     this.stalePageReloadAttempts = 0;
-    this.mstromShoeSessions.clear();
-    this.mstromProtocolParsers.clear();
-    this.mstromRuntimeParsers.clear();
     this.pragmaticParser = new PragmaticRuntimeParser();
     this.pragmaticProtocol.reset();
     this.parsedSourceSeqByTable.clear();
@@ -1123,12 +1109,10 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.runtimeStateLastObservedAt.clear();
     this.runtimeStateStaleTableIds.clear();
     for (const [key, exportInstance] of this.exports) {
-      if (!key.startsWith('dafabet-live::') && !key.startsWith('dafabet-pragmatic::')) continue;
+      if (!key.startsWith('dafabet-pragmatic::')) continue;
       void exportInstance.stop();
       this.exports.delete(key);
     }
-    this.rooms.delete('dafabet-live');
-    this.discoveredRooms.delete('dafabet-live');
     this.rooms.delete('dafabet-pragmatic');
     this.discoveredRooms.delete('dafabet-pragmatic');
   }
@@ -1146,20 +1130,16 @@ export class BrowserBridgeServer implements RoomMonitor {
 
   confirmPhysicalShoe(tableId: string): void {
     if (!this.isTableSelected(tableId)) throw new Error(`table ${tableId} is not selected`);
-    const confirmation = this.getMstromShoeSession(tableId).confirmOperatorPhysicalShoe(tableId);
-    if (!confirmation.rotated) return;
-    const shoe = confirmation.shoe;
-    this.mstromProtocolParsers.delete(tableId);
-    this.mstromRuntimeParsers.delete(tableId);
+    const shoeId = `pragmatic-${tableId}-operator`;
     this.ingestParsedEvents([{
       type: 'newShoeSignal',
-      eventId: `mstrom-session:${shoe.shoeId}:new-shoe`,
+      eventId: `pragmatic-session:${shoeId}:new-shoe`,
       tableId,
       timestamp: new Date().toISOString(),
       sourceSeq: 0,
       source: 'operator',
       schemaVersion: EVENT_SCHEMA_VERSION,
-      shoeId: shoe.shoeId,
+      shoeId,
       baseline: 'physical-shoe',
       profile: { ...defaultProfile(tableId), autoConfirmNewShoe: true },
     }]);
@@ -1177,9 +1157,7 @@ export class BrowserBridgeServer implements RoomMonitor {
       const revision = typeof receipt.raw === 'object' && receipt.raw !== null
         ? Reflect.get(receipt.raw, 'runtimeRevision')
         : undefined;
-      const expectedFamily = PRAGMATIC_TABLE_ID_PATTERN.test(request.wager.tableId)
-        ? PRAGMATIC_BET_RUNTIME_FAMILY
-        : MSTROM_BET_RUNTIME_FAMILY;
+      const expectedFamily = PRAGMATIC_BET_RUNTIME_FAMILY;
       if (!isCompatibleOperationalRuntimeRevision(revision, expectedFamily)) {
         throw new OperationalWagerRuntimeRevisionError(receipt);
       }
@@ -1262,9 +1240,6 @@ export class BrowserBridgeServer implements RoomMonitor {
       return previousRuntimeSelectedTables?.has(tableId) ?? false;
     };
     const trackedTableIds = new Set([
-      ...this.mstromShoeSessions.keys(),
-      ...this.mstromProtocolParsers.keys(),
-      ...this.mstromRuntimeParsers.keys(),
       ...this.parsedSourceSeqByTable.keys(),
     ]);
     const newlySelectedTableIds = [...nextSelectedTables].filter(tableId => !wasPreviouslySelected(tableId));
@@ -1278,7 +1253,7 @@ export class BrowserBridgeServer implements RoomMonitor {
     }
     for (const tableId of trackedTableIds) {
       if (!nextSelectedTables.has(tableId) || !wasPreviouslySelected(tableId)) {
-        this.resetMstromTableState(tableId);
+        this.resetTableState(tableId);
       }
     }
     for (const tableId of newlySelectedTableIds) {
@@ -1414,9 +1389,7 @@ export class BrowserBridgeServer implements RoomMonitor {
       case 'networkCapture':
         logNetworkCapture(message);
         capturePragmaticNetworkFrame(message);
-        if (message.source === 'baccarat-bridge-jsonparse') {
-          this.ingestParsedEvents(this.evolutionParser.parse(message.data));
-        } else if (message.source === 'baccarat-bridge-pragmatic-state') {
+        if (message.source === 'baccarat-bridge-pragmatic-state') {
           for (const tableId of this.pragmaticParser.observedTableIds(message.data)) {
             if (this.isTableSelected(tableId)) this.noteTableObservation(tableId);
           }
@@ -1442,28 +1415,6 @@ export class BrowserBridgeServer implements RoomMonitor {
           }
         } else if (message.source === 'baccarat-bridge-runtime-selection') {
           this.applyRuntimeSelection(message.data);
-        } else if (message.source === 'baccarat-bridge-runtime-state') {
-          const runtimeState = runtimeStateObservation(message.data);
-          if (runtimeState !== undefined && this.isTableSelected(runtimeState.tableId)) {
-            this.noteRuntimeStateObservation(runtimeState.tableId);
-            this.noteTableObservation(runtimeState.tableId);
-            this.ingestParsedEvents(this.getMstromRuntimeParser(runtimeState.tableId).parse(message.data));
-          }
-        } else if (
-          message.source === 'baccarat-bridge-ws'
-          && message.encoding === 'base64'
-          && message.direction !== 'send'
-        ) {
-          const bytes = Uint8Array.from(Buffer.from(message.data, 'base64'));
-          const parsed = parseMstromFrame(bytes);
-          if (parsed.ok && this.isTableSelected(parsed.frame.tableId)) {
-            this.noteProtocolObservation(parsed.frame.tableId);
-            if (this.runtimeStateStaleTableIds.has(parsed.frame.tableId)) break;
-            this.noteTableObservation(parsed.frame.tableId);
-            this.ingestParsedEvents(
-              this.getMstromProtocolParser(parsed.frame.tableId).ingest(parsed.frame, new Date().toISOString()),
-            );
-          }
         }
         break;
       case 'sessionExpired':
@@ -1571,39 +1522,12 @@ export class BrowserBridgeServer implements RoomMonitor {
     }
   }
 
-  private resetMstromTableState(tableId: string): void {
-    this.mstromShoeSessions.delete(tableId);
-    this.mstromProtocolParsers.delete(tableId);
-    this.mstromRuntimeParsers.delete(tableId);
+  private resetTableState(tableId: string): void {
     this.parsedSourceSeqByTable.delete(tableId);
     this.protocolObservationStartedAt.delete(tableId);
     this.protocolLastObservedAt.delete(tableId);
     this.runtimeStateLastObservedAt.delete(tableId);
     this.runtimeStateStaleTableIds.delete(tableId);
-  }
-
-  private getMstromShoeSession(tableId: string): MstromShoeSessionRegistry {
-    const existing = this.mstromShoeSessions.get(tableId);
-    if (existing) return existing;
-    const created = new MstromShoeSessionRegistry();
-    this.mstromShoeSessions.set(tableId, created);
-    return created;
-  }
-
-  private getMstromProtocolParser(tableId: string): MstromProtocolEventParser {
-    const existing = this.mstromProtocolParsers.get(tableId);
-    if (existing) return existing;
-    const created = new MstromProtocolEventParser(this.getMstromShoeSession(tableId));
-    this.mstromProtocolParsers.set(tableId, created);
-    return created;
-  }
-
-  private getMstromRuntimeParser(tableId: string): MstromRuntimeParser {
-    const existing = this.mstromRuntimeParsers.get(tableId);
-    if (existing) return existing;
-    const created = new MstromRuntimeParser(this.getMstromShoeSession(tableId));
-    this.mstromRuntimeParsers.set(tableId, created);
-    return created;
   }
 
   private requestMultiviewRecovery(): void {
@@ -1670,9 +1594,7 @@ export class BrowserBridgeServer implements RoomMonitor {
       if (BRIDGE_DEBUG_ENABLED) {
         console.log('[bridge-event]', JSON.stringify(normalizedEvent));
       }
-      const roomId = normalizedEvent.source === 'pragmatic-runtime'
-        ? 'dafabet-pragmatic'
-        : 'dafabet-live';
+      const roomId = 'dafabet-pragmatic';
       this.ensureRoomForTable(normalizedEvent.tableId, roomId);
       const exportInstance = this.getOrCreateExport(roomId, normalizedEvent.tableId);
       exportInstance.ingestEvent(normalizedEvent);
@@ -1704,10 +1626,8 @@ export class BrowserBridgeServer implements RoomMonitor {
     }
   }
 
-  private ensureRoomForTable(tableId: string, roomId = 'dafabet-live'): void {
-    const displayName = roomId === 'dafabet-pragmatic'
-      ? 'Dafabet Pragmatic Play'
-      : 'Dafabet Live Dealer';
+  private ensureRoomForTable(tableId: string, roomId = 'dafabet-pragmatic'): void {
+    const displayName = 'Dafabet Pragmatic Play';
     upsertBridgeRoom(this.discoveredRooms, {
       roomId,
       displayName,

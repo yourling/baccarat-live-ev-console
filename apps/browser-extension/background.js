@@ -9,12 +9,9 @@ const DEFAULT_BRIDGE_URL = `ws://127.0.0.1:17890/?token=${DEFAULT_BRIDGE_TOKEN}`
 const CDP_MIN_INTERVAL_MS = 60 * 1000;
 const EXTENSION_RELOAD_DELAY_MS = 1000;
 const BRIDGE_RECONNECT_ALARM = 'baccarat-bridge-reconnect';
-const DAFABET_BACCARAT_POPUP_URL = 'https://www.dafabet.net/sc/live-dealer/popup-launch/live-baccarat-pa';
 const DAFABET_PRAGMATIC_POPUP_PATH = '/live-dealer/popup-launch/jeju-speed-baccarat';
-const DAFABET_POPUP_QUERY = 'https://www.dafabet.net/*/live-dealer/popup-launch/*';
-const GAME_TAB_URL_PATTERN = /^https?:\/\/(?:[a-z0-9-]+\.)*(?:dafabet\.(?:net|com)|df888evo\.com|egcvi\.com|mstrom-uno\.com|673ing\.com|vbgames88\.com|pragmaticplaylive\.net)(?::\d+)?(?:[/?#]|$)/i;
-const MSTROM_FRAME_HOST_PATTERN = /(^|\.)(?:mstrom-uno|673ing)\.com$/i;
-const MSTROM_BET_RUNTIME_REVISION = 'mstrom-bet-runtime/2026-08-28.1';
+const DAFABET_POPUP_QUERY = 'https://www.dafabet.net/*/live-dealer/popup-launch/jeju-speed-baccarat*';
+const GAME_TAB_URL_PATTERN = /^https?:\/\/(?:[a-z0-9-]+\.)*(?:dafabet\.net|vbgames88\.com|zavjcswh\.biz|pragmaticplaylive\.net)(?::\d+)?(?:[/?#]|$)/i;
 const PRAGMATIC_FRAME_HOST_PATTERN = /(^|\.)client\.pragmaticplaylive\.net$/i;
 const PRAGMATIC_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
 const PRAGMATIC_BET_RUNTIME_REVISION = 'pragmatic-bet-runtime/2026-08-30.21';
@@ -136,7 +133,6 @@ function pragmaticProtocolWindow(tableId) {
 }
 
 if (typeof importScripts === 'function') {
-  importScripts('mstrom-bet-runtime.js');
   importScripts('pragmatic-bet-runtime.js');
 }
 
@@ -291,16 +287,6 @@ function isLiveBetSessionCurrent(generation) {
     && socket
     && socket.readyState === WebSocket.OPEN;
 }
-
-function exactDafabetBaccaratPopup(url) {
-  try {
-    const parsed = new URL(String(url || ''));
-    return `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}` === DAFABET_BACCARAT_POPUP_URL;
-  } catch (_) {
-    return false;
-  }
-}
-
 function exactDafabetPragmaticPopup(url) {
   try {
     const parsed = new URL(String(url || ''));
@@ -312,7 +298,7 @@ function exactDafabetPragmaticPopup(url) {
 }
 
 function exactSupportedBaccaratPopup(url) {
-  return exactDafabetBaccaratPopup(url) || exactDafabetPragmaticPopup(url);
+  return exactDafabetPragmaticPopup(url);
 }
 
 function betErrorMessage(error) {
@@ -322,11 +308,11 @@ function betErrorMessage(error) {
   return String(error || 'unknown live bet error').slice(0, 500);
 }
 
-function unknownBetReceipt(request, requestId, reason, platform = 'mstrom', rawDetails = {}) {
+function unknownBetReceipt(request, requestId, reason, platform = 'pragmatic', rawDetails = {}) {
   const runtimeRevision = platform === 'pragmatic'
     ? PRAGMATIC_BET_RUNTIME_REVISION
-    : MSTROM_BET_RUNTIME_REVISION;
-  const receiptPrefix = platform === 'pragmatic' ? 'pragmatic-bridge' : 'mstrom-bridge';
+    : PRAGMATIC_BET_RUNTIME_REVISION;
+  const receiptPrefix = 'pragmatic-bridge';
   const wager = request && request.wager ? request.wager : null;
   if (wager && typeof wager === 'object') {
     const tableId = typeof wager.tableId === 'string' ? wager.tableId : '';
@@ -379,11 +365,11 @@ function unknownBetReceipt(request, requestId, reason, platform = 'mstrom', rawD
   };
 }
 
-function precommitRejectedBetReceipt(request, requestId, reason, platform = 'mstrom') {
+function precommitRejectedBetReceipt(request, requestId, reason, platform = 'pragmatic') {
   const runtimeRevision = platform === 'pragmatic'
     ? PRAGMATIC_BET_RUNTIME_REVISION
-    : MSTROM_BET_RUNTIME_REVISION;
-  const receiptPrefix = platform === 'pragmatic' ? 'pragmatic-bridge' : 'mstrom-bridge';
+    : PRAGMATIC_BET_RUNTIME_REVISION;
+  const receiptPrefix = 'pragmatic-bridge';
   const wager = request && request.wager ? request.wager : null;
   if (wager && typeof wager === 'object') {
     const tableId = typeof wager.tableId === 'string' ? wager.tableId : '';
@@ -440,7 +426,7 @@ function validateLiveBetMessage(message) {
     throw new Error('invalid bet request id');
   }
   if (!request || request.mode !== 'live') {
-    throw new Error('only live bet requests can enter the Dafabet executor');
+    throw new Error('only live bet requests can enter the Pragmatic executor');
   }
   const intent = request.intent;
   const wager = request.wager;
@@ -452,95 +438,14 @@ function validateLiveBetMessage(message) {
     : wager && typeof wager === 'object'
       ? wager.tableId
       : null;
-  const platform = typeof tableId === 'string' && /^[A-Z]\d{3}$/.test(tableId)
-    ? 'mstrom'
-    : typeof tableId === 'string' && PRAGMATIC_TABLE_ID_PATTERN.test(tableId)
-      ? 'pragmatic'
-      : null;
+  const platform = typeof tableId === 'string' && PRAGMATIC_TABLE_ID_PATTERN.test(tableId)
+    ? 'pragmatic'
+    : null;
   if (platform === null) {
-    throw new Error('invalid Dafabet table id');
+    throw new Error('invalid Pragmatic table id');
   }
   return { requestId: message.requestId, request, tableId, platform };
 }
-
-async function executeUniqueMstromBet(message, generation) {
-  const parsed = validateLiveBetMessage(message);
-  let tabId;
-  let frameId;
-  try {
-    assertLiveBetSession(generation);
-    const tabs = await chrome.tabs.query({
-      url: [`${DAFABET_BACCARAT_POPUP_URL}*`],
-    });
-    assertLiveBetSession(generation);
-    const targets = tabs.filter(tab => tab.id && exactDafabetBaccaratPopup(tab.url));
-    if (targets.length !== 1) {
-      throw new Error(`expected exactly one Dafabet baccarat popup tab, found ${targets.length}`);
-    }
-    tabId = targets[0].id;
-
-    assertLiveBetSession(generation);
-    const probes = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      world: 'MAIN',
-      args: [parsed.tableId],
-      func: globalThis.probeMstromBetStore,
-    });
-    assertLiveBetSession(generation);
-    const candidates = probes.filter(entry => {
-      const result = entry && entry.result;
-      return result
-        && (result.status === 'ready' || result.ownsTargetStore === true)
-        && result.tableId === parsed.tableId
-        && result.runtimeRevision === MSTROM_BET_RUNTIME_REVISION
-        && MSTROM_FRAME_HOST_PATTERN.test(String(result.host || ''));
-    });
-    if (candidates.length !== 1 || !Number.isInteger(candidates[0].frameId)) {
-      throw new Error(`expected exactly one matching frame for ${parsed.tableId}, found ${candidates.length}`);
-    }
-    frameId = candidates[0].frameId;
-    assertLiveBetSession(generation);
-  } catch (error) {
-    return precommitRejectedBetReceipt(
-      parsed.request,
-      parsed.requestId,
-      `precommit-routing-failed:${betErrorMessage(error)}`,
-    );
-  }
-
-  let executions;
-  try {
-    executions = await chrome.scripting.executeScript({
-      target: { tabId, frameIds: [frameId] },
-      world: 'MAIN',
-      args: [parsed.request],
-      func: globalThis.executeMstromBetOneShot,
-    });
-  } catch (error) {
-    return unknownBetReceipt(
-      parsed.request,
-      parsed.requestId,
-      `final-execute-failed:${betErrorMessage(error)}`,
-    );
-  }
-  if (!isLiveBetSessionCurrent(generation)) {
-    return unknownBetReceipt(
-      parsed.request,
-      parsed.requestId,
-      'bridge-disconnected-after-final-execute',
-    );
-  }
-  const receipt = executions.length === 1 ? executions[0].result : null;
-  if (!receipt || typeof receipt !== 'object') {
-    return unknownBetReceipt(
-      parsed.request,
-      parsed.requestId,
-      'final-execute-returned-no-receipt',
-    );
-  }
-  return receipt;
-}
-
 async function preparePragmaticTable(tabId, tableId, market) {
   const protocolWindow = pragmaticProtocolWindow(tableId);
   return await chrome.scripting.executeScript({
@@ -1083,121 +988,8 @@ async function executeUniquePragmaticBet(message, generation) {
 }
 
 async function executeUniqueLiveBet(message, generation) {
-  const parsed = validateLiveBetMessage(message);
-  return parsed.platform === 'pragmatic'
-    ? executeUniquePragmaticBet(message, generation)
-    : executeUniqueMstromBet(message, generation);
+  return executeUniquePragmaticBet(message, generation);
 }
-
-async function probeMstromBetReadiness(tableIds, generation) {
-  const requestedTableIds = Array.from(new Set(
-    (Array.isArray(tableIds) ? tableIds : [])
-      .filter(tableId => typeof tableId === 'string' && /^[A-Z]\d{3}$/.test(tableId)),
-  ));
-  if (requestedTableIds.length === 0) {
-    send({
-      kind: 'sessionAction',
-      action: 'command-executed',
-      url: '',
-      frame: 'allFrames',
-      detail: 'probeBetReadiness:no-valid-table',
-      timestamp: new Date().toISOString(),
-    });
-    return;
-  }
-
-  const tabs = await chrome.tabs.query({
-    url: [`${DAFABET_BACCARAT_POPUP_URL}*`],
-  });
-  if (generation !== activeSocketGeneration) return;
-  const targets = tabs.filter(tab => tab.id && exactDafabetBaccaratPopup(tab.url));
-  if (targets.length !== 1) {
-    send({
-      kind: 'sessionAction',
-      action: 'command-executed',
-      url: '',
-      frame: 'allFrames',
-      detail: `probeBetReadiness:popup-count=${targets.length}`,
-      timestamp: new Date().toISOString(),
-    });
-    return;
-  }
-
-  for (const tableId of requestedTableIds) {
-    let probes;
-    try {
-      probes = await chrome.scripting.executeScript({
-        target: { tabId: targets[0].id, allFrames: true },
-        world: 'MAIN',
-        args: [tableId],
-        func: globalThis.probeMstromBetStore,
-      });
-    } catch (error) {
-      send({
-        kind: 'sessionAction',
-        action: 'command-executed',
-        url: '',
-        frame: 'allFrames',
-        detail: `probeBetReadiness:${tableId}:probe-failed=${betErrorMessage(error)}`,
-        timestamp: new Date().toISOString(),
-      });
-      continue;
-    }
-    if (generation !== activeSocketGeneration) return;
-    const candidates = probes.filter(entry => {
-      const result = entry && entry.result;
-      return result
-        && (result.status === 'ready' || result.ownsTargetStore === true)
-        && result.tableId === tableId
-        && result.runtimeRevision === MSTROM_BET_RUNTIME_REVISION
-        && MSTROM_FRAME_HOST_PATTERN.test(String(result.host || ''));
-    });
-    const result = candidates.length === 1 ? candidates[0].result : null;
-    const frameDiagnostics = candidates.length === 0
-      ? probes
-        .map(entry => entry && entry.result)
-        .filter(frameResult => frameResult && MSTROM_FRAME_HOST_PATTERN.test(String(frameResult.host || '')))
-        .map(frameResult => {
-          const diagnostics = frameResult.diagnostics || {};
-          const coreKeys = Array.isArray(diagnostics.coreKeys) ? diagnostics.coreKeys.slice(0, 8).join(',') : '';
-          const linkKeys = Array.isArray(diagnostics.linkFactoryKeys)
-            ? diagnostics.linkFactoryKeys.slice(0, 12).join(',')
-            : '';
-          const gameLinkKeys = Array.isArray(diagnostics.gameLinkStoreKeys)
-            ? diagnostics.gameLinkStoreKeys.slice(0, 8).join(',')
-            : '';
-          return [
-            `host=${String(frameResult.host || '')}`,
-            `core=${diagnostics.corePresent === true}`,
-            `coreKeys=${coreKeys}`,
-            `linkFactory=${diagnostics.linkFactoryPresent === true}`,
-            `linkKeys=${linkKeys}`,
-            `gameLink=${diagnostics.gameLinkStorePresent === true}`,
-            `gameLinkKeys=${gameLinkKeys}`,
-          ].join(',');
-        })
-        .join('|')
-      : '';
-    send({
-      kind: 'sessionAction',
-      action: 'command-executed',
-      url: '',
-      frame: 'allFrames',
-      detail: [
-        `probeBetReadiness:${tableId}`,
-        `candidates=${candidates.length}`,
-        `betEnabled=${result && result.betEnabled === true}`,
-        `gmcode=${result && typeof result.gmcode === 'string' ? result.gmcode : ''}`,
-        `addChip=${result && result.hasAddChip === true}`,
-        `confirm=${result && result.hasConfirm === true}`,
-        `calculateDiff=${result && result.hasCalculateDiff === true}`,
-        ...(frameDiagnostics ? [`frames=${frameDiagnostics}`] : []),
-      ].join(':'),
-      timestamp: new Date().toISOString(),
-    });
-  }
-}
-
 async function probePragmaticBetReadiness(tableIds, generation) {
   const requestedTableIds = Array.from(new Set(
     (Array.isArray(tableIds) ? tableIds : [])
@@ -1338,13 +1130,10 @@ async function probePragmaticBetReadiness(tableIds, generation) {
 
 async function probeLiveBetReadiness(tableIds, generation) {
   const requestedTableIds = Array.isArray(tableIds) ? tableIds : [];
-  const mstromTableIds = requestedTableIds.filter(
-    tableId => typeof tableId === 'string' && /^[A-Z]\d{3}$/.test(tableId),
-  );
   const pragmaticTableIds = requestedTableIds.filter(
     tableId => typeof tableId === 'string' && PRAGMATIC_TABLE_ID_PATTERN.test(tableId),
   );
-  if (mstromTableIds.length === 0 && pragmaticTableIds.length === 0) {
+  if (pragmaticTableIds.length === 0) {
     send({
       kind: 'sessionAction',
       action: 'command-executed',
@@ -1355,8 +1144,7 @@ async function probeLiveBetReadiness(tableIds, generation) {
     });
     return;
   }
-  if (mstromTableIds.length > 0) await probeMstromBetReadiness(mstromTableIds, generation);
-  if (pragmaticTableIds.length > 0) await probePragmaticBetReadiness(pragmaticTableIds, generation);
+  await probePragmaticBetReadiness(pragmaticTableIds, generation);
 }
 
 function handleBetRequest(message, generation) {
@@ -1381,9 +1169,7 @@ function handleBetRequest(message, generation) {
           : message.request && message.request.wager
             ? message.request.wager.tableId
             : '';
-        const platform = PRAGMATIC_TABLE_ID_PATTERN.test(String(receiptTableId || ''))
-          ? 'pragmatic'
-          : 'mstrom';
+        const platform = 'pragmatic';
         receipt = unknownBetReceipt(
           message.request,
           requestId,
@@ -1519,16 +1305,6 @@ async function replayRuntimeStateInGameFrames() {
   for (const tab of tabs) {
     if (!tab.id || !isGameTabUrl(tab.url)) continue;
     tabCount += 1;
-    const injected = await injectRuntimeProbe(tab.id);
-    if (!injected) {
-      failureCount += 1;
-      sendRuntimeProbe(tab.id, null, {
-        frameUrl: String(tab.url || ''),
-        hook: 'injection-failed',
-        replay: 'not-called',
-      }, tab.url);
-      continue;
-    }
     try {
       const results = await chrome.scripting.executeScript({
         target: { tabId: tab.id, allFrames: true },
@@ -1536,11 +1312,9 @@ async function replayRuntimeStateInGameFrames() {
         func: () => {
           const frameUrl = String(location.href || '');
           const host = String(location.hostname || '');
-          const replay = globalThis.__baccaratRuntimeStateHookReplay;
-          const diagnostic = globalThis.__baccaratRuntimeStateHookDiagnostics;
+          const replay = globalThis.__baccaratPragmaticReplay;
           let replayState = 'not-called';
           let error = '';
-          let diagnostics = null;
           if (typeof replay === 'function') {
             try {
               replay();
@@ -1550,15 +1324,6 @@ async function replayRuntimeStateInGameFrames() {
               error = caught && typeof caught === 'object' && typeof caught.message === 'string'
                 ? caught.message.slice(0, 300)
                 : String(caught || '').slice(0, 300);
-            }
-          }
-          if (typeof diagnostic === 'function') {
-            try {
-              diagnostics = diagnostic();
-            } catch (caught) {
-              error = error || (caught && typeof caught === 'object' && typeof caught.message === 'string'
-                ? caught.message.slice(0, 300)
-                : String(caught || '').slice(0, 300));
             }
           }
           return {
@@ -1571,7 +1336,6 @@ async function replayRuntimeStateInGameFrames() {
               ? String(globalThis.WebSocket.name || '').slice(0, 80)
               : '',
             ...(error ? { error } : {}),
-            ...(diagnostics === null ? {} : { diagnostics }),
           };
         },
       });
@@ -1792,7 +1556,7 @@ async function handleRemoteCommand(name, tableIds = [], generation) {
 }
 
 /**
- * 在当前活动游戏标签的 mstrom iframe 内调用客户端自己的“多台”导航入口。
+ * 在当前 Dafabet Pragmatic 弹窗的游戏 iframe 内打开 Pragmatic 多桌路由。
  * 这是一次性的显式远程命令；不会触发下注，也不会写入任何下注开关。
  */
 async function openActiveGameTabInMultiplay(tableIds = []) {
@@ -1800,10 +1564,7 @@ async function openActiveGameTabInMultiplay(tableIds = []) {
     const tabs = await chrome.tabs.query({});
     const tab = tabs.find(candidate => candidate.active && exactDafabetPragmaticPopup(candidate.url))
       || tabs.find(candidate => exactDafabetPragmaticPopup(candidate.url))
-      || tabs.find(candidate => {
-      const url = String(candidate && candidate.url ? candidate.url : '');
-      return /popup-launch\/live-baccarat/i.test(url);
-    }) || tabs.find(candidate => isGameTabUrl(candidate && candidate.url));
+      || tabs.find(candidate => isGameTabUrl(candidate && candidate.url));
     if (!tab || !tab.id) {
       send({
         kind: 'sessionAction',
@@ -1863,124 +1624,7 @@ async function openActiveGameTabInMultiplay(tableIds = []) {
           }
           return { status: 'not-ready', frameUrl, state: `pragmatic-control-missing:${location.pathname}` };
         }
-        if (!/(^|\.)(?:mstrom-uno|673ing)\.com$/i.test(location.hostname)) {
-          return { status: 'skipped', frameUrl };
-        }
-        try {
-          const page = globalThis;
-          const sdk = page.MicroSDK;
-          const plaza = page.Plaza || (sdk && sdk.Plaza);
-          const createInstance = sdk && sdk.Utils && sdk.Utils.createInstance;
-          const MultiplayStore = plaza && plaza.MultiplayStore;
-          const configuredTableIds = Array.isArray(requestedTableIds)
-            ? requestedTableIds
-              .filter(value => typeof value === 'string' && /^[A-Z]\d{3}$/.test(value))
-              .slice(0, 4)
-            : [];
-          const videoGameCore = page.VideoGameCore;
-          const gameLinkStore = videoGameCore
-            && videoGameCore.GameLinkStore
-            && videoGameCore.GameLinkStore.instance;
-          const plazaSdk = sdk && sdk.Plaza;
-          const rootPageStore = plazaSdk && typeof plazaSdk.getRootPageStore === 'function'
-            ? plazaSdk.getRootPageStore()
-            : plazaSdk && plazaSdk.RootPageStore && plazaSdk.RootPageStore.instance;
-          const gameLink = videoGameCore && videoGameCore.GAME_LINK;
-          if (
-            configuredTableIds.length > 1
-            && gameLinkStore
-            && typeof gameLinkStore.changeTable === 'function'
-          ) {
-            configuredTableIds.forEach((tableId, index) => gameLinkStore.changeTable(tableId, index));
-            if (typeof gameLinkStore.connectSocket === 'function') {
-              gameLinkStore.connectSocket();
-              if (rootPageStore && typeof rootPageStore.changeGame === 'function' && typeof gameLink === 'string' && gameLink) {
-                rootPageStore.changeGame(gameLink);
-              }
-              return {
-                status: 'opened',
-                frameUrl,
-                state: 'configured-game-link',
-                configuredCount: configuredTableIds.length,
-              };
-            }
-          }
-          if (typeof createInstance === 'function' && MultiplayStore) {
-            const store = createInstance(MultiplayStore);
-            if (store && typeof store.openMultiplayPage === 'function') {
-              store.openMultiplayPage({ fromEntry: 'MultiTab' });
-              return { status: 'opened', frameUrl, state: 'store' };
-            }
-          }
-
-          // PC builds expose the left-side “多台” path as a RootPageStore module transition.
-          // GAME_LINK is the casino's own multi-table module; this only changes the displayed game mode.
-          if (rootPageStore && typeof rootPageStore.changeGame === 'function' && typeof gameLink === 'string' && gameLink) {
-            rootPageStore.changeGame(gameLink);
-            return { status: 'opened', frameUrl, state: 'root-change-game' };
-          }
-
-          // PageNavigator retains the live GameBac page even when its module-private Plaza symbol
-          // is not exported to window. Calling its explicitly named multitable handler is equivalent
-          // to one click on the page's “多台” button and cannot execute a bet.
-          const navigator = page.Core && page.Core.pageNavigator;
-          const topPage = navigator && typeof navigator.getTopPage === 'function'
-            ? navigator.getTopPage()
-            : null;
-          const topPageClass = topPage && page.egret && typeof page.egret.getQualifiedClassName === 'function'
-            ? page.egret.getQualifiedClassName(topPage)
-            : '';
-          if (/^GameBac\./.test(topPageClass) && typeof topPage.onMultiplayButtonTap === 'function') {
-            topPage.onMultiplayButtonTap();
-            return { status: 'opened', frameUrl, state: 'navigator-handler' };
-          }
-
-          // 某些站点版本把 Plaza.MultiplayStore 保留在 GameBac 的模块闭包中，
-          // 不再暴露为 window 属性；此时只调用舞台上真实“多台”按钮的同一处理器。
-          // 处理器源码必须明确包含 openMultiplayPage，避免误触任何下注控件。
-          const stage = page.egret && page.egret.MainContext && page.egret.MainContext.instance
-            ? page.egret.MainContext.instance.stage
-            : null;
-          const queue = stage ? [stage] : [];
-          const visited = new Set();
-          let handlerOwner = null;
-          while (queue.length > 0 && visited.size < 4000) {
-            const node = queue.shift();
-            if (!node || visited.has(node)) continue;
-            visited.add(node);
-            // `multiplayButton` is the exact named UI component wired by GameBac to the “多台” action.
-            // The handler is invoked once, never coordinates or generic pointer input.
-            if (node.multiplayButton && typeof node.onMultiplayButtonTap === 'function') {
-              handlerOwner = node;
-              break;
-            }
-            try {
-              const childNodes = ['$_children', '$children', 'children', '_children']
-                .flatMap(key => Array.isArray(node[key]) ? node[key] : []);
-              if (childNodes.length > 0) {
-                for (const child of childNodes) queue.push(child);
-                continue;
-              }
-              const childCount = Number(node.numChildren);
-              if (Number.isInteger(childCount) && childCount > 0 && typeof node.getChildAt === 'function') {
-                for (let index = 0; index < childCount; index += 1) queue.push(node.getChildAt(index));
-              }
-            } catch (_) {
-              // A transient Egret display child must not prevent a later frame from being inspected.
-            }
-          }
-          if (handlerOwner) {
-            handlerOwner.onMultiplayButtonTap();
-            return { status: 'opened', frameUrl, state: 'stage-handler' };
-          }
-          return {
-            status: 'not-ready',
-            frameUrl,
-            state: `sdk=${!!sdk};plaza=${!!plaza};store=${!!MultiplayStore};factory=${typeof createInstance};stage=${!!stage}`,
-          };
-        } catch (_) {
-          return { status: 'failed', frameUrl };
-        }
+        return { status: 'skipped', frameUrl };
       },
     });
     const opened = results.filter(result => result && result.result && result.result.status === 'opened').length;
@@ -2354,7 +1998,7 @@ async function getExistingKeeperTab() {
   }
 
   const candidates = await chrome.tabs.query({
-    url: ['https://www.dafabet.net/*', 'https://evoad.df888evo.com/*'],
+    url: ['https://www.dafabet.net/*'],
   });
   const existing = candidates.find(tab => tab.id && tab.pinned && !tab.active)
     || candidates.find(tab => tab.id && !tab.active)
@@ -2367,7 +2011,7 @@ async function getExistingKeeperTab() {
 }
 
 async function ensureKeeperTab(url) {
-  if (!url || !/dafabet\.net|evoad\.df888evo\.com|frontend\/evo|evolution|evo/i.test(url)) return;
+  if (!url || !/dafabet\.net|pragmaticplaylive\.net|vbgames88\.com|zavjcswh\.biz/i.test(url)) return;
   if (keeperCreationPromise) return keeperCreationPromise;
 
   keeperCreationPromise = (async () => {
@@ -2481,21 +2125,6 @@ chrome.tabs.onRemoved.addListener(tabId => {
     cdpAttachedTabId = null;
   }
 });
-
-async function injectRuntimeProbe(tabId) {
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      files: ['runtime-state-hook.js'],
-      world: 'MAIN',
-    });
-    return true;
-  } catch (_) {
-    // Chrome 内部页、已关闭标签或未授予 scripting 权限时忽略。
-    return false;
-  }
-}
-
 async function reloadPendingGameTabs() {
   const stored = await chrome.storage.local.get({ reloadGameTabsAfterExtensionReload: false });
   if (!stored.reloadGameTabsAfterExtensionReload) return;

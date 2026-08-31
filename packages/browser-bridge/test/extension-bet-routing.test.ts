@@ -4,42 +4,12 @@ import {
   extensionManifest,
   flushAsyncWork,
   installedContentScripts,
-  liveRequest,
   pragmaticLiveRequest,
   pragmaticOperationalRequest,
   sentMessages,
 } from './extension-bet-harness.js';
 
 describe('extension background live bet routing', () => {
-  it('routes one request to the unique matching mstrom frame and returns one receipt', async () => {
-    const harness = await createHarness();
-
-    harness.socket.emit('message', { data: JSON.stringify(liveRequest()) });
-    await flushAsyncWork();
-    await flushAsyncWork();
-
-    const execution = harness.executeScript.mock.calls.find(
-      ([injection]) => String(injection.func).includes('executeMstromBetOneShot'),
-    );
-    expect(execution?.[0].target).toEqual({ tabId: 42, frameIds: [7] });
-    expect(execution?.[0].world).toBe('MAIN');
-    expect(harness.sendMessage).not.toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ kind: 'executeBet' }),
-    );
-    const betResults = sentMessages(harness.socket)
-      .filter(message => message['kind'] === 'betResult');
-    expect(betResults).toHaveLength(1);
-    expect(betResults[0]).toEqual(expect.objectContaining({
-      kind: 'betResult',
-      requestId: 'request-1',
-      receipt: harness.receipt,
-      bridgeSessionId: expect.stringMatching(/^bridge-/),
-      bridgeSeq: expect.any(Number),
-    }));
-    expect(Number.isSafeInteger(betResults[0]?.['bridgeSeq'])).toBe(true);
-  });
-
   it('rejects a pragmatic wager when shared-panel preparation does not activate', async () => {
     const harness = await createHarness({
       tabs: [{
@@ -374,21 +344,21 @@ describe('extension background live bet routing', () => {
   it('returns a precommit rejection when more than one exact Dafabet popup tab exists', async () => {
     const harness = await createHarness({
       tabs: [
-        { id: 42, url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/live-baccarat-pa' },
-        { id: 43, url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/live-baccarat-pa' },
+        { id: 42, url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat' },
+        { id: 43, url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat' },
       ],
     });
 
-    harness.socket.emit('message', { data: JSON.stringify(liveRequest()) });
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest()) });
     await flushAsyncWork();
     await flushAsyncWork();
 
     expect(harness.executeScript).not.toHaveBeenCalledWith(expect.objectContaining({
-      files: ['mstrom-bet-runtime.js'],
+      files: ['pragmatic-bet-runtime.js'],
     }));
     expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
       kind: 'betResult',
-      requestId: 'request-1',
+      requestId: 'pragmatic-request-1',
       receipt: expect.objectContaining({
         status: 'REJECTED',
         raw: expect.objectContaining({
@@ -407,12 +377,12 @@ describe('extension background live bet routing', () => {
       }],
     });
 
-    harness.socket.emit('message', { data: JSON.stringify(liveRequest()) });
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest()) });
     await flushAsyncWork();
     await flushAsyncWork();
 
     expect(harness.executeScript).not.toHaveBeenCalledWith(expect.objectContaining({
-      files: ['mstrom-bet-runtime.js'],
+      files: ['pragmatic-bet-runtime.js'],
     }));
     expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
       kind: 'betResult',
@@ -435,9 +405,9 @@ describe('extension background live bet routing', () => {
         mode: 'live',
         wager: {
           wagerId: 'opw-precommit-rejection',
-          tableId: 'D067',
+          tableId: 'bc281koreanch281',
           shoeId: 'shoe-1',
-          handId: 'GD06726824AB',
+          handId: '1726012345',
           market: 'player',
           amount: 20,
           source: 'keepalive',
@@ -451,7 +421,7 @@ describe('extension background live bet routing', () => {
     await flushAsyncWork();
 
     expect(harness.executeScript.mock.calls.some(
-      ([injection]) => String(injection.func).includes('executeMstromBetOneShot'),
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot'),
     )).toBe(false);
     expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
       kind: 'betResult',
@@ -472,17 +442,17 @@ describe('extension background live bet routing', () => {
   it('fails closed when two frames expose the requested table store', async () => {
     const harness = await createHarness({
       probeResults: [
-        { frameId: 7, result: { status: 'ready', runtimeRevision: 'mstrom-bet-runtime/2026-08-28.1', host: 'gci.agad.mstrom-uno.com', tableId: 'D067' } },
-        { frameId: 9, result: { status: 'ready', runtimeRevision: 'mstrom-bet-runtime/2026-08-28.1', host: 'live2.673ing.com', tableId: 'D067' } },
+        { frameId: 11, result: { status: 'ready', runtimeRevision: 'pragmatic-bet-runtime/2026-08-30.21', host: 'client.pragmaticplaylive.net', tableId: 'bc281koreanch281' } },
+        { frameId: 12, result: { status: 'ready', runtimeRevision: 'pragmatic-bet-runtime/2026-08-30.21', host: 'client.pragmaticplaylive.net', tableId: 'bc281koreanch281' } },
       ],
     });
 
-    harness.socket.emit('message', { data: JSON.stringify(liveRequest()) });
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest()) });
     await flushAsyncWork();
     await flushAsyncWork();
 
     expect(harness.executeScript.mock.calls.some(
-      ([injection]) => String(injection.func).includes('executeMstromBetOneShot'),
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot'),
     )).toBe(false);
     expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
       kind: 'betResult',
@@ -490,7 +460,7 @@ describe('extension background live bet routing', () => {
         status: 'REJECTED',
         raw: expect.objectContaining({
           commitStarted: false,
-          reason: expect.stringContaining('exactly one matching frame'),
+          reason: expect.stringContaining('authoritative ready Pragmatic frame'),
         }),
       }),
     }));
@@ -499,30 +469,30 @@ describe('extension background live bet routing', () => {
   it('fails closed before confirmBet when the injected runtime revision is obsolete', async () => {
     const harness = await createHarness({
       probeResults: [{
-        frameId: 7,
+        frameId: 11,
         result: {
           status: 'ready',
-          host: 'gci.agad.mstrom-uno.com',
-          tableId: 'D067',
+          host: 'client.pragmaticplaylive.net',
+          tableId: 'bc281koreanch281',
         },
       }],
     });
 
-    harness.socket.emit('message', { data: JSON.stringify(liveRequest()) });
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest()) });
     await flushAsyncWork();
     await flushAsyncWork();
 
     expect(harness.executeScript.mock.calls.some(
-      ([injection]) => String(injection.func).includes('executeMstromBetOneShot'),
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot'),
     )).toBe(false);
     expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
       kind: 'betResult',
-      requestId: 'request-1',
+      requestId: 'pragmatic-request-1',
       receipt: expect.objectContaining({
         status: 'REJECTED',
         raw: expect.objectContaining({
           commitStarted: false,
-          reason: expect.stringContaining('matching frame'),
+          reason: expect.stringContaining('authoritative ready Pragmatic frame'),
         }),
       }),
     }));
@@ -534,12 +504,12 @@ describe('extension background live bet routing', () => {
       armCurrentSession: false,
     });
 
-    harness.socket.emit('message', { data: JSON.stringify(liveRequest()) });
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest()) });
     await flushAsyncWork();
     await flushAsyncWork();
 
     expect(harness.executeScript.mock.calls.some(
-      ([injection]) => String(injection.func).includes('executeMstromBetOneShot'),
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot'),
     )).toBe(true);
     expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
       kind: 'betResult',
@@ -555,12 +525,12 @@ describe('extension background live bet routing', () => {
       armCurrentSession: false,
     });
 
-    harness.socket.emit('message', { data: JSON.stringify(liveRequest()) });
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest()) });
     await flushAsyncWork();
     await flushAsyncWork();
 
     expect(harness.executeScript).not.toHaveBeenCalledWith(expect.objectContaining({
-      files: ['mstrom-bet-runtime.js'],
+      files: ['pragmatic-bet-runtime.js'],
     }));
     expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
       kind: 'betResult',
@@ -576,7 +546,7 @@ describe('extension background live bet routing', () => {
 
   it('deduplicates repeated requestIds and emits exactly one betResult', async () => {
     const harness = await createHarness();
-    const message = { data: JSON.stringify(liveRequest('duplicate-request')) };
+    const message = { data: JSON.stringify(pragmaticLiveRequest('duplicate-request')) };
 
     harness.socket.emit('message', message);
     harness.socket.emit('message', message);
@@ -584,7 +554,10 @@ describe('extension background live bet routing', () => {
     await flushAsyncWork();
 
     expect(harness.executeScript.mock.calls.filter(
-      ([injection]) => String(injection.func).includes('executeMstromBetOneShot'),
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot')
+        && injection.args?.[1]
+        && typeof injection.args[1] === 'object'
+        && (injection.args[1] as { phase?: string }).phase === 'observe',
     )).toHaveLength(1);
     expect(sentMessages(harness.socket).filter(
       sent => sent['kind'] === 'betResult' && sent['requestId'] === 'duplicate-request',
@@ -594,22 +567,22 @@ describe('extension background live bet routing', () => {
   it('keeps a requestId single-shot after the request cache exceeds its previous limit', async () => {
     const harness = await createHarness();
     for (let index = 0; index <= 500; index += 1) {
-      harness.socket.emit('message', { data: JSON.stringify(liveRequest(`request-${index}`)) });
+      harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest(`request-${index}`)) });
     }
     for (let tick = 0; tick < 6; tick += 1) await flushAsyncWork();
 
     const executeCount = harness.executeScript.mock.calls.filter(
-      ([injection]) => String(injection.func).includes('executeMstromBetOneShot'),
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot'),
     ).length;
     const requestZeroResults = sentMessages(harness.socket).filter(
       sent => sent['kind'] === 'betResult' && sent['requestId'] === 'request-0',
     );
 
-    harness.socket.emit('message', { data: JSON.stringify(liveRequest('request-0')) });
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest('request-0')) });
     for (let tick = 0; tick < 3; tick += 1) await flushAsyncWork();
 
     expect(harness.executeScript.mock.calls.filter(
-      ([injection]) => String(injection.func).includes('executeMstromBetOneShot'),
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot'),
     )).toHaveLength(executeCount);
     expect(sentMessages(harness.socket).filter(
       sent => sent['kind'] === 'betResult' && sent['requestId'] === 'request-0',
@@ -622,6 +595,10 @@ describe('extension background live bet routing', () => {
 
     expect(installedScripts).not.toContain('site-adapter.js');
     expect(installedScripts).not.toContain('bet-executor.js');
+    expect(installedScripts).not.toContain('network-hook.js');
+    expect(installedScripts).not.toContain('runtime-state-hook.js');
+    expect(installedScripts).not.toContain('dom-probe.js');
+    expect(installedScripts).not.toContain('mstrom-bet-runtime.js');
   });
 
   it('limits extension injection to known game hosts', () => {
@@ -632,9 +609,14 @@ describe('extension background live bet routing', () => {
     expect(serializedManifest).not.toContain('<all_urls>');
     expect(serializedManifest).toContain('"alarms"');
 
-    // Then: the current mstrom game host remains explicitly covered.
-    expect(serializedManifest).toContain('https://*.mstrom-uno.com/*');
+    // Then: only Pragmatic game hosts and the Dafabet Jeju launcher remain.
+    expect(serializedManifest).not.toContain('mstrom-uno.com');
+    expect(serializedManifest).not.toContain('673ing.com');
+    expect(serializedManifest).not.toContain('df888evo.com');
+    expect(serializedManifest).not.toContain('egcvi.com');
+    expect(serializedManifest).toContain('https://*.dafabet.net/*');
     expect(serializedManifest).toContain('https://*.pragmaticplaylive.net/*');
     expect(installedContentScripts()).toContain('pragmatic-dom-hook.js');
+    expect(installedContentScripts()).toContain('pragmatic-network-hook.js');
   });
 });

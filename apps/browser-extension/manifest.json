@@ -13,11 +13,6 @@
   ],
   "host_permissions": [
     "https://*.dafabet.net/*",
-    "https://*.dafabet.com/*",
-    "https://*.df888evo.com/*",
-    "https://*.egcvi.com/*",
-    "https://*.mstrom-uno.com/*",
-    "https://*.673ing.com/*",
     "https://*.vbgames88.com/*",
     "https://*.zavjcswh.biz/*",
     "https://*.pragmaticplaylive.net/*"
@@ -43,7 +38,8 @@
       "matches": [
         "https://client.pragmaticplaylive.net/*",
         "https://*.vbgames88.com/*",
-        "https://*.zavjcswh.biz/*"
+        "https://*.zavjcswh.biz/*",
+        "https://*.dafabet.net/*"
       ],
       "js": [
         "content.js"
@@ -57,53 +53,6 @@
       ],
       "js": [
         "pragmatic-dom-hook.js"
-      ],
-      "run_at": "document_idle",
-      "all_frames": true
-    },
-    {
-      "matches": [
-        "https://*.dafabet.net/*",
-        "https://*.dafabet.com/*",
-        "https://*.df888evo.com/*",
-        "https://*.egcvi.com/*",
-        "https://*.mstrom-uno.com/*",
-        "https://*.673ing.com/*"
-      ],
-      "js": [
-        "network-hook.js",
-        "runtime-state-hook.js"
-      ],
-      "run_at": "document_start",
-      "all_frames": true,
-      "world": "MAIN"
-    },
-    {
-      "matches": [
-        "https://*.dafabet.net/*",
-        "https://*.dafabet.com/*",
-        "https://*.df888evo.com/*",
-        "https://*.egcvi.com/*",
-        "https://*.mstrom-uno.com/*",
-        "https://*.673ing.com/*"
-      ],
-      "js": [
-        "dom-probe.js"
-      ],
-      "run_at": "document_idle",
-      "all_frames": true
-    },
-    {
-      "matches": [
-        "https://*.dafabet.net/*",
-        "https://*.dafabet.com/*",
-        "https://*.df888evo.com/*",
-        "https://*.egcvi.com/*",
-        "https://*.mstrom-uno.com/*",
-        "https://*.673ing.com/*"
-      ],
-      "js": [
-        "content.js"
       ],
       "run_at": "document_idle",
       "all_frames": true

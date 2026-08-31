@@ -27,7 +27,7 @@
 
   // 只在游戏相关页面上工作:其他页面(控制台/搜索引擎/追踪器)不采集、不保活、不发心跳。
   const PRAGMATIC_PAGE = /(?:^|\.)(?:pragmaticplaylive\.net|vbgames88\.com|zavjcswh\.biz)$/i.test(location.hostname);
-  const GAME_PAGE = /(?:^|\.)(?:pragmaticplaylive\.net|vbgames88\.com|zavjcswh\.biz|dafabet\.(?:net|com)|df888evo\.com|egcvi\.com|mstrom-uno\.com|673ing\.com)$/i.test(location.hostname);
+  const GAME_PAGE = /(?:^|\.)(?:pragmaticplaylive\.net|vbgames88\.com|zavjcswh\.biz|dafabet\.net)$/i.test(location.hostname);
 
   const knownRooms = new Map();
   let diagnosticSent = false;
@@ -108,7 +108,7 @@
     window.dispatchEvent(new Event('focus'));
     window.scrollBy(0, 1);
     window.scrollBy(0, -1);
-    // 通知 MAIN world 的 network-hook 重放已捕获的心跳消息。
+    // 通知 MAIN world 的 pragmatic-network-hook 重放已捕获的心跳消息。
     window.postMessage({ source: 'baccarat-bridge-keepalive' }, '*');
   }
 
@@ -290,12 +290,10 @@
   // ---- 会话过期检测与自动恢复 ----
 
   function isSessionExpiredText(text) {
-    // 覆盖 Evolution 平台真实文案:
-    // "User authentication failed or your session may be expired, please try again. Error Code: EV.7"
-    return /会话已过期|会话已经过期|再次登录|重新登录|session\s+(has\s+|may\s+be\s+|is\s+)?expired|authentication\s+failed|error\s*code\s*[\s:]*\s*ev[\s.:-]?\d*/i.test(text);
+    return /会话已过期|会话已经过期|再次登录|重新登录|session\s+(has\s+|may\s+be\s+|is\s+)?expired|authentication\s+failed/i.test(text);
   }
 
-  /** 收集按钮,穿透开放 Shadow Root(EVO 客户端可能用 shadow DOM 渲染弹窗)。 */
+  /** 收集按钮,穿透开放 Shadow Root（客户端可能用 shadow DOM 渲染弹窗）。 */
   function collectClickables(root, out, depth) {
     try {
       for (const el of root.querySelectorAll('button, a, [role="button"]')) out.push(el);
@@ -556,29 +554,15 @@
     sendToBackground({ kind: 'heartbeat', timestamp: new Date().toISOString() });
   }
 
-  // 接收 MAIN world network-hook 发来的网络数据。
-  // WebSocket/SSE/运行时牌面全部转发；普通 fetch/XHR 仍按游戏域名过滤。
+  // 接收 MAIN world pragmatic-network-hook 发来的网络数据。
   window.addEventListener('message', event => {
     if (!GAME_PAGE || event.source !== window || event.origin !== location.origin) return;
     const data = event.data;
     if (!data || typeof data.source !== 'string' || !data.source.startsWith('baccarat-bridge-')) return;
     const url = String(data.url || '');
-    const isRealtimeSocket = data.source === 'baccarat-bridge-ws'
-      || data.source === 'baccarat-bridge-sse'
-      || data.source === 'baccarat-bridge-decrypt'
-      || data.source === 'baccarat-bridge-jsonparse'
-      || data.source === 'baccarat-bridge-runtime-state'
-      || data.source === 'baccarat-bridge-runtime-selection'
-      || data.source === 'baccarat-bridge-worker-message'
-      || data.source.startsWith('baccarat-bridge-pragmatic-');
-    if (!isRealtimeSocket && !/evoad\.df888evo\.com|evolution|evo|mstrom-uno|673ing\.com/i.test(url)) return;
-    // 解析器需要完整 JSON:游戏数据消息的传输截断上限放宽到 120KB。
-    const limit = data.source === 'baccarat-bridge-jsonparse'
-      || data.source === 'baccarat-bridge-decrypt'
-      || data.source === 'baccarat-bridge-pragmatic-ws'
-      || data.source.startsWith('baccarat-bridge-pragmatic-')
-      ? 120000
-      : 8000;
+    const isRealtimeSocket = data.source.startsWith('baccarat-bridge-pragmatic-');
+    if (!isRealtimeSocket && !/pragmaticplaylive\.net|vbgames88\.com|zavjcswh\.biz|dafabet\.net/i.test(url)) return;
+    const limit = data.source.startsWith('baccarat-bridge-pragmatic-') ? 120000 : 8000;
     sendToBackground({
       kind: 'networkCapture',
       source: data.source,
@@ -739,7 +723,7 @@
       } catch (_) {
         src = '';
       }
-      if (!/evoad\.df888evo\.com|evolution|evo/i.test(src)) continue;
+      if (!/pragmaticplaylive\.net|vbgames88\.com|zavjcswh\.biz/i.test(src)) continue;
       const r = frame.getBoundingClientRect();
       if (r.width < 50 || r.height < 50) continue;
       const area = r.width * r.height;

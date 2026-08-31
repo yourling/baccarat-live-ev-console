@@ -7,11 +7,6 @@ export const backgroundSource = readFileSync(
   'utf8',
 );
 
-export const mstromRuntimeSource = readFileSync(
-  new URL('../../../apps/browser-extension/mstrom-bet-runtime.js', import.meta.url),
-  'utf8',
-);
-
 export const pragmaticRuntimeSource = readFileSync(
   new URL('../../../apps/browser-extension/pragmatic-bet-runtime.js', import.meta.url),
   'utf8',
@@ -59,30 +54,6 @@ export class FakeWebSocket {
 
 export function flushAsyncWork(): Promise<void> {
   return new Promise(resolve => setImmediate(resolve));
-}
-
-export function liveRequest(requestId = 'request-1') {
-  return {
-    kind: 'betRequest',
-    requestId,
-    request: {
-      mode: 'live',
-      reservationId: 'reservation-1',
-      intent: {
-        intentId: 'intent-1',
-        tableId: 'D067',
-        shoeId: 'shoe-1',
-        handId: 'GD06726824AB',
-        market: 'bankerPair',
-        amount: 10,
-        mode: 'live',
-        idempotencyKey: 'D067:GD06726824AB:bankerPair',
-        strategy: { type: 'fixed', market: 'bankerPair' },
-        decisionSnapshotId: 'decision-1',
-        createdAt: '2026-08-24T12:00:00.000Z',
-      },
-    },
-  };
 }
 
 export function pragmaticLiveRequest(requestId = 'pragmatic-request-1') {
@@ -150,10 +121,10 @@ export async function createHarness(options: HarnessOptions = {}) {
   const scheduledTimers: Array<() => void> = [];
   const tabs = options.tabs ?? [{
     id: 42,
-    url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/live-baccarat-pa',
+    url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
   }];
   const receipt = {
-    receiptId: 'mstrom-receipt-1',
+    receiptId: 'pragmatic-receipt-legacy',
     intentId: 'intent-1',
     reservationId: 'reservation-1',
     status: 'ACCEPTED',
@@ -184,26 +155,9 @@ export async function createHarness(options: HarnessOptions = {}) {
       readonly files?: readonly string[];
       readonly func?: unknown;
       readonly args?: readonly unknown[];
-      readonly target?: { readonly frameIds?: readonly number[] };
+      readonly target?: { readonly frameIds?: readonly number[]; readonly allFrames?: boolean };
     },
   ) => {
-    if (
-      String(injection.func).includes('__baccaratMstromBetProbe')
-      || String(injection.func).includes('probeMstromBetStore')
-    ) {
-      return options.probeResults ?? [{
-        frameId: 7,
-        result: {
-          status: 'ready',
-          runtimeRevision: 'mstrom-bet-runtime/2026-08-28.1',
-          frameUrl: 'https://gci.agad.mstrom-uno.com/pc/pcv1/index.jsp',
-          host: 'gci.agad.mstrom-uno.com',
-          tableId: 'D067',
-          gmcode: 'GD06726824AB',
-          betEnabled: true,
-        },
-      }];
-    }
     if (String(injection.func).includes('probePragmaticBetTable')) {
       return options.probeResults ?? [{
         frameId: 11,
@@ -231,15 +185,6 @@ export async function createHarness(options: HarnessOptions = {}) {
           countdown: 8,
         },
       }];
-    }
-    if (
-      injection.target?.frameIds?.length === 1
-      && (
-        String(injection.func).includes('__baccaratMstromBetExecute')
-        || String(injection.func).includes('executeMstromBetOneShot')
-      )
-    ) {
-      return [{ frameId: 7, result: receipt }];
     }
     if (String(injection.func).includes('executePragmaticBetOneShot') && injection.target?.allFrames === true) {
       return [{
@@ -408,13 +353,8 @@ export async function createHarness(options: HarnessOptions = {}) {
     URL,
     Map,
     importScripts: (script: string) => {
-      const source = script === 'mstrom-bet-runtime.js'
-        ? mstromRuntimeSource
-        : script === 'pragmatic-bet-runtime.js'
-          ? pragmaticRuntimeSource
-          : null;
-      if (source === null) throw new Error(`unexpected script import: ${script}`);
-      vm.runInContext(source, context, { filename: script });
+      if (script !== 'pragmatic-bet-runtime.js') throw new Error(`unexpected script import: ${script}`);
+      vm.runInContext(pragmaticRuntimeSource, context, { filename: script });
     },
   });
 

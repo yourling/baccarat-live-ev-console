@@ -47,7 +47,7 @@ function liveReceipt(request: BetExecutionRequest, status: 'ACCEPTED' | 'REJECTE
     market: request.intent.market,
     mode: 'live',
     createdAt: '2025-01-01T00:00:30.000Z',
-    externalRef: `dafabet-${receiptId}`,
+    externalRef: `pragmatic-${receiptId}`,
   };
 }
 
@@ -552,7 +552,7 @@ describe('orchestrator table actor', () => {
       tableId: 't1',
       timestamp: '2025-01-01T00:00:02.000Z',
       sourceSeq: ledger.nextSourceSeq('t1'),
-      source: 'mstrom-runtime',
+      source: 'pragmatic-runtime',
       schemaVersion: 1,
       shoeId: 's1',
       handId: 'h1',

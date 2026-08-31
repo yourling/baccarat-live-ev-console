@@ -22,16 +22,16 @@
 - 事件冲突检测：event_id 相同但 payload 不同 / sourceSeq 冲突均拒绝，绝不静默改写历史
 - 每桌串行 Actor、决策与回执幂等、重启恢复（`packages/orchestrator`）
 - 持久化全局风控：预留/释放/结算、日/桌/靴亏损、重启恢复（`packages/risk-execution`）
-- 影子/模拟执行桥；Dafabet/mstrom 的庄对/闲对 `BetIntent` 与四市场受控 `OperationalWager` 执行实现（`packages/adapter-contract`、`packages/browser-bridge`、`apps/browser-extension`）
+- 影子/模拟执行桥；Pragmatic Play 的庄对/闲对 `BetIntent` 与四市场受控 `OperationalWager` 执行实现（`packages/adapter-contract`、`packages/browser-bridge`、`apps/browser-extension`）
 - 房间级牌桌数据导出监控层：房间发现、逐桌导出、游标/批量/健康、断点续传（`packages/room-monitor`）
-- 浏览器扩展 + 本地 WebSocket 桥：从真实游戏页面采集房间/牌桌数据，并提供 Dafabet/mstrom 真实下注执行通道（`packages/browser-bridge` + `apps/browser-extension`）
+- 浏览器扩展 + 本地 WebSocket 桥：从 Pragmatic Play 真实游戏页面采集房间/牌桌数据，并提供真实下注执行通道（`packages/browser-bridge` + `apps/browser-extension`）。Dafabet 只作为 Jeju Speed Baccarat 弹窗启动器（`dafabet-pragmatic`）
 - Electron + React 桌面控制台：IPC、arm/disarm、副数修正、事件/决策/回执审计、运行事故与后台生命周期（`apps/desktop`）
 
-## Dafabet/mstrom 集成边界
+## Pragmatic Play 集成边界
 
 自动对子 EV 策略和 `BetIntent`/单次下注仅接受 `bankerPair`（庄对）和 `playerPair`（闲对）。`OperationalWager` 接受 `banker`（庄）、`player`（闲）、`bankerPair` 和 `playerPair`，其中全局定时保活只选择庄或闲。两者都由桌台 actor 串行执行并接入统一风控、预留、回执审计和牌局结算。
 
-浏览器端还会检查唯一 Dafabet 百家樂弹窗、唯一匹配桌台的游戏 iframe、会话 live gate、平台状态、限额、余额和未确认筹码。其他平台仍需单独实现执行适配器。当前标准结算条款按庄赢净利 `0.95`、闲赢净利 `1`、和局退回本金处理；对子使用桌台配置赔率。最终收益由对应 reservation 的 `realizedPnl` 汇总，而不是仅按平台接受回执推算。
+浏览器端还会检查唯一 Dafabet Pragmatic 弹窗（`/live-dealer/popup-launch/jeju-speed-baccarat`）、唯一匹配桌台的 `client.pragmaticplaylive.net` iframe、会话 live gate、平台状态、限额、余额和未确认筹码。仓库已删除 mstrom / Evolution / 旧 live-baccarat 适配器。当前标准结算条款按庄赢净利 `0.95`、闲赢净利 `1`、和局退回本金处理；对子使用桌台配置赔率。最终收益由对应 reservation 的 `realizedPnl` 汇总，而不是仅按平台接受回执推算。
 
 ## 目录
 
@@ -71,8 +71,8 @@ Electron 主进程默认加载 `apps/desktop/dist/index.html`；如需连接开�
    ```
 2. Chrome/Edge 扩展管理页加载 `apps/browser-extension`（开发者模式 → 加载已解压的扩展）。
 3. 打包扩展默认连接带固定 token 的 `ws://127.0.0.1:17890`，Manifest key 保证扩展 ID 稳定。`bridgeUrl` 仍可通过 `chrome.storage.local` 修改，但桌面桥只信任固定 ID/token；不要改为不受信任或非隔离的端点。
-4. Dafabet/mstrom 通过网络与运行时状态采集上报房间/牌桌事件；其他平台仍需填写对应适配器。
-5. 桥接层收到事件后，经 `BridgeRoomMonitor`/`TableExport` 导出给 orchestrator/ledger。`BetIntent` 与 `OperationalWager` 都可能请求唯一匹配的 Dafabet 百家樂弹窗和游戏 iframe；`live` 只是实现中的开关，不是资金使用许可。保持 `shadow` 或 `simulated`，不要执行资金验证。
+4. Pragmatic Play 通过 `pragmatic-network-hook` / `pragmatic-dom-hook` 上报房间/牌桌事件。游戏 iframe 在 `pragmaticplaylive.net`（以及 `vbgames88.com` / `zavjcswh.biz` 镜像）；Dafabet 弹窗只负责启动该 iframe。
+5. 桥接层收到事件后，经 `BridgeRoomMonitor`/`TableExport` 导出给 orchestrator/ledger。`BetIntent` 与 `OperationalWager` 都可能请求唯一匹配的 Dafabet Pragmatic 弹窗和游戏 iframe。
 
 ## 核心验证点
 
@@ -91,6 +91,6 @@ Electron 主进程默认加载 `apps/desktop/dist/index.html`；如需连接开�
 - 关闭桌面窗口只会隐藏窗口，监控、桥接、保活调度和账本继续运行；真正退出应用时才关闭服务。
 - 页面诊断只传长度/数量元数据，桥接调试日志只保留脱敏 URL 和载荷长度，不记录正文、HTML 或原始网络载荷预览。
 
-## Dafabet/mstrom 集成核对
+## Pragmatic Play 集成核对
 
-非资金的构建、连接和数据导出核对见 [Dafabet/mstrom 集成核对指南](docs/dafabet-mstrom-acceptance.md)。当前没有获批的最小金额真实验证流程。
+当前没有获批的最小金额真实验证流程。不要把代码中的 `live` 开关视为资金使用许可。

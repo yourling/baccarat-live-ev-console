@@ -4,16 +4,16 @@
 
 1. 从真实游戏房间页面抽取房间/桌台数据；
 2. 通过本地 WebSocket 桥接到 `@baccarat/browser-bridge`；
-3. 执行 Dafabet/mstrom 页面下注请求的浏览器端实现。
+3. 执行 Pragmatic Play 页面下注请求的浏览器端实现。
 
 **发布状态：仅限隔离、非资金的集成与长稳验证。** 扩展包含会调用页面下注方法的代码，工程侧执行链路已统一加固，但当前仍未获得真实资金发布审批或授权。
 
 当前执行实现分为两条路径：
 
-- `BetIntent`/单次下注路径仅支持 Dafabet/mstrom 的庄对/闲对。桌面端先经过 actor、reservation 和全局风控，再由 `background.js` 与 `mstrom-bet-runtime.js` 执行。
+- `BetIntent`/单次下注路径仅支持 Pragmatic Play 的庄对/闲对。桌面端先经过 actor、reservation 和全局风控，再由 `background.js` 与 `pragmatic-bet-runtime.js` 执行。
 - `OperationalWager` 支持庄、闲、庄对、闲对，用于桌面端手动按钮和庄/闲保活调度。它同样经过 `TableActor`、reservation、全局风控、回执审计、结算和按桌/靴/局/市场/来源的重复保护。
 
-`site-adapter.js` 和 `bet-executor.js` 未被当前 Manifest 加载，不能作为执行路径。其他平台仍需单独填写适配器。
+扩展只加载 Pragmatic 钩子：`pragmatic-network-hook.js`、`pragmatic-dom-hook.js`、`pragmatic-bet-runtime.js`。Dafabet 仅保留 Jeju Speed Baccarat 弹窗启动器权限。
 
 - `matches`
 - `roomSelector` / `tableSelector`
@@ -56,7 +56,7 @@ await server.start();
 
 ## 执行实现与安全状态
 
-`background.js` 在收到执行请求后，会尝试验证当前扩展会话的 live gate，并要求浏览器中恰好存在一个 Dafabet 百家樂弹窗、其 iframe 中恰好一个匹配目标桌台的 mstrom BetStore。满足这些浏览器端检查后，才会把一次性执行函数注入该 iframe 的 `MAIN` world。
+`background.js` 在收到执行请求后，会尝试验证当前扩展会话的 live gate，并要求浏览器中恰好存在一个 Dafabet Pragmatic 弹窗（`/live-dealer/popup-launch/jeju-speed-baccarat`），其 iframe 中恰好一个匹配目标桌台的 Pragmatic 游戏帧。满足这些浏览器端检查后，才会把一次性执行函数注入该 iframe 的 `MAIN` world。
 
 运行时 playType 映射为 `banker=1`、`player=2`、`bankerPair=4`、`playerPair=5`。`BetIntent` 会拒绝非对子市场；`OperationalWager` 接受全部四个市场。所有真实请求还必须由桌面端先建立 reservation，并通过实体牌靴、连接、下注窗口、未封靴、风控限额、重复保护和运行授权门禁。
 
@@ -68,8 +68,6 @@ npx tsx scripts/bridge-command.ts liveOff
 ```
 
 `liveOn` 只会尝试打开扩展连接的执行资格，本身不提交下注，也不代表环境已通过真实资金审批。平台返回拒绝或无资金时，执行器可返回 `REJECTED`；若 `confirmBet` 已开始而无法证明结果，可返回 `UNKNOWN`。`UNKNOWN` 对应的 reservation 保留敞口，桌面端会立即关闭保活、撤销当前运行授权并阻断后续执行，不会在下一调度周期再次尝试。
-
-非资金集成核对见 [Dafabet/mstrom 集成核对指南](../../docs/dafabet-mstrom-acceptance.md)。
 
 ## 信任、恢复与日志边界
 
@@ -85,7 +83,7 @@ npx tsx scripts/bridge-command.ts liveOff
 `sessionAction` 消息上报到桥接服务日志（`[session-action]`），便于观测哪一层真正生效：
 
 1. **合成 DOM 活动**：mousemove / focus / 滚动抖动，并通知 MAIN world 的
-   `network-hook.js` 重放已捕获的 WebSocket 心跳消息。
+   `pragmatic-network-hook.js` 重放已捕获的 WebSocket 心跳消息。
 2. **同源网络信标**：对页面 origin 发起真实 `HEAD`（失败退回 `GET`）请求，
    携带会话 cookie，重置服务端闲置计时。
 3. **对局记录按钮双击**：点击右下角“对局记录表”按钮（点击一次放大、再点一次缩小），
@@ -101,7 +99,7 @@ npx tsx scripts/bridge-command.ts liveOff
 
 桥接服务还独立监测牌桌状态是否真正推进，而不是把扩展心跳或重复快照当作新鲜数据。
 若牌桌连续 8 分钟没有状态推进，即使页面没有出现过期文案，也会请求扩展先撤销实盘
-执行资格再重载百家乐弹窗；未恢复时按 1m / 5m / 15m / 30m 监督退避重试。
+执行资格再重载Pragmatic 弹窗；未恢复时按 1m / 5m / 15m / 30m 监督退避重试。
 重载动作不会生成下注，也不会伪造恢复证明。
 
 页面不再显示过期文案时只上报 `sessionAction: recovered`。该事件本身不会生成

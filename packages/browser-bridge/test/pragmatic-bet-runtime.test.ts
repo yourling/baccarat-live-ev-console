@@ -112,6 +112,7 @@ function pageContext(open = true, headerText?: string) {
       setTimeout,
       innerWidth: 1280,
       innerHeight: 720,
+      __baccaratPragmaticBetChannel: undefined as { placeBet: () => { ok: boolean } } | undefined,
     },
   };
 }
