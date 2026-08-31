@@ -458,6 +458,7 @@ function validateLiveBetMessage(message) {
   }
   return { requestId: message.requestId, request, tableId, platform };
 }
+/** 只读取多台页上该桌自己的下注按钮；绝不点视频入座。 */
 async function preparePragmaticTable(tabId, tableId, market) {
   const protocolWindow = pragmaticProtocolWindow(tableId);
   return await chrome.scripting.executeScript({
@@ -474,70 +475,21 @@ async function preparePragmaticTable(tabId, tableId, market) {
       }
       delete globalThis.__baccaratPragmaticPreparedTable;
       const targetId = `TileHeight-${targetTableId}`;
-      let root = document.getElementById(targetId);
+      const root = document.getElementById(targetId);
       if (!root) {
-        const scrollables = [document.scrollingElement, ...document.querySelectorAll('*')]
-          .filter((element, index, values) => element
-            && values.indexOf(element) === index
-            && (
-              Number(element.scrollHeight) > Number(element.clientHeight) + 80
-              || Number(element.scrollWidth) > Number(element.clientWidth) + 80
-            ))
-          .sort((left, right) => {
-            const leftRange = Math.max(
-              Number(left.scrollHeight) - Number(left.clientHeight),
-              Number(left.scrollWidth) - Number(left.clientWidth),
-            );
-            const rightRange = Math.max(
-              Number(right.scrollHeight) - Number(right.clientHeight),
-              Number(right.scrollWidth) - Number(right.clientWidth),
-            );
-            return rightRange - leftRange;
-          })
-          .slice(0, 8);
-        let scanSteps = 0;
-        for (const scrollable of scrollables) {
-          const originalTop = Number(scrollable.scrollTop) || 0;
-          const originalLeft = Number(scrollable.scrollLeft) || 0;
-          const verticalMax = Math.max(0, Number(scrollable.scrollHeight) - Number(scrollable.clientHeight));
-          const horizontalMax = Math.max(0, Number(scrollable.scrollWidth) - Number(scrollable.clientWidth));
-          const verticalStep = Math.max(240, Math.floor(Number(scrollable.clientHeight) * 0.8));
-          const horizontalStep = Math.max(240, Math.floor(Number(scrollable.clientWidth) * 0.8));
-          const positions = [];
-          for (let top = 0; top <= verticalMax && positions.length < 24; top += verticalStep) {
-            positions.push([Math.min(top, verticalMax), originalLeft]);
-          }
-          for (let left = 0; left <= horizontalMax && positions.length < 32; left += horizontalStep) {
-            positions.push([originalTop, Math.min(left, horizontalMax)]);
-          }
-          for (const [top, left] of positions) {
-            try {
-              if (typeof scrollable.scrollTo === 'function') scrollable.scrollTo({ top, left, behavior: 'instant' });
-              else {
-                scrollable.scrollTop = top;
-                scrollable.scrollLeft = left;
-              }
-            } catch (_) {
-              continue;
-            }
-            scanSteps += 1;
-            await new Promise(resolve => setTimeout(resolve, 80));
-            root = document.getElementById(targetId);
-            if (root || scanSteps >= 64) break;
-          }
-          if (root || scanSteps >= 64) break;
-          try {
-            scrollable.scrollTop = originalTop;
-            scrollable.scrollLeft = originalLeft;
-          } catch (_) {}
-        }
-        if (!root) {
-          const tableIds = Array.from(document.querySelectorAll('[id^="TileHeight-"]'))
-            .map(element => String(element.id || '').slice('TileHeight-'.length))
-            .filter(Boolean)
-            .slice(0, 80);
-          return { status: 'not-found-after-scroll', frameUrl, scanSteps, tableIds };
-        }
+        return { status: 'not-seated', frameUrl };
+      }
+      try {
+        const rect = root.getBoundingClientRect();
+        const seated = rect.width > 0
+          && rect.height > 0
+          && !!(
+            root.querySelector('[data-betcode="0"]')
+            || root.querySelector('[data-testid^="timer-countdown-"]')
+          );
+        if (!seated) return { status: 'not-seated', frameUrl };
+      } catch (_) {
+        return { status: 'not-seated', frameUrl };
       }
       try {
         root.scrollIntoView({ block: 'center', inline: 'center' });
@@ -568,17 +520,6 @@ async function preparePragmaticTable(tabId, tableId, market) {
       if (!Number.isFinite(countdown) || countdown < 1) {
         return { status: 'betting-window-closed', frameUrl, roundId: effectiveRoundId, domRoundId: roundId };
       }
-      const videoIcon = root.querySelector('[data-testid="icon-Video"]');
-      const activator = videoIcon?.closest?.('button, [role="button"], a') || videoIcon?.parentElement;
-      if (!activator || activator.querySelector?.('[data-betcode]') || activator.hasAttribute?.('data-betcode')) {
-        return { status: 'activation-control-missing', frameUrl };
-      }
-      try {
-        activator.click();
-      } catch (_) {
-        return { status: 'activation-failed', frameUrl };
-      }
-      await new Promise(resolve => setTimeout(resolve, 500));
       const visible = element => {
         if (!element || element.disabled === true) return false;
         try {
@@ -595,8 +536,7 @@ async function preparePragmaticTable(tabId, tableId, market) {
       const marketControls = {};
       const marketCounts = {};
       for (const [market, code] of Object.entries(marketCodes)) {
-        const candidates = Array.from(document.querySelectorAll(`[data-betcode="${code}"]`))
-          .filter(element => visible(element) && !element.closest?.('[id^="TileHeight-"]'));
+        const candidates = Array.from(root.querySelectorAll(`[data-betcode="${code}"]`)).filter(visible);
         marketCounts[market] = candidates.length;
         if (candidates.length === 1) marketControls[market] = candidates[0];
       }
@@ -1027,20 +967,8 @@ async function probePragmaticBetReadiness(tableIds, generation) {
 
   for (const tableId of requestedTableIds) {
     let probes;
-    let preparationSummary = '';
+    const preparationSummary = 'skipped-no-join';
     try {
-      const preparations = await preparePragmaticTable(targets[0].id, tableId);
-      preparationSummary = preparations
-        .filter(entry => entry && entry.result && entry.result.status !== 'skipped')
-        .map(entry => [
-          `id=${Number.isInteger(entry.frameId) ? entry.frameId : ''}`,
-          `status=${String(entry.result.status || '')}`,
-          `round=${String(entry.result.roundId || '')}`,
-          `countdown=${Number.isFinite(entry.result.countdown) ? entry.result.countdown : ''}`,
-          `tables=${Array.isArray(entry.result.tableIds) ? entry.result.tableIds.join(',') : ''}`,
-        ].join(','))
-        .join('|');
-      if (generation !== activeSocketGeneration) return;
       probes = await chrome.scripting.executeScript({
         target: { tabId: targets[0].id, allFrames: true },
         world: 'MAIN',

@@ -767,7 +767,7 @@ describe('DesktopConsoleService operational wagers', () => {
       await service.injectEvent(openWindow('D001'));
       await waitFor(() => requestOperationalWager.mock.calls.length > 0);
 
-      // Then: fixed keepalive uses the controlled live path, while EV pair automation can remain armed.
+      // Then: fixed keepalive uses the controlled live path; pair EV stays disarmed until the physical shoe is known.
       expect(requestOperationalWager).toHaveBeenCalledWith(expect.objectContaining({
         mode: 'live',
         wager: expect.objectContaining({
@@ -783,7 +783,7 @@ describe('DesktopConsoleService operational wagers', () => {
           source: 'keepalive',
         }),
       }));
-      expect(service.snapshot().snapshot.tables.D001?.projection.autoBetStatus).toBe('ARMED');
+      expect(service.snapshot().snapshot.tables.D001?.projection.autoBetStatus).toBe('DISARMED');
       expect(service.snapshot().runtime.reasons).not.toContain('physical-shoe-baseline-unknown');
     } finally {
       await service.close();

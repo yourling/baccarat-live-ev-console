@@ -283,7 +283,13 @@ function probePragmaticBetTable(tableId, targetMarket) {
   const root = roots[0] || null;
   const prepared = preparedLease(tableId);
   const preparedLeaseActive = !!prepared;
-  const multitableRouteReady = location.pathname !== '/desktop/multibaccarat/' || preparedLeaseActive;
+  const tileHasOwnMarkets = !!(root && root !== document && ['player', 'banker'].every(market => {
+    const code = MARKET_CODES[market];
+    return code !== undefined && Array.from(root.querySelectorAll(`[data-betcode="${code}"]`)).some(visible);
+  }));
+  const multitableRouteReady = location.pathname !== '/desktop/multibaccarat/'
+    || preparedLeaseActive
+    || tileHasOwnMarkets;
   const bettingRoot = location.pathname === '/desktop/multibaccarat/' && preparedLeaseActive
     ? document
     : root;

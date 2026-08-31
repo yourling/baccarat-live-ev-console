@@ -148,15 +148,11 @@ describe('extension background multitable command', () => {
       ([injection]) => isPragmaticProbeInjection(injection.func),
     )).toBe(true);
     expect(harness.executeScript.mock.calls.some(
-      ([injection]) => String(injection.func).includes('scrollIntoView'),
-    )).toBe(true);
+      ([injection]) => String(injection.func).includes('icon-Video'),
+    )).toBe(false);
     expect(harness.executeScript.mock.calls.some(
-      ([injection]) => String(injection.func).includes('icon-Video'),
-    )).toBe(true);
-    const preparation = harness.executeScript.mock.calls.find(
-      ([injection]) => String(injection.func).includes('icon-Video'),
-    );
-    expect(preparation?.[0].args?.[2]).toBeNull();
+      ([injection]) => String(injection.func).includes('not-found-after-scroll'),
+    )).toBe(false);
     expect(harness.executeScript.mock.calls.some(
       ([injection]) => isPragmaticFinalInjection(injection.func),
     )).toBe(false);

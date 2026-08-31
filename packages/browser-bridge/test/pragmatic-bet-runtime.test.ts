@@ -289,6 +289,60 @@ describe('Pragmatic bet runtime', () => {
     expect(Number(closing.countdown)).toBeLessThanOrEqual(2);
   });
 
+  it('treats a multi-table tile with its own bet buttons as ready without sitting', () => {
+    const runtime = exportedRuntime();
+    const timer = element('8');
+    const header = element('ID: 17260578524');
+    const player = element('闲家');
+    const banker = element('庄家');
+    const root = element('粤语极速百家乐¥ 10ID: 17260578524');
+    root.querySelector = (selector: string): FakeElement | null => {
+      if (selector.includes('game-header-game-id')) return header;
+      if (selector.includes('timer-countdown')) return timer;
+      if (selector === '[data-betcode="0"]') return player;
+      if (selector === '[data-betcode="1"]') return banker;
+      return null;
+    };
+    root.querySelectorAll = (selector: string): FakeElement[] => {
+      if (selector === '[data-betcode="0"]') return [player];
+      if (selector === '[data-betcode="1"]') return [banker];
+      if (selector.includes('data-betcode="0"') && selector.includes('data-betcode="1"')) return [player, banker];
+      return [];
+    };
+    const result = runInNewContext(
+      `(${String(runtime.probe)})('tobcbaccaragen92')`,
+      {
+        document: {
+          referrer: '',
+          querySelector: () => null,
+          querySelectorAll: () => [],
+          getElementById: (id: string) => id === 'TileHeight-tobcbaccaragen92' ? root : null,
+        },
+        location: {
+          pathname: '/desktop/multibaccarat/',
+          hostname: 'client.pragmaticplaylive.net',
+        },
+        URL,
+        Date,
+        Number,
+        Object,
+        Array,
+        String,
+        Promise,
+        setTimeout,
+        innerWidth: 1280,
+        innerHeight: 720,
+      },
+    ) as Record<string, unknown>;
+
+    expect(result).toEqual(expect.objectContaining({
+      status: 'ready',
+      tableId: 'tobcbaccaragen92',
+      routingAuthority: 'table-root',
+      roundId: '17260578524',
+    }));
+  });
+
   it('requires a fresh prepared-table lease for the shared multitable betting panel', () => {
     const runtime = exportedRuntime();
     const wrongTable = multitablePageContext(8, 'otherpragmatictable');

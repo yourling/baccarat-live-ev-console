@@ -1327,6 +1327,80 @@ describe('browser bridge server', () => {
     await server.close();
   });
 
+  it('does not recover multi-view while the page already shows multiple seated tables', async () => {
+    const server = new BrowserBridgeServer({
+      port: 0,
+      selectedTableIds: ['tableaaaaaa01', 'tableaaaaaa02', 'tableaaaaaa03', 'tableaaaaaa04', 'tableaaaaaa05'],
+      multiviewRecoveryCooldownMs: 1,
+    });
+    const port = await server.start();
+    const extension = extensionClient(port);
+    const commands: string[] = [];
+    try {
+      await new Promise<void>((resolve, reject) => {
+        extension.once('open', resolve);
+        extension.once('error', reject);
+      });
+      extension.on('message', data => {
+        const message = JSON.parse(data.toString()) as { readonly kind?: string; readonly name?: string };
+        if (message.kind === 'command' && message.name) commands.push(message.name);
+      });
+      server.ingestClientMessage({
+        kind: 'networkCapture',
+        source: 'baccarat-bridge-runtime-selection',
+        url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/',
+        direction: 'recv',
+        encoding: 'text',
+        data: JSON.stringify({
+          tableIds: ['tableaaaaaa01', 'tableaaaaaa02', 'tableaaaaaa03', 'tableaaaaaa04'],
+        }),
+      });
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(commands).not.toContain('openMultiView');
+    } finally {
+      extension.close();
+      await server.close();
+    }
+  });
+
+  it('recovers multi-view only after the page falls back to a single table', async () => {
+    const server = new BrowserBridgeServer({
+      port: 0,
+      selectedTableIds: ['tableaaaaaa01', 'tableaaaaaa02'],
+      multiviewRecoveryCooldownMs: 1,
+    });
+    const port = await server.start();
+    const extension = extensionClient(port);
+    const opened = new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('openMultiView was not requested')), 1_000);
+      extension.on('message', data => {
+        const message = JSON.parse(data.toString()) as { readonly kind?: string; readonly name?: string };
+        if (message.kind === 'command' && message.name === 'openMultiView') {
+          clearTimeout(timer);
+          resolve(message.name);
+        }
+      });
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        extension.once('open', resolve);
+        extension.once('error', reject);
+      });
+      server.ingestClientMessage({
+        kind: 'networkCapture',
+        source: 'baccarat-bridge-runtime-selection',
+        url: 'https://client.pragmaticplaylive.net/desktop/baccarat/',
+        direction: 'recv',
+        encoding: 'text',
+        data: JSON.stringify({ tableIds: ['tableaaaaaa01'] }),
+      });
+      await expect(opened).resolves.toBe('openMultiView');
+    } finally {
+      extension.close();
+      await server.close();
+    }
+  });
+
   it('filters unselected tables from discovered and updated rooms', async () => {
     const server = new BrowserBridgeServer({ selectedTableIds: ['D055', 'D056'] });
     server.ingestClientMessage({

@@ -92,7 +92,7 @@ describe('OperationalWagerCoordinator', () => {
     }
   });
 
-  it('tries keepalive tables in order and stops after an unknown result', async () => {
+  it('attempts keepalive only on the seated table whose betting window opened', async () => {
     const ledger = new SqliteLedger(':memory:');
     const calls: string[] = [];
     const coordinator = new OperationalWagerCoordinator({
@@ -100,9 +100,6 @@ describe('OperationalWagerCoordinator', () => {
       actor: tableId => ({
         placeOperationalWager: async command => {
           calls.push(tableId);
-          if (tableId === 'D001') {
-            return { status: 'REJECTED', tableId, reason: 'betting-window-required' };
-          }
           if (tableId === 'D002') {
             return {
               ...accepted(tableId, command),
@@ -124,8 +121,13 @@ describe('OperationalWagerCoordinator', () => {
         market: 'player',
         amount: 20,
       }, BASE_TIME);
+      expect(calls).toEqual([]);
 
-      expect(calls).toEqual(['D001', 'D002']);
+      await coordinator.tick(BASE_TIME);
+      expect(calls).toEqual([]);
+
+      await coordinator.tick(BASE_TIME, 'D002');
+      expect(calls).toEqual(['D002']);
       expect(coordinator.getKeepaliveState()).toMatchObject({
         enabled: true,
         lastStatus: 'UNKNOWN',
@@ -145,6 +147,37 @@ describe('OperationalWagerCoordinator', () => {
         lastTableId: 'D002',
       });
       replacement.close();
+    } finally {
+      coordinator.close();
+      ledger.close();
+    }
+  });
+
+  it('does not fall through to other monitored tables when the opened table is not seated', async () => {
+    const ledger = new SqliteLedger(':memory:');
+    const calls: string[] = [];
+    const coordinator = new OperationalWagerCoordinator({
+      ledger,
+      actor: tableId => ({
+        placeOperationalWager: async command => {
+          calls.push(tableId);
+          return accepted(tableId, command);
+        },
+      }),
+      monitorTableIds: () => ['D001', 'D002', 'D003'],
+      keepaliveTableIds: () => ['D001'],
+      serialize: async operation => await operation(),
+    });
+
+    try {
+      await coordinator.updateKeepalive({
+        enabled: true,
+        intervalMinutes: 5,
+        market: 'player',
+        amount: 20,
+      }, BASE_TIME);
+      await coordinator.tick(BASE_TIME, 'D003');
+      expect(calls).toEqual([]);
     } finally {
       coordinator.close();
       ledger.close();
@@ -195,6 +228,7 @@ describe('OperationalWagerCoordinator', () => {
         market: 'player',
         amount: 20,
       }, BASE_TIME);
+      await coordinator.tick(BASE_TIME, 'D001');
 
       expect(calls).toEqual(['D001']);
       expect(coordinator.getKeepaliveState()).toMatchObject({
@@ -243,10 +277,9 @@ describe('OperationalWagerCoordinator', () => {
         market: 'banker',
         amount: 20,
       }, BASE_TIME);
-      expect(placeOperationalWager).toHaveBeenCalledTimes(1);
-      placeOperationalWager.mockClear();
+      expect(placeOperationalWager).not.toHaveBeenCalled();
       ready = true;
-      const queuedTick = coordinator.tick(BASE_TIME);
+      const queuedTick = coordinator.tick(BASE_TIME, 'D001');
       await serializationStarted;
       coordinator.disableKeepaliveImmediately();
       releaseSerialization();

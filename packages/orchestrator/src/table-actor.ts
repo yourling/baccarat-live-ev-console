@@ -53,7 +53,7 @@ export interface TableActorOptions {
   operationalExecutor?: OperationalWagerExecutor | null;
   operationalWagerTerms?: OperationalWagerTerms;
   canExecuteAutomaticBets?: (tableId: string) => boolean;
-  onBettingWindowOpened?: () => void;
+  onBettingWindowOpened?: (tableId: string) => void;
   executionMode: 'shadow' | 'simulated' | 'live';
   defaultBetAmount: number;
   riskLimits: RiskLimits;
@@ -83,7 +83,7 @@ export class TableActor {
   private operationalExecutor: OperationalWagerExecutor | null;
   private readonly operationalWagerTerms?: OperationalWagerTerms;
   private readonly canExecuteAutomaticBets: (tableId: string) => boolean;
-  private readonly onBettingWindowOpened?: () => void;
+  private readonly onBettingWindowOpened?: (tableId: string) => void;
   private profile: TableProfile;
   private executionMode: 'shadow' | 'simulated' | 'live';
   private defaultBetAmount: number;
@@ -420,6 +420,10 @@ export class TableActor {
   ): Promise<void> {
     if (event.shoeId !== projection.shoeId || projection.sealed) return;
     if (projection.status !== 'BETTING_WINDOW') return;
+    if (projection.shoeBaseline !== 'physical-shoe') {
+      this.requestKeepalive();
+      return;
+    }
     const evalKey = `${event.shoeId}:${event.handId}:${event.market}`;
     const previousEval = this.evaluatedWindows.get(evalKey);
     const hasClosesAt = typeof event.closesAt === 'string' && event.closesAt.length > 0;
@@ -562,7 +566,7 @@ export class TableActor {
   }
 
   private requestKeepalive(): void {
-    this.onBettingWindowOpened?.();
+    this.onBettingWindowOpened?.(this.tableId);
   }
 
   private recordUnobservableWindow(
@@ -755,7 +759,7 @@ export interface OrchestratorOptions {
   operationalExecutor?: OperationalWagerExecutor | null;
   operationalWagerTerms?: OperationalWagerTerms;
   canExecuteAutomaticBets?: (tableId: string) => boolean;
-  onBettingWindowOpened?: () => void;
+  onBettingWindowOpened?: (tableId: string) => void;
 }
 
 export interface RegisteredTableConfig {
@@ -783,7 +787,7 @@ export class Orchestrator {
   private operationalExecutor: OperationalWagerExecutor | null;
   private readonly operationalWagerTerms?: OperationalWagerTerms;
   private readonly canExecuteAutomaticBets: (tableId: string) => boolean;
-  private readonly onBettingWindowOpened?: () => void;
+  private readonly onBettingWindowOpened?: (tableId: string) => void;
 
   constructor(options: OrchestratorOptions) {
     this.ledger = options.ledger;

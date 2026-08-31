@@ -860,7 +860,7 @@ class BridgeTableExport implements TableExport {
             tableId: this.tableId,
             sourceSeq: event.sourceSeq,
             eventId: event.eventId,
-            payloadHash: sha256(stableStringify(event)),
+            payloadHash: event.eventId,
           },
           kind: this.cursor.sourceSeq > 0 ? 'replay' : 'live',
         };
@@ -1563,14 +1563,11 @@ export class BrowserBridgeServer implements RoomMonitor {
       const configuredSelectedTables = this.configuredSelectedTables;
       const hasConfiguredOverlap = configuredSelectedTables === undefined
         || [...selected].some(tableId => configuredSelectedTables.has(tableId));
-      const configuredMultiviewIsIncomplete = configuredSelectedTables !== undefined
-        && configuredSelectedTables.size > 1
-        && [...configuredSelectedTables].some(tableId => !selected.has(tableId));
       this.runtimeSelectedTables = hasConfiguredOverlap ? selected : new Set();
       this.refreshEffectiveSelectedTables();
       if (this.configuredSelectedTables === undefined) this.pruneUnselectedTables();
 
-      if (configuredMultiviewIsIncomplete || (selected.size > 0 && !hasConfiguredOverlap)) {
+      if (this.isConfiguredMultiviewIncomplete() || (selected.size > 0 && !hasConfiguredOverlap)) {
         this.requestMultiviewRecovery();
       } else {
         this.clearMultiviewRecoveryTimer();
@@ -1631,11 +1628,12 @@ export class BrowserBridgeServer implements RoomMonitor {
     }
   }
 
+  /** 控制台监控很多桌不等于要把它们都加入 4 格多台；只有页面掉到单桌/空桌时才恢复。 */
   private isConfiguredMultiviewIncomplete(): boolean {
     return this.configuredSelectedTables !== undefined
       && this.configuredSelectedTables.size > 1
       && this.runtimeSelectedTables !== undefined
-      && [...this.configuredSelectedTables].some(tableId => !this.runtimeSelectedTables?.has(tableId));
+      && this.runtimeSelectedTables.size <= 1;
   }
 
   private scheduleMultiviewRecovery(delayMs: number): void {

@@ -326,8 +326,8 @@ export class DesktopConsoleService {
       executor: null,
       operationalWagerTerms: STANDARD_COMMISSION_BACCARAT_TERMS,
       canExecuteAutomaticBets: tableId => this.canExecuteAutomaticBets(tableId),
-      onBettingWindowOpened: () => {
-        void this.operationalWagers.tick().catch(error => {
+      onBettingWindowOpened: tableId => {
+        void this.operationalWagers.tick(undefined, tableId).catch(error => {
           this.recordLiveMonitorError(error, 'scheduler-failure', 'degraded');
         });
       },
@@ -1157,6 +1157,7 @@ export class DesktopConsoleService {
     if (!actor) return;
     const projection = actor.getProjection();
     const canArm = projection.autoBetStatus === 'DISARMED'
+      && projection.shoeBaseline === 'physical-shoe'
       && projection.connectionStatus === 'CONNECTED'
       && !projection.sealed
       && (projection.status === 'TRACKING'
@@ -1513,7 +1514,7 @@ export class DesktopConsoleService {
                 if (event.tableId !== table.tableId || !this.isCurrentLiveFeed(table.tableId, feed)) continue;
                 const sourceSeq = this.nextMonitorSourceSeq(event.tableId);
                 if (!this.isCurrentLiveFeed(table.tableId, feed)) continue;
-                await this.enqueueMonitorEvent({ ...event, sourceSeq });
+                void this.enqueueMonitorEvent({ ...event, sourceSeq });
               }
             },
             onDisconnect: (tableId, reason) => {

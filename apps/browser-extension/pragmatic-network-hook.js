@@ -4,6 +4,9 @@
  * This hook mirrors received *game protocol* WebSocket frames to the isolated
  * content script and, when a previous real bet send has been observed, can
  * replay a mutated copy of that send for request-path betting.
+ * It never sends <autoBet> and never sits a table. Multi-baccarat already
+ * lets lpbet target any tile on the page; joining is what triggers
+ * Pragmatic's "joined from another device" toast.
  * It does not observe fetch/XHR/Worker/MessageChannel/video sockets.
  */
 (function () {
@@ -68,6 +71,10 @@
     if (!text || text.length < 8) return false;
     return /bet|betcode|"bc"|stake|amount|amt/i.test(text)
       && /table|game|round|playtype|playType|market/i.test(text);
+  }
+
+  function isBettableTableId(tableId) {
+    return typeof tableId === 'string' && /^[a-z0-9]{8,32}$/i.test(tableId);
   }
 
   function rememberSession(data) {
@@ -157,12 +164,12 @@
   function placePragmaticBet(command) {
     const payload = mutateBetTemplate(command);
     if (!payload) return { ok: false, reason: 'bet-template-missing' };
+    if (!isBettableTableId(command && command.tableId)) {
+      return { ok: false, reason: 'invalid-table-id' };
+    }
     const socket = pickGameSocket();
     if (!socket) return { ok: false, reason: 'bet-socket-not-open' };
     try {
-      if (/<lpbet[\s>]/i.test(payload) && command && command.tableId) {
-        socket.send('<command channel="table-' + command.tableId + '"><autoBet></autoBet></command>');
-      }
       socket.send(payload);
       return { ok: true };
     } catch (_) {

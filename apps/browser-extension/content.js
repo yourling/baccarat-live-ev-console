@@ -848,17 +848,31 @@
     recoveryCheckTimer = setTimeout(finishRecoveryCheck, RECOVERY_CHECK_DELAY_MS);
   }
 
+  function suppressMedia() {
+    if (!PRAGMATIC_PAGE) return;
+    try {
+      for (const video of document.querySelectorAll('video')) {
+        video.muted = true;
+        if (!video.paused) video.pause();
+      }
+    } catch (_) {}
+  }
+
   if (!GAME_PAGE) return; // 非游戏页面:内容脚本保持惰性
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
       scan();
+      suppressMedia();
       startKeepAlive();
       setInterval(scan, SCAN_INTERVAL_MS);
+      setInterval(suppressMedia, SCAN_INTERVAL_MS);
     });
   } else {
     scan();
+    suppressMedia();
     startKeepAlive();
     setInterval(scan, SCAN_INTERVAL_MS);
+    setInterval(suppressMedia, SCAN_INTERVAL_MS);
   }
 })();

@@ -177,7 +177,7 @@ describe('Pragmatic passive network hook', () => {
       __baccaratPragmaticBetChannel?: { placeBet(command: Record<string, unknown>): { ok: boolean } };
     }).__baccaratPragmaticBetChannel;
     expect(channel?.placeBet({
-      tableId: 'speedbca14gesbc1',
+      tableId: 'h22z8qhp17sa0vkh',
       roundId: '16387259910',
       amount: 10,
       code: '1',
@@ -185,14 +185,31 @@ describe('Pragmatic passive network hook', () => {
     const sends = posted
       .filter(message => (message as { direction?: string }).direction === 'send')
       .map(message => String((message as { data?: string }).data));
-    expect(sends.some(data => data.includes('<autoBet></autoBet>') && data.includes('table-speedbca14gesbc1'))).toBe(true);
+    expect(sends.some(data => data.includes('<autoBet></autoBet>'))).toBe(false);
     expect(sends.some(data =>
       data.includes('<lpbet')
+      && data.includes('channel="table-h22z8qhp17sa0vkh"')
       && data.includes('gId="16387259910"')
       && data.includes('uId="ppc1735377833837"')
       && data.includes('bc="1"')
       && data.includes('amt="10"')
     )).toBe(true);
+    expect(channel?.placeBet({
+      tableId: 'speedbca14gesbc1',
+      roundId: '16387259910',
+      amount: 10,
+      code: '1',
+    })).toEqual({ ok: true });
+    const afterSecond = posted
+      .filter(message => (message as { direction?: string }).direction === 'send')
+      .map(message => String((message as { data?: string }).data));
+    expect(afterSecond.some(data =>
+      data.includes('<lpbet')
+      && data.includes('channel="table-speedbca14gesbc1"')
+      && data.includes('gId="16387259910"')
+      && data.includes('bc="1"')
+    )).toBe(true);
+    expect(afterSecond.some(data => data.includes('<autoBet></autoBet>'))).toBe(false);
   });
 
   it('does not capture binary WebSocket frames or video sockets', () => {

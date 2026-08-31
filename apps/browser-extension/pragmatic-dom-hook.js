@@ -296,6 +296,12 @@
     const now = Date.now();
     continueNativeIdleSession(now);
     recoverExpiredSession(now);
+    try {
+      for (const video of document.querySelectorAll('video')) {
+        video.muted = true;
+        if (!video.paused) video.pause();
+      }
+    } catch (_) {}
     if (!isStateFrame) return;
     const tables = isSingle ? singleSnapshot() : multiSnapshot();
     if (tables.length === 0) return;

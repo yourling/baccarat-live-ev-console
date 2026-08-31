@@ -26,6 +26,11 @@ describe('extension background live bet routing', () => {
     harness.socket.emit('message', { data: JSON.stringify(pragmaticOperationalRequest()) });
     for (let tick = 0; tick < 4; tick += 1) await flushAsyncWork();
 
+    const preparation = harness.executeScript.mock.calls.find(
+      ([injection]) => String(injection.func).includes('shared-market-controls-ambiguous'),
+    );
+    expect(String(preparation?.[0].func)).toContain('not-seated');
+    expect(String(preparation?.[0].func)).not.toContain('not-found-after-scroll');
     expect(harness.executeScript.mock.calls.some(
       ([injection]) => String(injection.func).includes('executePragmaticBetOneShot')
         && Array.isArray(injection.target?.frameIds),

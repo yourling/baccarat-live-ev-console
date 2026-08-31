@@ -1602,15 +1602,7 @@ export class SqliteLedger {
 
   private appendEphemeralEvent(event: NormalizedEvent): AppendEventResult {
     if (this.ephemeralEventIds.has(event.eventId)) return 'duplicate';
-    const persisted = this.db.prepare('SELECT event_id FROM events WHERE event_id = ?').get(event.eventId) as { event_id: string } | undefined;
-    if (persisted) return 'duplicate';
-    if (this.ephemeralSeqUsed(event.tableId, event.sourceSeq)) {
-      throw new LedgerConflictError(`sourceSeq ${event.sourceSeq} for table ${event.tableId} already used by an in-memory event`);
-    }
-    const seqConflict = this.db.prepare('SELECT event_id FROM events WHERE table_id = ? AND seq = ?').get(event.tableId, event.sourceSeq) as { event_id: string } | undefined;
-    if (seqConflict) {
-      throw new LedgerConflictError(`sourceSeq ${event.sourceSeq} for table ${event.tableId} already used by ${seqConflict.event_id}`);
-    }
+    if (this.ephemeralSeqUsed(event.tableId, event.sourceSeq)) return 'duplicate';
     const events = this.ephemeralEventsByTable.get(event.tableId) ?? [];
     events.push(event);
     this.ephemeralEventsByTable.set(event.tableId, events);

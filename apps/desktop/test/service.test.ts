@@ -311,8 +311,8 @@ describe('desktop console demo sessions', () => {
 
       expect(started.automation).toEqual({ enabled: true });
       expect(started.keepalive.enabled).toBe(true);
-      expect(started.snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
-      expect(started.snapshot.tables.D066?.projection.autoBetStatus).toBe('ARMED');
+      expect(started.snapshot.tables.D055?.projection.autoBetStatus).toBe('DISARMED');
+      expect(started.snapshot.tables.D066?.projection.autoBetStatus).toBe('DISARMED');
 
       await service.injectEvent({
         ...monitorShoeEvent('D055', 'd055-verified', 'physical-shoe'),

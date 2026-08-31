@@ -15,6 +15,9 @@ import {
   parseOneShotLiveBetCommand,
 } from '../src/api-types.js';
 
+app.commandLine.appendSwitch('disk-cache-size', '1');
+app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
+
 const devUrl = process.env.VITE_DEV_SERVER_URL;
 let service: DesktopConsoleService | null = null;
 const mainWindowRetainer = new MainWindowRetainer<BrowserWindow>();
