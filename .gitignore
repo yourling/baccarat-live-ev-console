@@ -13,7 +13,7 @@ apps/desktop/node_modules/.vite/
 apps/desktop/release/
 
 # Local capture / research dumps (not product)
-.tmp-mstrom/
+.tmp-pragmatic/
 scripts/temp-*.cjs
 eng.traineddata
 .jspace/

@@ -316,7 +316,7 @@ describe('ledger replay', () => {
     // Given: monitoring attaches mid-shoe and receives a live betting window.
     const profile = defaultProfile('t1');
     const events: NormalizedEvent[] = [
-      ev({ type: 'newShoeSignal', shoeId: 'monitor-session-1', source: 'mstrom-runtime', profile: { ...profile, autoConfirmNewShoe: true, autoBetArmedByDefault: true } }, 1),
+      ev({ type: 'newShoeSignal', shoeId: 'monitor-session-1', source: 'pragmatic-runtime', profile: { ...profile, autoConfirmNewShoe: true, autoBetArmedByDefault: true } }, 1),
       ev({ type: 'bettingWindowOpened', shoeId: 'monitor-session-1', handId: 'h1', market: 'bankerPair' }, 2),
     ];
 

@@ -29,6 +29,7 @@ class FakeWebSocket extends FakeEventTarget {
   static readonly CLOSING = 2;
   static readonly CLOSED = 3;
   readonly send = vi.fn();
+  readyState = FakeWebSocket.CONNECTING;
 
   constructor(readonly url: string) {
     super();

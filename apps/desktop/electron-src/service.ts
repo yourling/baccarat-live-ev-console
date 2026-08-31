@@ -70,7 +70,7 @@ import {
   type RuntimeIncidentSeverity,
 } from './runtime-supervisor.js';
 
-const DEFAULT_APPROVED_LIVE_TABLE_IDS = ['D066', 'D067', 'D056', 'D057'] as const;
+const DEFAULT_APPROVED_LIVE_TABLE_IDS = ['bc281koreanch281', 'tobcbaccaragen92', 'speedbca14gesbc1', 'h22z8qhp17sa0vkh'] as const;
 const MONITOR_TABLE_CONFIG_KEY = 'desktop:monitor-tables:v1';
 const TABLE_METADATA_CONFIG_KEY = 'desktop:table-metadata:v1';
 const LEGACY_MONITOR_TABLE_ID_PATTERN = /^[A-Z]{1,4}\d{2,6}$/i;
