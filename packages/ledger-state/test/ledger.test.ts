@@ -1457,6 +1457,74 @@ describe('monitor history retention', () => {
     ledger.close();
   });
 
+  it('keeps previous-shoe settlements for recent decision hands', () => {
+    const ledger = new SqliteLedger();
+    const profile = { ...defaultProfile('t1'), autoConfirmNewShoe: true };
+    ledger.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'shoe-old', profile }, 1));
+    ledger.saveDecision(decision('d-old', 'old-h', 'bankerPair', true, '2026-08-24T01:00:00.000Z'));
+    ledger.appendEvent(ev({
+      type: 'handSettled',
+      shoeId: 'shoe-old',
+      handId: 'old-h',
+      playerCards: [{ rank: 'A' }, { rank: 'K' }],
+      bankerCards: [{ rank: 'Q' }, { rank: 'Q' }],
+      outcomes: { bankerPair: true, playerPair: false },
+    }, 2));
+    ledger.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'shoe-new', profile }, 3));
+    ledger.appendEvent(ev({
+      type: 'cardObserved', shoeId: 'shoe-new', handId: 'new-h', card: { rank: 'A' }, position: 'player',
+    }, 4));
+    ledger.saveDecision({
+      ...decision('d-new', 'new-h', 'bankerPair', false, '2026-08-24T01:02:00.000Z'),
+      shoeId: 'shoe-new',
+    });
+
+    ledger.pruneMonitorHistory(2);
+
+    expect(ledger.listDecisionHandsPage({ page: 1, pageSize: 20 }).rows).toEqual([
+      expect.objectContaining({
+        handId: 'new-h',
+        actualResult: { status: 'PENDING' },
+      }),
+      expect.objectContaining({
+        handId: 'old-h',
+        actualResult: {
+          status: 'SETTLED',
+          outcomes: { bankerPair: true, playerPair: false },
+        },
+      }),
+    ]);
+    expect(ledger.listHandCards('t1', 'old-h').playerCards).toEqual([]);
+    ledger.close();
+  });
+
+  it('attaches a settlement to the only decision hand even when shoe ids drifted', () => {
+    const ledger = new SqliteLedger();
+    ledger.saveDecision({
+      ...decision('d-drifted', 'same-hand', 'bankerPair', true, '2026-08-24T01:00:00.000Z'),
+      shoeId: 'shoe-6',
+    });
+    ledger.appendEvent({
+      type: 'handSettled',
+      eventId: 'settled-drifted',
+      tableId: 't1',
+      timestamp: '2026-08-24T01:00:30.000Z',
+      sourceSeq: 1,
+      shoeId: 'shoe-2',
+      handId: 'same-hand',
+      playerCards: [{ rank: 'A' }, { rank: 'K' }],
+      bankerCards: [{ rank: 'Q' }, { rank: 'Q' }],
+      outcomes: { bankerPair: true, playerPair: false },
+    });
+
+    expect(ledger.listDecisionHandsPage({ page: 1, pageSize: 20 }).rows[0]?.actualResult).toEqual({
+      status: 'SETTLED',
+      outcomes: { bankerPair: true, playerPair: false },
+    });
+    expect(ledger.getHandSettlement('t1', 'shoe-6', 'same-hand')?.shoeId).toBe('shoe-2');
+    ledger.close();
+  });
+
   it('drops previous-shoe cards while keeping the current shoe inventory', () => {
     const ledger = new SqliteLedger();
     const profile = { ...defaultProfile('t1'), autoConfirmNewShoe: true };

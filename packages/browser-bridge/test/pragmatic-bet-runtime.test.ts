@@ -489,6 +489,25 @@ describe('Pragmatic bet runtime', () => {
     expect(page.chip.click).not.toHaveBeenCalled();
   });
 
+  it('rejects a click-path target when the page round does not match', async () => {
+    const runtime = exportedRuntime();
+    const page = pageContext(true, 'ID: 17260230224');
+    const execute = runInNewContext(`(${String(runtime.execute)})`, page.context) as
+      (request: unknown, command: unknown) => Promise<Record<string, unknown>>;
+    const receipt = await execute({
+      ...operationalRequest(),
+      wager: { ...operationalRequest().wager, handId: '17260239999' },
+    }, {
+      phase: 'target',
+      action: 'market',
+      expectedRoundId: '17260239999',
+    });
+    expect(receipt).toEqual(expect.objectContaining({
+      status: 'REJECTED',
+      raw: expect.objectContaining({ reason: 'round-not-current' }),
+    }));
+  });
+
   it('rechecks the betting window before returning a market click target', async () => {
     const runtime = exportedRuntime();
     const page = pageContext(true);
@@ -514,6 +533,65 @@ describe('Pragmatic bet runtime', () => {
         reason: 'betting-window-closed',
         commitStarted: false,
       }),
+    }));
+  });
+
+  it('does not send a request-path wager when the page round id cannot be read', async () => {
+    const runtime = exportedRuntime();
+    const page = pageContext(true, 'no-round-header');
+    const placeBet = vi.fn(() => ({ ok: true }));
+    page.context.__baccaratPragmaticBetChannel = { placeBet };
+    const execute = runInNewContext(`(${String(runtime.execute)})`, page.context) as
+      (request: unknown, command: unknown) => Promise<Record<string, unknown>>;
+    const requested = await execute(operationalRequest(), {
+      phase: 'request',
+      expectedRoundId: '17260230224',
+    });
+    expect(placeBet).not.toHaveBeenCalled();
+    expect(requested).toEqual(expect.objectContaining({
+      phase: 'request-unavailable',
+      reason: 'round-id-unreadable',
+    }));
+  });
+
+  it('does not send a request-path wager before the page shows the same round', async () => {
+    const runtime = exportedRuntime();
+    const page = pageContext(true, 'ID: 17260230224');
+    const placeBet = vi.fn(() => ({ ok: true }));
+    page.context.__baccaratPragmaticBetChannel = { placeBet };
+    const execute = runInNewContext(`(${String(runtime.execute)})`, page.context) as
+      (request: unknown, command: unknown) => Promise<Record<string, unknown>>;
+    const requested = await execute({
+      ...operationalRequest(),
+      wager: { ...operationalRequest().wager, handId: '17260239999' },
+    }, {
+      phase: 'request',
+      expectedRoundId: '17260239999',
+    });
+    expect(placeBet).not.toHaveBeenCalled();
+    expect(requested).toEqual(expect.objectContaining({
+      phase: 'request-unavailable',
+      reason: 'round-not-current',
+      currentRoundId: '17260230224',
+      expectedRoundId: '17260239999',
+    }));
+  });
+
+  it('does not send a request-path wager after the betting window has closed', async () => {
+    const runtime = exportedRuntime();
+    const page = pageContext(false);
+    const placeBet = vi.fn(() => ({ ok: true }));
+    page.context.__baccaratPragmaticBetChannel = { placeBet };
+    const execute = runInNewContext(`(${String(runtime.execute)})`, page.context) as
+      (request: unknown, command: unknown) => Promise<Record<string, unknown>>;
+    const requested = await execute(operationalRequest(), {
+      phase: 'request',
+      expectedRoundId: '17260230224',
+    });
+    expect(placeBet).not.toHaveBeenCalled();
+    expect(requested).toEqual(expect.objectContaining({
+      phase: 'request-unavailable',
+      reason: 'betting-window-closed',
     }));
   });
 

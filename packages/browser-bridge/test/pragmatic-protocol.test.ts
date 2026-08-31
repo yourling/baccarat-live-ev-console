@@ -17,7 +17,8 @@ describe('PragmaticProtocolState', () => {
     const round = '17264753224';
     protocol.ingest(message('game', { table, id: round, value: '06:47:41', seq: 1 }));
     const timed = protocol.ingest(message('timer', { table, id: round, value: '12', seq: 2 }));
-    expect(timed?.tables[0]?.bettingOpen).toBe(true);
+    expect(timed?.tables[0]?.bettingOpen).not.toBe(true);
+    expect(timed?.tables[0]?.countdown).toBe(12);
     const opened = protocol.ingest(message('betsopen', { table, game: round, seq: 3 }));
     expect(opened?.tables[0]).toEqual(expect.objectContaining({
       tableId: table,
@@ -208,6 +209,22 @@ describe('PragmaticProtocolState', () => {
       gameSettled: true,
       playerCards: ['QS', '9H'],
       bankerCards: ['3S', '7D'],
+    }));
+  });
+
+  it('does not treat a timer tick as betsopen', () => {
+    const protocol = new PragmaticProtocolState();
+    const table = 'speedbca14gesbc1';
+    const round = '16391965010';
+    protocol.ingest(message('game', { table, game: round, seq: 1 }));
+    protocol.ingest(message('timer', { table, game: round, value: '12', seq: 2 }));
+    expect(protocol.snapshot(table)?.tables[0]?.bettingOpen).not.toBe(true);
+    const opened = protocol.ingest(message('betsopen', { table, game: round, seq: 3 }));
+    expect(opened?.tables[0]?.bettingOpen).toBe(true);
+    const stillOpen = protocol.ingest(message('timer', { table, game: round, value: '9', seq: 4 }));
+    expect(stillOpen?.tables[0]).toEqual(expect.objectContaining({
+      bettingOpen: true,
+      countdown: 9,
     }));
   });
 

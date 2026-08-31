@@ -372,15 +372,18 @@ export class TableActor {
       if (record.status !== 'UNKNOWN' || record.reservationId === undefined) continue;
       if (record.receipt?.status !== 'UNKNOWN') continue;
       if (record.wager.tableId !== this.tableId) continue;
-      if (record.wager.shoeId !== event.shoeId) continue;
       if (record.wager.handId !== event.handId) continue;
       if (!operationalReceiptCommitStarted(record.receipt?.raw)) continue;
       const reservation = this.riskManager.snapshot(this.tableId)
         .find(candidate => candidate.reservationId === record.reservationId);
-      if (reservation === undefined || reservation.status !== 'UNKNOWN') continue;
-      try {
-        this.riskManager.settleUnknown(record.reservationId, settlement, 'committed-hand-settled');
-      } catch {
+      if (reservation === undefined) continue;
+      if (reservation.status === 'UNKNOWN') {
+        try {
+          this.riskManager.settleUnknown(record.reservationId, settlement, 'committed-hand-settled');
+        } catch {
+          continue;
+        }
+      } else if (reservation.status !== 'SETTLED') {
         continue;
       }
       if (record.reconciliation !== undefined) continue;
@@ -447,6 +450,15 @@ export class TableActor {
         return;
       }
     }
+    const closesAt = event.closesAt ?? projection.bettingWindowClosesAt;
+    const eventMs = Date.parse(event.timestamp);
+    const closesAtMs = typeof closesAt === 'string' ? Date.parse(closesAt) : Number.NaN;
+    const liveSkewMs = Number.isFinite(eventMs) ? Math.abs(Date.now() - eventMs) : Number.POSITIVE_INFINITY;
+    const windowNowMs = liveSkewMs < 60_000 ? Date.now() : eventMs;
+    if (Number.isFinite(windowNowMs) && Number.isFinite(closesAtMs) && closesAtMs - windowNowMs < 3_000) {
+      this.requestKeepalive();
+      return;
+    }
     const handPlaced = placedHandKey(this.tableId, event.shoeId, event.handId);
     if (this.placedHandKeys.has(handPlaced)) return;
     const reminder = reminderKey(event.shoeId, event.handId, projection.modelRevision, event.market);
@@ -498,6 +510,13 @@ export class TableActor {
     if (receipt) {
       if (!receiptMatchesIntent(receipt, intent, reservation)) {
         this.riskManager.release(reservation.reservationId, false, 'receipt-mismatch', receipt.receiptId);
+        return;
+      }
+      if (isRetryableWindowRejection(receipt)) {
+        this.placedKeys.delete(placed);
+        this.placedHandKeys.delete(handPlaced);
+        this.reminderKeys.delete(reminder);
+        this.riskManager.release(reservation.reservationId, false, 'window-not-ready', receipt.receiptId);
         return;
       }
       const receiptEvent: NormalizedEvent = {
@@ -983,6 +1002,14 @@ export class Orchestrator {
       riskLimits: this.riskLimits,
     });
   }
+}
+
+function isRetryableWindowRejection(receipt: BetReceipt): boolean {
+  if (receipt.status !== 'REJECTED') return false;
+  const reason = typeof receipt.raw === 'object' && receipt.raw !== null
+    ? String(Reflect.get(receipt.raw, 'reason') ?? '')
+    : '';
+  return /round-not-current|betting-window-closed|round-id-unreadable/.test(reason);
 }
 
 function receiptMatchesIntent(receipt: BetReceipt, intent: BetIntent, reservation: { reservationId: string }): boolean {
