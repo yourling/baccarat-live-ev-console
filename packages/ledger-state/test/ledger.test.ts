@@ -443,7 +443,13 @@ describe('ledger persistence and append safety', () => {
     const profile = defaultProfile('t1');
     const events: NormalizedEvent[] = [
       ev({ type: 'newShoeSignal', shoeId: 'shoe-1', profile: { ...profile, autoConfirmNewShoe: true } }, 1),
-      ev({ type: 'cardObserved', shoeId: 'shoe-1', handId: 'h1', card: { rank: 'A' } }, 2),
+      ev({
+        type: 'handSettled',
+        shoeId: 'shoe-1',
+        handId: 'h1',
+        playerCards: [{ rank: 'A' }, { rank: 'K' }],
+        bankerCards: [{ rank: 'Q' }, { rank: 'Q' }],
+      }, 2),
     ];
     const first = new SqliteLedger(dbPath);
     for (const e of events) first.appendEvent(e);
@@ -1067,6 +1073,46 @@ describe('event tail ordering', () => {
     ledger.close();
   });
 
+  it('caps connection and arm events to the latest handful', () => {
+    const ledger = new SqliteLedger();
+    const profile = { ...defaultProfile('t1'), autoConfirmNewShoe: true };
+    ledger.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'shoe-1', profile }, 1));
+    for (let index = 0; index < 20; index += 1) {
+      ledger.appendEvent(ev({ type: 'connectionLost', reason: 'table-feed-stale' }, index * 2 + 2));
+      ledger.appendEvent(ev({ type: 'connectionRestored' }, index * 2 + 3));
+    }
+    const transients = ledger.listEvents('t1').filter(event =>
+      event.type === 'connectionLost' || event.type === 'connectionRestored');
+    expect(transients).toHaveLength(8);
+    ledger.close();
+  });
+
+  it('returns only recent cards and settlements for the monitor display', () => {
+    const ledger = new SqliteLedger();
+    ledger.appendEvent(ev({ type: 'bettingWindowOpened', shoeId: 'shoe-1', handId: 'h1', market: 'bankerPair' }, 1));
+    ledger.appendEvent(ev({
+      type: 'cardObserved', shoeId: 'shoe-1', handId: 'h1', position: 'player',
+      card: { rank: 'A', suit: 'S' },
+    }, 2));
+    ledger.appendEvent(ev({
+      type: 'handSettled', shoeId: 'shoe-1', handId: 'h1',
+      playerCards: [{ rank: 'A', suit: 'S' }, { rank: '2', suit: 'H' }],
+      bankerCards: [{ rank: '3', suit: 'C' }, { rank: '4', suit: 'D' }],
+      outcomes: { playerPair: false, bankerPair: false },
+    }, 3));
+    ledger.appendEvent(ev({ type: 'bettingWindowOpened', shoeId: 'shoe-1', handId: 'h2', market: 'playerPair' }, 4));
+
+    expect(ledger.listRecentDisplayEvents('t1', 8).map(event => event.type)).toEqual([
+      'cardObserved',
+      'handSettled',
+    ]);
+    expect(ledger.listRecentDisplayEventsForTables(['t1'], 8).map(event => event.type)).toEqual([
+      'cardObserved',
+      'handSettled',
+    ]);
+    ledger.close();
+  });
+
   it('filters event pages by the market stored in the event payload', () => {
     // Given: events with banker, player, and no market payload.
     const ledger = new SqliteLedger();
@@ -1548,6 +1594,46 @@ describe('monitor history retention', () => {
       expect.objectContaining({ rank: 'A' }),
     ]);
     expect(ledger.listHandCards('t1', 'old-h').playerCards).toEqual([]);
+    ledger.close();
+  });
+
+  it('caps hot card and window events per table after settlement', () => {
+    const ledger = new SqliteLedger();
+    const profile = { ...defaultProfile('t1'), autoConfirmNewShoe: true };
+    ledger.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'shoe-1', profile }, 1));
+    let seq = 2;
+    for (let hand = 0; hand < 20; hand += 1) {
+      const handId = `h${hand}`;
+      ledger.appendEvent(ev({
+        type: 'bettingWindowOpened', shoeId: 'shoe-1', handId, market: 'bankerPair',
+      }, seq++));
+      ledger.appendEvent(ev({
+        type: 'bettingWindowOpened', shoeId: 'shoe-1', handId, market: 'playerPair',
+      }, seq++));
+      ledger.appendEvent(ev({
+        type: 'cardObserved', shoeId: 'shoe-1', handId, card: { rank: 'A' }, position: 'player',
+      }, seq++));
+      ledger.appendEvent(ev({
+        type: 'cardObserved', shoeId: 'shoe-1', handId, card: { rank: 'K' }, position: 'banker',
+      }, seq++));
+      ledger.appendEvent(ev({
+        type: 'bettingWindowClosed', shoeId: 'shoe-1', handId, market: 'bankerPair',
+      }, seq++));
+      ledger.appendEvent(ev({
+        type: 'bettingWindowClosed', shoeId: 'shoe-1', handId, market: 'playerPair',
+      }, seq++));
+      ledger.appendEvent(ev({
+        type: 'handSettled',
+        shoeId: 'shoe-1',
+        handId,
+        playerCards: [{ rank: 'A' }, { rank: '2' }],
+        bankerCards: [{ rank: 'K' }, { rank: '3' }],
+      }, seq++));
+    }
+    const events = ledger.listEvents('t1');
+    expect(events.filter(event => event.type === 'cardObserved')).toHaveLength(36);
+    expect(events.filter(event => event.type === 'bettingWindowOpened')).toHaveLength(8);
+    expect(events.filter(event => event.type === 'bettingWindowClosed')).toHaveLength(8);
     ledger.close();
   });
 

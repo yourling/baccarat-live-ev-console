@@ -515,14 +515,18 @@ export class PragmaticProtocolState {
       roundCards(state, roundId);
     }
 
-    if (kind === 'game') return { changed: true, snapshotRoundId: state.roundId };
+    if (kind === 'game') return { changed: isNewRound, snapshotRoundId: state.roundId };
     if (kind === 'timer') {
-      state.countdown = finiteNumber(record.value);
-      if (state.countdown === 0) {
+      const countdown = finiteNumber(record.value);
+      const previous = state.countdown;
+      state.countdown = countdown;
+      let changed = previous === undefined && countdown !== undefined;
+      if (countdown === 0) {
+        if (state.bettingOpen !== false) changed = true;
         state.bettingOpen = false;
         if (state.roundId !== undefined) roundCards(state, state.roundId).closed = true;
       }
-      return { changed: true, snapshotRoundId: state.roundId };
+      return { changed, snapshotRoundId: state.roundId };
     }
     if (kind === 'betsopen') {
       state.bettingOpen = true;

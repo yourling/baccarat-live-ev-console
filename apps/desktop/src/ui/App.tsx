@@ -344,7 +344,7 @@ export function App() {
 
   useEffect(() => {
     void refresh();
-    const intervalMs = view === 'monitor' ? 300 : 2_000;
+    const intervalMs = view === 'monitor' ? 1_000 : 2_000;
     timerRef.current = window.setInterval(() => void refresh(), intervalMs);
     return () => {
       if (timerRef.current !== null) window.clearInterval(timerRef.current);
@@ -436,7 +436,7 @@ export function App() {
   const monitorCandidates = (snapshot?.monitorCandidates ?? []).filter(candidate => !monitoredTableIds.has(candidate.tableId));
   const selectedMonitorTable = selectedMonitorTableId === null ? undefined : tableMap.get(selectedMonitorTableId);
   const automationEnabled = snapshot?.automation.enabled ?? false;
-  const monitorNow = useNow(250);
+  const monitorNow = useNow(1_000);
   const visibleTables = useMemo(() => {
     if (view === 'monitor') return tables;
     return tables.filter(table => {
@@ -1100,8 +1100,8 @@ function TableMonitorRow(props: {
   const physicalShoeKnown = projection.shoeId.length > 0 && projection.shoeBaseline === 'physical-shoe';
   const pair = physicalShoeKnown
     ? combinePairEvaluations(
-      safeEvaluate(projection.profileSnapshot, 'bankerPair', projection.seenCards),
-      safeEvaluate(projection.profileSnapshot, 'playerPair', projection.seenCards),
+      safeEvaluate(projection.profileSnapshot, 'bankerPair', projection),
+      safeEvaluate(projection.profileSnapshot, 'playerPair', projection),
     )
     : null;
   const alerts = tableAlerts(actor);
@@ -2191,12 +2191,6 @@ function exactPairProbabilityLocal(counts: Counts): number {
   return pairs / combinations2Local(total);
 }
 
-function cardCountsLocal(cards: Card[]): Counts {
-  const counts = emptyCounts();
-  for (const card of cards) counts[card.rank] += 1;
-  return counts;
-}
-
 function pairProbabilityMeanLocal(base: Counts, unknownBurnCount: number): number {
   const baseTotal = totalCounts(base);
   if (unknownBurnCount === 0) return exactPairProbabilityLocal(base);
@@ -2232,25 +2226,27 @@ function evForPairLocal(odds: { netWin: number; loss: number }, probability: num
 function evaluatePairMarketLocal(
   profile: ShoeStateProjection['profileSnapshot'],
   market: BettingMarket,
-  observedCards: Card[],
+  remainingCounts: ShoeStateProjection['remainingCounts'],
 ): MarketEvaluation {
-  const initial = initialCounts(profile.numberOfDecks);
-  const observed = cardCountsLocal(observedCards);
-  const knownBurn = cardCountsLocal(profile.burnModel.knownCards ?? []);
   const base = emptyCounts();
-  for (const rank of CARD_RANKS) base[rank] = Math.max(0, initial[rank] - observed[rank] - knownBurn[rank]);
+  for (const rank of CARD_RANKS) base[rank] = Math.max(0, remainingCounts[rank] ?? 0);
   let unknownBurnCount = 0;
-  if (profile.burnModel.kind === 'countKnown') unknownBurnCount = profile.burnModel.count ?? 0;
-  if (profile.burnModel.kind === 'partialKnown') unknownBurnCount = Math.max(0, (profile.burnModel.count ?? 0) - (profile.burnModel.knownCards ?? []).length);
+  if (profile.burnModel.kind === 'countKnown' || profile.burnModel.kind === 'partialKnown') {
+    unknownBurnCount = Math.max(0, (profile.burnModel.count ?? 0) - (profile.burnModel.knownCards ?? []).length);
+  }
   const pMean = pairProbabilityMeanLocal(base, unknownBurnCount);
   const pLower = pairProbabilityWorstCaseLocal(base, unknownBurnCount);
   const odds = profile.odds[market];
   return { pMean, pLower, evMean: evForPairLocal(odds, pMean), evLower: evForPairLocal(odds, pLower) };
 }
 
-function safeEvaluate(profile: ShoeStateProjection['profileSnapshot'], market: BettingMarket, seenCards: Card[]): MarketEvaluation | null {
+function safeEvaluate(
+  profile: ShoeStateProjection['profileSnapshot'],
+  market: BettingMarket,
+  projection: Pick<ShoeStateProjection, 'remainingCounts'>,
+): MarketEvaluation | null {
   try {
-    return evaluatePairMarketLocal(profile, market, seenCards);
+    return evaluatePairMarketLocal(profile, market, projection.remainingCounts);
   } catch {
     return null;
   }

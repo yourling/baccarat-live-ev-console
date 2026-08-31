@@ -263,4 +263,74 @@ describe('Pragmatic bridge integration', () => {
     expect(events).toEqual([]);
     await server.close();
   });
+
+  it('opens a physical shoe from a DOM road count after protocol hands piled up', async () => {
+    const tableId = 'spto21bctorobc21';
+    const server = new BrowserBridgeServer({ selectedTableIds: [tableId] });
+    for (let index = 0; index < 8; index += 1) {
+      const round = `1640732490${index}`;
+      const seq = index * 10;
+      server.ingestClientMessage(protocolCapture('game', { table: tableId, id: round, seq: seq + 1 }));
+      server.ingestClientMessage(protocolCapture('betsopen', { table: tableId, game: round, seq: seq + 2 }));
+      server.ingestClientMessage(protocolCapture('card', {
+        table: tableId, game: round, sc: 'QS3', place: 'player', seq: seq + 3,
+      }));
+      server.ingestClientMessage(protocolCapture('card', {
+        table: tableId, game: round, sc: '9H2', place: 'player', seq: seq + 4,
+      }));
+      server.ingestClientMessage(protocolCapture('card', {
+        table: tableId, game: round, sc: '3S1', place: 'banker', seq: seq + 5,
+      }));
+      server.ingestClientMessage(protocolCapture('card', {
+        table: tableId, game: round, sc: '7D0', place: 'banker', seq: seq + 6,
+      }));
+      server.ingestClientMessage(protocolCapture('gameresult', {
+        table: tableId, game: round, seq: seq + 7, player: ['QS3', '9H2'], banker: ['3S1', '7D0'],
+      }));
+    }
+
+    const feed = server.openTable('dafabet-pragmatic', tableId);
+    const events: NormalizedEvent[] = [];
+    await feed.start({ onBatch: batch => { events.push(...batch.events); } });
+    await feed.flush();
+    const shoesBefore = events.filter(event => event.type === 'newShoeSignal').length;
+    expect(shoesBefore).toBe(1);
+
+    server.ingestClientMessage(capture([{
+      tableId,
+      roundId: '16407324910',
+      gameCount: 5,
+      bettingOpen: true,
+      countdown: 6,
+      playerCards: ['2C', '2S'],
+      bankerCards: ['AH', '6D'],
+      visible: true,
+      source: 'dom',
+    }], '2026-08-31T12:00:00.000Z'));
+    await feed.flush();
+
+    const shoes = events.filter(event => event.type === 'newShoeSignal');
+    expect(shoes).toHaveLength(2);
+    expect(shoes[1]).toEqual(expect.objectContaining({
+      type: 'newShoeSignal',
+      baseline: 'physical-shoe',
+      shoeId: `pragmatic-${tableId}-2`,
+    }));
+    expect(events.filter(event => event.type === 'cardObserved' && event.shoeId === `pragmatic-${tableId}-2`))
+      .toHaveLength(0);
+
+    server.ingestClientMessage(capture([{
+      tableId,
+      roundId: '16407324910',
+      gameCount: 5,
+      bettingOpen: true,
+      countdown: 5,
+      visible: true,
+      source: 'dom',
+    }], '2026-08-31T12:00:01.000Z'));
+    await feed.flush();
+    expect(events.filter(event => event.type === 'newShoeSignal')).toHaveLength(2);
+
+    await server.close();
+  });
 });

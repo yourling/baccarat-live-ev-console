@@ -316,7 +316,14 @@
     }
 
     const snapshot = { version: 1, view: isSingle ? 'single' : 'multi', observedAt: observedAt(), tables };
-    const stateHash = JSON.stringify({ ...snapshot, observedAt: '' });
+    const stateHash = JSON.stringify({
+      version: snapshot.version,
+      view: snapshot.view,
+      tables: snapshot.tables.map(table => {
+        const { countdown, ...rest } = table;
+        return rest;
+      }),
+    });
     if (!force && stateHash === lastSnapshotHash && now - lastSentAt < HEARTBEAT_INTERVAL_MS) return;
     lastSnapshotHash = stateHash;
     lastSentAt = now;

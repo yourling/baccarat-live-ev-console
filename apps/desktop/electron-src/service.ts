@@ -78,6 +78,11 @@ const PRAGMATIC_MONITOR_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
 const DISCONNECTED_MONITOR_REMOVAL_MS = 15_000;
 const MAX_LIVE_FEED_STALENESS_MS = 45_000;
 const LIVE_MONITOR_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000] as const;
+const MAX_SMALL_DISCOVERY_AUTO_ADD = 4;
+const MAX_LIVE_MONITOR_TABLES = 64;
+const EMPTY_RECORD_COUNTS: DesktopRecordCounts = { events: 0, decisions: 0, ledger: 0 };
+const EMPTY_MONITOR_SUMMARY: MonitorSummary = { rows: [], incomePoints: [] };
+const ACCOUNTING_REFRESH_MIN_MS = 2_000;
 
 type MonitorTableConfig = {
   readonly tableIds: readonly string[];
@@ -198,14 +203,15 @@ function optionalNumber(value: object, field: string): Record<string, number> {
   return typeof raw === 'number' && Number.isFinite(raw) ? { [field]: raw } : {};
 }
 
-function sameTableMetadata(left: StoredTableMetadata | undefined, right: StoredTableMetadata): boolean {
+function samePersistentTableMetadata(
+  left: StoredTableMetadata | undefined,
+  right: StoredTableMetadata,
+): boolean {
   return left !== undefined
     && left.tableId === right.tableId
     && left.roomId === right.roomId
     && left.roomName === right.roomName
-    && left.displayName === right.displayName
-    && left.roundId === right.roundId
-    && left.gameCount === right.gameCount;
+    && left.displayName === right.displayName;
 }
 
 function discoveredMonitorTableIds(rooms: readonly RoomDescriptor[]): Set<string> {
@@ -293,11 +299,13 @@ export class DesktopConsoleService {
   private liveMonitorRetryAttempt = 0;
   private liveMonitorOperation: Promise<void> = Promise.resolve();
   private liveMonitorActivated = false;
+  private readonly missedShuffleRequested = new Set<string>();
   private oneShotLiveBetInFlight: Promise<OneShotLiveBetResult> | null = null;
   private executionStateOperation: Promise<void> = Promise.resolve();
   private cachedRecordCounts?: DesktopRecordCounts;
   private cachedSummary?: MonitorSummary;
-  private readonly lastHistoryPruneAt = new Map<string, number>();
+  private cachedLightSnapshot?: { key: string; at: number; value: DesktopConsoleSnapshot };
+  private lastAccountingRefreshAt = 0;
   private closing = false;
   private suppressDiscoveredMonitorAutoAdd = false;
   /** The transient allowlist used only while a serialized live transition is being validated. */
@@ -310,7 +318,7 @@ export class DesktopConsoleService {
     this.ledger.repairPrecommitUnknownOperationalReservations();
     const repairedAcceptedReservations = this.ledger
       .restoreInvalidlyExpiredAcceptedOperationalReservations();
-    this.ledger.pruneMonitorHistory();
+    this.ledger.pruneTransientHistory();
     this.currentExecutor = null;
     this.orchestrator = new Orchestrator({
       ledger: this.ledger,
@@ -383,13 +391,19 @@ export class DesktopConsoleService {
 
   private loadMonitorTableIds(): string[] {
     const configured = monitorTableIdsFromConfig(this.ledger.getConfig<unknown>(MONITOR_TABLE_CONFIG_KEY));
-    if (configured !== null && configured.length > 0) return configured;
+    if (configured !== null && configured.length > 0) {
+      if (configured.length <= MAX_LIVE_MONITOR_TABLES) return configured;
+      const trimmed = configured.slice(0, MAX_LIVE_MONITOR_TABLES);
+      this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: trimmed });
+      return trimmed;
+    }
     const restored = [...this.tableMetadata.keys()].filter(tableId =>
       normalizeOptionalMonitorTableId(tableId) !== undefined,
     );
     if (restored.length > 0) {
-      this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: restored });
-      return restored;
+      const trimmed = restored.slice(0, MAX_LIVE_MONITOR_TABLES);
+      this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: trimmed });
+      return trimmed;
     }
     if (configured !== null) return configured;
     const defaults = defaultMonitorTableIds();
@@ -423,18 +437,53 @@ export class DesktopConsoleService {
           ...(table.roundId === undefined ? {} : { roundId: table.roundId }),
           ...(table.gameCount === undefined ? {} : { gameCount: table.gameCount }),
         };
-        if (!sameTableMetadata(existing, next)) {
-          this.tableMetadata.set(tableId, next);
-          changed = true;
-        }
+        this.tableMetadata.set(tableId, next);
+        if (!samePersistentTableMetadata(existing, next)) changed = true;
       }
     }
     if (changed) this.persistTableMetadata();
+    this.recoverMissedShuffles(rooms);
+  }
+
+  private recoverMissedShuffles(rooms: readonly RoomDescriptor[]): void {
+    if (!this.browserBridge) return;
+    const liveGameCount = new Map<string, number>();
+    for (const room of rooms) {
+      for (const table of room.tables) {
+        if (Number.isInteger(table.gameCount) && (table.gameCount ?? -1) >= 0) {
+          liveGameCount.set(table.tableId, table.gameCount!);
+        }
+      }
+    }
+    for (const tableId of this.monitorTableIds) {
+      const gameCount = liveGameCount.get(tableId);
+      if (gameCount === undefined) continue;
+      const projection = this.orchestrator.getActor(tableId)?.peekProjection();
+      if (projection === undefined || projection.shoeBaseline !== 'physical-shoe') {
+        this.missedShuffleRequested.delete(tableId);
+        continue;
+      }
+      if (projection.handNumber <= gameCount + 8) {
+        this.missedShuffleRequested.delete(tableId);
+        continue;
+      }
+      const parserShoeId = this.browserBridge.currentPragmaticShoeId(tableId);
+      if (parserShoeId !== undefined && parserShoeId !== projection.shoeId) continue;
+      if (this.missedShuffleRequested.has(tableId)) continue;
+      this.missedShuffleRequested.add(tableId);
+      this.browserBridge.openPhysicalShoe(tableId);
+    }
   }
 
   private persistTableMetadata(): void {
     this.ledger.setConfig<TableMetadataConfig>(TABLE_METADATA_CONFIG_KEY, {
-      tables: [...this.tableMetadata.values()],
+      tables: [...this.tableMetadata.values()].map(table => ({
+        tableId: table.tableId,
+        roomId: table.roomId,
+        updatedAt: table.updatedAt,
+        ...(table.roomName === undefined ? {} : { roomName: table.roomName }),
+        ...(table.displayName === undefined ? {} : { displayName: table.displayName }),
+      })),
     });
   }
 
@@ -450,8 +499,23 @@ export class DesktopConsoleService {
       }
     }
     if (added.length === 0) return;
+    const visible = new Set(
+      (this.browserBridge?.getVisibleTableIds() ?? [])
+        .map(tableId => normalizeOptionalMonitorTableId(tableId))
+        .filter((tableId): tableId is string => tableId !== undefined),
+    );
+    const visibleAdded = added.filter(tableId => visible.has(tableId));
+    const remaining = MAX_LIVE_MONITOR_TABLES - this.monitorTableIds.length;
+    if (remaining <= 0) return;
+    const acceptedRaw = added.length <= MAX_SMALL_DISCOVERY_AUTO_ADD
+      ? added
+      : visibleAdded.length > 0 && visibleAdded.length <= MAX_LIVE_MONITOR_TABLES
+        ? visibleAdded
+        : [];
+    const accepted = acceptedRaw.slice(0, remaining);
+    if (accepted.length === 0) return;
     const inheritedSettings = this.currentUnifiedTableSettings();
-    const nextTableIds = [...this.monitorTableIds, ...added];
+    const nextTableIds = [...this.monitorTableIds, ...accepted];
     this.ensureMonitorActors(nextTableIds, inheritedSettings);
     this.monitorTableIds = nextTableIds;
     this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
@@ -558,7 +622,10 @@ export class DesktopConsoleService {
     this.runtimeIncidents.record(input);
   }
 
-  private refreshAccountingIncidents(): void {
+  private refreshAccountingIncidents(force = false): void {
+    const now = Date.now();
+    if (!force && now - this.lastAccountingRefreshAt < ACCOUNTING_REFRESH_MIN_MS) return;
+    this.lastAccountingRefreshAt = now;
     const reservations = this.orchestrator.getReservations();
     const unknownTableIds = new Set(
       reservations
@@ -569,7 +636,7 @@ export class DesktopConsoleService {
       reservations
         .filter(reservation => {
           if (reservation.status !== 'RESERVED') return false;
-          const projection = this.orchestrator.getActor(reservation.tableId)?.getProjection();
+          const projection = this.orchestrator.getActor(reservation.tableId)?.peekProjection();
           if (!projection) return false;
           return (projection.shoeId !== '' && projection.shoeId !== reservation.shoeId)
             || (projection.currentHandId !== null && projection.currentHandId !== reservation.handId);
@@ -606,12 +673,10 @@ export class DesktopConsoleService {
     }
   }
 
-  private maybePruneMonitorHistory(tableId: string): void {
-    const now = Date.now();
-    const previous = this.lastHistoryPruneAt.get(tableId) ?? 0;
-    if (now - previous < 15_000) return;
-    this.lastHistoryPruneAt.set(tableId, now);
-    this.ledger.pruneMonitorHistory(undefined, tableId);
+  compactMonitorHistory(): void {
+    this.ledger.pruneTransientHistory();
+    this.ledger.pruneMonitorHistory();
+    this.ledger.checkpoint();
   }
 
   private trySettleReservedOperationalHand(
@@ -716,7 +781,7 @@ export class DesktopConsoleService {
         },
       }),
       maxFeedStalenessMs: MAX_LIVE_FEED_STALENESS_MS,
-      projection: actor.getProjection(),
+      projection: actor.peekProjection(),
       hasUnknownExecution: false,
       hasSettlementGap: this.hasSettlementGap(tableId),
     });
@@ -783,7 +848,6 @@ export class DesktopConsoleService {
   }
 
   private runtimeSnapshot(): DesktopRuntimeState {
-    this.refreshAccountingIncidents();
     const bridge = this.bridgeRuntimeStatus();
     const approvedLiveTableIds = [...this.monitorTableIds];
     const tables: DesktopRuntimeState['tables'] = Object.fromEntries(
@@ -792,7 +856,8 @@ export class DesktopConsoleService {
         const actor = this.orchestrator.getActor(tableId);
         return [tableId, {
           approved: true,
-          active: actor?.snapshot().executionMode === 'live'
+          active: actor !== undefined
+            && actor.peekExecutionMode() === 'live'
             && this.liveAuthorizationSources.has(tableId),
           reasons: this.keepaliveTableReasons(tableId),
           ...(feedHealth === undefined ? {} : {
@@ -1036,6 +1101,7 @@ export class DesktopConsoleService {
       this.runtimeIncidents.resolve('bridge-disconnected', event.tableId);
     }
     if (event.type === 'bettingWindowOpened') this.detectSettlementGap(event);
+    this.cachedLightSnapshot = undefined;
     await this.orchestrator.enqueue(event.tableId, event);
     if (
       event.type === 'handSettled'
@@ -1043,7 +1109,7 @@ export class DesktopConsoleService {
       || event.type === 'connectionLost'
       || event.type === 'connectionRestored'
     ) {
-      this.refreshAccountingIncidents();
+      this.refreshAccountingIncidents(true);
     }
     if (event.type === 'cardObserved' || event.type === 'handSettled') {
       this.trySettleReservedOperationalHand(event.tableId, event.shoeId, event.handId);
@@ -1053,7 +1119,6 @@ export class DesktopConsoleService {
     }
     if (event.type === 'handSettled') {
       this.resolveSettlementGapIfCleared(event.tableId);
-      this.maybePruneMonitorHistory(event.tableId);
     }
     if (
       event.type === 'newShoeSignal'
@@ -1349,9 +1414,13 @@ export class DesktopConsoleService {
       this.liveMonitorRetryAttempt += 1;
       this.recordLiveMonitorError(error, 'scheduler-failure', 'degraded');
     } finally {
-      const delay = LIVE_MONITOR_RETRY_DELAYS_MS[
-        Math.min(this.liveMonitorRetryAttempt, LIVE_MONITOR_RETRY_DELAYS_MS.length - 1)
-      ];
+      const attached = this.monitorTableIds.length > 0
+        && this.monitorTableIds.every(tableId => this.liveFeeds.has(tableId));
+      const delay = attached
+        ? 15_000
+        : LIVE_MONITOR_RETRY_DELAYS_MS[
+          Math.min(this.liveMonitorRetryAttempt, LIVE_MONITOR_RETRY_DELAYS_MS.length - 1)
+        ];
       this.scheduleLiveMonitorRetry(delay);
     }
   }
@@ -1602,6 +1671,23 @@ export class DesktopConsoleService {
 
   snapshot(options: DesktopSnapshotOptions = {}): DesktopConsoleSnapshot {
     const includeHistory = options.includeHistory !== false;
+    const lightKey = includeHistory
+      ? ''
+      : JSON.stringify({
+        counts: options.includeRecordCounts !== false,
+        summary: options.includeSummary !== false,
+        tableId: options.tableId ?? '',
+        fromTime: options.fromTime ?? '',
+        toTime: options.toTime ?? '',
+      });
+    if (
+      lightKey
+      && this.cachedLightSnapshot
+      && this.cachedLightSnapshot.key === lightKey
+      && Date.now() - this.cachedLightSnapshot.at < 500
+    ) {
+      return this.cachedLightSnapshot.value;
+    }
     const fullSnapshot = this.orchestrator.snapshot();
     const usingLiveMonitor = this.liveMonitorActivated;
     const displayedTableIds = this.displayedTableIds(fullSnapshot);
@@ -1616,22 +1702,23 @@ export class DesktopConsoleService {
     const filterToDisplayedTables = <T extends { tableId: string }>(rows: readonly T[]): T[] =>
       usingLiveMonitor ? rows.filter(row => activeTableIds.has(row.tableId)) : [...rows];
     const keepalive = this.operationalWagers.getKeepaliveState();
-    const events = includeHistory ? this.ledger.listEvents() : this.ledger.listEventsTail();
-    const decisions = includeHistory ? this.ledger.listDecisions() : this.ledger.listDecisionsTail();
-    const receipts = includeHistory ? this.ledger.listReceipts() : this.ledger.listReceiptsTail();
-    const reservations = includeHistory ? this.orchestrator.getReservations() : this.orchestrator.getReservations().slice(-200);
+    const events = includeHistory
+      ? this.ledger.listEvents()
+      : this.ledger.listRecentDisplayEventsForTables(displayedTableIds, 24);
+    const decisions = includeHistory ? this.ledger.listDecisions() : [];
+    const receipts = includeHistory ? this.ledger.listReceipts() : [];
+    const reservations = includeHistory ? this.orchestrator.getReservations() : [];
     const monitorCandidates = this.monitorCandidates();
     const tableMetadata = this.tableMetadataSnapshot(monitorCandidates);
     const scopedTableIds = usingLiveMonitor ? displayedTableIds : undefined;
-    const recordCounts = options.includeRecordCounts === false && this.cachedRecordCounts !== undefined
-      ? this.cachedRecordCounts
-      : this.recordCounts(scopedTableIds);
-    if (options.includeRecordCounts !== false) this.cachedRecordCounts = recordCounts;
-    const summary = options.includeSummary === false && this.cachedSummary !== undefined
-      ? this.cachedSummary
-      : this.ledger.getMonitorSummary(usingLiveMonitor ? { ...options, tableIds: displayedTableIds } : options);
-    if (options.includeSummary !== false) this.cachedSummary = summary;
-    return {
+    const now = Date.now();
+    const recordCounts = options.includeRecordCounts === false
+      ? (this.cachedRecordCounts ?? EMPTY_RECORD_COUNTS)
+      : (this.cachedRecordCounts = this.recordCounts(scopedTableIds));
+    const summary = options.includeSummary === false
+      ? (this.cachedSummary ?? EMPTY_MONITOR_SUMMARY)
+      : (this.cachedSummary = this.ledger.getMonitorSummary(usingLiveMonitor ? { ...options, tableIds: displayedTableIds } : options));
+    const result: DesktopConsoleSnapshot = {
       dbPath: this.dbPath,
       isOpen: this.ledger.isOpen(),
       seed: this.lastSeed,
@@ -1643,7 +1730,7 @@ export class DesktopConsoleService {
       keepalive,
       automation: { enabled: keepalive.enabled },
       runtime: this.runtimeSnapshot(),
-      operationalWagers: this.ledger.listOperationalWagersTail(),
+      operationalWagers: includeHistory ? this.ledger.listOperationalWagersTail() : [],
       events: filterToDisplayedTables(events),
       decisions: filterToDisplayedTables(decisions),
       receipts: filterToDisplayedTables(receipts),
@@ -1656,6 +1743,8 @@ export class DesktopConsoleService {
       },
       demoError: this.demoError,
     };
+    if (lightKey) this.cachedLightSnapshot = { key: lightKey, at: now, value: result };
+    return result;
   }
 
   async runDemo(seed?: number): Promise<DesktopConsoleSnapshot> {
@@ -1865,7 +1954,7 @@ export class DesktopConsoleService {
   }
 
   async updateMonitorTableIds(tableIds: readonly string[]): Promise<DesktopConsoleSnapshot> {
-    const nextTableIds = normalizeMonitorTableIds(tableIds, true);
+    const nextTableIds = normalizeMonitorTableIds(tableIds, true).slice(0, MAX_LIVE_MONITOR_TABLES);
     return await this.enqueueLiveMonitorOperation(() => this.updateMonitorTableIdsInner(nextTableIds));
   }
 
@@ -2002,7 +2091,7 @@ export class DesktopConsoleService {
     }
     const result = await this.operationalWagers.executeManual(input);
     if (result.status === 'UNKNOWN') {
-      this.refreshAccountingIncidents();
+      this.refreshAccountingIncidents(true);
     }
     return { ...result, snapshot: this.snapshot() };
   }
@@ -2116,7 +2205,7 @@ export class DesktopConsoleService {
           reconciliation.reason,
         );
       }
-      this.refreshAccountingIncidents();
+      this.refreshAccountingIncidents(true);
       this.cachedSummary = undefined;
       this.cachedRecordCounts = undefined;
       return this.snapshot();
@@ -2196,7 +2285,7 @@ export class DesktopConsoleService {
         realizedPnl,
         settlement.reason,
       );
-      this.refreshAccountingIncidents();
+      this.refreshAccountingIncidents(true);
       this.cachedSummary = undefined;
       this.cachedRecordCounts = undefined;
       return this.snapshot();
@@ -2303,7 +2392,7 @@ export class DesktopConsoleService {
     }
 
     if (result.status === 'UNKNOWN') {
-      this.refreshAccountingIncidents();
+      this.refreshAccountingIncidents(true);
     }
 
     const snapshot = this.snapshot();

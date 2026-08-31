@@ -95,6 +95,7 @@ export class TableActor {
   private readonly reminderKeys = new Set<string>();
   private readonly placedKeys = new Set<string>();
   private readonly placedHandKeys = new Set<string>();
+  private readonly evaluatedWindows = new Map<string, { hadClosesAt: boolean }>();
   private syntheticSeq = SYNTHETIC_SEQ_BASE;
   private alternateNext: 'bankerPair' | 'playerPair';
 
@@ -117,7 +118,7 @@ export class TableActor {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 12_000;
     this.syntheticSeq = Math.max(SYNTHETIC_SEQ_BASE, this.ledger.nextSourceSeq(this.tableId));
 
-    const replay = this.ledger.replay(this.tableId);
+    const replay = this.ledger.replay(this.tableId, { latestShoeOnly: true });
     this.projection = replay.state.get(this.tableId) ?? emptyProjection(this.tableId);
 
     for (const row of this.ledger.listReceipts(this.tableId)) {
@@ -196,6 +197,14 @@ export class TableActor {
     return structuredClone(this.projection);
   }
 
+  peekProjection(): ShoeStateProjection {
+    return this.projection;
+  }
+
+  peekExecutionMode(): ExecutionMode {
+    return this.executionMode;
+  }
+
   setExecutor(executor: Pick<BrowserAdapter, 'requestBet'> | null): void {
     this.executor = executor;
   }
@@ -237,10 +246,19 @@ export class TableActor {
   }
 
   snapshot(): TableActorSnapshot {
+    const projection = this.projection;
     return {
       tableId: this.tableId,
-      profile: this.getProfile(),
-      projection: this.getProjection(),
+      profile: this.profile,
+      projection: {
+        ...projection,
+        remainingCounts: { ...projection.remainingCounts },
+        seenCards: [],
+        cardInventoryKeys: [],
+        observedHandIds: projection.observedHandIds.length > 8
+          ? projection.observedHandIds.slice(-8)
+          : projection.observedHandIds,
+      },
       executionMode: this.executionMode,
       defaultBetAmount: this.defaultBetAmount,
       pendingEvents: this.queue.length,
@@ -290,6 +308,7 @@ export class TableActor {
     this.projection = tentativeProjection;
 
     if (event.type === 'newShoeSignal') {
+      this.evaluatedWindows.clear();
       if (previousProjection.shoeId && previousProjection.shoeId !== event.shoeId) {
         this.riskManager.expireOpenForShoe(this.tableId, previousProjection.shoeId, 'new-shoe-signal-received');
       }
@@ -401,6 +420,10 @@ export class TableActor {
   ): Promise<void> {
     if (event.shoeId !== projection.shoeId || projection.sealed) return;
     if (projection.status !== 'BETTING_WINDOW') return;
+    const evalKey = `${event.shoeId}:${event.handId}:${event.market}`;
+    const previousEval = this.evaluatedWindows.get(evalKey);
+    const hasClosesAt = typeof event.closesAt === 'string' && event.closesAt.length > 0;
+    if (previousEval !== undefined && (previousEval.hadClosesAt || !hasClosesAt)) return;
     const evaluation = evaluatePairMarket(this.profile, event.market, projection.seenCards);
     const eligible = evaluation.evLower >= this.profile.minEV;
     const reason = eligible
@@ -411,6 +434,7 @@ export class TableActor {
       this.requestKeepalive();
       return;
     }
+    this.evaluatedWindows.set(evalKey, { hadClosesAt: hasClosesAt || previousEval?.hadClosesAt === true });
     if (!this.canExecuteAutomaticBets(this.tableId)) {
       this.recordDecision(event, projection, eligible, reason, 'global-automation-disabled');
       return;
@@ -516,6 +540,7 @@ export class TableActor {
         this.placedKeys.delete(placed);
         this.placedHandKeys.delete(handPlaced);
         this.reminderKeys.delete(reminder);
+        this.evaluatedWindows.delete(evalKey);
         this.riskManager.release(reservation.reservationId, false, 'window-not-ready', receipt.receiptId);
         return;
       }

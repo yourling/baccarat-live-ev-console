@@ -1830,6 +1830,76 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('does not persist live roundId or gameCount into table metadata', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'baccarat-table-metadata-hot-'));
+    const dbPath = join(directory, 'console.sqlite');
+    const service = new DesktopConsoleService(dbPath);
+    let closed = false;
+    try {
+      const bridge = new BrowserBridgeServer();
+      service['browserBridge'] = bridge;
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{
+            tableId: 'tobcbaccaragen92',
+            displayName: '粤语极速百家乐',
+            roundId: '17260818724',
+            gameCount: 72,
+          }],
+        },
+      });
+      await service['attachLiveTables']();
+      const setConfig = vi.spyOn(service['ledger'], 'setConfig');
+      const metadataWrites = (): number => setConfig.mock.calls
+        .filter(([key]) => key === 'desktop:table-metadata:v1').length;
+
+      bridge.ingestClientMessage({
+        kind: 'roomUpdated',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{
+            tableId: 'tobcbaccaragen92',
+            displayName: '粤语极速百家乐',
+            roundId: '17260821524',
+            gameCount: 73,
+          }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(metadataWrites()).toBe(0);
+      expect(service.snapshot().tableMetadata).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          tableId: 'tobcbaccaragen92',
+          roundId: '17260821524',
+          gameCount: 73,
+        }),
+      ]));
+
+      await service.close();
+      closed = true;
+      const restarted = new DesktopConsoleService(dbPath);
+      try {
+        expect(restarted.snapshot().tableMetadata).toEqual(expect.arrayContaining([
+          expect.objectContaining({
+            tableId: 'tobcbaccaragen92',
+            displayName: '粤语极速百家乐',
+          }),
+        ]));
+        expect(restarted.snapshot().tableMetadata.find(table => table.tableId === 'tobcbaccaragen92'))
+          .not.toEqual(expect.objectContaining({ roundId: '17260821524' }));
+      } finally {
+        await restarted.close();
+      }
+    } finally {
+      if (!closed) await service.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('runs continuously until stopped', async () => {
     const service = new DesktopConsoleService(':memory:');
     try {
@@ -1863,7 +1933,13 @@ describe('desktop console demo sessions', () => {
       });
 
       const rooms = await bridge.discoverRooms();
-      expect(rooms.find(room => room.roomId === 'r1')?.tables.map(table => table.tableId)).toEqual(['D066']);
+      expect(rooms.find(room => room.roomId === 'r1')?.tables.map(table => table.tableId) ?? []).toEqual([]);
+      expect(service.snapshot().monitorTableIds).toEqual([
+        'bc281koreanch281',
+        'tobcbaccaragen92',
+        'speedbca14gesbc1',
+        'h22z8qhp17sa0vkh',
+      ]);
     } finally {
       await service.close();
       if (previousSelection === undefined) delete process.env.BACCARAT_LIVE_TABLES;
@@ -1915,6 +1991,29 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('caps persisted monitor tables to sixty-four live feeds', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'baccarat-monitor-cap-'));
+    const dbPath = join(directory, 'console.sqlite');
+    const first = new DesktopConsoleService(dbPath);
+    let closed = false;
+    try {
+      const tableIds = Array.from({ length: 70 }, (_, index) => `P${String(index).padStart(3, '0')}`);
+      await first.updateMonitorTableIds(tableIds);
+      expect(first.snapshot().monitorTableIds).toHaveLength(64);
+      await first.close();
+      closed = true;
+      const restarted = new DesktopConsoleService(dbPath);
+      try {
+        expect(restarted.snapshot().monitorTableIds).toEqual(tableIds.slice(0, 64));
+      } finally {
+        await restarted.close();
+      }
+    } finally {
+      if (!closed) await first.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('automatically adds and attaches a newly discovered monitor table', async () => {
     const service = new DesktopConsoleService(':memory:');
     const feed = {
@@ -1947,6 +2046,83 @@ describe('desktop console demo sessions', () => {
       expect(current.snapshot.tables.P001).toBeDefined();
       expect(current.snapshot.tables.D055).toBeDefined();
       expect(openTable).toHaveBeenCalledWith('room-with-unselected-table', 'P001');
+    } finally {
+      discoverRooms.mockRestore();
+      openTable.mockRestore();
+      await service.close();
+    }
+  });
+
+  it('does not auto-monitor a whole lobby of newly discovered tables', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const discoverRooms = vi.spyOn(BrowserBridgeServer.prototype, 'discoverRooms').mockResolvedValue([{
+      roomId: 'lobby',
+      tables: Array.from({ length: 20 }, (_, index) => {
+        const tableId = `P${String(index).padStart(3, '0')}`;
+        return { tableId, profile: defaultProfile(tableId) };
+      }),
+    }]);
+    try {
+      await service.updateMonitorTableIds(['D055']);
+      await service.startLiveRoomMonitor(0);
+      expect(service.snapshot().monitorTableIds).toEqual(['D055']);
+    } finally {
+      discoverRooms.mockRestore();
+      await service.close();
+    }
+  });
+
+  it('auto-monitors visible page tables without ingesting the whole lobby', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const feed = {
+      tableId: 'P001',
+      start: async () => undefined,
+      stop: async () => undefined,
+      flush: async () => undefined,
+      keepAlive: async () => ({ ok: true }),
+      health: () => ({
+        tableId: 'P001',
+        state: 'CONNECTED',
+        lastAckedSeq: 0,
+        lastEmittedSeq: 0,
+        bufferDepth: 0,
+        reconnectCount: 0,
+      }),
+    } satisfies TableExport;
+    const discoverRooms = vi.spyOn(BrowserBridgeServer.prototype, 'discoverRooms').mockResolvedValue([{
+      roomId: 'lobby',
+      tables: Array.from({ length: 20 }, (_, index) => {
+        const tableId = `P${String(index).padStart(3, '0')}`;
+        return { tableId, profile: defaultProfile(tableId) };
+      }),
+    }]);
+    const openTable = vi.spyOn(BrowserBridgeServer.prototype, 'openTable').mockReturnValue(feed);
+    try {
+      await service.updateMonitorTableIds(['D055']);
+      await service.startLiveRoomMonitor(0);
+      expect(service.snapshot().monitorTableIds).toEqual(['D055']);
+
+      service['browserBridge']?.ingestClientMessage({
+        kind: 'networkCapture',
+        source: 'baccarat-bridge-pragmatic-state',
+        url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/',
+        direction: 'recv',
+        encoding: 'text',
+        data: JSON.stringify({
+          version: 1,
+          view: 'multi',
+          observedAt: '2026-08-31T14:00:00.000Z',
+          tables: [
+            { tableId: 'P001', visible: true },
+            { tableId: 'P002', visible: false },
+            { tableId: 'P003', visible: false },
+          ],
+        }),
+      });
+      await service['attachLiveTables']();
+
+      expect(service.snapshot().monitorTableIds).toEqual(['D055', 'P001']);
+      expect(openTable).toHaveBeenCalledWith('lobby', 'P001');
     } finally {
       discoverRooms.mockRestore();
       openTable.mockRestore();

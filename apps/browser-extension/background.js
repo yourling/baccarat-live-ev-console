@@ -15,6 +15,12 @@ const GAME_TAB_URL_PATTERN = /^https?:\/\/(?:[a-z0-9-]+\.)*(?:dafabet\.net|vbgam
 const PRAGMATIC_FRAME_HOST_PATTERN = /(^|\.)client\.pragmaticplaylive\.net$/i;
 const PRAGMATIC_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
 const PRAGMATIC_BET_RUNTIME_REVISION = 'pragmatic-bet-runtime/2026-08-30.21';
+const PROTOCOL_CAPTURE_SOURCES = new Set([
+  'baccarat-bridge-pragmatic-ws',
+  'baccarat-bridge-pragmatic-state',
+  'baccarat-bridge-runtime-selection',
+  'baccarat-bridge-runtime-state',
+]);
 const betRequests = new Map();
 const pragmaticProtocolWindows = new Map();
 let liveBetSessionEnabled = false;
@@ -36,7 +42,8 @@ function notePragmaticOutboundSend(message) {
   ) return;
   const data = String(message.data || '');
   if (data.length < 8) return;
-  if (!/bet|betcode|"bc"|stake|amount|amt/i.test(data)) return;
+  if (/<autoBet[\s>/]/i.test(data) && !/<lpbet[\s>]/i.test(data)) return;
+  if (!/(<lpbet[\s>]|betcode|"bc"=)/i.test(data)) return;
   if (/<lpbet[\s>]/i.test(data) || /\buId="/.test(data)) {
     const uId = (data.match(/\buId="([^"]+)"/) || [])[1];
     const gm = (data.match(/\bgm="([^"]+)"/) || [])[1];
@@ -137,6 +144,12 @@ if (typeof importScripts === 'function') {
 
 function isGameTabUrl(url) {
   return GAME_TAB_URL_PATTERN.test(String(url || ''));
+}
+
+function isReloadableGameTabUrl(url) {
+  if (exactSupportedBaccaratPopup(url)) return true;
+  const href = String(url || '');
+  return /(?:^|\.)(?:pragmaticplaylive\.net|vbgames88\.com|zavjcswh\.biz)(?::\d+)?(?:[/?#]|$)/i.test(href);
 }
 
 function isTrustedGameSender(sender) {
@@ -1231,8 +1244,17 @@ function sendBetResult(message, generation) {
   }
 }
 
+function isProtocolNetworkCapture(message) {
+  if (!message || message.kind !== 'networkCapture') return false;
+  if (message.encoding === 'base64') return false;
+  if (typeof message.data === 'string' && message.data.length > 16_384) return false;
+  if (PROTOCOL_CAPTURE_SOURCES.has(message.source)) return true;
+  return /pragmaticplaylive\.net\/game/i.test(String(message.url || ''));
+}
+
 function send(message) {
   if (message && message.kind === 'betResult') return;
+  if (message && message.kind === 'networkCapture' && !isProtocolNetworkCapture(message)) return;
   const sequenced = withBridgeSequence(message);
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify(sequenced));
@@ -1256,6 +1278,7 @@ function flushOutbox() {
   while (outbox.length > 0) {
     const message = outbox.shift();
     if (message && message.kind === 'betResult') continue;
+    if (message && message.kind === 'networkCapture' && !isProtocolNetworkCapture(message)) continue;
     try {
       socket.send(JSON.stringify(message));
     } catch (_) {
@@ -1358,35 +1381,12 @@ async function replayRuntimeStateInGameFrames() {
 async function handleRemoteCommand(name, tableIds = [], generation) {
   if (generation !== activeSocketGeneration) return;
   if (name === 'startPragmaticNetworkCapture') {
-    const tabs = await chrome.tabs.query({ url: [DAFABET_POPUP_QUERY] });
-    const targets = tabs.filter(tab => tab.id && exactDafabetPragmaticPopup(tab.url));
-    let enabled = false;
-    if (targets.length === 1 && await ensureCdpAttached(targets[0].id)) {
-      await chrome.debugger.sendCommand({ tabId: targets[0].id }, 'Network.enable', {
-        maxTotalBufferSize: 10_000_000,
-        maxResourceBufferSize: 2_000_000,
-        maxPostDataSize: 0,
-      });
-      await chrome.debugger.sendCommand({ tabId: targets[0].id }, 'Target.setAutoAttach', {
-        autoAttach: true,
-        waitForDebuggerOnStart: false,
-        flatten: true,
-        filter: [
-          { type: 'iframe', exclude: false },
-          { type: 'worker', exclude: false },
-          { type: 'shared_worker', exclude: false },
-          { type: 'service_worker', exclude: false },
-        ],
-      });
-      pragmaticCdpTabs.add(targets[0].id);
-      enabled = true;
-    }
     send({
       kind: 'sessionAction',
       action: 'command-executed',
       url: '',
       frame: '',
-      detail: `startPragmaticNetworkCapture:enabled=${enabled}:targets=${targets.length}`,
+      detail: 'startPragmaticNetworkCapture:enabled=page-hook',
       timestamp: new Date().toISOString(),
     });
     return;
@@ -1471,11 +1471,11 @@ async function handleRemoteCommand(name, tableIds = [], generation) {
     // reloading so a stale page cannot retain authorization across recovery.
     liveBetSessionEnabled = false;
     await chrome.storage.local.set({ liveBetEnabled: false });
-    const tabs = await chrome.tabs.query({ url: [DAFABET_POPUP_QUERY] });
+    const tabs = await chrome.tabs.query({});
     if (generation !== activeSocketGeneration) return;
     let reloaded = 0;
     for (const tab of tabs) {
-      if (!tab.id || !exactSupportedBaccaratPopup(tab.url)) continue;
+      if (!tab.id || !isReloadableGameTabUrl(tab.url)) continue;
       try {
         await chrome.tabs.reload(tab.id, { bypassCache: true });
         reloaded += 1;
@@ -1686,16 +1686,7 @@ async function ensureCdpAttached(tabId) {
 chrome.debugger.onEvent?.addListener((source, method, params) => {
   const tabId = source && source.tabId;
   if (!Number.isInteger(tabId) || !pragmaticCdpTabs.has(tabId)) return;
-  if (method === 'Target.attachedToTarget') {
-    const sessionId = params && typeof params.sessionId === 'string' ? params.sessionId : '';
-    if (!sessionId) return;
-    void chrome.debugger.sendCommand({ tabId, sessionId }, 'Network.enable', {
-      maxTotalBufferSize: 10_000_000,
-      maxResourceBufferSize: 2_000_000,
-      maxPostDataSize: 0,
-    }).catch(() => {});
-    return;
-  }
+  if (method === 'Target.attachedToTarget') return;
   const requestId = params && typeof params.requestId === 'string' ? params.requestId : '';
   const sessionId = source && typeof source.sessionId === 'string' ? source.sessionId : 'root';
   const key = `${tabId}:${sessionId}:${requestId}`;
@@ -1730,13 +1721,17 @@ chrome.debugger.onEvent?.addListener((source, method, params) => {
     const response = params && params.response;
     const payload = response && typeof response.payloadData === 'string' ? response.payloadData : '';
     if (!payload) return;
+    if (Number(response && response.opcode) === 2) return;
+    if (payload.length > 8_192) return;
+    const url = pragmaticCdpSocketUrls.get(key) || '';
+    if (url && !/pragmaticplaylive\.net\/game|\/game(?:\?|$)/i.test(url)) return;
     send({
       kind: 'networkCapture',
       source: 'baccarat-bridge-pragmatic-cdp-ws',
-      url: pragmaticCdpSocketUrls.get(key) || '',
+      url,
       direction: 'recv',
-      encoding: response.opcode === 2 ? 'base64' : 'text',
-      data: payload.slice(0, 120000),
+      encoding: 'text',
+      data: payload,
     });
     return;
   }
@@ -1834,13 +1829,15 @@ function sendPragmaticCdpBody(url, payload, base64Encoded, resourceType, phase) 
       }
     } catch (_) {}
   }
+  const text = String(data || '');
+  if (text.length > 8_192) return;
   send({
     kind: 'networkCapture',
     source: 'baccarat-bridge-pragmatic-cdp-body',
     url,
     direction: 'recv',
     encoding,
-    data: String(data || '').slice(0, 120000),
+    data: text,
     resourceType,
     phase,
   });
@@ -2132,7 +2129,7 @@ async function reloadPendingGameTabs() {
   await chrome.storage.local.remove('reloadGameTabsAfterExtensionReload');
   const tabs = await chrome.tabs.query({});
   for (const tab of tabs) {
-    if (!tab.id || !isGameTabUrl(tab.url)) continue;
+    if (!tab.id || !isReloadableGameTabUrl(tab.url)) continue;
     try {
       await chrome.tabs.reload(tab.id);
       setTimeout(() => { void replayRuntimeStateInGameFrames(); }, 3000);

@@ -560,16 +560,20 @@
     const data = event.data;
     if (!data || typeof data.source !== 'string' || !data.source.startsWith('baccarat-bridge-')) return;
     const url = String(data.url || '');
-    const isRealtimeSocket = data.source.startsWith('baccarat-bridge-pragmatic-');
-    if (!isRealtimeSocket && !/pragmaticplaylive\.net|vbgames88\.com|zavjcswh\.biz|dafabet\.net/i.test(url)) return;
-    const limit = data.source.startsWith('baccarat-bridge-pragmatic-') ? 120000 : 8000;
+    const isGameProtocol = data.source === 'baccarat-bridge-pragmatic-ws'
+      || data.source === 'baccarat-bridge-pragmatic-state'
+      || /pragmaticplaylive\.net\/game/i.test(url);
+    if (!isGameProtocol) return;
+    if (data.encoding === 'base64') return;
+    const text = String(data.data || '');
+    if (!text || text.length > 16_384) return;
     sendToBackground({
       kind: 'networkCapture',
       source: data.source,
       url,
       direction: data.direction || 'recv',
-      encoding: data.encoding || 'text',
-      data: String(data.data || '').slice(0, limit),
+      encoding: 'text',
+      data: text,
     });
   });
 

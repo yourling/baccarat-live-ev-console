@@ -222,10 +222,24 @@ describe('PragmaticProtocolState', () => {
     const opened = protocol.ingest(message('betsopen', { table, game: round, seq: 3 }));
     expect(opened?.tables[0]?.bettingOpen).toBe(true);
     const stillOpen = protocol.ingest(message('timer', { table, game: round, value: '9', seq: 4 }));
-    expect(stillOpen?.tables[0]).toEqual(expect.objectContaining({
+    expect(stillOpen).toBeUndefined();
+    expect(protocol.snapshot(table)?.tables[0]).toEqual(expect.objectContaining({
       bettingOpen: true,
       countdown: 9,
     }));
+  });
+
+  it('does not emit snapshots for intermediate timer ticks', () => {
+    const protocol = new PragmaticProtocolState();
+    const table = 'speedbca14gesbc1';
+    const round = '16391965010';
+    protocol.ingest(message('betsopen', { table, game: round, seq: 1 }));
+    expect(protocol.ingest(message('timer', { table, game: round, value: '12', seq: 2 }))?.tables[0])
+      .toEqual(expect.objectContaining({ countdown: 12, bettingOpen: true }));
+    expect(protocol.ingest(message('timer', { table, game: round, value: '11', seq: 3 }))).toBeUndefined();
+    expect(protocol.ingest(message('timer', { table, game: round, value: '1', seq: 4 }))).toBeUndefined();
+    expect(protocol.ingest(message('timer', { table, game: round, value: '0', seq: 5 }))?.tables[0])
+      .toEqual(expect.objectContaining({ countdown: 0, bettingOpen: false }));
   });
 
   it('opens a dedicated-socket betsopen after a higher shared-socket seq on the same round', () => {

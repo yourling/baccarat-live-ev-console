@@ -37,6 +37,8 @@ async function createWindow(): Promise<void> {
     width: 1360,
     height: 900,
     title: '百家乐实时 EV 中控台',
+    backgroundColor: '#0b1118',
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -44,16 +46,44 @@ async function createWindow(): Promise<void> {
       sandbox: false,
     },
   });
+  win.webContents.on('did-fail-load', (_event, code, description, url) => {
+    console.error('desktop window failed to load', { code, description, url });
+    void win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(
+      `<!doctype html><html><body style="font-family:sans-serif;background:#0b1118;color:#e6edf3;padding:24px">
+       <h1>中控页面加载失败</h1><p>${description} (${code})</p><p>${url}</p></body></html>`,
+    )}`);
+  });
+  win.webContents.on('render-process-gone', (_event, details) => {
+    console.error('desktop renderer gone', details);
+  });
+  win.webContents.on('preload-error', (_event, preloadPath, error) => {
+    console.error('desktop preload error', preloadPath, error);
+  });
+  win.once('ready-to-show', () => {
+    if (win.isDestroyed()) return;
+    win.show();
+    win.focus();
+  });
   win.on('close', event => {
     if (!shouldHideMainWindowOnClose(appQuitting)) return;
     event.preventDefault();
     win.hide();
   });
   mainWindowRetainer.retain(win);
-  if (devUrl) {
-    await win.loadURL(devUrl);
-  } else {
-    await win.loadFile(path.join(__dirname, '../dist/index.html'));
+  try {
+    if (devUrl) {
+      await win.loadURL(devUrl);
+    } else {
+      await win.loadFile(path.join(__dirname, '../dist/index.html'));
+    }
+  } catch (error) {
+    console.error('desktop window load threw', error);
+    if (!win.isDestroyed()) win.show();
+    throw error;
+  }
+  if (!win.isVisible() && !win.isDestroyed()) {
+    win.show();
+    win.focus();
   }
 }
 
@@ -130,12 +160,12 @@ if (acquireSingleInstance(app)) {
 
   app.whenReady().then(async () => {
     getService();
-    await getService().startLiveRoomMonitor(17890).catch(error => {
-      console.error('failed to start live room bridge', error);
-    });
     await createWindow();
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) void createWindow();
+    });
+    void getService().startLiveRoomMonitor(17890).catch(error => {
+      console.error('failed to start live room bridge', error);
     });
   });
 

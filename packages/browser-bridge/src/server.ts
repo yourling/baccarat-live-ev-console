@@ -34,7 +34,7 @@ import type {
   BridgeRoomDescriptor,
   BridgeServerMessage,
 } from './protocol.js';
-import { PragmaticRuntimeParser } from './pragmatic-runtime.js';
+import { PragmaticRuntimeParser, pragmaticGameCountSnapshot } from './pragmatic-runtime.js';
 import {
   PragmaticProtocolState,
   inspectPragmaticGameresult,
@@ -169,11 +169,52 @@ function selectedBridgeRoom(
  * 让 bridge:observe 之类的观察者在桌面控制台已占用端口时仍能实时观测。
  */
 const OBSERVABLE_KINDS = new Set(['sessionExpired', 'sessionAction', 'keepalive']);
+const NOISY_SESSION_ACTIONS = new Set([
+  'pragmatic-outbound-send',
+  'native-idle-keepalive-armed',
+  'native-idle-continue-cleared',
+  'native-idle-continue-click',
+]);
 const PRAGMATIC_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
 const PRAGMATIC_EXECUTION_LANE = 'pragmatic:shared-multitable-ui';
 
-/** 观察广播允许透传的网络捕获域名(游戏/聊天/会话通道,不含视频流)。 */
-const OBSERVABLE_NETWORK_PATTERN = /pragmaticplaylive|mdvuz|e9p1|vbgames88|zavjcswh|dafabet\.net/i;
+/** 观察广播只透传游戏协议通道，不含视频/资源/页面 IPC。 */
+const OBSERVABLE_NETWORK_PATTERN = /pragmaticplaylive\.net\/game/i;
+
+const LIVE_PROTOCOL_CAPTURE_SOURCES = new Set([
+  'baccarat-bridge-pragmatic-ws',
+  'baccarat-bridge-pragmatic-state',
+  'baccarat-bridge-runtime-selection',
+  'baccarat-bridge-runtime-state',
+]);
+
+function isLiveProtocolCapture(
+  message: Extract<BridgeClientMessage, { kind: 'networkCapture' }>,
+): boolean {
+  if (message.encoding === 'base64') return false;
+  if (typeof message.data === 'string' && message.data.length > 16_384) return false;
+  if (LIVE_PROTOCOL_CAPTURE_SOURCES.has(message.source)) return true;
+  return OBSERVABLE_NETWORK_PATTERN.test(message.url);
+}
+
+function visibleTableIdsFromPragmaticState(raw: string): string[] | undefined {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+    const tables = Reflect.get(parsed, 'tables');
+    if (!Array.isArray(tables)) return undefined;
+    const tableIds: string[] = [];
+    for (const table of tables) {
+      if (typeof table !== 'object' || table === null) continue;
+      const tableId = Reflect.get(table, 'tableId');
+      if (typeof tableId !== 'string' || tableId.length === 0) continue;
+      if (Reflect.get(table, 'visible') === true) tableIds.push(tableId);
+    }
+    return tableIds;
+  } catch {
+    return undefined;
+  }
+}
 
 const LIVE_EXTENSION_CONNECTION_ERROR =
   'live bet execution requires exactly one browser extension connection with an authenticated extension sequence';
@@ -481,6 +522,7 @@ function pragmaticWsFrameCapturePath(): string {
 }
 
 function capturePragmaticGameresult(raw: string): void {
+  if (process.env.PRAGMATIC_WS_CAPTURE !== '1') return;
   const inspection = inspectPragmaticGameresult(raw);
   if (inspection === undefined) return;
   const line = JSON.stringify({
@@ -905,6 +947,7 @@ export class BrowserBridgeServer implements RoomMonitor {
   private readonly protocolLastObservedAt = new Map<string, number>();
   private readonly runtimeStateLastObservedAt = new Map<string, number>();
   private readonly runtimeStateStaleTableIds = new Set<string>();
+  private visibleTableIds = new Set<string>();
   private configuredSelectedTables: ReadonlySet<string> | undefined;
   private runtimeSelectedTables: ReadonlySet<string> | undefined;
   private effectiveSelectedTables: ReadonlySet<string> | undefined;
@@ -1096,6 +1139,15 @@ export class BrowserBridgeServer implements RoomMonitor {
   }
 
   /** Starts an independent logical monitor session without claiming a physical shoe reset. */
+  currentPragmaticShoeId(tableId: string): string | undefined {
+    return this.pragmaticParser.currentShoeId(tableId);
+  }
+
+  openPhysicalShoe(tableId: string): void {
+    if (!this.isTableSelected(tableId)) return;
+    this.ingestParsedEvents(this.pragmaticParser.openPhysicalShoe(tableId, new Date().toISOString()));
+  }
+
   beginMonitorSession(): void {
     this.clearStalePageReloadTimer();
     this.staleTableIds.clear();
@@ -1307,6 +1359,10 @@ export class BrowserBridgeServer implements RoomMonitor {
     return this.runtimeSelectedTables === undefined || this.runtimeSelectedTables.has(tableId);
   }
 
+  getVisibleTableIds(): readonly string[] {
+    return [...this.visibleTableIds];
+  }
+
   getDiscoveredRooms(): RoomDescriptor[] {
     return [...this.discoveredRooms.values()].map(room => ({
       roomId: room.roomId,
@@ -1353,6 +1409,7 @@ export class BrowserBridgeServer implements RoomMonitor {
             tableId => this.isTableSelected(tableId),
           ),
         );
+        this.ingestPragmaticGameCountsFromRoom(message.room);
         break;
       case 'tableEvent': {
         if (!this.isTableSelected(message.tableId)) break;
@@ -1387,11 +1444,21 @@ export class BrowserBridgeServer implements RoomMonitor {
         }
         break;
       case 'networkCapture':
+        if (!isLiveProtocolCapture(message)) break;
         logNetworkCapture(message);
         capturePragmaticNetworkFrame(message);
         if (message.source === 'baccarat-bridge-pragmatic-state') {
+          const visibleTableIds = visibleTableIdsFromPragmaticState(message.data);
+          if (visibleTableIds !== undefined) this.visibleTableIds = new Set(visibleTableIds);
           for (const tableId of this.pragmaticParser.observedTableIds(message.data)) {
             if (this.isTableSelected(tableId)) this.noteTableObservation(tableId);
+          }
+          const gameCountSnapshot = pragmaticGameCountSnapshot(message.data);
+          if (gameCountSnapshot !== undefined) {
+            this.ingestParsedEvents(this.pragmaticParser.parse(
+              gameCountSnapshot,
+              tableId => this.isTableSelected(tableId),
+            ));
           }
         } else if (
           message.source === 'baccarat-bridge-pragmatic-ws'
@@ -1422,7 +1489,9 @@ export class BrowserBridgeServer implements RoomMonitor {
         this.invalidateBridgeContinuity('game-session-expired');
         break;
       case 'sessionAction':
-        console.log('[session-action]', JSON.stringify(redactedLifecycleMessage(message)));
+        if (BRIDGE_DEBUG_ENABLED && !NOISY_SESSION_ACTIONS.has(message.action)) {
+          console.log('[session-action]', JSON.stringify(redactedLifecycleMessage(message)));
+        }
         if (
           message.action === 'command-executed'
           && message.detail?.startsWith('reloadGameTabs:')
@@ -1450,7 +1519,9 @@ export class BrowserBridgeServer implements RoomMonitor {
         }
         break;
       case 'command':
-        console.log('[bridge-command]', JSON.stringify(message));
+        if (BRIDGE_DEBUG_ENABLED) {
+          console.log('[bridge-command]', JSON.stringify(message));
+        }
         this.broadcastToSockets({
           kind: 'command',
           name: message.name,
@@ -1462,7 +1533,10 @@ export class BrowserBridgeServer implements RoomMonitor {
       case 'keepalive':
         break;
     }
-    if (OBSERVABLE_KINDS.has(message.kind)) {
+    if (
+      OBSERVABLE_KINDS.has(message.kind)
+      && (message.kind !== 'sessionAction' || !NOISY_SESSION_ACTIONS.has(message.action))
+    ) {
       this.broadcastToObservers({
         kind: 'observe',
         message: redactedLifecycleMessage(message as Extract<
@@ -1472,10 +1546,8 @@ export class BrowserBridgeServer implements RoomMonitor {
       });
     } else if (
       message.kind === 'networkCapture'
-      && (
-        OBSERVABLE_NETWORK_PATTERN.test(message.url)
-        || message.source.startsWith('baccarat-bridge-pragmatic-cdp-')
-      )
+      && isLiveProtocolCapture(message)
+      && OBSERVABLE_NETWORK_PATTERN.test(message.url)
     ) {
       this.broadcastToObservers({ kind: 'observe', message: observableNetworkCapture(message) });
     }
@@ -1581,10 +1653,31 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.multiviewRecoveryTimer = undefined;
   }
 
+  private ingestPragmaticGameCountsFromRoom(room: BridgeRoomDescriptor): void {
+    const tables = room.tables.filter(table => Number.isInteger(table.gameCount) && (table.gameCount ?? -1) >= 0);
+    if (tables.length === 0) return;
+    this.ingestParsedEvents(this.pragmaticParser.parse(
+      JSON.stringify({
+        version: 1,
+        view: 'multi',
+        observedAt: new Date().toISOString(),
+        tables: tables.map(table => ({ tableId: table.tableId, gameCount: table.gameCount })),
+      }),
+      tableId => this.isTableSelected(tableId),
+    ));
+  }
+
   private ingestParsedEvents(events: readonly NormalizedEvent[]): void {
     for (const event of events) {
       if (!this.isTableSelected(event.tableId)) continue;
       if (this.parsedEventIds.has(event.eventId)) continue;
+      if (event.type === 'newShoeSignal') {
+        for (const eventId of this.parsedEventIds) {
+          if (eventId.includes(`:${event.tableId}:`)) this.parsedEventIds.delete(eventId);
+        }
+      } else if (this.parsedEventIds.size >= 20_000) {
+        this.parsedEventIds.clear();
+      }
       this.parsedEventIds.add(event.eventId);
       const sourceSeq = (this.parsedSourceSeqByTable.get(event.tableId) ?? 0) + 1;
       this.parsedSourceSeqByTable.set(event.tableId, sourceSeq);

@@ -30,6 +30,9 @@ export interface PragmaticRuntimeSnapshot {
   readonly tables: readonly PragmaticTableSnapshot[];
 }
 
+/** DOM road count may lag a couple of hands; beyond this the shoe was missed. */
+const GAME_COUNT_SHOE_LAG = 2;
+
 type SnapshotSource = 'dom' | 'protocol';
 type HandCards = { playerCards: Card[]; bankerCards: Card[]; source?: SnapshotSource };
 
@@ -148,6 +151,36 @@ function validSnapshot(value: unknown): value is PragmaticRuntimeSnapshot {
     && Array.isArray(candidate.tables);
 }
 
+/**
+ * Protocol frames omit gameCount. DOM snapshots carry the road #, but their
+ * round/card fields are unsafe to ingest on multibaccarat. Keep only tableId
+ * and gameCount so a missed shuffle can still open a physical shoe.
+ */
+export function pragmaticGameCountSnapshot(raw: string): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined;
+  const snapshot = parsed as Partial<PragmaticRuntimeSnapshot>;
+  if (snapshot.version !== 1 || !Array.isArray(snapshot.tables)) return undefined;
+  const tables: Array<{ tableId: string; gameCount: number }> = [];
+  for (const table of snapshot.tables) {
+    if (!table || typeof table.tableId !== 'string' || table.tableId.length === 0) continue;
+    if (!Number.isInteger(table.gameCount) || (table.gameCount ?? -1) < 0) continue;
+    tables.push({ tableId: table.tableId, gameCount: table.gameCount! });
+  }
+  if (tables.length === 0) return undefined;
+  return JSON.stringify({
+    version: 1,
+    view: snapshot.view === 'single' ? 'single' : 'multi',
+    observedAt: typeof snapshot.observedAt === 'string' ? snapshot.observedAt : new Date().toISOString(),
+    tables,
+  });
+}
+
 export class PragmaticRuntimeParser {
   private readonly runId = Math.random().toString(36).slice(2, 10);
   private readonly generationByTable = new Map<string, number>();
@@ -156,6 +189,7 @@ export class PragmaticRuntimeParser {
   private readonly shoeIdByTable = new Map<string, string>();
   private readonly lastShoeResetByTable = new Map<string, string>();
   private readonly lastGameCountByTable = new Map<string, number>();
+  private readonly handsThisShoeByTable = new Map<string, number>();
   private readonly lastRoundByTable = new Map<string, string>();
   private readonly cardBoundaryByHand = new Set<string>();
   private readonly cardsByHand = new Map<string, HandCards>();
@@ -198,6 +232,16 @@ export class PragmaticRuntimeParser {
       .filter(tableId => tableId.length > 0);
   }
 
+  currentShoeId(tableId: string): string | undefined {
+    return this.shoeIdByTable.get(tableId);
+  }
+
+  openPhysicalShoe(tableId: string, timestamp: string): NormalizedEvent[] {
+    const events: NormalizedEvent[] = [];
+    this.beginNewShoe(tableId, timestamp, events);
+    return events;
+  }
+
   resetTable(tableId: string): void {
     this.generationByTable.set(tableId, (this.generationByTable.get(tableId) ?? 0) + 1);
     this.seqByTable.delete(tableId);
@@ -205,16 +249,9 @@ export class PragmaticRuntimeParser {
     this.shoeIdByTable.delete(tableId);
     this.lastShoeResetByTable.delete(tableId);
     this.lastGameCountByTable.delete(tableId);
+    this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
-    const prefix = `${tableId}:`;
-    for (const key of this.cardsByHand.keys()) if (key.startsWith(prefix)) this.cardsByHand.delete(key);
-    for (const key of this.seenCardsByHand.keys()) if (key.startsWith(prefix)) this.seenCardsByHand.delete(key);
-    for (const key of this.cardBoundaryByHand) if (key.startsWith(prefix)) this.cardBoundaryByHand.delete(key);
-    for (const key of this.openedWindows) if (key.startsWith(prefix)) this.openedWindows.delete(key);
-    for (const key of this.closedWindows) if (key.startsWith(prefix)) this.closedWindows.delete(key);
-    for (const key of this.windowClosesAtMs.keys()) if (key.startsWith(prefix)) this.windowClosesAtMs.delete(key);
-    for (const key of this.settledHands) if (key.startsWith(prefix)) this.settledHands.delete(key);
-    for (const key of this.finishedHands) if (key.startsWith(prefix)) this.finishedHands.delete(key);
+    this.clearHandState(tableId);
   }
 
   private ingestTable(
@@ -223,25 +260,33 @@ export class PragmaticRuntimeParser {
     events: NormalizedEvent[],
   ): void {
     const tableId = table.tableId;
-    this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
 
     if (typeof table.shoeReset === 'string'
       && table.shoeReset.length > 0
       && this.lastShoeResetByTable.get(tableId) !== table.shoeReset) {
+      this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
       this.lastShoeResetByTable.set(tableId, table.shoeReset);
       this.beginNewShoe(tableId, observedAt, events);
     }
 
     if (Number.isInteger(table.gameCount) && (table.gameCount ?? -1) >= 0) {
       const previous = this.lastGameCountByTable.get(tableId);
-      if (previous !== undefined && table.gameCount! < previous) {
+      const tracked = this.handsThisShoeByTable.get(tableId) ?? 0;
+      const gameCount = table.gameCount!;
+      if (
+        (previous !== undefined && gameCount < previous)
+        || tracked > gameCount + GAME_COUNT_SHOE_LAG
+      ) {
+        this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
         this.beginNewShoe(tableId, observedAt, events);
       }
-      this.lastGameCountByTable.set(tableId, table.gameCount!);
+      this.lastGameCountByTable.set(tableId, gameCount);
     }
 
     const handId = typeof table.roundId === 'string' ? table.roundId.trim() : '';
     if (!handId || handId === '—') return;
+
+    this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
 
     const source = table.source === 'protocol' || table.source === 'dom' ? table.source : undefined;
     const playerCards = parseCards(table.playerCards);
@@ -265,6 +310,9 @@ export class PragmaticRuntimeParser {
       this.finishedHands.add(`${tableId}:${previousHandId}`);
       this.closeWindows(tableId, previousHandId, observedAt, events);
       this.settleRememberedHand(tableId, previousHandId, observedAt, events);
+      this.handsThisShoeByTable.set(tableId, (this.handsThisShoeByTable.get(tableId) ?? 1) + 1);
+    } else if (previousHandId === undefined) {
+      this.handsThisShoeByTable.set(tableId, 1);
     }
     this.lastRoundByTable.set(tableId, handId);
 
@@ -330,9 +378,30 @@ export class PragmaticRuntimeParser {
   }
 
   private beginNewShoe(tableId: string, timestamp: string, events: NormalizedEvent[]): void {
+    this.clearShoeTracking(tableId);
     const sequence = (this.shoeSeqByTable.get(tableId) ?? 1) + 1;
     this.shoeSeqByTable.set(tableId, sequence);
     this.emitShoe(tableId, sequence, 'physical-shoe', timestamp, events);
+  }
+
+  private clearShoeTracking(tableId: string): void {
+    this.lastGameCountByTable.delete(tableId);
+    this.handsThisShoeByTable.delete(tableId);
+    this.lastRoundByTable.delete(tableId);
+    this.clearHandState(tableId);
+  }
+
+  private clearHandState(tableId: string): void {
+    const prefix = `${tableId}:`;
+    for (const key of this.cardsByHand.keys()) if (key.startsWith(prefix)) this.cardsByHand.delete(key);
+    for (const key of this.seenCardsByHand.keys()) if (key.startsWith(prefix)) this.seenCardsByHand.delete(key);
+    for (const key of this.cardBoundaryByHand) if (key.startsWith(prefix)) this.cardBoundaryByHand.delete(key);
+    for (const key of this.openedWindows) if (key.startsWith(prefix)) this.openedWindows.delete(key);
+    for (const key of this.closedWindows) if (key.startsWith(prefix)) this.closedWindows.delete(key);
+    for (const key of this.windowClosesAtMs.keys()) if (key.startsWith(prefix)) this.windowClosesAtMs.delete(key);
+    for (const key of this.lastWindowEmitAtMs.keys()) if (key.startsWith(prefix)) this.lastWindowEmitAtMs.delete(key);
+    for (const key of this.settledHands) if (key.startsWith(prefix)) this.settledHands.delete(key);
+    for (const key of this.finishedHands) if (key.startsWith(prefix)) this.finishedHands.delete(key);
   }
 
   private emitShoe(
@@ -401,11 +470,8 @@ export class PragmaticRuntimeParser {
         const hadClosesAt = this.windowClosesAtMs.get(key) !== undefined;
         if (!Number.isFinite(closesAtMs) && !hadClosesAt) continue;
         if (hadClosesAt) {
-          const lastEmitAtMs = this.lastWindowEmitAtMs.get(key);
-          if (lastEmitAtMs !== undefined && Number.isFinite(observedAtMs) && observedAtMs - lastEmitAtMs < 2_000) {
-            this.windowClosesAtMs.set(key, closesAtMs!);
-            continue;
-          }
+          this.windowClosesAtMs.set(key, closesAtMs!);
+          continue;
         }
       }
       this.openedWindows.add(key);
@@ -414,7 +480,7 @@ export class PragmaticRuntimeParser {
       if (Number.isFinite(observedAtMs)) this.lastWindowEmitAtMs.set(key, observedAtMs);
       const closesAt = Number.isFinite(closesAtMs) ? new Date(closesAtMs!).toISOString() : undefined;
       const stableKey = alreadyOpen
-        ? `open:${handId}:${market}:eta:${Math.round((closesAtMs ?? 0) / 1000)}`
+        ? `open:${handId}:${market}:eta`
         : `open:${handId}:${market}`;
       events.push(this.makeEvent(tableId, 'bettingWindowOpened', stableKey, timestamp, {
         shoeId: this.shoeIdByTable.get(tableId) ?? '',

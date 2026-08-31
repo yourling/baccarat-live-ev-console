@@ -536,7 +536,7 @@ describe('Pragmatic bet runtime', () => {
     }));
   });
 
-  it('does not send a request-path wager when the page round id cannot be read', async () => {
+  it('still sends a request-path wager when the tile round id cannot be scraped', async () => {
     const runtime = exportedRuntime();
     const page = pageContext(true, 'no-round-header');
     const placeBet = vi.fn(() => ({ ok: true }));
@@ -547,10 +547,10 @@ describe('Pragmatic bet runtime', () => {
       phase: 'request',
       expectedRoundId: '17260230224',
     });
-    expect(placeBet).not.toHaveBeenCalled();
+    expect(placeBet).toHaveBeenCalled();
     expect(requested).toEqual(expect.objectContaining({
-      phase: 'request-unavailable',
-      reason: 'round-id-unreadable',
+      phase: 'requested',
+      requestSent: true,
     }));
   });
 

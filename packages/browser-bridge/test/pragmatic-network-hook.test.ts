@@ -102,14 +102,14 @@ describe('Pragmatic passive network hook', () => {
   it('buffers early receive frames and never sends to game transports', () => {
     const posted: unknown[] = [];
     const { testWindow, windowEvents } = runHook(posted);
-    const socket = new testWindow.WebSocket('wss://example.test/state');
+    const socket = new testWindow.WebSocket('wss://gs24.pragmaticplaylive.net/game');
     socket.emit('message', { data: JSON.stringify({ type: 'tableState', tableId: 'speedbca14gesbc1' }) });
 
     expect(posted).toEqual([]);
     signalContentReady(testWindow, windowEvents);
     expect(posted).toContainEqual(expect.objectContaining({
       source: 'baccarat-bridge-pragmatic-ws',
-      url: 'wss://example.test/state',
+      url: 'wss://gs24.pragmaticplaylive.net/game',
       direction: 'recv',
       encoding: 'text',
       data: expect.stringContaining('speedbca14gesbc1'),
@@ -121,7 +121,7 @@ describe('Pragmatic passive network hook', () => {
     const posted: unknown[] = [];
     const { testWindow, windowEvents } = runHook(posted);
     signalContentReady(testWindow, windowEvents);
-    const socket = new testWindow.WebSocket('wss://example.test/state');
+    const socket = new testWindow.WebSocket('wss://gs24.pragmaticplaylive.net/game');
     socket.readyState = FakeWebSocket.OPEN;
     socket.send(JSON.stringify({
       bet: { table: 'speedbca14gesbc1', game: '111', amount: 10, bc: '0' },
@@ -152,7 +152,7 @@ describe('Pragmatic passive network hook', () => {
     const posted: unknown[] = [];
     const { testWindow, windowEvents } = runHook(posted);
     signalContentReady(testWindow, windowEvents);
-    const socket = new testWindow.WebSocket('wss://example.test/state');
+    const socket = new testWindow.WebSocket('wss://gs24.pragmaticplaylive.net/game');
     socket.readyState = FakeWebSocket.OPEN;
     socket.send(JSON.stringify({
       playerWager: { table: 'speedbca14gesbc1', game: '333', amount: 10, code: '0' },
@@ -195,37 +195,34 @@ describe('Pragmatic passive network hook', () => {
     )).toBe(true);
   });
 
-  it('observes Worker responses without posting to the Worker', () => {
+  it('does not capture binary WebSocket frames or video sockets', () => {
+    const posted: unknown[] = [];
+    const { testWindow, windowEvents } = runHook(posted);
+    signalContentReady(testWindow, windowEvents);
+    const game = new testWindow.WebSocket('wss://gs24.pragmaticplaylive.net/game');
+    game.emit('message', { data: new Uint8Array([1, 2, 3, 4]).buffer });
+    const video = new testWindow.WebSocket('wss://video.pragmaticplaylive.net/stream');
+    video.emit('message', { data: JSON.stringify({ type: 'media' }) });
+    expect(posted).toEqual([]);
+  });
+
+  it('does not capture Worker, MessageChannel, or window IPC', () => {
     const posted: unknown[] = [];
     const { testWindow, windowEvents } = runHook(posted);
     signalContentReady(testWindow, windowEvents);
     const worker = new testWindow.Worker('/worker.js');
     worker.emit('message', { data: JSON.stringify({ eventType: 'roundUpdate', roundId: '12345' }) });
-
-    expect(posted).toContainEqual(expect.objectContaining({
-      source: 'baccarat-bridge-pragmatic-worker',
-      url: '/worker.js',
-      encoding: 'text',
-    }));
-    expect(worker.postMessage).not.toHaveBeenCalled();
-  });
-
-  it('captures structured MessageChannel values without posting to either port', () => {
-    const posted: unknown[] = [];
-    const { testWindow, windowEvents } = runHook(posted);
-    signalContentReady(testWindow, windowEvents);
     const channel = new testWindow.MessageChannel();
     channel.port1.emit('message', {
       data: { type: 'tableState', tableId: 'speedbca14gesbc1', roundId: '17260818724' },
     });
-
-    expect(posted).toContainEqual(expect.objectContaining({
-      source: 'baccarat-bridge-pragmatic-message-port',
-      encoding: 'text',
-      data: JSON.stringify({
-        type: 'tableState', tableId: 'speedbca14gesbc1', roundId: '17260818724',
-      }),
-    }));
+    windowEvents.emit('message', {
+      source: testWindow,
+      origin: 'https://client.pragmaticplaylive.net',
+      data: { type: 'video-stats', bytes: 1_024_000 },
+    });
+    expect(posted).toEqual([]);
+    expect(worker.postMessage).not.toHaveBeenCalled();
     expect(channel.port1.postMessage).not.toHaveBeenCalled();
     expect(channel.port2.postMessage).not.toHaveBeenCalled();
   });

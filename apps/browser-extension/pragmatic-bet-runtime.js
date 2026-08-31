@@ -113,7 +113,10 @@ function probePragmaticBetTable(tableId, targetMarket) {
     if (prepared) {
       return Math.floor(prepared.countdown - Math.max(0, Date.now() - prepared.countdownAt) / 1000);
     }
-    return Number(clean(countdownTimer(root)?.textContent));
+    const text = clean(countdownTimer(root)?.textContent);
+    if (!text) return Number.NaN;
+    const parsed = Number(text);
+    return Number.isFinite(parsed) ? parsed : Number.NaN;
   }
   function isOpen(root, targetTableId, expectedRoundId) {
     const prepared = preparedLease(targetTableId, expectedRoundId);
@@ -455,7 +458,10 @@ async function executePragmaticBetOneShot(request, command) {
     if (prepared) {
       return Math.floor(prepared.countdown - Math.max(0, Date.now() - prepared.countdownAt) / 1000);
     }
-    return Number(clean(countdownTimer(root)?.textContent));
+    const text = clean(countdownTimer(root)?.textContent);
+    if (!text) return Number.NaN;
+    const parsed = Number(text);
+    return Number.isFinite(parsed) ? parsed : Number.NaN;
   }
   function isOpen(root, targetTableId, expectedRoundId) {
     const prepared = preparedLease(targetTableId, expectedRoundId);
@@ -777,18 +783,8 @@ async function executePragmaticBetOneShot(request, command) {
     const gId = String(value.handId || '');
     const requestRoot = tableRoot(value.tableId);
     const pageRoundId = requestRoot ? String(roundId(requestRoot) || '') : '';
-    const requestCountdown = requestRoot ? remainingSeconds(requestRoot, value.tableId, gId) : NaN;
-    if (!requestRoot || !pageRoundId) {
-      return {
-        phase: 'request-unavailable',
-        runtimeRevision: RUNTIME_REVISION,
-        reason: 'round-id-unreadable',
-        currentRoundId: pageRoundId,
-        expectedRoundId: gId,
-        currentCountdown: Number.isFinite(requestCountdown) ? requestCountdown : undefined,
-      };
-    }
-    if (gId && pageRoundId !== gId) {
+    const requestCountdown = requestRoot ? remainingSeconds(requestRoot, value.tableId, gId) : Number.NaN;
+    if (gId && pageRoundId && pageRoundId !== gId) {
       return {
         phase: 'request-unavailable',
         runtimeRevision: RUNTIME_REVISION,
@@ -798,13 +794,22 @@ async function executePragmaticBetOneShot(request, command) {
         currentCountdown: Number.isFinite(requestCountdown) ? requestCountdown : undefined,
       };
     }
-    if (!Number.isFinite(requestCountdown) || requestCountdown < REQUEST_MIN_REMAINING_SECONDS) {
+    if (Number.isFinite(requestCountdown) && requestCountdown < REQUEST_MIN_REMAINING_SECONDS) {
       return {
         phase: 'request-unavailable',
         runtimeRevision: RUNTIME_REVISION,
         reason: 'betting-window-closed',
         currentRoundId: gId || pageRoundId,
         currentCountdown: requestCountdown,
+      };
+    }
+    if (!Number.isFinite(requestCountdown) && pageRoundId && gId && pageRoundId === gId) {
+      return {
+        phase: 'request-unavailable',
+        runtimeRevision: RUNTIME_REVISION,
+        reason: 'betting-window-closed',
+        currentRoundId: pageRoundId,
+        expectedRoundId: gId,
       };
     }
     if (!channel || typeof channel.placeBet !== 'function') {

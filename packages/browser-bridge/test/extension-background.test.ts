@@ -169,6 +169,46 @@ describe('extension background multitable command', () => {
     }));
   });
 
+  it('does not forward HTTP, Worker, or CDP captures to the bridge', async () => {
+    const harness = await createHarness();
+    for (const source of [
+      'baccarat-bridge-pragmatic-http',
+      'baccarat-bridge-pragmatic-worker',
+      'baccarat-bridge-pragmatic-window',
+      'baccarat-bridge-pragmatic-cdp-body',
+    ]) {
+      vm.runInContext(
+        `send(${JSON.stringify({
+          kind: 'networkCapture',
+          source,
+          url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/',
+          direction: 'recv',
+          encoding: 'text',
+          data: '{"ok":true}',
+        })})`,
+        harness.context,
+      );
+    }
+    vm.runInContext(
+      `send(${JSON.stringify({
+        kind: 'networkCapture',
+        source: 'baccarat-bridge-pragmatic-ws',
+        url: 'wss://gs24.pragmaticplaylive.net/game',
+        direction: 'recv',
+        encoding: 'text',
+        data: '{"timer":{"table":"tobcbaccaragen92","value":"9"}}',
+      })})`,
+      harness.context,
+    );
+    const captures = sentMessages(harness.socket).filter(message => message.kind === 'networkCapture');
+    expect(captures).toEqual([
+      expect.objectContaining({
+        source: 'baccarat-bridge-pragmatic-ws',
+        url: 'wss://gs24.pragmaticplaylive.net/game',
+      }),
+    ]);
+  });
+
   it('maintains a fresh per-table Pragmatic protocol betting window', async () => {
     const harness = await createHarness();
     const capture = (data: unknown) => vm.runInContext(
