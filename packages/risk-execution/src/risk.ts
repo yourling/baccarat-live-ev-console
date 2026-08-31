@@ -471,8 +471,8 @@ export class RiskManager {
         )
       )
       && r.tableId === tableId
-      && r.shoeId === shoeId
-      && r.handId === handId,
+      && r.handId === handId
+      && (r.shoeId === shoeId || r.status === 'UNKNOWN'),
     );
     if (matches.length === 0) return [];
 

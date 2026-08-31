@@ -163,6 +163,7 @@ export class PragmaticRuntimeParser {
   private readonly openedWindows = new Set<string>();
   private readonly closedWindows = new Set<string>();
   private readonly windowClosesAtMs = new Map<string, number>();
+  private readonly lastWindowEmitAtMs = new Map<string, number>();
   private readonly settledHands = new Set<string>();
   private readonly finishedHands = new Set<string>();
 
@@ -396,12 +397,21 @@ export class PragmaticRuntimeParser {
     for (const market of ['bankerPair', 'playerPair'] as const) {
       const key = `${tableId}:${handId}:${market}`;
       const alreadyOpen = this.openedWindows.has(key) && !this.closedWindows.has(key);
-      const previousClosesAtMs = this.windowClosesAtMs.get(key);
-      if (alreadyOpen && previousClosesAtMs !== undefined) continue;
-      if (alreadyOpen && !Number.isFinite(closesAtMs)) continue;
+      if (alreadyOpen) {
+        const hadClosesAt = this.windowClosesAtMs.get(key) !== undefined;
+        if (!Number.isFinite(closesAtMs) && !hadClosesAt) continue;
+        if (hadClosesAt) {
+          const lastEmitAtMs = this.lastWindowEmitAtMs.get(key);
+          if (lastEmitAtMs !== undefined && Number.isFinite(observedAtMs) && observedAtMs - lastEmitAtMs < 2_000) {
+            this.windowClosesAtMs.set(key, closesAtMs!);
+            continue;
+          }
+        }
+      }
       this.openedWindows.add(key);
       this.closedWindows.delete(key);
       if (Number.isFinite(closesAtMs)) this.windowClosesAtMs.set(key, closesAtMs!);
+      if (Number.isFinite(observedAtMs)) this.lastWindowEmitAtMs.set(key, observedAtMs);
       const closesAt = Number.isFinite(closesAtMs) ? new Date(closesAtMs!).toISOString() : undefined;
       const stableKey = alreadyOpen
         ? `open:${handId}:${market}:eta:${Math.round((closesAtMs ?? 0) / 1000)}`

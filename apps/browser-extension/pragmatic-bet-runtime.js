@@ -34,7 +34,7 @@ function probePragmaticBetTable(tableId, targetMarket) {
     }
     return controls;
   }
-  function preparedLease(targetTableId) {
+  function preparedLease(targetTableId, expectedRoundId) {
     const prepared = globalThis.__baccaratPragmaticPreparedTable;
     if (!(
       location.pathname === '/desktop/multibaccarat/'
@@ -43,6 +43,7 @@ function probePragmaticBetTable(tableId, targetMarket) {
       && Number.isFinite(prepared.preparedAt)
       && Date.now() - prepared.preparedAt <= 5000
       && typeof prepared.roundId === 'string'
+      && (!expectedRoundId || prepared.roundId === expectedRoundId)
       && Number.isFinite(prepared.countdown)
       && Number.isFinite(prepared.countdownAt)
     )) return null;
@@ -107,16 +108,16 @@ function probePragmaticBetTable(tableId, targetMarket) {
       ? root.querySelector('[data-testid="round-timer"] [data-testid^="timer-countdown-"]')
       : root?.querySelector('[data-testid^="timer-countdown-"]');
   }
-  function remainingSeconds(root, targetTableId) {
-    const prepared = preparedLease(targetTableId);
+  function remainingSeconds(root, targetTableId, expectedRoundId) {
+    const prepared = preparedLease(targetTableId, expectedRoundId);
     if (prepared) {
       return Math.floor(prepared.countdown - Math.max(0, Date.now() - prepared.countdownAt) / 1000);
     }
     return Number(clean(countdownTimer(root)?.textContent));
   }
-  function isOpen(root, targetTableId) {
-    const prepared = preparedLease(targetTableId);
-    const remaining = remainingSeconds(root, targetTableId);
+  function isOpen(root, targetTableId, expectedRoundId) {
+    const prepared = preparedLease(targetTableId, expectedRoundId);
+    const remaining = remainingSeconds(root, targetTableId, expectedRoundId);
     const targetWasVisibleWhenPrepared = location.pathname === '/desktop/multibaccarat/' && !!prepared;
     return (targetWasVisibleWhenPrepared || visible(root))
       && Number.isFinite(remaining)
@@ -343,6 +344,7 @@ function probePragmaticBetTable(tableId, targetMarket) {
 async function executePragmaticBetOneShot(request, command) {
   const RUNTIME_REVISION = 'pragmatic-bet-runtime/2026-08-30.21';
   const MIN_REMAINING_SECONDS = 1;
+  const REQUEST_MIN_REMAINING_SECONDS = 3;
   const MARKET_CODES = Object.freeze({ player: '0', banker: '1', playerPair: '3', bankerPair: '4' });
   const RECEIPT_TIMEOUT_MS = 5000;
 
@@ -374,7 +376,7 @@ async function executePragmaticBetOneShot(request, command) {
     }
     return controls;
   }
-  function preparedLease(targetTableId) {
+  function preparedLease(targetTableId, expectedRoundId) {
     const prepared = globalThis.__baccaratPragmaticPreparedTable;
     if (!(
       location.pathname === '/desktop/multibaccarat/'
@@ -383,6 +385,7 @@ async function executePragmaticBetOneShot(request, command) {
       && Number.isFinite(prepared.preparedAt)
       && Date.now() - prepared.preparedAt <= 5000
       && typeof prepared.roundId === 'string'
+      && (!expectedRoundId || prepared.roundId === expectedRoundId)
       && Number.isFinite(prepared.countdown)
       && Number.isFinite(prepared.countdownAt)
     )) return null;
@@ -447,16 +450,16 @@ async function executePragmaticBetOneShot(request, command) {
       ? root.querySelector('[data-testid="round-timer"] [data-testid^="timer-countdown-"]')
       : root?.querySelector('[data-testid^="timer-countdown-"]');
   }
-  function remainingSeconds(root, targetTableId) {
-    const prepared = preparedLease(targetTableId);
+  function remainingSeconds(root, targetTableId, expectedRoundId) {
+    const prepared = preparedLease(targetTableId, expectedRoundId);
     if (prepared) {
       return Math.floor(prepared.countdown - Math.max(0, Date.now() - prepared.countdownAt) / 1000);
     }
     return Number(clean(countdownTimer(root)?.textContent));
   }
-  function isOpen(root, targetTableId) {
-    const prepared = preparedLease(targetTableId);
-    const remaining = remainingSeconds(root, targetTableId);
+  function isOpen(root, targetTableId, expectedRoundId) {
+    const prepared = preparedLease(targetTableId, expectedRoundId);
+    const remaining = remainingSeconds(root, targetTableId, expectedRoundId);
     const targetWasVisibleWhenPrepared = location.pathname === '/desktop/multibaccarat/' && !!prepared;
     return (targetWasVisibleWhenPrepared || visible(root))
       && Number.isFinite(remaining)
@@ -772,6 +775,38 @@ async function executePragmaticBetOneShot(request, command) {
   if (phase === 'request') {
     const channel = globalThis.__baccaratPragmaticBetChannel;
     const gId = String(value.handId || '');
+    const requestRoot = tableRoot(value.tableId);
+    const pageRoundId = requestRoot ? String(roundId(requestRoot) || '') : '';
+    const requestCountdown = requestRoot ? remainingSeconds(requestRoot, value.tableId, gId) : NaN;
+    if (!requestRoot || !pageRoundId) {
+      return {
+        phase: 'request-unavailable',
+        runtimeRevision: RUNTIME_REVISION,
+        reason: 'round-id-unreadable',
+        currentRoundId: pageRoundId,
+        expectedRoundId: gId,
+        currentCountdown: Number.isFinite(requestCountdown) ? requestCountdown : undefined,
+      };
+    }
+    if (gId && pageRoundId !== gId) {
+      return {
+        phase: 'request-unavailable',
+        runtimeRevision: RUNTIME_REVISION,
+        reason: 'round-not-current',
+        currentRoundId: pageRoundId,
+        expectedRoundId: gId,
+        currentCountdown: Number.isFinite(requestCountdown) ? requestCountdown : undefined,
+      };
+    }
+    if (!Number.isFinite(requestCountdown) || requestCountdown < REQUEST_MIN_REMAINING_SECONDS) {
+      return {
+        phase: 'request-unavailable',
+        runtimeRevision: RUNTIME_REVISION,
+        reason: 'betting-window-closed',
+        currentRoundId: gId || pageRoundId,
+        currentCountdown: requestCountdown,
+      };
+    }
     if (!channel || typeof channel.placeBet !== 'function') {
       return {
         phase: 'request-unavailable',
@@ -819,9 +854,80 @@ async function executePragmaticBetOneShot(request, command) {
   const prepared = preparedLease(value.tableId);
   const bettingRoot = location.pathname === '/desktop/multibaccarat/' && prepared ? document : root;
   const currentRoundId = roundId(root);
-  const currentCountdown = remainingSeconds(root, value.tableId);
-  if (!isOpen(root, value.tableId)) {
-    return makeReceipt('REJECTED', 'betting-window-closed', false, { currentRoundId, currentCountdown });
+  const expectedRoundId = String(command && command.expectedRoundId || '');
+  const currentCountdown = remainingSeconds(root, value.tableId, expectedRoundId || currentRoundId);
+  if (phase === 'observe') {
+    const beforeTotal = Number(command.beforeTotal);
+    const expectedTotal = Number(command.expectedTotal);
+    const selectedChips = Array.isArray(command.selectedChips)
+      ? command.selectedChips.filter(Number.isFinite)
+      : [];
+    const expectedRoundId = String(command.expectedRoundId || currentRoundId || '');
+    const final = command.final === true;
+    const deadline = Date.now() + RECEIPT_TIMEOUT_MS;
+    let after = totalBetObservation();
+    while (Date.now() < deadline) {
+      after = totalBetObservation();
+      if (after.observed && Number.isFinite(expectedTotal) && after.value >= expectedTotal) {
+        if (!final) {
+          return {
+            phase: 'observed',
+            runtimeRevision: RUNTIME_REVISION,
+            afterTotal: after.value,
+            afterTotalObserved: true,
+            selectedChips,
+            currentRoundId: expectedRoundId,
+          };
+        }
+        return makeReceipt('ACCEPTED', 'wallet-total-bet-increased', true, {
+          beforeTotal,
+          afterTotal: after.value,
+          beforeTotalObserved: command.beforeTotalObserved === true,
+          afterTotalObserved: true,
+          selectedChips,
+          currentRoundId: expectedRoundId,
+          trustedInput: true,
+        });
+      }
+      const observedRoundId = roundId(root);
+      if (expectedRoundId && observedRoundId && observedRoundId !== expectedRoundId) {
+        return makeReceipt('UNKNOWN', 'round-advanced-before-ack', true, {
+          beforeTotal,
+          afterTotal: after.value,
+          beforeTotalObserved: command.beforeTotalObserved === true,
+          afterTotalObserved: after.observed,
+          selectedChips,
+          currentCountdown,
+          currentRoundId: expectedRoundId,
+          observedRoundId,
+          trustedInput: true,
+        });
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    return makeReceipt('UNKNOWN', 'platform-ack-not-observed', true, {
+      beforeTotal,
+      afterTotal: after.value,
+      beforeTotalObserved: command.beforeTotalObserved === true,
+      afterTotalObserved: after.observed,
+      selectedChips,
+      currentRoundId: expectedRoundId,
+      currentCountdown,
+      trustedInput: true,
+    });
+  }
+  const preparedRoundId = preparedLease(value.tableId, expectedRoundId || currentRoundId)?.roundId || '';
+  const pageRoundId = preparedRoundId || currentRoundId;
+  if (expectedRoundId && !pageRoundId) {
+    return makeReceipt('REJECTED', 'round-id-unreadable', false, { currentRoundId: pageRoundId, currentCountdown, expectedRoundId });
+  }
+  if (expectedRoundId && pageRoundId && pageRoundId !== expectedRoundId) {
+    return makeReceipt('REJECTED', 'round-not-current', false, { currentRoundId: pageRoundId, currentCountdown, expectedRoundId });
+  }
+  if (!isOpen(root, value.tableId, expectedRoundId || pageRoundId)
+    || !Number.isFinite(currentCountdown)
+    || currentCountdown < REQUEST_MIN_REMAINING_SECONDS) {
+    return makeReceipt('REJECTED', 'betting-window-closed', false, { currentRoundId: pageRoundId || currentRoundId, currentCountdown });
   }
   const target = targetFor(bettingRoot, value.market);
   if (!target) return makeReceipt('REJECTED', 'unsupported-market', false, { currentRoundId, currentCountdown });
@@ -890,66 +996,6 @@ async function executePragmaticBetOneShot(request, command) {
       currentCountdown,
       point,
     };
-  }
-  if (phase === 'observe') {
-    const beforeTotal = Number(command.beforeTotal);
-    const expectedTotal = Number(command.expectedTotal);
-    const selectedChips = Array.isArray(command.selectedChips)
-      ? command.selectedChips.filter(Number.isFinite)
-      : [];
-    const expectedRoundId = String(command.expectedRoundId || currentRoundId || '');
-    const final = command.final === true;
-    const deadline = Date.now() + RECEIPT_TIMEOUT_MS;
-    let after = totalBetObservation();
-    while (Date.now() < deadline) {
-      after = totalBetObservation();
-      if (after.observed && Number.isFinite(expectedTotal) && after.value >= expectedTotal) {
-        if (!final) {
-          return {
-            phase: 'observed',
-            runtimeRevision: RUNTIME_REVISION,
-            afterTotal: after.value,
-            afterTotalObserved: true,
-            selectedChips,
-            currentRoundId: expectedRoundId,
-          };
-        }
-        return makeReceipt('ACCEPTED', 'wallet-total-bet-increased', true, {
-          beforeTotal,
-          afterTotal: after.value,
-          beforeTotalObserved: command.beforeTotalObserved === true,
-          afterTotalObserved: true,
-          selectedChips,
-          currentRoundId: expectedRoundId,
-          trustedInput: true,
-        });
-      }
-      const observedRoundId = roundId(root);
-      if (expectedRoundId && observedRoundId && observedRoundId !== expectedRoundId) {
-        return makeReceipt('UNKNOWN', 'round-advanced-before-ack', true, {
-          beforeTotal,
-          afterTotal: after.value,
-          beforeTotalObserved: command.beforeTotalObserved === true,
-          afterTotalObserved: after.observed,
-          selectedChips,
-          currentCountdown,
-          currentRoundId: expectedRoundId,
-          observedRoundId,
-          trustedInput: true,
-        });
-      }
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    return makeReceipt('UNKNOWN', 'platform-ack-not-observed', true, {
-      beforeTotal,
-      afterTotal: after.value,
-      beforeTotalObserved: command.beforeTotalObserved === true,
-      afterTotalObserved: after.observed,
-      selectedChips,
-      currentRoundId: expectedRoundId,
-      currentCountdown,
-      trustedInput: true,
-    });
   }
   return makeReceipt('REJECTED', 'trusted-input-required', false, { currentRoundId, currentCountdown });
 }

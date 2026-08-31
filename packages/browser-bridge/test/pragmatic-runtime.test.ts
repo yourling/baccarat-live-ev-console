@@ -67,7 +67,7 @@ describe('PragmaticRuntimeParser', () => {
         countdown: 2,
       }],
     }));
-    expect(laterTick.filter(event => event.type === 'bettingWindowOpened')).toHaveLength(0);
+    expect(laterTick.filter(event => event.type === 'bettingWindowOpened')).toHaveLength(2);
   });
 
   it('promotes an attached monitor session to a physical shoe on protocol shuffle', () => {

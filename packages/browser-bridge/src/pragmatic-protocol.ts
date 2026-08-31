@@ -518,9 +518,9 @@ export class PragmaticProtocolState {
     if (kind === 'game') return { changed: true, snapshotRoundId: state.roundId };
     if (kind === 'timer') {
       state.countdown = finiteNumber(record.value);
-      if (state.countdown !== undefined) state.bettingOpen = state.countdown >= 1;
-      if (state.countdown === 0 && state.roundId !== undefined) {
-        roundCards(state, state.roundId).closed = true;
+      if (state.countdown === 0) {
+        state.bettingOpen = false;
+        if (state.roundId !== undefined) roundCards(state, state.roundId).closed = true;
       }
       return { changed: true, snapshotRoundId: state.roundId };
     }

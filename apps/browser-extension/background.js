@@ -105,7 +105,6 @@ function ingestPragmaticProtocolWindow(message) {
     if (Number.isFinite(countdown)) {
       previous.countdown = countdown;
       previous.countdownAt = now;
-      if (countdown >= 1) previous.bettingOpen = true;
       if (countdown === 0) previous.bettingOpen = false;
     }
   } else if (kind === 'betsopen') {

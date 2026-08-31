@@ -248,6 +248,30 @@ function decisionHandKey(tableId: string, shoeId: string, handId: string): strin
   return JSON.stringify([tableId, shoeId, handId]);
 }
 
+function decisionHandIdentity(tableId: string, handId: string): string {
+  return JSON.stringify([tableId, handId]);
+}
+
+function settlementActualResult(
+  settlement: Extract<NormalizedEvent, { type: 'handSettled' }>,
+): DecisionHandActualResult {
+  const outcomes = settlement.outcomes;
+  if (
+    outcomes
+    && typeof outcomes.bankerPair === 'boolean'
+    && typeof outcomes.playerPair === 'boolean'
+  ) {
+    return {
+      status: 'SETTLED',
+      outcomes: {
+        bankerPair: outcomes.bankerPair,
+        playerPair: outcomes.playerPair,
+      },
+    };
+  }
+  return { status: 'UNKNOWN' };
+}
+
 function decisionHandScope(options: DecisionHandPageOptions): {
   readonly where: string;
   readonly params: string[];
@@ -890,7 +914,7 @@ export class SqliteLedger {
     shoeId: string,
     handId: string,
   ): Extract<NormalizedEvent, { type: 'handSettled' }> | undefined {
-    const row = this.db.prepare(`
+    const exact = this.db.prepare(`
       SELECT payload FROM events
       WHERE table_id = ?
         AND type = 'handSettled'
@@ -899,8 +923,19 @@ export class SqliteLedger {
       ORDER BY id DESC
       LIMIT 1
     `).get(tableId, shoeId, handId) as { payload: string } | undefined;
-    return row
-      ? JSON.parse(row.payload) as Extract<NormalizedEvent, { type: 'handSettled' }>
+    if (exact) {
+      return JSON.parse(exact.payload) as Extract<NormalizedEvent, { type: 'handSettled' }>;
+    }
+    const fallback = this.db.prepare(`
+      SELECT payload FROM events
+      WHERE table_id = ?
+        AND type = 'handSettled'
+        AND json_extract(payload, '$.handId') = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(tableId, handId) as { payload: string } | undefined;
+    return fallback
+      ? JSON.parse(fallback.payload) as Extract<NormalizedEvent, { type: 'handSettled' }>
       : undefined;
   }
 
@@ -1165,26 +1200,25 @@ export class SqliteLedger {
     }
 
     const actualResultByKey = new Map<string, DecisionHandActualResult>();
+    const decisionKeysByHand = new Map<string, string[]>();
+    for (const key of decisionsByKey.keys()) {
+      const [tableId, , handId] = JSON.parse(key) as [string, string, string];
+      const handKey = decisionHandIdentity(tableId, handId);
+      const keys = decisionKeysByHand.get(handKey) ?? [];
+      keys.push(key);
+      decisionKeysByHand.set(handKey, keys);
+    }
     for (const row of settlementRows) {
       const settlement = JSON.parse(row.payload) as Extract<NormalizedEvent, { type: 'handSettled' }>;
-      const key = decisionHandKey(row.table_id, settlement.shoeId, settlement.handId);
-      if (!decisionsByKey.has(key)) continue;
-      if (actualResultByKey.has(key)) continue;
-      const outcomes = settlement.outcomes;
-      if (
-        outcomes
-        && typeof outcomes.bankerPair === 'boolean'
-        && typeof outcomes.playerPair === 'boolean'
-      ) {
-        actualResultByKey.set(key, {
-          status: 'SETTLED',
-          outcomes: {
-            bankerPair: outcomes.bankerPair,
-            playerPair: outcomes.playerPair,
-          },
-        });
-      } else {
-        actualResultByKey.set(key, { status: 'UNKNOWN' });
+      const result = settlementActualResult(settlement);
+      const exactKey = decisionHandKey(row.table_id, settlement.shoeId, settlement.handId);
+      if (decisionsByKey.has(exactKey) && !actualResultByKey.has(exactKey)) {
+        actualResultByKey.set(exactKey, result);
+      }
+      const handKeys = decisionKeysByHand.get(decisionHandIdentity(row.table_id, settlement.handId)) ?? [];
+      if (handKeys.length === 1) {
+        const onlyKey = handKeys[0]!;
+        if (!actualResultByKey.has(onlyKey)) actualResultByKey.set(onlyKey, result);
       }
     }
 
@@ -1250,12 +1284,9 @@ export class SqliteLedger {
   }
 
   getSettledOutcome(tableId: string, shoeId: string, handId: string, market: string): boolean | undefined {
-    const row = this.db.prepare('SELECT payload FROM events WHERE table_id = ? AND type = \'handSettled\' AND json_extract(payload, \'$.shoeId\') = ? AND json_extract(payload, \'$.handId\') = ? ORDER BY id DESC LIMIT 1').get(tableId, shoeId, handId) as { payload: string } | undefined;
-    if (!row) return undefined;
-    const payload = JSON.parse(row.payload) as {
-      outcomes?: { bankerPair?: unknown; playerPair?: unknown } | null;
-    };
-    const outcomes = payload.outcomes;
+    const settlement = this.getHandSettlement(tableId, shoeId, handId);
+    if (!settlement) return undefined;
+    const outcomes = settlement.outcomes;
     if (
       !outcomes
       || typeof outcomes.bankerPair !== 'boolean'
@@ -1392,13 +1423,28 @@ export class SqliteLedger {
       }
 
       if (typeof latestShoe?.shoeId === 'string' && latestShoe.shoeId.length > 0) {
-        this.db.prepare(`
-          DELETE FROM events
-          WHERE table_id = ?
-            AND type != 'newShoeSignal'
-            AND json_extract(payload, '$.shoeId') IS NOT NULL
-            AND json_extract(payload, '$.shoeId') != ?
-        `).run(tableId, latestShoe.shoeId);
+        if (keep.size > 0) {
+          const placeholders = [...keep].map(() => '?').join(',');
+          this.db.prepare(`
+            DELETE FROM events
+            WHERE table_id = ?
+              AND type != 'newShoeSignal'
+              AND json_extract(payload, '$.shoeId') IS NOT NULL
+              AND json_extract(payload, '$.shoeId') != ?
+              AND NOT (
+                type = 'handSettled'
+                AND json_extract(payload, '$.handId') IN (${placeholders})
+              )
+          `).run(tableId, latestShoe.shoeId, ...keep);
+        } else {
+          this.db.prepare(`
+            DELETE FROM events
+            WHERE table_id = ?
+              AND type != 'newShoeSignal'
+              AND json_extract(payload, '$.shoeId') IS NOT NULL
+              AND json_extract(payload, '$.shoeId') != ?
+          `).run(tableId, latestShoe.shoeId);
+        }
       }
 
       this.db.prepare(`

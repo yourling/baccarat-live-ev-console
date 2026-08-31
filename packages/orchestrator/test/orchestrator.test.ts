@@ -697,6 +697,66 @@ describe('orchestrator table actor', () => {
     ledger.close();
   });
 
+  it('does not persist a precommit window rejection so the same hand can retry', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile = simProfile();
+    let attempts = 0;
+    const executor = {
+      requestBet: async (request: { readonly intent: BetIntent; readonly reservationId?: string }) => {
+        attempts += 1;
+        if (attempts === 1) {
+          return {
+            receiptId: 'window-not-ready',
+            intentId: request.intent.intentId,
+            reservationId: request.reservationId ?? '',
+            status: 'REJECTED' as const,
+            amount: request.intent.amount,
+            market: request.intent.market,
+            mode: request.intent.mode,
+            createdAt: new Date().toISOString(),
+            raw: { reason: 'request-unavailable:round-not-current', commitStarted: false },
+          };
+        }
+        return {
+          receiptId: 'retry-accepted',
+          intentId: request.intent.intentId,
+          reservationId: request.reservationId ?? '',
+          status: 'ACCEPTED' as const,
+          amount: request.intent.amount,
+          market: request.intent.market,
+          mode: request.intent.mode,
+          createdAt: new Date().toISOString(),
+        };
+      },
+    };
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor });
+    const actor = orchestrator.registerTable(profile, 'simulated', 10);
+    const first = new FixtureBuilder('t1')
+      .newShoe('s1', profile)
+      .openWindow('s1', 'h1', 'bankerPair')
+      .build();
+    await Promise.all(first.map(event => orchestrator.enqueue('t1', event)));
+    await actor.flush();
+    expect(ledger.listReceipts('t1')).toEqual([]);
+    expect(orchestrator.getReservations('t1')[0]?.status).toBe('RELEASED');
+
+    const retryWindow: NormalizedEvent = {
+      type: 'bettingWindowOpened',
+      eventId: newId('evt'),
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: ledger.nextSourceSeq('t1'),
+      shoeId: 's1',
+      handId: 'h1',
+      market: 'bankerPair',
+    };
+    await orchestrator.enqueue('t1', retryWindow);
+    await actor.flush();
+    expect(attempts).toBe(2);
+    expect(ledger.listReceipts('t1')[0]?.receipt.status).toBe('ACCEPTED');
+    ledger.close();
+  });
+
   it('keeps an unknown acknowledgement active and disarms automatic betting', async () => {
     // Given: the platform may have received the bet but no authoritative acknowledgement arrives.
     const { ledger, riskLimits } = makeContext();
