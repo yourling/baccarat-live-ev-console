@@ -311,6 +311,7 @@ describe('PragmaticProtocolState', () => {
     const started = protocol.ingest(message('startshuffling', { table, seq: 10 }));
     const token = started?.tables[0]?.shoeReset;
     expect(token).toEqual(expect.stringMatching(/^protocol:h22z8qhp17sa0vkh:10$/));
+    expect(started?.tables[0]?.shuffleEvent).toBe(true);
 
     const during = protocol.ingest(JSON.stringify({
       currentShoe: { cc: '0', code: 'blue', changeShoe: 'true', seq: 18 },
@@ -318,15 +319,18 @@ describe('PragmaticProtocolState', () => {
     expect(during?.tables[0]).toEqual(expect.objectContaining({
       tableId: table,
       shoeReset: token,
+      shuffleEvent: true,
     }));
 
     const ended = protocol.ingest(message('endshuffling', { table, game: '', seq: 40 }));
     expect(ended?.tables[0]?.shoeReset).toBe(token);
+    expect(ended?.tables[0]?.shuffleEvent).toBe(true);
 
     const after = protocol.ingest(JSON.stringify({
       currentShoe: { cc: '0', code: 'blue', changeShoe: 'true', seq: 55 },
     }));
     expect(after?.tables[0]?.shoeReset).toBe(token);
+    expect(after?.tables[0]?.shuffleEvent).toBeUndefined();
   });
 
   it('does not guess a currentShoe table while two tables are shuffling', () => {

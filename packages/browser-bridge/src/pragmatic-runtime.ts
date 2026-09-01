@@ -19,6 +19,7 @@ export interface PragmaticTableSnapshot {
   readonly visible?: boolean;
   readonly minBet?: number;
   readonly shoeReset?: string;
+  readonly shuffleEvent?: boolean;
   readonly source?: 'dom' | 'protocol';
   readonly gameSettled?: boolean;
 }
@@ -315,17 +316,8 @@ export class PragmaticRuntimeParser {
   ): void {
     const tableId = table.tableId;
 
-    if (typeof table.shoeReset === 'string' && table.shoeReset.length > 0) {
-      const previousToken = this.lastShoeResetByTable.get(tableId);
-      if (previousToken !== table.shoeReset) {
-        this.lastShoeResetByTable.set(tableId, table.shoeReset);
-        this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
-        // First token is attach, not a shuffle. Only a later token change is physical.
-        if (previousToken !== undefined) {
-          this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
-        }
-      }
-    }
+    this.ingestShoeReset(table, observedAt, events);
+
 
     if (Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1) {
       const previous = this.lastGameCountByTable.get(tableId);
@@ -430,6 +422,44 @@ export class PragmaticRuntimeParser {
       schemaVersion: EVENT_SCHEMA_VERSION,
       ...extra,
     } as NormalizedEvent;
+  }
+
+  private ingestShoeReset(
+    table: PragmaticTableSnapshot,
+    observedAt: string,
+    events: NormalizedEvent[],
+  ): void {
+    const tableId = table.tableId;
+    const token = typeof table.shoeReset === 'string' && table.shoeReset.length > 0
+      ? table.shoeReset
+      : undefined;
+    const shuffleEvent = table.shuffleEvent === true;
+    if (token === undefined) {
+      if (shuffleEvent) this.promoteProtocolShuffle(tableId, observedAt, events);
+      return;
+    }
+    const previousToken = this.lastShoeResetByTable.get(tableId);
+    if (previousToken !== token) {
+      this.lastShoeResetByTable.set(tableId, token);
+      this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
+      // A leftover currentShoe token on first attach is not a shuffle.
+      // startshuffling/endshuffling sets shuffleEvent even on the first token.
+      if (previousToken !== undefined || shuffleEvent) {
+        this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
+      }
+      return;
+    }
+    if (shuffleEvent) this.promoteProtocolShuffle(tableId, observedAt, events);
+  }
+
+  private promoteProtocolShuffle(
+    tableId: string,
+    observedAt: string,
+    events: NormalizedEvent[],
+  ): void {
+    if (this.evidenceByTable.get(tableId)?.reason === 'protocol-shuffle') return;
+    this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
+    this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
   }
 
   private ensureShoe(

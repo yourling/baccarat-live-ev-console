@@ -532,7 +532,7 @@ export class DesktopConsoleService {
         const tableId = normalizeOptionalMonitorTableId(table.tableId);
         if (tableId === undefined || this.monitorTableIds.includes(tableId)) continue;
         const gameCount = table.gameCount;
-        if (!Number.isInteger(gameCount) || (gameCount ?? -1) < 0) continue;
+        if (!Number.isInteger(gameCount) || (gameCount ?? 0) < 1) continue;
         const previous = this.pendingGameCountByTable.get(tableId);
         this.pendingGameCountByTable.set(tableId, gameCount!);
         if (isJoinableNewShoeRoadCount(previous, gameCount!)) this.promotePendingTable(tableId);

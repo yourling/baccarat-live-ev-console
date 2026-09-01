@@ -18,6 +18,7 @@ interface ProtocolTableState {
   previousRoundIds: string[];
   rounds: Map<string, RoundCards>;
   shoeReset?: string;
+  shuffleEvent?: boolean;
 }
 
 interface FinishedShuffle {
@@ -373,6 +374,7 @@ function snapshotOf(state: ProtocolTableState, roundId: string | undefined, obse
     source: 'protocol',
     ...(cards.gameSettled === true ? { gameSettled: true } : {}),
     ...(state.shoeReset === undefined ? {} : { shoeReset: state.shoeReset }),
+    ...(state.shuffleEvent === true ? { shuffleEvent: true } : {}),
   };
   return { version: 1, view: 'multi', observedAt, tables: [table] };
 }
@@ -406,7 +408,9 @@ export class PragmaticProtocolState {
       if (applied.snapshotRoundId !== undefined) snapshotRoundId = applied.snapshotRoundId;
     }
     this.tables.set(tableId, state);
-    return changed ? snapshotOf(state, snapshotRoundId, observedAt) : undefined;
+    const snapshot = changed ? snapshotOf(state, snapshotRoundId, observedAt) : undefined;
+    if (state.shuffleEvent) state.shuffleEvent = false;
+    return snapshot;
   }
 
   snapshot(tableId: string, observedAt = new Date().toISOString()): PragmaticRuntimeSnapshot | undefined {
@@ -445,6 +449,7 @@ export class PragmaticProtocolState {
     this.shufflingTables.set(state.tableId, token);
     const changed = state.shoeReset !== token;
     state.shoeReset = token;
+    state.shuffleEvent = true;
     if (changed) this.clearRoundInventory(state);
     return { changed: true, snapshotRoundId: state.roundId };
   }
@@ -460,6 +465,7 @@ export class PragmaticProtocolState {
     this.lastFinishedShuffle = { tableId: state.tableId, token, seq: seq ?? 0 };
     const changed = state.shoeReset !== token;
     state.shoeReset = token;
+    state.shuffleEvent = true;
     if (changed) this.clearRoundInventory(state);
     return { changed: true, snapshotRoundId: state.roundId };
   }
@@ -564,6 +570,7 @@ export class PragmaticProtocolState {
       const activeToken = this.shufflingTables.get(state.tableId);
       if (activeToken !== undefined) {
         state.shoeReset = activeToken;
+        state.shuffleEvent = true;
         return { changed: true, snapshotRoundId: state.roundId };
       }
       if (this.lastFinishedShuffle?.tableId === state.tableId) {

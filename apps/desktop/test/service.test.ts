@@ -557,6 +557,50 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('does not forget the previous road count when shuffle briefly reports #0', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    try {
+      service['browserBridge'] = bridge;
+      service['liveMonitorActivated'] = true;
+      await service.updateMonitorTableIds([]);
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'tobcspbaccarat92', displayName: '韩语百家乐2', gameCount: 48 }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(service.snapshot().monitorTableIds).not.toContain('tobcspbaccarat92');
+
+      bridge.ingestClientMessage({
+        kind: 'roomUpdated',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'tobcspbaccarat92', displayName: '韩语百家乐2', gameCount: 0 }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(service.snapshot().monitorTableIds).not.toContain('tobcspbaccarat92');
+
+      bridge.ingestClientMessage({
+        kind: 'roomUpdated',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'tobcspbaccarat92', displayName: '韩语百家乐2', gameCount: 1 }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(service.snapshot().monitorTableIds).toContain('tobcspbaccarat92');
+    } finally {
+      await service.close();
+    }
+  });
+
   it('lets keepalive target a pending table without arming pair bets', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();

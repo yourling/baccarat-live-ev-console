@@ -167,6 +167,56 @@ describe('PragmaticRuntimeParser', () => {
     expect(parser.shoeEvidence('bc281koreanch281')).toEqual({ reason: 'attach' });
   });
 
+  it('promotes a watched table when the first shoeReset is a live shuffle event', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat92',
+      roundId: '16431832310',
+      source: 'protocol',
+      gameCount: 48,
+    }]));
+    expect(parser.shoeEvidence('tobcspbaccarat92')?.reason).toBe('attach');
+
+    const shuffled = parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat92',
+      roundId: '16431832310',
+      source: 'protocol',
+      shoeReset: 'protocol:tobcspbaccarat92:10',
+      shuffleEvent: true,
+    }]));
+    expect(shuffled.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({
+        type: 'newShoeSignal',
+        baseline: 'physical-shoe',
+      }),
+    ]);
+    expect(parser.shoeEvidence('tobcspbaccarat92')).toEqual({ reason: 'protocol-shuffle' });
+  });
+
+  it('promotes after an attach token when the same token later arrives as a shuffle event', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      roundId: '16432040410',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+      gameCount: 22,
+    }]));
+    expect(parser.shoeEvidence('spto41bctorobc41')?.reason).toBe('attach');
+
+    const shuffled = parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      roundId: '16432040410',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+      shuffleEvent: true,
+    }]));
+    expect(shuffled.find(event => event.type === 'newShoeSignal')).toEqual(expect.objectContaining({
+      baseline: 'physical-shoe',
+    }));
+    expect(parser.shoeEvidence('spto41bctorobc41')).toEqual({ reason: 'protocol-shuffle' });
+  });
+
   it('records protocol-shuffle evidence when the shoeReset token changes', () => {
     const parser = new PragmaticRuntimeParser();
     parser.parse(snapshot([{
