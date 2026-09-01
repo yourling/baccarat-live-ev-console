@@ -1,8 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { OperationalWagerExecutionRequest } from '@baccarat/adapter-contract';
 import { BrowserBridgeServer, OperationalWagerRuntimeRevisionError } from '@baccarat/browser-bridge';
-import { EVENT_SCHEMA_VERSION, defaultProfile, type NormalizedEvent } from '@baccarat/contracts';
+import { EVENT_SCHEMA_VERSION, defaultProfile, defaultRiskLimits, type NormalizedEvent } from '@baccarat/contracts';
+import { SqliteLedger } from '@baccarat/ledger-state';
+import { RiskManager } from '@baccarat/risk-execution';
 import type { TableExport } from '@baccarat/room-monitor';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { parseDesktopKeepaliveSettings, parseDesktopPendingSettlementCommand } from '../src/api-types.js';
 import { DesktopConsoleService } from '../electron-src/service.js';
 
@@ -839,6 +844,79 @@ describe('DesktopConsoleService operational wagers', () => {
       }));
     } finally {
       await service.close();
+    }
+  });
+
+  it('recovers committed unknown pair receipts against the stored hand settlement', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'baccarat-unknown-ledger-'));
+    const dbPath = join(dir, 'console.sqlite');
+    const tableId = 'tobcspbaccarat92';
+    const shoeId = 'shoe-recover';
+    const handId = '16431851710';
+    const ledger = new SqliteLedger(dbPath);
+    const risk = new RiskManager(ledger);
+    const profile = { ...defaultProfile(tableId), limits: { minBet: 1, maxBet: 1000 } };
+    const reserved = risk.tryReserve({
+      intentId: 'int-recover',
+      tableId,
+      shoeId,
+      handId,
+      market: 'bankerPair',
+      amount: 20,
+      mode: 'live',
+      idempotencyKey: `${tableId}:${shoeId}:${handId}:bankerPair:recover`,
+      strategy: { type: 'fixed', market: 'bankerPair' },
+      decisionSnapshotId: 'dec-recover',
+      createdAt: '2026-09-01T18:30:00.000Z',
+    }, profile, {
+      ...defaultRiskLimits,
+      defaultExposureCap: 100_000,
+      perTableLossLimit: 100_000,
+      perShoeLossLimit: 100_000,
+      perDayLossLimit: 1_000_000,
+      maxConcurrentExecutions: 4,
+      insufficientBehavior: 'skip',
+    });
+    expect(reserved.ok).toBe(true);
+    const reservationId = reserved.reservation!.reservationId;
+    expect(risk.markUnknown(reservationId, 'platform-acknowledgement-unknown', 'receipt-recover')).toBe(true);
+    ledger.saveReceipt({
+      receiptId: 'receipt-recover',
+      intentId: 'int-recover',
+      reservationId,
+      status: 'UNKNOWN',
+      amount: 20,
+      market: 'bankerPair',
+      mode: 'live',
+      createdAt: '2026-09-01T18:30:00.886Z',
+      raw: { commitStarted: true, reason: 'round-advanced-before-ack' },
+    }, tableId, shoeId, handId, 'bankerPair');
+    expect(ledger.appendEvent({
+      type: 'handSettled',
+      eventId: 'evt-recover-settled',
+      tableId,
+      timestamp: '2026-09-01T18:30:20.000Z',
+      sourceSeq: 1,
+      source: 'pragmatic-runtime',
+      schemaVersion: EVENT_SCHEMA_VERSION,
+      shoeId,
+      handId,
+      playerCards: [{ rank: 'K' }, { rank: 'Q' }],
+      bankerCards: [{ rank: 'A' }, { rank: 'A' }],
+      outcomes: { bankerPair: true, playerPair: false },
+    })).toBe('appended');
+    ledger.close();
+
+    const service = new DesktopConsoleService(dbPath);
+    try {
+      expect(service.snapshot().reservations.find(row => row.reservationId === reservationId)).toEqual(expect.objectContaining({
+        status: 'SETTLED',
+        releaseReason: 'committed-hand-settled',
+        realizedPnl: 220,
+      }));
+    } finally {
+      await service.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

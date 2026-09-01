@@ -385,6 +385,7 @@ export class TableActor {
     };
     this.riskManager.settleHand(this.tableId, event.shoeId, event.handId, settlement);
     this.settleCommittedUnknownOperationalWagers(event, settlement);
+    this.settleCommittedUnknownReceipts(event, settlement);
   }
 
   private settleCommittedUnknownOperationalWagers(
@@ -419,6 +420,37 @@ export class TableActor {
         reason: 'committed-hand-settled',
         reconciledAt: new Date().toISOString(),
       });
+    }
+  }
+
+  private settleCommittedUnknownReceipts(
+    event: Extract<NormalizedEvent, { type: 'handSettled' }>,
+    settlement: {
+      outcomes?: { bankerPair: boolean; playerPair: boolean };
+      playerCards: readonly { rank: string }[];
+      bankerCards: readonly { rank: string }[];
+    },
+  ): void {
+    for (const reservation of this.riskManager.snapshot(this.tableId)) {
+      if (reservation.status !== 'UNKNOWN') continue;
+      if (reservation.handId !== event.handId) continue;
+      const stored = this.ledger.getReceipt(
+        this.tableId,
+        reservation.shoeId,
+        reservation.handId,
+        reservation.market,
+      ) ?? (
+        reservation.shoeId === event.shoeId
+          ? undefined
+          : this.ledger.getReceipt(this.tableId, event.shoeId, event.handId, reservation.market)
+      );
+      if (stored?.receipt.status !== 'UNKNOWN') continue;
+      if (!operationalReceiptCommitStarted(stored.receipt.raw)) continue;
+      try {
+        this.riskManager.settleUnknown(reservation.reservationId, settlement, 'committed-hand-settled');
+      } catch {
+        continue;
+      }
     }
   }
 

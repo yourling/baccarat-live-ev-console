@@ -819,9 +819,21 @@ export class DesktopConsoleService {
     for (const reservation of this.orchestrator.getReservations()) {
       if (reservation.status !== 'UNKNOWN') continue;
       const record = records.find(candidate => candidate.reservationId === reservation.reservationId);
-      if (record === undefined || record.status !== 'UNKNOWN') continue;
-      if (record.receipt?.status !== 'UNKNOWN') continue;
-      if (!operationalReceiptCommitStarted(record.receipt?.raw)) continue;
+      const receipt = this.ledger.getReceipt(
+        reservation.tableId,
+        reservation.shoeId,
+        reservation.handId,
+        reservation.market,
+      )?.receipt;
+      const committedUnknown = (
+        record?.status === 'UNKNOWN'
+        && record.receipt?.status === 'UNKNOWN'
+        && operationalReceiptCommitStarted(record.receipt?.raw)
+      ) || (
+        receipt?.status === 'UNKNOWN'
+        && operationalReceiptCommitStarted(receipt.raw)
+      );
+      if (!committedUnknown) continue;
       const settlement = this.ledger.getHandSettlement(
         reservation.tableId,
         reservation.shoeId,
@@ -841,7 +853,7 @@ export class DesktopConsoleService {
       } catch {
         continue;
       }
-      if (record.reconciliation !== undefined) continue;
+      if (record === undefined || record.reconciliation !== undefined) continue;
       this.ledger.reconcileOperationalWager(record.wager.wagerId, {
         status: 'ACCEPTED',
         reason: 'committed-hand-settled',
