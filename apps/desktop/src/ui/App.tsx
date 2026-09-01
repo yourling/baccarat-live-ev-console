@@ -1186,7 +1186,7 @@ function TableMonitorRow(props: {
         </strong>
       </td>
       <td data-label="自动"><strong>{shortAutoBetLabel(projection.autoBetStatus)}</strong></td>
-      <td data-label="剩余"><strong>{physicalShoeKnown ? `${projection.remainingTotal} 张` : '未知'}</strong></td>
+      <td data-label="剩余"><strong>{physicalShoeKnown ? `${projection.remainingTotal} 张` : '未知'}</strong><br /><span className="muted">{physicalShoeKnown ? '实体新靴' : '待牌靴'}</span></td>
       <td data-label="对子 EV">
         {bankerPair && playerPair
           ? <span className="monitor-pair-ev">

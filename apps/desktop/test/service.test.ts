@@ -404,6 +404,46 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('does not join a pending table from an unknown mid-shoe attach', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    try {
+      service['browserBridge'] = bridge;
+      service['liveMonitorActivated'] = true;
+      await service.updateMonitorTableIds([]);
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          tables: [{ tableId: 'bc281koreanch281', gameCount: 55 }],
+        },
+      });
+      await service['attachLiveTables']();
+      await service.injectEvent(monitorShoeEvent('bc281koreanch281', 'korean-attach', 'unknown-monitor-session'));
+      expect(service.snapshot().monitorTableIds).not.toContain('bc281koreanch281');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('hides full-shoe inventory when a physical label contradicts a deep road after restart', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      await service.updateMonitorTableIds(['bc281koreanch281']);
+      service['tableMetadata'].set('bc281koreanch281', {
+        tableId: 'bc281koreanch281',
+        roomId: 'dafabet-pragmatic',
+        updatedAt: '2026-09-01T00:00:00.000Z',
+        gameCount: 55,
+      });
+      await service.injectEvent(monitorShoeEvent('bc281koreanch281', 'korean-false-physical', 'physical-shoe'));
+      const projection = service.snapshot().snapshot.tables.bc281koreanch281?.projection;
+      expect(projection?.shoeBaseline).toBe('unknown-monitor-session');
+    } finally {
+      await service.close();
+    }
+  });
+
   it('joins a pending table when the road wraps to an early count after shuffle lag', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();

@@ -36,7 +36,7 @@
 
 浏览器端还会检查唯一 Dafabet Pragmatic 弹窗（`/live-dealer/popup-launch/jeju-speed-baccarat`）、唯一匹配桌台的 `client.pragmaticplaylive.net` iframe、会话 live gate、平台状态、限额、余额和未确认筹码。仓库已删除 mstrom / Evolution / 旧 live-baccarat 适配器。当前标准结算条款按庄赢净利 `0.95`、闲赢净利 `1`、和局退回本金处理；对子使用桌台配置赔率（默认净利 `11`）。最终收益由对应 reservation 的 `realizedPnl` 汇总，而不是仅按平台接受回执推算。
 
-实盘最多监控 64 张桌。新会话默认不监控任何桌；只有环境变量 BACCARAT_LIVE_TABLES 才会预填桌号。大厅里尚未入监控的 Dafabet Pragmatic 桌显示为「待加入」，实体新靴或路子明显回绕后才自动晋升。断开超过 15 秒的监控桌会被移除。
+实盘最多监控 64 张桌。新会话默认不监控任何桌；只有环境变量 BACCARAT_LIVE_TABLES 才会预填桌号。大厅里尚未入监控的 Dafabet Pragmatic 桌显示为「待加入」，仅本进程见过的协议换靴 token 变化或路子明显回绕后才标实体新靴并晋升；第一次见到 shoeReset 或路子 #55 配满靴库存仍为待牌靴。断开超过 15 秒的监控桌会被移除。
 
 ## 目录
 

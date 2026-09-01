@@ -264,7 +264,7 @@ describe('Pragmatic bridge integration', () => {
     await server.close();
   });
 
-  it('opens a physical shoe from a DOM road count after protocol hands piled up', async () => {
+  it('does not open a physical shoe from a DOM road count after protocol hands piled up', async () => {
     const tableId = 'spto21bctorobc21';
     const server = new BrowserBridgeServer({ selectedTableIds: [tableId] });
     for (let index = 0; index < 24; index += 1) {
@@ -293,8 +293,10 @@ describe('Pragmatic bridge integration', () => {
     const events: NormalizedEvent[] = [];
     await feed.start({ onBatch: batch => { events.push(...batch.events); } });
     await feed.flush();
-    const shoesBefore = events.filter(event => event.type === 'newShoeSignal').length;
-    expect(shoesBefore).toBe(1);
+    expect(events.filter(event => event.type === 'newShoeSignal')).toHaveLength(1);
+    expect(events.find(event => event.type === 'newShoeSignal')).toEqual(expect.objectContaining({
+      baseline: 'unknown-monitor-session',
+    }));
 
     server.ingestClientMessage(capture([{
       tableId,
@@ -308,28 +310,7 @@ describe('Pragmatic bridge integration', () => {
       source: 'dom',
     }], '2026-08-31T12:00:00.000Z'));
     await feed.flush();
-
-    const shoes = events.filter(event => event.type === 'newShoeSignal');
-    expect(shoes).toHaveLength(2);
-    expect(shoes[1]).toEqual(expect.objectContaining({
-      type: 'newShoeSignal',
-      baseline: 'physical-shoe',
-      shoeId: `pragmatic-${tableId}-2`,
-    }));
-    expect(events.filter(event => event.type === 'cardObserved' && event.shoeId === `pragmatic-${tableId}-2`))
-      .toHaveLength(0);
-
-    server.ingestClientMessage(capture([{
-      tableId,
-      roundId: '16407324910',
-      gameCount: 5,
-      bettingOpen: true,
-      countdown: 5,
-      visible: true,
-      source: 'dom',
-    }], '2026-08-31T12:00:01.000Z'));
-    await feed.flush();
-    expect(events.filter(event => event.type === 'newShoeSignal')).toHaveLength(2);
+    expect(events.filter(event => event.type === 'newShoeSignal')).toHaveLength(1);
 
     await server.close();
   });

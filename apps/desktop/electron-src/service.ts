@@ -19,6 +19,7 @@ import {
   operationalReceiptCommitStarted,
   type MonitorSummary,
   type MonitorSummaryOptions,
+  effectiveShoeBaseline,
 } from '@baccarat/ledger-state';
 import {
   Orchestrator,
@@ -240,7 +241,7 @@ function defaultMonitorTableIds(): string[] {
 
 function isRetiredDefaultMonitorList(tableIds: readonly string[]): boolean {
   if (tableIds.length !== RETIRED_DEFAULT_MONITOR_TABLE_IDS.length) return false;
-  const expected = new Set(RETIRED_DEFAULT_MONITOR_TABLE_IDS);
+  const expected = new Set<string>(RETIRED_DEFAULT_MONITOR_TABLE_IDS);
   return tableIds.every(tableId => expected.has(tableId));
 }
 
@@ -457,34 +458,10 @@ export class DesktopConsoleService {
     this.recoverMissedShuffles(rooms);
   }
 
-  private recoverMissedShuffles(rooms: readonly RoomDescriptor[]): void {
-    if (!this.browserBridge) return;
-    const liveGameCount = new Map<string, number>();
-    for (const room of rooms) {
-      for (const table of room.tables) {
-        if (Number.isInteger(table.gameCount) && (table.gameCount ?? -1) >= 0) {
-          liveGameCount.set(table.tableId, table.gameCount!);
-        }
-      }
-    }
-    for (const tableId of this.monitorTableIds) {
-      const gameCount = liveGameCount.get(tableId);
-      if (gameCount === undefined) continue;
-      const projection = this.orchestrator.getActor(tableId)?.peekProjection();
-      if (projection === undefined || projection.shoeBaseline !== 'physical-shoe') {
-        this.missedShuffleRequested.delete(tableId);
-        continue;
-      }
-      if (!(gameCount <= 8 && projection.handNumber > gameCount + 16)) {
-        this.missedShuffleRequested.delete(tableId);
-        continue;
-      }
-      const parserShoeId = this.browserBridge.currentPragmaticShoeId(tableId);
-      if (parserShoeId !== undefined && parserShoeId !== projection.shoeId) continue;
-      if (this.missedShuffleRequested.has(tableId)) continue;
-      this.missedShuffleRequested.add(tableId);
-      this.browserBridge.openPhysicalShoe(tableId);
-    }
+  private recoverMissedShuffles(_rooms: readonly RoomDescriptor[]): void {
+    // Automatic physical shoes come only from protocol token change or road wrap
+    // in the parser. Do not invent a full 8-deck shoe from lagged DOM counts.
+    this.missedShuffleRequested.clear();
   }
 
   private persistTableMetadata(): void {
@@ -814,7 +791,14 @@ export class DesktopConsoleService {
         },
       }),
       maxFeedStalenessMs: MAX_LIVE_FEED_STALENESS_MS,
-      projection: actor.peekProjection(),
+      projection: (() => {
+        const projection = actor.peekProjection();
+        const gameCount = this.tableMetadata.get(tableId)?.gameCount;
+        const baseline = effectiveShoeBaseline(projection, gameCount);
+        return baseline === projection.shoeBaseline
+          ? projection
+          : { ...projection, shoeBaseline: baseline };
+      })(),
       hasUnknownExecution: false,
       hasSettlementGap: this.hasSettlementGap(tableId),
     });
@@ -1195,8 +1179,9 @@ export class DesktopConsoleService {
     const actor = this.orchestrator.getActor(tableId);
     if (!actor) return;
     const projection = actor.getProjection();
+    const gameCount = this.tableMetadata.get(tableId)?.gameCount;
     const canArm = projection.autoBetStatus === 'DISARMED'
-      && projection.shoeBaseline === 'physical-shoe'
+      && effectiveShoeBaseline(projection, gameCount) === 'physical-shoe'
       && projection.connectionStatus === 'CONNECTED'
       && !projection.sealed
       && (projection.status === 'TRACKING'
@@ -1746,7 +1731,13 @@ export class DesktopConsoleService {
     const tables = Object.fromEntries(
       displayedTableIds.flatMap(tableId => {
         const table = fullSnapshot.tables[tableId];
-        return table === undefined ? [] : [[tableId, table]];
+        if (table === undefined) return [];
+        const gameCount = this.tableMetadata.get(tableId)?.gameCount;
+        const baseline = effectiveShoeBaseline(table.projection, gameCount);
+        const next = baseline === table.projection.shoeBaseline
+          ? table
+          : { ...table, projection: { ...table.projection, shoeBaseline: baseline } };
+        return [[tableId, next]];
       }),
     );
     const snapshot: OrchestratorSnapshot = { ...fullSnapshot, tables };

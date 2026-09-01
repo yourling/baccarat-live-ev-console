@@ -70,7 +70,7 @@ describe('PragmaticRuntimeParser', () => {
     expect(laterTick.filter(event => event.type === 'bettingWindowOpened')).toHaveLength(0);
   });
 
-  it('promotes an attached monitor session to a physical shoe on protocol shuffle', () => {
+  it('keeps the first shoeReset token as an unknown attach, not a physical shoe', () => {
     const parser = new PragmaticRuntimeParser();
     const attached = parser.parse(snapshot([{
       tableId: 'h22z8qhp17sa0vkh',
@@ -82,21 +82,15 @@ describe('PragmaticRuntimeParser', () => {
       baseline: 'unknown-monitor-session',
     }));
 
-    const shuffled = parser.parse(snapshot([{
+    const firstToken = parser.parse(snapshot([{
       tableId: 'h22z8qhp17sa0vkh',
       roundId: '16387766710',
       bettingOpen: true,
       source: 'protocol',
       shoeReset: 'protocol:h22z8qhp17sa0vkh:10',
+      gameCount: 55,
     }]));
-    const shoes = shuffled.filter(event => event.type === 'newShoeSignal');
-    expect(shoes).toEqual([
-      expect.objectContaining({
-        type: 'newShoeSignal',
-        baseline: 'physical-shoe',
-        shoeId: 'pragmatic-h22z8qhp17sa0vkh-2',
-      }),
-    ]);
+    expect(firstToken.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
 
     const sameCycle = parser.parse(snapshot([{
       tableId: 'h22z8qhp17sa0vkh',
@@ -104,8 +98,53 @@ describe('PragmaticRuntimeParser', () => {
       bettingOpen: true,
       source: 'protocol',
       shoeReset: 'protocol:h22z8qhp17sa0vkh:10',
+      gameCount: 55,
     }]));
     expect(sameCycle.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+  });
+
+  it('promotes to a physical shoe only after a later shoeReset token change', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh',
+      roundId: '16387761010',
+      source: 'protocol',
+      shoeReset: 'protocol:h22z8qhp17sa0vkh:10',
+      gameCount: 55,
+    }]));
+    const shuffled = parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh',
+      roundId: '16387766710',
+      bettingOpen: true,
+      source: 'protocol',
+      shoeReset: 'protocol:h22z8qhp17sa0vkh:20',
+    }]));
+    expect(shuffled.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({
+        type: 'newShoeSignal',
+        baseline: 'physical-shoe',
+        shoeId: 'pragmatic-h22z8qhp17sa0vkh-2',
+      }),
+    ]);
+  });
+
+  it('does not treat a mid-shoe attach with a shoeReset token as a full 8-deck shoe', () => {
+    const parser = new PragmaticRuntimeParser();
+    const events = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281',
+      roundId: '16428076310',
+      gameCount: 55,
+      bettingOpen: true,
+      source: 'protocol',
+      shoeReset: 'protocol:bc281koreanch281:99',
+      playerCards: ['QS', '9H'],
+      bankerCards: ['3S', '7D', '2C'],
+    }]));
+    const shoe = events.find(event => event.type === 'newShoeSignal') as
+      | Extract<NormalizedEvent, { type: 'newShoeSignal' }>
+      | undefined;
+    expect(shoe?.baseline).toBe('unknown-monitor-session');
+    expect(events.filter(event => event.type === 'newShoeSignal')).toHaveLength(1);
   });
 
   it('opens both pair markets from a live single-table snapshot', () => {
@@ -277,7 +316,7 @@ describe('PragmaticRuntimeParser', () => {
       .filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
   });
 
-  it('opens a physical shoe when the road count is far behind tracked hands', () => {
+  it('does not open a physical shoe from tracked-hand lag against a low road count', () => {
     const parser = new PragmaticRuntimeParser();
     const tableId = 'spto21bctorobc21';
     for (let index = 0; index < 24; index += 1) {
@@ -292,30 +331,7 @@ describe('PragmaticRuntimeParser', () => {
     }
 
     const reset = parser.parse(snapshot([{ tableId, gameCount: 5 }]));
-    expect(reset).toEqual([
-      expect.objectContaining({
-        type: 'newShoeSignal',
-        baseline: 'physical-shoe',
-        shoeId: `pragmatic-${tableId}-2`,
-      }),
-    ]);
-
-    expect(parser.parse(snapshot([{ tableId, gameCount: 5 }]))).toEqual([]);
-    expect(parser.parse(snapshot([{ tableId, roundId: '16407324910', gameCount: 5 }]))
-      .filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
-
-    const dealt = parser.parse(snapshot([{
-      tableId,
-      roundId: '16407324910',
-      gameCount: 5,
-      bettingOpen: false,
-      playerCards: ['2C', '2S'],
-      bankerCards: ['AH', '6D'],
-      source: 'protocol',
-    }]));
-    const cards = dealt.filter(event => event.type === 'cardObserved');
-    expect(cards).toHaveLength(4);
-    expect(cards.every(event => event.shoeId === `pragmatic-${tableId}-2`)).toBe(true);
+    expect(reset.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
   });
 
   it('does not treat a nearby road count as a missed shuffle', () => {

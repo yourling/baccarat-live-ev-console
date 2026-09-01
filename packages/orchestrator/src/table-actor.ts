@@ -23,6 +23,7 @@ import {
 import {
   SqliteLedger,
   applyEvent,
+  effectiveShoeBaseline,
   emptyProjection,
   modelRevisionFor,
   operationalReceiptCommitStarted,
@@ -420,7 +421,7 @@ export class TableActor {
   ): Promise<void> {
     if (event.shoeId !== projection.shoeId || projection.sealed) return;
     if (projection.status !== 'BETTING_WINDOW') return;
-    if (projection.shoeBaseline !== 'physical-shoe') {
+    if (effectiveShoeBaseline(projection) !== 'physical-shoe') {
       this.requestKeepalive();
       return;
     }
