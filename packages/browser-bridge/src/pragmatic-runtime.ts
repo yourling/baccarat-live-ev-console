@@ -41,6 +41,7 @@ export function isRoadWrapToNewShoe(
 ): boolean {
   return previous !== undefined
     && previous >= ROAD_WRAP_MIN_PREVIOUS
+    && gameCount >= 1
     && gameCount <= ROAD_WRAP_MAX
     && previous - gameCount >= ROAD_WRAP_MIN_DROP;
 }
@@ -53,6 +54,7 @@ export function isJoinableNewShoeRoadCount(
   if (isRoadWrapToNewShoe(previous, gameCount)) return true;
   return previous !== undefined
     && previous >= ROAD_WRAP_MIN_PREVIOUS
+    && gameCount >= 1
     && gameCount <= 8
     && previous - gameCount >= ROAD_WRAP_MIN_DROP;
 }
@@ -208,7 +210,7 @@ export function pragmaticGameCountSnapshot(raw: string): string | undefined {
   const tables: Array<{ tableId: string; gameCount: number }> = [];
   for (const table of snapshot.tables) {
     if (!table || typeof table.tableId !== 'string' || table.tableId.length === 0) continue;
-    if (!Number.isInteger(table.gameCount) || (table.gameCount ?? -1) < 0) continue;
+    if (!Number.isInteger(table.gameCount) || (table.gameCount ?? 0) < 1) continue;
     tables.push({ tableId: table.tableId, gameCount: table.gameCount! });
   }
   if (tables.length === 0) return undefined;
@@ -323,7 +325,7 @@ export class PragmaticRuntimeParser {
       }
     }
 
-    if (Number.isInteger(table.gameCount) && (table.gameCount ?? -1) >= 0) {
+    if (Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1) {
       const previous = this.lastGameCountByTable.get(tableId);
       const gameCount = table.gameCount!;
       if (isPhysicalShoeFromRoadCount(previous, gameCount)) {

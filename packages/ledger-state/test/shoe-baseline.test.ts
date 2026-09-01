@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { defaultProfile } from '@baccarat/contracts';
 import { emptyProjection } from '../src/projection.js';
-import { effectiveShoeBaseline, explainShoeBaseline, initialShoeTotal, isVerifiedPhysicalShoeReason, shoeBaselineReasonLabel } from '../src/shoe-baseline.js';
+import { effectiveShoeBaseline, explainShoeBaseline, initialShoeTotal, isVerifiedPhysicalShoeEvidence, isVerifiedPhysicalShoeReason, shoeBaselineReasonLabel } from '../src/shoe-baseline.js';
 
 describe('effectiveShoeBaseline', () => {
   it('keeps unknown attach unknown', () => {
@@ -69,5 +69,26 @@ describe('effectiveShoeBaseline', () => {
     expect(isVerifiedPhysicalShoeReason('manual-confirm')).toBe(true);
     expect(isVerifiedPhysicalShoeReason('attach')).toBe(false);
     expect(isVerifiedPhysicalShoeReason(undefined)).toBe(false);
+    expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 1 })).toBe(true);
+    expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 0 })).toBe(false);
+  });
+
+  it('rejects remaining 22 on road #51 as an impossible physical shoe', () => {
+    const projection = emptyProjection('bc281koreanch281');
+    projection.shoeBaseline = 'physical-shoe';
+    projection.profileSnapshot = defaultProfile('bc281koreanch281');
+    projection.remainingTotal = 22;
+    projection.handNumber = 51;
+    projection.seenCards = Array.from({ length: 20 }, () => ({ rank: 'A' as const }));
+    expect(effectiveShoeBaseline(
+      projection,
+      51,
+      { reason: 'road-wrap', previousGameCount: 72, gameCount: 0 },
+    )).toBe('unknown-monitor-session');
+    expect(explainShoeBaseline(
+      projection,
+      51,
+      { reason: 'road-wrap', previousGameCount: 72, gameCount: 0 },
+    ).evidence.reason).toBe('inventory-contradiction');
   });
 });

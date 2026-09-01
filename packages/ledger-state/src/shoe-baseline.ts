@@ -32,6 +32,16 @@ export function isVerifiedPhysicalShoeReason(
   return reason === 'protocol-shuffle' || reason === 'road-wrap' || reason === 'manual-confirm';
 }
 
+export function isVerifiedPhysicalShoeEvidence(
+  evidence?: Pick<ShoeBaselineEvidence, 'reason' | 'gameCount'>,
+): boolean {
+  if (evidence?.reason === 'protocol-shuffle' || evidence?.reason === 'manual-confirm') return true;
+  return evidence?.reason === 'road-wrap'
+    && typeof evidence.gameCount === 'number'
+    && evidence.gameCount >= 1
+    && evidence.gameCount <= 8;
+}
+
 export function shoeBaselineReasonLabel(evidence: ShoeBaselineEvidence): string {
   switch (evidence.reason) {
     case 'attach':
@@ -45,7 +55,7 @@ export function shoeBaselineReasonLabel(evidence: ShoeBaselineEvidence): string 
     case 'manual-confirm':
       return '人工确认';
     case 'inventory-contradiction':
-      return '跟踪手数与库存矛盾';
+      return '剩余张数与路子矛盾';
     case 'restart-empty-inventory':
       return '路子已深但未见牌面';
   }
@@ -84,7 +94,7 @@ export function explainShoeBaseline(
     };
   }
   const initial = initialShoeTotal(projection.profileSnapshot.numberOfDecks);
-  const verified = isVerifiedPhysicalShoeReason(parserEvidence?.reason);
+  const verified = isVerifiedPhysicalShoeEvidence(parserEvidence);
   // Lagged DOM road counts must not demote a shoe this process already saw shuffle.
   if (
     !verified
@@ -108,6 +118,15 @@ export function explainShoeBaseline(
         ...(gameCount === undefined ? {} : { gameCount }),
       },
     };
+  }
+  if (typeof gameCount === 'number' && gameCount >= 1) {
+    const minRemaining = initial - gameCount * 6 - 20;
+    if (projection.remainingTotal < minRemaining) {
+      return {
+        baseline: 'unknown-monitor-session',
+        evidence: { reason: 'inventory-contradiction', gameCount },
+      };
+    }
   }
   return {
     baseline: 'physical-shoe',

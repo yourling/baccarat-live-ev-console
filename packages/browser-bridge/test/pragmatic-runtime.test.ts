@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { NormalizedEvent } from '@baccarat/contracts';
-import { PragmaticRuntimeParser, isJoinableNewShoeRoadCount, pragmaticGameCountSnapshot } from '../src/pragmatic-runtime.js';
+import { PragmaticRuntimeParser, isJoinableNewShoeRoadCount, isRoadWrapToNewShoe, pragmaticGameCountSnapshot } from '../src/pragmatic-runtime.js';
 import { pragmaticNetworkObservation } from '../src/server.js';
 
 function snapshot(
@@ -183,6 +183,20 @@ describe('PragmaticRuntimeParser', () => {
       shoeReset: 'protocol:h22z8qhp17sa0vkh:20',
     }]));
     expect(parser.shoeEvidence('h22z8qhp17sa0vkh')).toEqual({ reason: 'protocol-shuffle' });
+  });
+
+  it('does not treat a drop to #0 as a shuffled shoe', () => {
+    expect(isRoadWrapToNewShoe(72, 0)).toBe(false);
+    expect(isJoinableNewShoeRoadCount(72, 0)).toBe(false);
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-1', gameCount: 72,
+    }]));
+    const dropped = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 0,
+    }]));
+    expect(dropped.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+    expect(parser.shoeEvidence('bc281koreanch281')?.reason).not.toBe('road-wrap');
   });
 
   it('records road-wrap evidence on a large gameCount drop', () => {

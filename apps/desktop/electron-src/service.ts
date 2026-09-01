@@ -21,7 +21,7 @@ import {
   type MonitorSummaryOptions,
   effectiveShoeBaseline,
   explainShoeBaseline,
-  isVerifiedPhysicalShoeReason,
+  isVerifiedPhysicalShoeEvidence,
   shoeBaselineReasonLabel,
 } from '@baccarat/ledger-state';
 import {
@@ -1131,8 +1131,8 @@ export class DesktopConsoleService {
     if (event.type === 'newShoeSignal' && event.baseline === 'physical-shoe') {
       // Only protocol-shuffle, road-wrap, or manual-confirm may promote a pending
       // table. A physical label without that evidence is attach/restart noise.
-      const reason = this.browserBridge?.shoeEvidence(event.tableId)?.reason;
-      if (isVerifiedPhysicalShoeReason(reason)) this.promotePendingTable(event.tableId);
+      const evidence = this.browserBridge?.shoeEvidence(event.tableId);
+      if (isVerifiedPhysicalShoeEvidence(evidence)) this.promotePendingTable(event.tableId);
     }
     this.cachedLightSnapshot = undefined;
     await this.orchestrator.enqueue(event.tableId, event);

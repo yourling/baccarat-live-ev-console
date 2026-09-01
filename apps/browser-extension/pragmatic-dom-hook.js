@@ -148,11 +148,17 @@
     return (text.match(/ID:\s*([0-9]+|—)/) || [])[1] || '';
   }
 
+  function parseGameCountText(raw) {
+    const match = /#[\s\u00a0]*([1-9]\d{0,2})\b/.exec(clean(raw));
+    if (!match) return undefined;
+    const value = Number(match[1]);
+    return value >= 1 && value <= 150 ? value : undefined;
+  }
+
   function parseGameCount(root) {
-    const renderedText = typeof root.innerText === 'string' ? root.innerText : '';
-    const match = /#[\s\u00a0]*(\d{1,3})(?!\d)/.exec(renderedText)
-      || /#[\s\u00a0]*(\d{1,3})(?!\d)/.exec(String(root.textContent || ''));
-    return match ? Number(match[1]) : undefined;
+    const labeled = root.querySelector('.game-count, [class*="game-count" i], [data-testid*="game-count"]');
+    if (labeled) return parseGameCountText(labeled.innerText || labeled.textContent);
+    return parseGameCountText(root.innerText || root.textContent);
   }
 
   function stableGameCount(tableId, root) {

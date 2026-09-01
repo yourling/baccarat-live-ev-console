@@ -2222,8 +2222,9 @@ function safeEvaluate(
   }
 }
 
-function isVerifiedPhysicalShoeReason(reason: string | undefined): boolean {
-  return reason === 'protocol-shuffle' || reason === 'road-wrap' || reason === 'manual-confirm';
+function isVerifiedPhysicalShoeReason(reason: string | undefined, gameCount?: number): boolean {
+  if (reason === 'protocol-shuffle' || reason === 'manual-confirm') return true;
+  return reason === 'road-wrap' && typeof gameCount === 'number' && gameCount >= 1 && gameCount <= 8;
 }
 
 function isDisplayedPhysicalShoe(
@@ -2232,7 +2233,7 @@ function isDisplayedPhysicalShoe(
 ): boolean {
   return projection.shoeId.length > 0
     && projection.shoeBaseline === 'physical-shoe'
-    && (evidence === undefined || isVerifiedPhysicalShoeReason(evidence.reason));
+    && (evidence === undefined || isVerifiedPhysicalShoeReason(evidence.reason, evidence.gameCount));
 }
 
 function tableAlerts(actor: TableActorSnapshot): string[] {
