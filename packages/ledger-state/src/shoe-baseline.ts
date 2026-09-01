@@ -18,6 +18,20 @@ export interface ShoeBaselineEvidence {
   readonly gameCount?: number;
 }
 
+export const VERIFIED_PHYSICAL_SHOE_REASONS = [
+  'protocol-shuffle',
+  'road-wrap',
+  'manual-confirm',
+] as const;
+
+export type VerifiedPhysicalShoeReason = (typeof VERIFIED_PHYSICAL_SHOE_REASONS)[number];
+
+export function isVerifiedPhysicalShoeReason(
+  reason: string | undefined,
+): reason is VerifiedPhysicalShoeReason {
+  return reason === 'protocol-shuffle' || reason === 'road-wrap' || reason === 'manual-confirm';
+}
+
 export function shoeBaselineReasonLabel(evidence: ShoeBaselineEvidence): string {
   switch (evidence.reason) {
     case 'attach':
@@ -48,8 +62,9 @@ export function effectiveShoeBaseline(
     'shoeBaseline' | 'seenCards' | 'handNumber' | 'remainingTotal' | 'profileSnapshot'
   >,
   gameCount?: number,
+  parserEvidence?: ShoeBaselineEvidence,
 ): ShoeBaseline {
-  return explainShoeBaseline(projection, gameCount).baseline;
+  return explainShoeBaseline(projection, gameCount, parserEvidence).baseline;
 }
 
 export function explainShoeBaseline(
@@ -69,8 +84,11 @@ export function explainShoeBaseline(
     };
   }
   const initial = initialShoeTotal(projection.profileSnapshot.numberOfDecks);
+  const verified = isVerifiedPhysicalShoeReason(parserEvidence?.reason);
+  // Lagged DOM road counts must not demote a shoe this process already saw shuffle.
   if (
-    projection.seenCards.length < 8
+    !verified
+    && projection.seenCards.length < 8
     && typeof gameCount === 'number'
     && gameCount >= 8
   ) {

@@ -34,7 +34,7 @@ import type {
   BridgeRoomDescriptor,
   BridgeServerMessage,
 } from './protocol.js';
-import { PragmaticRuntimeParser, pragmaticGameCountSnapshot } from './pragmatic-runtime.js';
+import { PragmaticRuntimeParser, pragmaticGameCountSnapshot, type ParserShoeEvidence } from './pragmatic-runtime.js';
 import {
   PragmaticProtocolState,
   inspectPragmaticGameresult,
@@ -1145,6 +1145,10 @@ export class BrowserBridgeServer implements RoomMonitor {
 
   shoeEvidence(tableId: string) {
     return this.pragmaticParser.shoeEvidence(tableId);
+  }
+
+  recordShoeEvidence(tableId: string, evidence: ParserShoeEvidence): void {
+    this.pragmaticParser.recordShoeEvidence(tableId, evidence);
   }
 
   openPhysicalShoe(tableId: string): void {

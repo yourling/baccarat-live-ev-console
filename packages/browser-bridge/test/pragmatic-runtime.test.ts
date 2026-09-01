@@ -146,6 +146,25 @@ describe('PragmaticRuntimeParser', () => {
     expect(shoe?.baseline).toBe('unknown-monitor-session');
     expect(events.filter(event => event.type === 'newShoeSignal')).toHaveLength(1);
     expect(parser.shoeEvidence('bc281koreanch281')).toEqual({ reason: 'attach' });
+    expect(events.filter(event => event.type === 'newShoeSignal' && event.baseline === 'physical-shoe')).toHaveLength(0);
+  });
+
+  it('keeps a first shoeReset on Korean baccarat #55 with nine visible cards as an unknown attach', () => {
+    const parser = new PragmaticRuntimeParser();
+    const events = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281',
+      roundId: '16428076310',
+      gameCount: 55,
+      bettingOpen: true,
+      source: 'protocol',
+      shoeReset: 'protocol:bc281koreanch281:99',
+      playerCards: ['QS', '9H', '4C'],
+      bankerCards: ['3S', '7D', '2C', 'AH', '6D', '9S'],
+    }]));
+    expect(events.find(event => event.type === 'newShoeSignal')).toEqual(expect.objectContaining({
+      baseline: 'unknown-monitor-session',
+    }));
+    expect(parser.shoeEvidence('bc281koreanch281')).toEqual({ reason: 'attach' });
   });
 
   it('records protocol-shuffle evidence when the shoeReset token changes', () => {

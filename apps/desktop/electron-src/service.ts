@@ -21,6 +21,7 @@ import {
   type MonitorSummaryOptions,
   effectiveShoeBaseline,
   explainShoeBaseline,
+  isVerifiedPhysicalShoeReason,
   shoeBaselineReasonLabel,
 } from '@baccarat/ledger-state';
 import {
@@ -348,6 +349,8 @@ export class DesktopConsoleService {
           this.recordLiveMonitorError(error, 'scheduler-failure', 'degraded');
         });
       },
+      observedGameCount: tableId => this.tableMetadata.get(tableId)?.gameCount,
+      observedShoeEvidence: tableId => this.browserBridge?.shoeEvidence(tableId),
     });
     for (const repair of repairedAcceptedReservations) {
       const settlement = this.ledger.getHandSettlement(
@@ -797,7 +800,11 @@ export class DesktopConsoleService {
       projection: (() => {
         const projection = actor.peekProjection();
         const gameCount = this.tableMetadata.get(tableId)?.gameCount;
-        const baseline = effectiveShoeBaseline(projection, gameCount);
+        const baseline = effectiveShoeBaseline(
+          projection,
+          gameCount,
+          this.browserBridge?.shoeEvidence(tableId),
+        );
         return baseline === projection.shoeBaseline
           ? projection
           : { ...projection, shoeBaseline: baseline };
@@ -1122,10 +1129,10 @@ export class DesktopConsoleService {
     }
     if (event.type === 'bettingWindowOpened') this.detectSettlementGap(event);
     if (event.type === 'newShoeSignal' && event.baseline === 'physical-shoe') {
-      // Protocol/DOM already proved a physical new shoe. Do not wait for the
-      // road # to wrap to 0-2; that count often stays on the old shoe or skips
-      // ahead to 3-8, which left shuffled tables stuck in 待加入.
-      this.promotePendingTable(event.tableId);
+      // Only protocol-shuffle, road-wrap, or manual-confirm may promote a pending
+      // table. A physical label without that evidence is attach/restart noise.
+      const reason = this.browserBridge?.shoeEvidence(event.tableId)?.reason;
+      if (isVerifiedPhysicalShoeReason(reason)) this.promotePendingTable(event.tableId);
     }
     this.cachedLightSnapshot = undefined;
     await this.orchestrator.enqueue(event.tableId, event);
@@ -1184,7 +1191,7 @@ export class DesktopConsoleService {
     const projection = actor.getProjection();
     const gameCount = this.tableMetadata.get(tableId)?.gameCount;
     const canArm = projection.autoBetStatus === 'DISARMED'
-      && effectiveShoeBaseline(projection, gameCount) === 'physical-shoe'
+      && effectiveShoeBaseline(projection, gameCount, this.browserBridge?.shoeEvidence(tableId)) === 'physical-shoe'
       && projection.connectionStatus === 'CONNECTED'
       && !projection.sealed
       && (projection.status === 'TRACKING'
@@ -2104,6 +2111,13 @@ export class DesktopConsoleService {
       if (!actor) throw new Error(`unknown table ${tableId}`);
       if (armed && !this.automationEnabled) {
         throw new Error('global automation is disabled');
+      }
+      if (armed) {
+        const projection = actor.getProjection();
+        const gameCount = this.tableMetadata.get(tableId)?.gameCount;
+        if (effectiveShoeBaseline(projection, gameCount, this.browserBridge?.shoeEvidence(tableId)) !== 'physical-shoe') {
+          throw new Error('physical shoe baseline is unknown');
+        }
       }
       await actor.setAutoBet(armed, shoeId);
       return this.snapshot();

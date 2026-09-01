@@ -1,13 +1,24 @@
 import { describe, expect, it } from 'vitest';
 import { defaultProfile } from '@baccarat/contracts';
 import { emptyProjection } from '../src/projection.js';
-import { effectiveShoeBaseline, explainShoeBaseline, initialShoeTotal, shoeBaselineReasonLabel } from '../src/shoe-baseline.js';
+import { effectiveShoeBaseline, explainShoeBaseline, initialShoeTotal, isVerifiedPhysicalShoeReason, shoeBaselineReasonLabel } from '../src/shoe-baseline.js';
 
 describe('effectiveShoeBaseline', () => {
   it('keeps unknown attach unknown', () => {
     const projection = emptyProjection('bc281koreanch281');
     expect(effectiveShoeBaseline(projection, 55)).toBe('unknown-monitor-session');
     expect(explainShoeBaseline(projection, 55).evidence.reason).toBe('attach');
+  });
+
+  it('treats remaining 407 on road #55 with no tracked cards as unknown, not an 8-deck shoe', () => {
+    const projection = emptyProjection('bc281koreanch281');
+    projection.shoeBaseline = 'physical-shoe';
+    projection.profileSnapshot = defaultProfile('bc281koreanch281');
+    projection.remainingTotal = 407;
+    projection.seenCards = [];
+    projection.handNumber = 0;
+    expect(effectiveShoeBaseline(projection, 55)).toBe('unknown-monitor-session');
+    expect(explainShoeBaseline(projection, 55).evidence.reason).toBe('restart-empty-inventory');
   });
 
   it('rejects a physical label with almost-full inventory on a deep road after restart', () => {
@@ -32,6 +43,16 @@ describe('effectiveShoeBaseline', () => {
     expect(effectiveShoeBaseline(projection, 55)).toBe('physical-shoe');
   });
 
+  it('does not use a lagged road #55 to demote a protocol-shuffled shoe before cards arrive', () => {
+    const projection = emptyProjection('bc281koreanch281');
+    projection.shoeBaseline = 'physical-shoe';
+    projection.profileSnapshot = defaultProfile('bc281koreanch281');
+    projection.remainingTotal = initialShoeTotal(8);
+    projection.seenCards = [];
+    projection.handNumber = 0;
+    expect(effectiveShoeBaseline(projection, 55, { reason: 'protocol-shuffle' })).toBe('physical-shoe');
+  });
+
   it('rejects physical inventory that did not decrease across tracked hands', () => {
     const projection = emptyProjection('bc281koreanch281');
     projection.shoeBaseline = 'physical-shoe';
@@ -40,5 +61,13 @@ describe('effectiveShoeBaseline', () => {
     projection.seenCards = [{ rank: 'A' }, { rank: 'K' }];
     projection.handNumber = 10;
     expect(effectiveShoeBaseline(projection)).toBe('unknown-monitor-session');
+  });
+
+  it('only treats protocol-shuffle, road-wrap, and manual-confirm as verified physical evidence', () => {
+    expect(isVerifiedPhysicalShoeReason('protocol-shuffle')).toBe(true);
+    expect(isVerifiedPhysicalShoeReason('road-wrap')).toBe(true);
+    expect(isVerifiedPhysicalShoeReason('manual-confirm')).toBe(true);
+    expect(isVerifiedPhysicalShoeReason('attach')).toBe(false);
+    expect(isVerifiedPhysicalShoeReason(undefined)).toBe(false);
   });
 });

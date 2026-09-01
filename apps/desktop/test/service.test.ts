@@ -397,8 +397,32 @@ describe('desktop console demo sessions', () => {
       await service['attachLiveTables']();
       expect(service.snapshot().monitorTableIds).not.toContain('speedbca14gesbc1');
 
+      bridge.recordShoeEvidence('speedbca14gesbc1', { reason: 'protocol-shuffle' });
       await service.injectEvent(monitorShoeEvent('speedbca14gesbc1', 'speed-physical-shoe', 'physical-shoe'));
       expect(service.snapshot().monitorTableIds).toContain('speedbca14gesbc1');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('does not join a pending table from a physical label without shuffle evidence', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    try {
+      service['browserBridge'] = bridge;
+      service['liveMonitorActivated'] = true;
+      await service.updateMonitorTableIds([]);
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          tables: [{ tableId: 'bc281koreanch281', gameCount: 55 }],
+        },
+      });
+      await service['attachLiveTables']();
+      bridge.recordShoeEvidence('bc281koreanch281', { reason: 'attach' });
+      await service.injectEvent(monitorShoeEvent('bc281koreanch281', 'korean-false-physical-join', 'physical-shoe'));
+      expect(service.snapshot().monitorTableIds).not.toContain('bc281koreanch281');
     } finally {
       await service.close();
     }
@@ -421,6 +445,29 @@ describe('desktop console demo sessions', () => {
       await service['attachLiveTables']();
       await service.injectEvent(monitorShoeEvent('bc281koreanch281', 'korean-attach', 'unknown-monitor-session'));
       expect(service.snapshot().monitorTableIds).not.toContain('bc281koreanch281');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('does not present Korean baccarat #55 remaining 407 as a trusted physical shoe', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      await service.updateMonitorTableIds(['bc281koreanch281']);
+      service['tableMetadata'].set('bc281koreanch281', {
+        tableId: 'bc281koreanch281',
+        roomId: 'dafabet-pragmatic',
+        updatedAt: '2026-09-01T00:00:00.000Z',
+        gameCount: 55,
+      });
+      await service.injectEvent(monitorShoeEvent('bc281koreanch281', 'korean-attach-55', 'unknown-monitor-session'));
+      const snapshot = service.snapshot();
+      const projection = snapshot.snapshot.tables.bc281koreanch281?.projection;
+      expect(projection?.shoeBaseline).toBe('unknown-monitor-session');
+      expect(snapshot.shoeEvidence.bc281koreanch281).toEqual(expect.objectContaining({
+        reason: 'attach',
+        label: '入桌，未见洗牌',
+      }));
     } finally {
       await service.close();
     }

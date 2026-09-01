@@ -1114,4 +1114,41 @@ describe('unknown monitor-session baseline execution', () => {
     expect(actor.getProjection().shoeBaseline).toBe('unknown-monitor-session');
     ledger.close();
   });
+
+  it('does not auto-bet pairs when a physical label still has empty inventory on a deep road', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile = simProfile();
+    const requests: BetExecutionRequest[] = [];
+    const executor = {
+      requestBet: async (request: BetExecutionRequest) => {
+        requests.push(request);
+        return liveReceipt(request, 'ACCEPTED', 'live-false-physical-auto');
+      },
+    };
+    const orchestrator = new Orchestrator({
+      ledger,
+      riskLimits,
+      executor,
+      observedGameCount: () => 55,
+    });
+    const actor = orchestrator.registerTable(profile, 'live', 10);
+    const fixture = new FixtureBuilder('t1')
+      .newShoe('s1', profile)
+      .openWindow('s1', 'h1', 'bankerPair')
+      .build();
+    const physicalStart = {
+      ...fixture[0],
+      baseline: 'physical-shoe',
+    } as unknown as NormalizedEvent;
+
+    await orchestrator.enqueue('t1', physicalStart);
+    await orchestrator.enqueue('t1', fixture[1]!);
+    await actor.flush();
+
+    expect(requests).toEqual([]);
+    expect(ledger.listReceipts('t1')).toEqual([]);
+    expect(ledger.listDecisions('t1')).toEqual([]);
+    expect(actor.getProjection().shoeBaseline).toBe('physical-shoe');
+    ledger.close();
+  });
 });

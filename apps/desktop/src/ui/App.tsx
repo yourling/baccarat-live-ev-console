@@ -14,7 +14,7 @@ import type {
   ShoeStateProjection,
   TableStatus,
 } from '@baccarat/contracts';
-import type { DecisionHandRecord, OperationalWagerRecord } from '@baccarat/ledger-state';
+import { isVerifiedPhysicalShoeReason, type DecisionHandRecord, type OperationalWagerRecord } from '@baccarat/ledger-state';
 import type {
   DesktopConsoleSnapshot,
   DesktopKeepaliveState,
@@ -1050,6 +1050,7 @@ export function App() {
       {selectedMonitorTable && (
         <MonitorTableSettingsDialog
           actor={selectedMonitorTable}
+          evidence={snapshot?.shoeEvidence?.[selectedMonitorTable.tableId]}
           liveApproved={snapshot?.runtime.approvedLiveTableIds.includes(selectedMonitorTable.tableId) ?? false}
           riskLimits={snapshot?.snapshot.riskLimits}
           liveModeConfirmationOpen={pendingLiveExecutionTableId === selectedMonitorTable.tableId}
@@ -1121,7 +1122,7 @@ function TableMonitorRow(props: {
 }) {
   const { actor } = props;
   const projection = actor.projection;
-  const physicalShoeKnown = projection.shoeId.length > 0 && projection.shoeBaseline === 'physical-shoe';
+  const physicalShoeKnown = isDisplayedPhysicalShoe(projection, props.evidence);
   const bankerPair = physicalShoeKnown
     ? safeEvaluate(projection.profileSnapshot, 'bankerPair', projection.seenCards, projection.remainingCounts)
     : null;
@@ -1224,6 +1225,7 @@ function TableMonitorRow(props: {
 
 function MonitorTableSettingsDialog(props: {
   actor: TableActorSnapshot;
+  evidence?: DesktopShoeEvidence;
   liveApproved: boolean;
   riskLimits?: RiskLimits;
   liveModeConfirmationOpen: boolean;
@@ -1241,7 +1243,7 @@ function MonitorTableSettingsDialog(props: {
   tableLabel: (tableId: string) => string;
 }) {
   const { actor } = props;
-  const physicalShoeKnown = actor.projection.shoeId.length > 0 && actor.projection.shoeBaseline === 'physical-shoe';
+  const physicalShoeKnown = isDisplayedPhysicalShoe(actor.projection, props.evidence);
 
   return (
     <div className="monitor-settings-overlay" role="presentation" onClick={props.onClose}>
@@ -1251,7 +1253,11 @@ function MonitorTableSettingsDialog(props: {
           <button className="button button--small button--ghost" onClick={props.onClose}>关闭</button>
         </header>
         <section className="monitor-settings-dialog__autobet">
-          <div><span>自动下注</span><strong>{AUTO_BET_LABELS[actor.projection.autoBetStatus]}</strong></div>
+          <div>
+            <span>自动下注</span>
+            <strong>{AUTO_BET_LABELS[actor.projection.autoBetStatus]}</strong>
+            {props.evidence ? <span className="muted">{physicalShoeKnown ? '实体新靴' : '待牌靴'} · {props.evidence.label}</span> : null}
+          </div>
           <div className="monitor-settings-dialog__actions">
             {!physicalShoeKnown && <button className="button button--small button--secondary" onClick={props.onConfirmShoe}>人工重置牌靴</button>}
             <button className="button button--small button--secondary" onClick={props.onArm} disabled={!physicalShoeKnown} title={physicalShoeKnown ? undefined : '物理牌靴基线未知，无法人工恢复对子策略'}>人工恢复对子策略</button>
@@ -2204,6 +2210,15 @@ function safeEvaluate(
   } catch {
     return null;
   }
+}
+
+function isDisplayedPhysicalShoe(
+  projection: ShoeStateProjection,
+  evidence?: DesktopShoeEvidence,
+): boolean {
+  return projection.shoeId.length > 0
+    && projection.shoeBaseline === 'physical-shoe'
+    && (evidence === undefined || isVerifiedPhysicalShoeReason(evidence.reason));
 }
 
 function tableAlerts(actor: TableActorSnapshot): string[] {
