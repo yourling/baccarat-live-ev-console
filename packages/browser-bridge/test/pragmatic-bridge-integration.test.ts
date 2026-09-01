@@ -267,8 +267,8 @@ describe('Pragmatic bridge integration', () => {
   it('opens a physical shoe from a DOM road count after protocol hands piled up', async () => {
     const tableId = 'spto21bctorobc21';
     const server = new BrowserBridgeServer({ selectedTableIds: [tableId] });
-    for (let index = 0; index < 8; index += 1) {
-      const round = `1640732490${index}`;
+    for (let index = 0; index < 24; index += 1) {
+      const round = `164073249${String(index).padStart(2, '0')}`;
       const seq = index * 10;
       server.ingestClientMessage(protocolCapture('game', { table: tableId, id: round, seq: seq + 1 }));
       server.ingestClientMessage(protocolCapture('betsopen', { table: tableId, game: round, seq: seq + 2 }));

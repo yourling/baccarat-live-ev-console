@@ -47,13 +47,20 @@ function probePragmaticBetTable(tableId, targetMarket) {
       && Number.isFinite(prepared.countdown)
       && Number.isFinite(prepared.countdownAt)
     )) return null;
-    const liveControls = sharedMarketControls();
     const storedConnected = prepared.marketControls
       && Object.values(prepared.marketControls).every(element => element && element.isConnected !== false);
-    const marketControls = ['player', 'banker', 'playerPair', 'bankerPair'].every(market => liveControls[market])
-      ? liveControls
-      : storedConnected ? prepared.marketControls : null;
-    return marketControls ? { ...prepared, marketControls } : null;
+    if (!storedConnected) return null;
+    const tile = typeof document.getElementById === 'function'
+      ? document.getElementById(`TileHeight-${targetTableId}`)
+      : null;
+    const marketControls = {};
+    for (const [market, element] of Object.entries(prepared.marketControls)) {
+      const inTile = !tile || typeof tile.contains !== 'function' || tile.contains(element);
+      if (inTile && visible(element)) marketControls[market] = element;
+    }
+    return ['player', 'banker', 'playerPair', 'bankerPair'].every(market => marketControls[market])
+      ? { ...prepared, marketControls }
+      : null;
   }
   function tableRoots(targetTableId) {
     if (typeof targetTableId !== 'string' || !/^[a-z0-9]{8,32}$/i.test(targetTableId)) return null;
@@ -290,9 +297,7 @@ function probePragmaticBetTable(tableId, targetMarket) {
   const multitableRouteReady = location.pathname !== '/desktop/multibaccarat/'
     || preparedLeaseActive
     || tileHasOwnMarkets;
-  const bettingRoot = location.pathname === '/desktop/multibaccarat/' && preparedLeaseActive
-    ? document
-    : root;
+  const bettingRoot = root;
   const dedicatedReferrerMatch = location.pathname === '/desktop/baccarat/'
     && referrerTableId() === tableId;
   const rootVisible = root ? visible(root) : false;
@@ -398,13 +403,20 @@ async function executePragmaticBetOneShot(request, command) {
       && Number.isFinite(prepared.countdown)
       && Number.isFinite(prepared.countdownAt)
     )) return null;
-    const liveControls = sharedMarketControls();
     const storedConnected = prepared.marketControls
       && Object.values(prepared.marketControls).every(element => element && element.isConnected !== false);
-    const marketControls = ['player', 'banker', 'playerPair', 'bankerPair'].every(market => liveControls[market])
-      ? liveControls
-      : storedConnected ? prepared.marketControls : null;
-    return marketControls ? { ...prepared, marketControls } : null;
+    if (!storedConnected) return null;
+    const tile = typeof document.getElementById === 'function'
+      ? document.getElementById(`TileHeight-${targetTableId}`)
+      : null;
+    const marketControls = {};
+    for (const [market, element] of Object.entries(prepared.marketControls)) {
+      const inTile = !tile || typeof tile.contains !== 'function' || tile.contains(element);
+      if (inTile && visible(element)) marketControls[market] = element;
+    }
+    return ['player', 'banker', 'playerPair', 'bankerPair'].every(market => marketControls[market])
+      ? { ...prepared, marketControls }
+      : null;
   }
   function tableRoots(tableId) {
     if (typeof tableId !== 'string' || !/^[a-z0-9]{8,32}$/i.test(tableId)) return null;
@@ -787,10 +799,23 @@ async function executePragmaticBetOneShot(request, command) {
   if (phase === 'request') {
     const channel = globalThis.__baccaratPragmaticBetChannel;
     const gId = String(value.handId || '');
+    if (location.pathname === '/desktop/baccarat/') {
+      const bound = referrerTableId();
+      if (bound && bound !== value.tableId) {
+        return {
+          phase: 'request-unavailable',
+          runtimeRevision: RUNTIME_REVISION,
+          reason: 'table-not-in-current-session',
+          currentRoundId: gId,
+        };
+      }
+    }
     const requestRoot = tableRoot(value.tableId);
     const pageRoundId = requestRoot ? String(roundId(requestRoot) || '') : '';
     const requestCountdown = requestRoot ? remainingSeconds(requestRoot, value.tableId, gId) : Number.NaN;
-    if (gId && pageRoundId && pageRoundId !== gId) {
+    const protocolCountdown = Number(command && command.protocolCountdown);
+    const onMultiplay = location.pathname === '/desktop/multibaccarat/';
+    if (!onMultiplay && gId && pageRoundId && pageRoundId !== gId) {
       return {
         phase: 'request-unavailable',
         runtimeRevision: RUNTIME_REVISION,
@@ -800,7 +825,21 @@ async function executePragmaticBetOneShot(request, command) {
         currentCountdown: Number.isFinite(requestCountdown) ? requestCountdown : undefined,
       };
     }
-    if (Number.isFinite(requestCountdown) && requestCountdown < REQUEST_MIN_REMAINING_SECONDS) {
+    if (!onMultiplay && Number.isFinite(protocolCountdown) && protocolCountdown < REQUEST_MIN_REMAINING_SECONDS) {
+      return {
+        phase: 'request-unavailable',
+        runtimeRevision: RUNTIME_REVISION,
+        reason: 'betting-window-closed',
+        currentRoundId: gId || pageRoundId,
+        currentCountdown: protocolCountdown,
+      };
+    }
+    if (
+      !onMultiplay
+      && !Number.isFinite(protocolCountdown)
+      && Number.isFinite(requestCountdown)
+      && requestCountdown < REQUEST_MIN_REMAINING_SECONDS
+    ) {
       return {
         phase: 'request-unavailable',
         runtimeRevision: RUNTIME_REVISION,
@@ -809,7 +848,14 @@ async function executePragmaticBetOneShot(request, command) {
         currentCountdown: requestCountdown,
       };
     }
-    if (!Number.isFinite(requestCountdown) && pageRoundId && gId && pageRoundId === gId) {
+    if (
+      !onMultiplay
+      && !Number.isFinite(protocolCountdown)
+      && !Number.isFinite(requestCountdown)
+      && pageRoundId
+      && gId
+      && pageRoundId === gId
+    ) {
       return {
         phase: 'request-unavailable',
         runtimeRevision: RUNTIME_REVISION,
@@ -825,6 +871,19 @@ async function executePragmaticBetOneShot(request, command) {
         reason: 'bet-request-channel-unavailable',
         currentRoundId: gId,
       };
+    }
+    if (typeof channel.status === 'function') {
+      const status = channel.status();
+      const tableIds = status && Array.isArray(status.tableIds) ? status.tableIds : [];
+      const wanted = String(value.tableId || '').toLowerCase();
+      if (tableIds.length > 0 && !tableIds.some(id => String(id || '').toLowerCase() === wanted)) {
+        return {
+          phase: 'request-unavailable',
+          runtimeRevision: RUNTIME_REVISION,
+          reason: 'table-not-in-current-session',
+          currentRoundId: gId,
+        };
+      }
     }
     let result;
     try {
@@ -863,7 +922,7 @@ async function executePragmaticBetOneShot(request, command) {
   const root = tableRoot(value.tableId);
   if (!root) return makeReceipt('REJECTED', 'target-table-not-found', false);
   const prepared = preparedLease(value.tableId);
-  const bettingRoot = location.pathname === '/desktop/multibaccarat/' && prepared ? document : root;
+  const bettingRoot = root;
   const currentRoundId = roundId(root);
   const expectedRoundId = String(command && command.expectedRoundId || '');
   const currentCountdown = remainingSeconds(root, value.tableId, expectedRoundId || currentRoundId);

@@ -491,12 +491,6 @@ async function preparePragmaticTable(tabId, tableId, market) {
       } catch (_) {
         return { status: 'not-seated', frameUrl };
       }
-      try {
-        root.scrollIntoView({ block: 'center', inline: 'center' });
-      } catch (_) {
-        return { status: 'scroll-failed', frameUrl };
-      }
-      await new Promise(resolve => setTimeout(resolve, 250));
       const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
       const roundIdentity = clean(root.textContent);
       const roundId = (roundIdentity.match(/(?:ID|局号|游戏编号|牌局)\s*[:：#]?\s*(\d{8,20})/i) || [])[1] || '';
@@ -554,6 +548,45 @@ async function preparePragmaticTable(tabId, tableId, market) {
       return { status: 'activated', frameUrl, roundId: effectiveRoundId, domRoundId: roundId, countdown };
     },
   });
+}
+
+function channelServesTable(status, tableId) {
+  if (!status || status.hasSocket !== true) return false;
+  const wanted = String(tableId || '').toLowerCase();
+  const path = String(status.framePath || '');
+  const bound = String(status.boundTableId || '').toLowerCase();
+  const tableIds = Array.isArray(status.tableIds) ? status.tableIds : [];
+  const mentionsTable = tableIds.some(id => String(id || '').toLowerCase() === wanted);
+  if (path === '/desktop/baccarat/') {
+    if (bound) return bound === wanted;
+    return tableIds.length === 1 && mentionsTable;
+  }
+  if (path === '/desktop/multibaccarat/') return mentionsTable;
+  if (bound) return bound === wanted;
+  return mentionsTable;
+}
+
+function selectPragmaticRequestChannel(channelStatus, tableId) {
+  const wanted = String(tableId || '').toLowerCase();
+  const matching = (Array.isArray(channelStatus) ? channelStatus : []).filter(entry =>
+    entry
+    && Number.isInteger(entry.frameId)
+    && channelServesTable(entry.result, tableId),
+  );
+  const withUser = matching.filter(entry => entry.result && entry.result.hasUser === true);
+  const candidates = withUser.length > 0 ? withUser : matching;
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+  const dedicated = candidates.filter(entry =>
+    String(entry.result.framePath || '') === '/desktop/baccarat/'
+    && String(entry.result.boundTableId || '').toLowerCase() === wanted,
+  );
+  const multi = candidates.filter(entry =>
+    String(entry.result.framePath || '') === '/desktop/multibaccarat/',
+  );
+  if (dedicated.length === 1 && multi.length === 0) return dedicated[0];
+  if (multi.length === 1) return multi[0];
+  return null;
 }
 
 function selectPragmaticReadyFrame(probes, tableId) {
@@ -721,17 +754,27 @@ async function executeUniquePragmaticBet(message, generation) {
         const channel = globalThis.__baccaratPragmaticBetChannel;
         return channel && typeof channel.status === 'function'
           ? channel.status()
-          : { hasUser: false, hasSocket: false };
+          : { hasUser: false, hasSocket: false, tableIds: [] };
       },
     });
-    const readyChannel = channelStatus.find(entry =>
-      entry && entry.result && entry.result.hasSocket === true && entry.result.hasUser === true)
-      || channelStatus.find(entry => entry && entry.result && entry.result.hasSocket === true);
+    const anySocket = channelStatus.some(entry =>
+      entry && entry.result && entry.result.hasSocket === true);
+    const readyChannel = selectPragmaticRequestChannel(channelStatus, parsed.tableId);
+    const protocolWindow = pragmaticProtocolWindow(parsed.tableId);
     const requestHits = readyChannel && Number.isInteger(readyChannel.frameId)
       ? await chrome.scripting.executeScript({
         target: { tabId, frameIds: [readyChannel.frameId] },
         world: 'MAIN',
-        args: [parsed.request, { phase: 'request', expectedRoundId: expectedHandId }],
+        args: [parsed.request, {
+          phase: 'request',
+          expectedRoundId: expectedHandId,
+          ...(protocolWindow
+            ? {
+              protocolCountdown: protocolWindow.countdown,
+              protocolRoundId: protocolWindow.roundId,
+            }
+            : {}),
+        }],
         func: globalThis.executePragmaticBetOneShot,
       })
       : [];
@@ -749,6 +792,13 @@ async function executeUniquePragmaticBet(message, generation) {
       if (requestMiss) {
         frameId = requestMiss.frameId;
         requestResult = requestMiss.result;
+      } else if (anySocket) {
+        requestResult = {
+          phase: 'request-unavailable',
+          runtimeRevision: PRAGMATIC_BET_RUNTIME_REVISION,
+          reason: 'table-not-in-current-session',
+          currentRoundId: expectedHandId,
+        };
       } else {
     const preparations = await preparePragmaticTable(tabId, parsed.tableId, requestedMarket);
     const multitableResults = preparations.filter(entry =>
@@ -1504,54 +1554,113 @@ async function openActiveGameTabInMultiplay(tableIds = []) {
       return;
     }
 
+    const routes = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, allFrames: true },
+      world: 'MAIN',
+      func: () => ({
+        marker: 'pragmatic-frame-routes',
+        pathname: String(location.pathname || ''),
+        frameUrl: String(location.href || ''),
+        host: String(location.hostname || ''),
+      }),
+    });
+    const pragmaticRoutes = (routes || []).filter(entry => {
+      if (!entry || !entry.result) return false;
+      const host = String(entry.result.host || '');
+      if (/(^|\.)client\.pragmaticplaylive\.net$/i.test(host)) return true;
+      try {
+        return /(^|\.)client\.pragmaticplaylive\.net$/i.test(new URL(String(entry.result.frameUrl || '')).hostname);
+      } catch (_) {
+        return false;
+      }
+    });
+    const multi = pragmaticRoutes.filter(entry => entry.result.pathname === '/desktop/multibaccarat/');
+    const dedicated = pragmaticRoutes.filter(entry => entry.result.pathname === '/desktop/baccarat/');
+    if (multi.length > 0) {
+      if (dedicated.length > 0) {
+        send({
+          kind: 'sessionAction',
+          action: 'dual-game-session',
+          url: String(tab.url || ''),
+          frame: 'allFrames',
+          detail: `multibaccarat=${multi.length}:baccarat=${dedicated.length}`,
+          timestamp: new Date().toISOString(),
+        });
+      }
+      send({
+        kind: 'sessionAction',
+        action: 'command-executed',
+        url: '',
+        frame: 'allFrames',
+        detail: `openMultiView:opened:${multi.length}:pragmatic-already-open`,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+    if (dedicated.length === 1 && Number.isInteger(dedicated[0].frameId)) {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id, frameIds: [dedicated[0].frameId] },
+        world: 'MAIN',
+        func: () => {
+          location.pathname = '/desktop/multibaccarat/';
+          return { status: 'opened', frameUrl: String(location.href || ''), state: 'pragmatic-direct-route' };
+        },
+      });
+      send({
+        kind: 'sessionAction',
+        action: 'command-executed',
+        url: '',
+        frame: 'allFrames',
+        detail: 'openMultiView:opened:1:pragmatic-direct-route',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id, allFrames: true },
       world: 'MAIN',
       args: [tableIds],
       func: requestedTableIds => {
         const frameUrl = String(location.href || '');
-        if (/(^|\.)client\.pragmaticplaylive\.net$/i.test(location.hostname)) {
-          if (location.pathname === '/desktop/multibaccarat/') {
-            return { status: 'opened', frameUrl, state: 'pragmatic-already-open' };
-          }
-          if (location.pathname === '/desktop/baccarat/') {
-            // This is Pragmatic's own sibling route. Changing only pathname keeps
-            // the authenticated launch query and never touches a betting control.
-            location.pathname = '/desktop/multibaccarat/';
-            return { status: 'opened', frameUrl, state: 'pragmatic-direct-route' };
-          }
-          const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
-          const roots = [document];
-          const controls = [];
-          for (let rootIndex = 0; rootIndex < roots.length && rootIndex < 200; rootIndex += 1) {
-            const root = roots[rootIndex];
-            try {
-              controls.push(...root.querySelectorAll('a[href], button, [role="button"]'));
-              for (const element of root.querySelectorAll('*')) {
-                if (element.shadowRoot) roots.push(element.shadowRoot);
-              }
-            } catch (_) {}
-          }
-          const control = controls.find(element => {
-            const href = String(element.getAttribute && element.getAttribute('href') || '');
-            const text = clean(element.textContent || element.getAttribute?.('aria-label'));
-            const exactTarget = /\/desktop\/multibaccarat\//i.test(href)
-              || /^(?:多桌|多台|多桌百家乐|multi\s*(?:table|baccarat|play))$/i.test(text);
-            if (!exactTarget || element.disabled === true) return false;
-            try {
-              const rect = element.getBoundingClientRect();
-              return rect.width > 0 && rect.height > 0;
-            } catch (_) {
-              return true;
-            }
-          });
-          if (control && typeof control.click === 'function') {
-            control.click();
-            return { status: 'opened', frameUrl, state: 'pragmatic-native-control' };
-          }
-          return { status: 'not-ready', frameUrl, state: `pragmatic-control-missing:${location.pathname}` };
+        if (!/(^|\.)client\.pragmaticplaylive\.net$/i.test(location.hostname)) {
+          return { status: 'skipped', frameUrl };
         }
-        return { status: 'skipped', frameUrl };
+        const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+        const roots = [document];
+        const controls = [];
+        for (let rootIndex = 0; rootIndex < roots.length && rootIndex < 200; rootIndex += 1) {
+          const root = roots[rootIndex];
+          try {
+            controls.push(...root.querySelectorAll('a[href], button, [role="button"]'));
+            for (const element of root.querySelectorAll('*')) {
+              if (element.shadowRoot) roots.push(element.shadowRoot);
+            }
+          } catch (_) {}
+        }
+        const alreadyEmbedded = Array.from(document.querySelectorAll('iframe')).some(iframe =>
+          /\/desktop\/multibaccarat\//i.test(String(iframe.getAttribute?.('src') || iframe.src || '')));
+        if (alreadyEmbedded) {
+          return { status: 'opened', frameUrl, state: 'pragmatic-already-embedded' };
+        }
+        const control = controls.find(element => {
+          const href = String(element.getAttribute && element.getAttribute('href') || '');
+          const text = clean(element.textContent || element.getAttribute?.('aria-label'));
+          const exactTarget = /\/desktop\/multibaccarat\//i.test(href)
+            || /^(?:多桌|多台|多桌百家乐|multi\s*(?:table|baccarat|play))$/i.test(text);
+          if (!exactTarget || element.disabled === true) return false;
+          try {
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          } catch (_) {
+            return true;
+          }
+        });
+        if (control && typeof control.click === 'function') {
+          control.click();
+          return { status: 'opened', frameUrl, state: 'pragmatic-native-control' };
+        }
+        return { status: 'not-ready', frameUrl, state: `pragmatic-control-missing:${location.pathname}` };
       },
     });
     const opened = results.filter(result => result && result.result && result.result.status === 'opened').length;
@@ -1976,6 +2085,42 @@ async function ensureKeeperTab(url) {
 }
 
 let lastTabReloadAt = 0;
+const pragmaticFramesByTab = new Map();
+
+function notePragmaticFrame(tabId, frameId, url) {
+  if (!Number.isInteger(tabId) || !Number.isInteger(frameId) || typeof url !== 'string') return;
+  let pathname = '';
+  try {
+    pathname = new URL(url).pathname;
+  } catch (_) {
+    return;
+  }
+  if (pathname !== '/desktop/baccarat/' && pathname !== '/desktop/multibaccarat/') {
+    pragmaticFramesByTab.get(tabId)?.delete(frameId);
+    return;
+  }
+  let frames = pragmaticFramesByTab.get(tabId);
+  if (!frames) {
+    frames = new Map();
+    pragmaticFramesByTab.set(tabId, frames);
+  }
+  frames.set(frameId, { pathname, url });
+  const multi = [];
+  const dedicated = [];
+  for (const info of frames.values()) {
+    if (info.pathname === '/desktop/multibaccarat/') multi.push(info);
+    if (info.pathname === '/desktop/baccarat/') dedicated.push(info);
+  }
+  if (multi.length === 0 || dedicated.length === 0) return;
+  send({
+    kind: 'sessionAction',
+    action: 'dual-game-session',
+    url: '',
+    frame: 'allFrames',
+    detail: `autonomous:multibaccarat=${multi.length}:baccarat=${dedicated.length}`,
+    timestamp: new Date().toISOString(),
+  });
+}
 
 chrome.runtime.onMessage.addListener((message, sender, _sendResponse) => {
   if (!message || typeof message.kind !== 'string' || !isTrustedGameSender(sender)) return;
@@ -1983,6 +2128,7 @@ chrome.runtime.onMessage.addListener((message, sender, _sendResponse) => {
   ingestPragmaticProtocolWindow(message);
   notePragmaticOutboundSend(message);
   send(message);
+  notePragmaticFrame(sender.tab && sender.tab.id, sender.frameId, message.url || sender.url || '');
   const senderTabId = sender && sender.tab ? sender.tab.id : null;
   if (message.kind === 'keepalive') {
     if (autoKeeperEnabled && message.frame === 'top') {
@@ -2041,6 +2187,7 @@ chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
+  pragmaticFramesByTab.delete(tabId);
   if (tabId === keeperTabId) {
     keeperTabId = null;
     void chrome.storage.local.remove('keeperTabId');

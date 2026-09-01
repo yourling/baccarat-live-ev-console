@@ -30,8 +30,42 @@ export interface PragmaticRuntimeSnapshot {
   readonly tables: readonly PragmaticTableSnapshot[];
 }
 
-/** DOM road count may lag a couple of hands; beyond this the shoe was missed. */
-const GAME_COUNT_SHOE_LAG = 2;
+/** DOM road count may lag several hands; only a large gap means a missed shuffle. */
+const GAME_COUNT_SHOE_LAG = 16;
+const ROAD_WRAP_MAX = 2;
+const ROAD_WRAP_MIN_PREVIOUS = 10;
+const ROAD_WRAP_MIN_DROP = 8;
+
+export function isRoadWrapToNewShoe(
+  previous: number | undefined,
+  gameCount: number,
+): boolean {
+  return previous !== undefined
+    && previous >= ROAD_WRAP_MIN_PREVIOUS
+    && gameCount <= ROAD_WRAP_MAX
+    && previous - gameCount >= ROAD_WRAP_MIN_DROP;
+}
+
+/** DOM often lags past #2 after shuffle; still join if the road clearly wrapped. */
+export function isJoinableNewShoeRoadCount(
+  previous: number | undefined,
+  gameCount: number,
+): boolean {
+  if (isRoadWrapToNewShoe(previous, gameCount)) return true;
+  return previous !== undefined
+    && previous >= ROAD_WRAP_MIN_PREVIOUS
+    && gameCount <= 8
+    && previous - gameCount >= ROAD_WRAP_MIN_DROP;
+}
+
+function isPhysicalShoeFromRoadCount(
+  previous: number | undefined,
+  gameCount: number,
+  trackedHands: number,
+): boolean {
+  if (isRoadWrapToNewShoe(previous, gameCount)) return true;
+  return gameCount <= 8 && trackedHands > gameCount + GAME_COUNT_SHOE_LAG;
+}
 
 type SnapshotSource = 'dom' | 'protocol';
 type HandCards = { playerCards: Card[]; bankerCards: Card[]; source?: SnapshotSource };
@@ -273,10 +307,7 @@ export class PragmaticRuntimeParser {
       const previous = this.lastGameCountByTable.get(tableId);
       const tracked = this.handsThisShoeByTable.get(tableId) ?? 0;
       const gameCount = table.gameCount!;
-      if (
-        (previous !== undefined && gameCount < previous)
-        || tracked > gameCount + GAME_COUNT_SHOE_LAG
-      ) {
+      if (isPhysicalShoeFromRoadCount(previous, gameCount, tracked)) {
         this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
         this.beginNewShoe(tableId, observedAt, events);
       }

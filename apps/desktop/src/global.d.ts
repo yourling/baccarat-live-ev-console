@@ -40,6 +40,7 @@ declare global {
       reconcileUnknownOperationalWager: (command: DesktopUnknownWagerReconciliationCommand) => Promise<DesktopConsoleSnapshot>;
       settlePendingOperationalWager: (command: DesktopPendingSettlementCommand) => Promise<DesktopConsoleSnapshot>;
       updateKeepaliveSettings: (settings: DesktopKeepaliveStrategySettings) => Promise<DesktopConsoleSnapshot>;
+      setKeepaliveEnabled: (enabled: boolean) => Promise<DesktopConsoleSnapshot>;
       setAutomationEnabled: (enabled: boolean) => Promise<DesktopConsoleSnapshot>;
       acknowledgeRuntimeIncident: (incidentId: string) => Promise<DesktopConsoleSnapshot>;
       acknowledgeAllRuntimeIncidents: () => Promise<DesktopConsoleSnapshot>;

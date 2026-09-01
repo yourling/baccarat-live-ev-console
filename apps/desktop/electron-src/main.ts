@@ -121,6 +121,10 @@ function registerIpc(): void {
     ));
   ipcMain.handle('console:update-keepalive-settings', (_event, settings: unknown) =>
     getService().updateKeepaliveSettings(parseDesktopKeepaliveSettings(settings)));
+  ipcMain.handle('console:set-keepalive-enabled', (_event, enabled: unknown) => {
+    if (typeof enabled !== 'boolean') throw new TypeError('keepalive enabled must be boolean');
+    return getService().setKeepaliveEnabled(enabled);
+  });
   ipcMain.handle('console:set-automation-enabled', (_event, enabled: unknown) => {
     if (typeof enabled !== 'boolean') throw new TypeError('automation enabled must be boolean');
     return getService().setAutomationEnabled(enabled);
@@ -185,7 +189,6 @@ if (acquireSingleInstance(app)) {
   });
 
   app.on('window-all-closed', () => {
-    // The monitor, bridge, keepalive scheduler, and ledger remain active in the
-    // background. Launching the app again restores the retained hidden window.
+    app.quit();
   });
 }

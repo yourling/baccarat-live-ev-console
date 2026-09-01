@@ -26,11 +26,11 @@ export function KeepaliveSettings(props: {
     const intervalMinutes = Number(draft.intervalMinutes);
     const amount = Number(draft.amount);
     if (!Number.isInteger(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 1_440) {
-      props.onError('自动投注保活间隔必须是 1 到 1440 分钟的整数');
+      props.onError('保活间隔必须是 1 到 1440 分钟的整数');
       return;
     }
     if (!Number.isFinite(amount) || amount <= 0) {
-      props.onError('自动投注保活金额必须大于 0');
+      props.onError('保活金额必须大于 0');
       return;
     }
     const desktop = window.desktop;
@@ -57,10 +57,10 @@ export function KeepaliveSettings(props: {
   return (
     <section className="ledger-settings keepalive-settings">
       <div className="record-heading">
-        <h2>自动投注保活策略</h2>
+        <h2>保活策略</h2>
         <span className="record-count">{keepaliveStatus(props.state)}</span>
       </div>
-      <p className="muted">保存间隔和金额后，还须点顶部「开启自动投注」才会按开盘窗口下保活注。Pragmatic 牌桌走与手动下注相同的请求通道。</p>
+      <p className="muted">保存间隔和金额后，还须点顶部「开启保活」才会按开盘窗口下庄/闲保活注。与对子自动投注互相独立。</p>
       <div className="settings-fields keepalive-settings__fields">
         <label>
           <span>间隔（分钟）</span>

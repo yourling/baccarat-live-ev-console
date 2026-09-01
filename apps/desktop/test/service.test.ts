@@ -212,21 +212,12 @@ describe('desktop console demo sessions', () => {
   });
 
   // Contract: trim and uppercase IDs, keep first occurrence, reject blanks, and preserve order.
-  it('exposes the current ordered Pragmatic monitor fallback tables', async () => {
-    const service = new DesktopConsoleService(':memory:');
-    try {
-      expect(service.snapshot().monitorTableIds).toEqual(['bc281koreanch281', 'tobcbaccaragen92', 'speedbca14gesbc1', 'h22z8qhp17sa0vkh']);
-    } finally {
-      await service.close();
-    }
-  });
-
-  it('uses the Pragmatic monitor fallback for a fresh monitor session', async () => {
+  it('starts a fresh monitor session with no tables', async () => {
     const previous = process.env.BACCARAT_LIVE_TABLES;
     delete process.env.BACCARAT_LIVE_TABLES;
     const service = new DesktopConsoleService(':memory:');
     try {
-      expect(service.snapshot().monitorTableIds).toEqual(['bc281koreanch281', 'tobcbaccaragen92', 'speedbca14gesbc1', 'h22z8qhp17sa0vkh']);
+      expect(service.snapshot().monitorTableIds).toEqual([]);
     } finally {
       await service.close();
       if (previous === undefined) {
@@ -234,6 +225,23 @@ describe('desktop console demo sessions', () => {
       } else {
         process.env.BACCARAT_LIVE_TABLES = previous;
       }
+    }
+  });
+
+  it('clears a persisted copy of the retired four-table default list', async () => {
+    const previous = process.env.BACCARAT_LIVE_TABLES;
+    delete process.env.BACCARAT_LIVE_TABLES;
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      service['ledger'].setConfig('desktop:monitor-tables:v1', {
+        tableIds: ['bc281koreanch281', 'tobcbaccaragen92', 'speedbca14gesbc1', 'h22z8qhp17sa0vkh'],
+      });
+      expect(service['loadMonitorTableIds']()).toEqual([]);
+      expect(service['ledger'].getConfig('desktop:monitor-tables:v1')).toEqual({ tableIds: [] });
+    } finally {
+      await service.close();
+      if (previous === undefined) delete process.env.BACCARAT_LIVE_TABLES;
+      else process.env.BACCARAT_LIVE_TABLES = previous;
     }
   });
 
@@ -300,6 +308,194 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('enables keepalive without arming pair automation', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      await service.updateMonitorTableIds(['D055']);
+      await service.injectEvent(monitorShoeEvent('D055', 'd055-keepalive-only', 'physical-shoe'));
+
+      const started = await service.setKeepaliveEnabled(true);
+
+      expect(started.keepalive.enabled).toBe(true);
+      expect(started.automation.enabled).toBe(false);
+      expect(started.snapshot.tables.D055?.projection.autoBetStatus).toBe('DISARMED');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('enables pair automation without enabling keepalive', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      await service.updateMonitorTableIds(['D055']);
+      await service.injectEvent(monitorShoeEvent('D055', 'd055-pair-only', 'physical-shoe'));
+
+      const started = await service.setAutomationEnabled(true);
+
+      expect(started.automation.enabled).toBe(true);
+      expect(started.keepalive.enabled).toBe(false);
+      expect(started.snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('keeps mid-shoe discoveries pending until a physical new shoe starts', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    try {
+      service['browserBridge'] = bridge;
+      service['liveMonitorActivated'] = true;
+      await service.updateMonitorTableIds([]);
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'speedbca14gesbc1', displayName: '极速百家乐', gameCount: 42 }],
+        },
+      });
+
+      await service['attachLiveTables']();
+      const pending = service.snapshot();
+      expect(pending.monitorTableIds).not.toContain('speedbca14gesbc1');
+      expect(pending.monitorCandidates.map(candidate => candidate.tableId)).toContain('speedbca14gesbc1');
+      expect(pending.snapshot.tables.speedbca14gesbc1).toBeUndefined();
+
+      bridge.ingestClientMessage({
+        kind: 'roomUpdated',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'speedbca14gesbc1', displayName: '极速百家乐', gameCount: 1 }],
+        },
+      });
+      await service['attachLiveTables']();
+
+      const joined = service.snapshot();
+      expect(joined.monitorTableIds).toContain('speedbca14gesbc1');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('joins a pending table when a physical new shoe starts even if the road count is still high', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    try {
+      service['browserBridge'] = bridge;
+      service['liveMonitorActivated'] = true;
+      await service.updateMonitorTableIds([]);
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'speedbca14gesbc1', displayName: '极速百家乐', gameCount: 42 }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(service.snapshot().monitorTableIds).not.toContain('speedbca14gesbc1');
+
+      await service.injectEvent(monitorShoeEvent('speedbca14gesbc1', 'speed-physical-shoe', 'physical-shoe'));
+      expect(service.snapshot().monitorTableIds).toContain('speedbca14gesbc1');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('joins a pending table when the road wraps to an early count after shuffle lag', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    try {
+      service['browserBridge'] = bridge;
+      service['liveMonitorActivated'] = true;
+      await service.updateMonitorTableIds([]);
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'tobcbaccaragen92', displayName: '粤语极速百家乐', gameCount: 48 }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(service.snapshot().monitorTableIds).not.toContain('tobcbaccaragen92');
+
+      bridge.ingestClientMessage({
+        kind: 'roomUpdated',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'tobcbaccaragen92', displayName: '粤语极速百家乐', gameCount: 5 }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(service.snapshot().monitorTableIds).toContain('tobcbaccaragen92');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('does not auto-join a mid-shoe table when the road count only drops one hand', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    try {
+      service['browserBridge'] = bridge;
+      service['liveMonitorActivated'] = true;
+      await service.updateMonitorTableIds([]);
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'spto11bctorobc11', displayName: '越南语极速百家乐1', gameCount: 34 }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(service.snapshot().monitorTableIds).not.toContain('spto11bctorobc11');
+
+      bridge.ingestClientMessage({
+        kind: 'roomUpdated',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'spto11bctorobc11', displayName: '越南语极速百家乐1', gameCount: 33 }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(service.snapshot().monitorTableIds).not.toContain('spto11bctorobc11');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('lets keepalive target a pending table without arming pair bets', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    try {
+      service['browserBridge'] = bridge;
+      service['liveMonitorActivated'] = true;
+      await service.updateMonitorTableIds([]);
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          tables: [{ tableId: 'speedbca14gesbc1', gameCount: 18 }],
+        },
+      });
+      await service['attachLiveTables']();
+      await service.setKeepaliveEnabled(true);
+      await service.setAutomationEnabled(true);
+
+      expect(service.snapshot().monitorTableIds).not.toContain('speedbca14gesbc1');
+      expect(service['operationalWagers']['options'].keepaliveTableIds?.() ?? []).toContain('speedbca14gesbc1');
+      expect(service.snapshot().snapshot.tables.speedbca14gesbc1).toBeUndefined();
+    } finally {
+      await service.close();
+    }
+  });
+
   it('keeps global automation active when one table disconnects and rearms it after recovery', async () => {
     const service = new DesktopConsoleService(':memory:');
     try {
@@ -307,6 +503,7 @@ describe('desktop console demo sessions', () => {
       await service.injectEvent(monitorShoeEvent('D055', 'd055-attached', 'unknown-monitor-session'));
       await service.injectEvent(monitorShoeEvent('D066', 'd066-attached', 'unknown-monitor-session'));
 
+      await service.setKeepaliveEnabled(true);
       const started = await service.setAutomationEnabled(true);
 
       expect(started.automation).toEqual({ enabled: true });
@@ -360,7 +557,7 @@ describe('desktop console demo sessions', () => {
       const stopped = await service.setAutomationEnabled(false);
 
       expect(stopped.automation).toEqual({ enabled: false });
-      expect(stopped.keepalive.enabled).toBe(false);
+      expect(stopped.keepalive.enabled).toBe(true);
       expect(stopped.snapshot.tables.D055?.projection.autoBetStatus).toBe('DISARMED');
     } finally {
       await service.close();
@@ -1916,7 +2113,7 @@ describe('desktop console demo sessions', () => {
     }
   });
 
-  it('uses the approved four-table whitelist when no bridge environment override is set', async () => {
+  it('does not seed monitor tables when no bridge environment override is set', async () => {
     const previousSelection = process.env.BACCARAT_LIVE_TABLES;
     delete process.env.BACCARAT_LIVE_TABLES;
     const service = new DesktopConsoleService(':memory:');
@@ -1934,12 +2131,7 @@ describe('desktop console demo sessions', () => {
 
       const rooms = await bridge.discoverRooms();
       expect(rooms.find(room => room.roomId === 'r1')?.tables.map(table => table.tableId) ?? []).toEqual([]);
-      expect(service.snapshot().monitorTableIds).toEqual([
-        'bc281koreanch281',
-        'tobcbaccaragen92',
-        'speedbca14gesbc1',
-        'h22z8qhp17sa0vkh',
-      ]);
+      expect(service.snapshot().monitorTableIds).toEqual([]);
     } finally {
       await service.close();
       if (previousSelection === undefined) delete process.env.BACCARAT_LIVE_TABLES;
@@ -2014,7 +2206,7 @@ describe('desktop console demo sessions', () => {
     }
   });
 
-  it('automatically adds and attaches a newly discovered monitor table', async () => {
+  it('keeps a newly discovered table pending until a physical new shoe', async () => {
     const service = new DesktopConsoleService(':memory:');
     const feed = {
       tableId: 'P001',
@@ -2042,10 +2234,10 @@ describe('desktop console demo sessions', () => {
       await expect(service.startLiveRoomMonitor(0)).resolves.toEqual(expect.objectContaining({ port: expect.any(Number) }));
 
       const current = service.snapshot();
-      expect(current.monitorTableIds).toEqual(['D055', 'P001']);
-      expect(current.snapshot.tables.P001).toBeDefined();
+      expect(current.monitorTableIds).toEqual(['D055']);
+      expect(current.snapshot.tables.P001).toBeUndefined();
       expect(current.snapshot.tables.D055).toBeDefined();
-      expect(openTable).toHaveBeenCalledWith('room-with-unselected-table', 'P001');
+      expect(current.monitorCandidates.map(candidate => candidate.tableId)).not.toContain('P001');
     } finally {
       discoverRooms.mockRestore();
       openTable.mockRestore();
@@ -2121,8 +2313,7 @@ describe('desktop console demo sessions', () => {
       });
       await service['attachLiveTables']();
 
-      expect(service.snapshot().monitorTableIds).toEqual(['D055', 'P001']);
-      expect(openTable).toHaveBeenCalledWith('lobby', 'P001');
+      expect(service.snapshot().monitorTableIds).toEqual(['D055']);
     } finally {
       discoverRooms.mockRestore();
       openTable.mockRestore();
@@ -2294,6 +2485,89 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('keeps a monitored table when its live feed is only stale', async () => {
+    vi.useFakeTimers();
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const stop = vi.fn(async () => undefined);
+    const feed = {
+      tableId: 'D055',
+      start: async () => undefined,
+      stop,
+      flush: async () => undefined,
+      keepAlive: async () => ({ ok: false, error: 'table-feed-stale' }),
+      health: () => ({
+        tableId: 'D055',
+        state: 'DISCONNECTED',
+        lastAckedSeq: 0,
+        lastEmittedSeq: 0,
+        bufferDepth: 0,
+        reconnectCount: 1,
+        stalenessMs: 45_000,
+      }),
+    } satisfies TableExport;
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['D055']);
+      service['liveFeeds'].set('D055', feed);
+
+      service['scheduleDisconnectedMonitorRemoval']('D055', 'table-feed-stale');
+      await vi.advanceTimersByTimeAsync(15_000);
+      await service['liveMonitorOperation'];
+
+      expect(service.snapshot().monitorTableIds).toEqual(['D055']);
+      expect(service['liveFeeds'].has('D055')).toBe(true);
+      expect(stop).not.toHaveBeenCalled();
+    } finally {
+      await service.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps monitoring after a table-feed-stale runtime event', async () => {
+    vi.useFakeTimers();
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const stop = vi.fn(async () => undefined);
+    const feed = {
+      tableId: 'speedbca14gesbc1',
+      start: async () => undefined,
+      stop,
+      flush: async () => undefined,
+      keepAlive: async () => ({ ok: false, error: 'table-feed-stale' }),
+      health: () => ({
+        tableId: 'speedbca14gesbc1',
+        state: 'DISCONNECTED' as const,
+        lastAckedSeq: 0,
+        lastEmittedSeq: 0,
+        bufferDepth: 0,
+        reconnectCount: 1,
+        stalenessMs: 45_000,
+      }),
+    };
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['speedbca14gesbc1']);
+      service['liveFeeds'].set('speedbca14gesbc1', feed);
+      service['handleBridgeRuntimeEvent']({
+        kind: 'table-disconnected',
+        tableId: 'speedbca14gesbc1',
+        reason: 'table-feed-stale',
+        timestamp: new Date().toISOString(),
+      });
+      await service['executionStateOperation'];
+      await vi.advanceTimersByTimeAsync(15_000);
+      await service['liveMonitorOperation'];
+
+      expect(service.snapshot().monitorTableIds).toEqual(['speedbca14gesbc1']);
+      expect(service['liveFeeds'].has('speedbca14gesbc1')).toBe(true);
+      expect(stop).not.toHaveBeenCalled();
+    } finally {
+      await service.close();
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps configured monitor tables while live discovery is still empty', async () => {
     vi.useFakeTimers();
     const service = new DesktopConsoleService(':memory:');
@@ -2315,7 +2589,7 @@ describe('desktop console demo sessions', () => {
     }
   });
 
-  it('restores an emptied monitor list from persisted table metadata', async () => {
+  it('keeps an emptied monitor list empty after restart', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'baccarat-monitor-restore-'));
     const dbPath = join(directory, 'console.sqlite');
     const first = new DesktopConsoleService(dbPath);
@@ -2348,10 +2622,7 @@ describe('desktop console demo sessions', () => {
 
       const restarted = new DesktopConsoleService(dbPath);
       try {
-        expect(restarted.snapshot().monitorTableIds).toEqual([
-          'tobcbaccaragen92',
-          'speedbca14gesbc1',
-        ]);
+        expect(restarted.snapshot().monitorTableIds).toEqual([]);
       } finally {
         await restarted.close();
       }

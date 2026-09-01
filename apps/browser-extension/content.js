@@ -261,8 +261,13 @@
     }
   }
 
+  function isSessionConflictText(text) {
+    return /在其他地方启动了(?:对话|会话)|其他地方.*(?:对话|会话)|(?:对话|会话)已在其他|joined from another (?:device|location|place|window|tab)|(?:conversation|session) (?:has been |was )?started (?:elsewhere|in another)|(?:game|session) already open in another/i.test(text);
+  }
+
   function dismissIdleDialog() {
     if (betInFlight > 0) return;
+    if (isSessionConflictText(String(document.body?.innerText || document.body?.textContent || ''))) return;
     const strong = [];
     const fallback = [];
     for (const el of document.querySelectorAll('button, a, [role="button"]')) {
@@ -347,8 +352,8 @@
   }
 
   function checkSessionExpired(bodyText) {
-    if (!isSessionExpiredText(bodyText)) {
-      lastHealthyAt = Date.now();
+    if (isSessionConflictText(bodyText) || !isSessionExpiredText(bodyText)) {
+      if (!isSessionConflictText(bodyText)) lastHealthyAt = Date.now();
       return;
     }
     if (!sessionExpiredSent) {
@@ -848,31 +853,17 @@
     recoveryCheckTimer = setTimeout(finishRecoveryCheck, RECOVERY_CHECK_DELAY_MS);
   }
 
-  function suppressMedia() {
-    if (!PRAGMATIC_PAGE) return;
-    try {
-      for (const video of document.querySelectorAll('video')) {
-        video.muted = true;
-        if (!video.paused) video.pause();
-      }
-    } catch (_) {}
-  }
-
   if (!GAME_PAGE) return; // 非游戏页面:内容脚本保持惰性
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
       scan();
-      suppressMedia();
       startKeepAlive();
       setInterval(scan, SCAN_INTERVAL_MS);
-      setInterval(suppressMedia, SCAN_INTERVAL_MS);
     });
   } else {
     scan();
-    suppressMedia();
     startKeepAlive();
     setInterval(scan, SCAN_INTERVAL_MS);
-    setInterval(suppressMedia, SCAN_INTERVAL_MS);
   }
 })();

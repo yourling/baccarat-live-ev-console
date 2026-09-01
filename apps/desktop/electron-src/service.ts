@@ -33,6 +33,7 @@ import {
   BUNDLED_BROWSER_EXTENSION_TOKEN,
   BrowserBridgeServer,
   isCompleteBaccaratHand,
+  isJoinableNewShoeRoadCount,
   type BrowserBridgeRuntimeEvent,
 } from '@baccarat/browser-bridge';
 import {
@@ -70,15 +71,15 @@ import {
   type RuntimeIncidentSeverity,
 } from './runtime-supervisor.js';
 
-const DEFAULT_APPROVED_LIVE_TABLE_IDS = ['bc281koreanch281', 'tobcbaccaragen92', 'speedbca14gesbc1', 'h22z8qhp17sa0vkh'] as const;
+const RETIRED_DEFAULT_MONITOR_TABLE_IDS = ['bc281koreanch281', 'tobcbaccaragen92', 'speedbca14gesbc1', 'h22z8qhp17sa0vkh'] as const;
 const MONITOR_TABLE_CONFIG_KEY = 'desktop:monitor-tables:v1';
+const AUTOMATION_CONFIG_KEY = 'desktop:pair-automation:v1';
 const TABLE_METADATA_CONFIG_KEY = 'desktop:table-metadata:v1';
 const LEGACY_MONITOR_TABLE_ID_PATTERN = /^[A-Z]{1,4}\d{2,6}$/i;
 const PRAGMATIC_MONITOR_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
 const DISCONNECTED_MONITOR_REMOVAL_MS = 15_000;
 const MAX_LIVE_FEED_STALENESS_MS = 45_000;
 const LIVE_MONITOR_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000] as const;
-const MAX_SMALL_DISCOVERY_AUTO_ADD = 4;
 const MAX_LIVE_MONITOR_TABLES = 64;
 const EMPTY_RECORD_COUNTS: DesktopRecordCounts = { events: 0, decisions: 0, ledger: 0 };
 const EMPTY_MONITOR_SUMMARY: MonitorSummary = { rows: [], incomePoints: [] };
@@ -225,12 +226,22 @@ function discoveredMonitorTableIds(rooms: readonly RoomDescriptor[]): Set<string
   return tableIds;
 }
 
+function automationEnabledFromConfig(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && Reflect.get(value, 'enabled') === true;
+}
+
 function defaultMonitorTableIds(): string[] {
-  const rawTableIds = String(process.env.BACCARAT_LIVE_TABLES || DEFAULT_APPROVED_LIVE_TABLE_IDS.join(','))
+  const rawTableIds = String(process.env.BACCARAT_LIVE_TABLES || '')
     .split(',')
     .map(value => value.trim())
     .filter(value => value.length > 0);
-  return normalizeMonitorTableIds(rawTableIds);
+  return normalizeMonitorTableIds(rawTableIds, true);
+}
+
+function isRetiredDefaultMonitorList(tableIds: readonly string[]): boolean {
+  if (tableIds.length !== RETIRED_DEFAULT_MONITOR_TABLE_IDS.length) return false;
+  const expected = new Set(RETIRED_DEFAULT_MONITOR_TABLE_IDS);
+  return tableIds.every(tableId => expected.has(tableId));
 }
 
 export interface DesktopSnapshotOptions extends MonitorSummaryOptions {
@@ -308,6 +319,8 @@ export class DesktopConsoleService {
   private lastAccountingRefreshAt = 0;
   private closing = false;
   private suppressDiscoveredMonitorAutoAdd = false;
+  private automationEnabled = false;
+  private readonly pendingGameCountByTable = new Map<string, number>();
   /** The transient allowlist used only while a serialized live transition is being validated. */
   private pendingMonitorTableIds?: readonly string[];
   /** Operator-managed, persisted ordered selection; mutation is the configuration operation. */
@@ -380,10 +393,14 @@ export class DesktopConsoleService {
       ledger: this.ledger,
       actor: tableId => this.orchestrator.getActor(tableId),
       monitorTableIds: () => this.monitorTableIds,
+      keepaliveTableIds: () => this.keepaliveEligibleTableIds(),
       serialize: async operation => await this.enqueueExecutionStateOperation(operation),
       runtimeBlockReason: (tableId, source) => this.operationalWagerRuntimeBlockReason(tableId, source),
       onError: error => this.recordLiveMonitorError(error, 'scheduler-failure', 'degraded'),
     });
+    this.automationEnabled = automationEnabledFromConfig(
+      this.ledger.getConfig<unknown>(AUTOMATION_CONFIG_KEY),
+    );
     this.normalizeEvFloor();
     this.startupFailCloseTask = this.initializeFailClosedRuntime();
     this.refreshAccountingIncidents();
@@ -391,21 +408,16 @@ export class DesktopConsoleService {
 
   private loadMonitorTableIds(): string[] {
     const configured = monitorTableIdsFromConfig(this.ledger.getConfig<unknown>(MONITOR_TABLE_CONFIG_KEY));
-    if (configured !== null && configured.length > 0) {
+    if (configured !== null) {
+      if (isRetiredDefaultMonitorList(configured)) {
+        this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: [] });
+        return [];
+      }
       if (configured.length <= MAX_LIVE_MONITOR_TABLES) return configured;
       const trimmed = configured.slice(0, MAX_LIVE_MONITOR_TABLES);
       this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: trimmed });
       return trimmed;
     }
-    const restored = [...this.tableMetadata.keys()].filter(tableId =>
-      normalizeOptionalMonitorTableId(tableId) !== undefined,
-    );
-    if (restored.length > 0) {
-      const trimmed = restored.slice(0, MAX_LIVE_MONITOR_TABLES);
-      this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: trimmed });
-      return trimmed;
-    }
-    if (configured !== null) return configured;
     const defaults = defaultMonitorTableIds();
     this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: defaults });
     return defaults;
@@ -463,7 +475,7 @@ export class DesktopConsoleService {
         this.missedShuffleRequested.delete(tableId);
         continue;
       }
-      if (projection.handNumber <= gameCount + 8) {
+      if (!(gameCount <= 8 && projection.handNumber > gameCount + 16)) {
         this.missedShuffleRequested.delete(tableId);
         continue;
       }
@@ -487,40 +499,62 @@ export class DesktopConsoleService {
     });
   }
 
-  private autoAddDiscoveredMonitorTables(rooms: readonly RoomDescriptor[]): void {
-    const existing = new Set(this.monitorTableIds);
-    const added: string[] = [];
-    for (const room of rooms) {
-      for (const table of room.tables) {
-        const tableId = normalizeOptionalMonitorTableId(table.tableId);
-        if (tableId === undefined || existing.has(tableId)) continue;
-        existing.add(tableId);
-        added.push(tableId);
-      }
+  private pendingJoinTableIds(): string[] {
+    const monitored = new Set(this.monitorTableIds);
+    const pending: string[] = [];
+    for (const candidate of this.monitorCandidates()) {
+      if (candidate.roomId !== 'dafabet-pragmatic') continue;
+      const tableId = normalizeOptionalMonitorTableId(candidate.tableId);
+      if (tableId === undefined || monitored.has(tableId) || pending.includes(tableId)) continue;
+      pending.push(tableId);
     }
-    if (added.length === 0) return;
-    const visible = new Set(
-      (this.browserBridge?.getVisibleTableIds() ?? [])
-        .map(tableId => normalizeOptionalMonitorTableId(tableId))
-        .filter((tableId): tableId is string => tableId !== undefined),
-    );
-    const visibleAdded = added.filter(tableId => visible.has(tableId));
-    const remaining = MAX_LIVE_MONITOR_TABLES - this.monitorTableIds.length;
-    if (remaining <= 0) return;
-    const acceptedRaw = added.length <= MAX_SMALL_DISCOVERY_AUTO_ADD
-      ? added
-      : visibleAdded.length > 0 && visibleAdded.length <= MAX_LIVE_MONITOR_TABLES
-        ? visibleAdded
-        : [];
-    const accepted = acceptedRaw.slice(0, remaining);
-    if (accepted.length === 0) return;
-    const inheritedSettings = this.currentUnifiedTableSettings();
-    const nextTableIds = [...this.monitorTableIds, ...accepted];
-    this.ensureMonitorActors(nextTableIds, inheritedSettings);
+    return pending;
+  }
+
+  private keepaliveEligibleTableIds(): string[] {
+    return [...this.monitorTableIds, ...this.pendingJoinTableIds()];
+  }
+
+  private observedTableIds(): string[] {
+    const ids = [...this.currentMonitorTableIds()];
+    const seen = new Set(ids);
+    for (const tableId of this.pendingJoinTableIds()) {
+      if (seen.has(tableId)) continue;
+      seen.add(tableId);
+      ids.push(tableId);
+    }
+    return ids;
+  }
+
+  private isObservedTable(tableId: string): boolean {
+    return this.observedTableIds().includes(tableId);
+  }
+
+  private promotePendingTable(tableId: string): void {
+    if (this.monitorTableIds.includes(tableId)) return;
+    if (this.monitorTableIds.length >= MAX_LIVE_MONITOR_TABLES) return;
+    const nextTableIds = [...this.monitorTableIds, tableId];
+    this.ensureMonitorActors(nextTableIds, this.currentUnifiedTableSettings());
     this.monitorTableIds = nextTableIds;
+    this.pendingGameCountByTable.delete(tableId);
     this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
     this.syncLiveApprovalsToMonitorTables();
-    this.browserBridge?.setSelectedTableIds(nextTableIds);
+    this.browserBridge?.setSelectedTableIds(this.observedTableIds());
+  }
+
+  private promotePendingTablesFromRooms(rooms: readonly RoomDescriptor[]): void {
+    for (const room of rooms) {
+      if (room.roomId !== 'dafabet-pragmatic') continue;
+      for (const table of room.tables) {
+        const tableId = normalizeOptionalMonitorTableId(table.tableId);
+        if (tableId === undefined || this.monitorTableIds.includes(tableId)) continue;
+        const gameCount = table.gameCount;
+        if (!Number.isInteger(gameCount) || (gameCount ?? -1) < 0) continue;
+        const previous = this.pendingGameCountByTable.get(tableId);
+        this.pendingGameCountByTable.set(tableId, gameCount!);
+        if (isJoinableNewShoeRoadCount(previous, gameCount!)) this.promotePendingTable(tableId);
+      }
+    }
   }
 
   private ensureMonitorActors(
@@ -600,8 +634,7 @@ export class DesktopConsoleService {
   }
 
   private canExecuteAutomaticBets(_tableId: string): boolean {
-    if (!this.operationalWagers.getKeepaliveState().enabled) return false;
-    return true;
+    return this.automationEnabled;
   }
 
   private hasSettlementGap(tableId: string): boolean {
@@ -1075,7 +1108,7 @@ export class DesktopConsoleService {
   }
 
   private isCurrentLiveFeed(tableId: string, feed: TableExport): boolean {
-    return this.isMonitorTableSelected(tableId) && this.liveFeeds.get(tableId) === feed;
+    return this.isObservedTable(tableId) && this.liveFeeds.get(tableId) === feed;
   }
 
   private async enqueueMonitorEvent(event: NormalizedEvent): Promise<void> {
@@ -1101,6 +1134,12 @@ export class DesktopConsoleService {
       this.runtimeIncidents.resolve('bridge-disconnected', event.tableId);
     }
     if (event.type === 'bettingWindowOpened') this.detectSettlementGap(event);
+    if (event.type === 'newShoeSignal' && event.baseline === 'physical-shoe') {
+      // Protocol/DOM already proved a physical new shoe. Do not wait for the
+      // road # to wrap to 0-2; that count often stays on the old shoe or skips
+      // ahead to 3-8, which left shuffled tables stuck in 待加入.
+      this.promotePendingTable(event.tableId);
+    }
     this.cachedLightSnapshot = undefined;
     await this.orchestrator.enqueue(event.tableId, event);
     if (
@@ -1152,7 +1191,7 @@ export class DesktopConsoleService {
   }
 
   private async rearmPairAutomation(tableId: string): Promise<void> {
-    if (!this.operationalWagers.getKeepaliveState().enabled || !this.monitorTableIds.includes(tableId)) return;
+    if (!this.automationEnabled || !this.monitorTableIds.includes(tableId)) return;
     const actor = this.orchestrator.getActor(tableId);
     if (!actor) return;
     const projection = actor.getProjection();
@@ -1168,7 +1207,6 @@ export class DesktopConsoleService {
 
   private async applyKeepaliveSettings(settings: KeepaliveSettings): Promise<void> {
     await this.operationalWagers.updateKeepalive(settings);
-    await this.reconcilePairAutomation(settings.enabled);
   }
 
   private recordLiveMonitorError(
@@ -1276,8 +1314,12 @@ export class DesktopConsoleService {
 
   private scheduleDisconnectedMonitorRemoval(tableId: string, reason?: string): void {
     if (this.closing || !this.monitorTableIds.includes(tableId)) return;
+    // Multi-table pages reconnect the game socket often. A stale/disconnected
+    // feed must stay in the monitor list so the export can resume; dropping
+    // the table is what leaves the console stuck on 数据流已断开 / 已过期.
+    if (reason === 'table-feed-stale') return;
     if (this.disconnectedMonitorRemovalTimers.has(tableId)) return;
-    const delayMs = reason === 'table-feed-stale' ? 0 : DISCONNECTED_MONITOR_REMOVAL_MS;
+    const delayMs = DISCONNECTED_MONITOR_REMOVAL_MS;
     const timer = setTimeout(() => {
       this.disconnectedMonitorRemovalTimers.delete(tableId);
       void this.enqueueLiveMonitorOperation(async () => {
@@ -1303,7 +1345,7 @@ export class DesktopConsoleService {
     this.monitorTableIds = nextTableIds;
     this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
     this.syncLiveApprovalsToMonitorTables();
-    this.browserBridge?.setSelectedTableIds(nextTableIds);
+    this.browserBridge?.setSelectedTableIds(this.observedTableIds());
   }
 
   private resolveTransientTableIncidents(tableId: string): void {
@@ -1466,10 +1508,12 @@ export class DesktopConsoleService {
     const discoveredRooms = browserBridge.getDiscoveredRooms();
     this.refreshTableMetadataFromRooms(discoveredRooms);
     if (this.liveMonitorActivated && !this.suppressDiscoveredMonitorAutoAdd) {
-      this.autoAddDiscoveredMonitorTables(discoveredRooms);
+      this.promotePendingTablesFromRooms(discoveredRooms);
     }
+    browserBridge.setSelectedTableIds(this.observedTableIds());
     if (
       this.monitorTableIds.length === 0
+      && this.pendingJoinTableIds().length === 0
       && !browserBridge.hasRuntimeTableSelection()
       && !browserBridge.hasConfiguredTableSelection()
     ) return;
@@ -1477,7 +1521,7 @@ export class DesktopConsoleService {
     const rooms = await browserBridge.discoverRooms();
     this.refreshTableMetadataFromRooms(rooms);
     if (this.liveMonitorActivated && !this.suppressDiscoveredMonitorAutoAdd) {
-      this.autoAddDiscoveredMonitorTables(rooms);
+      this.promotePendingTablesFromRooms(rooms);
     }
     const discoveredTableIds = discoveredMonitorTableIds([...discoveredRooms, ...rooms]);
     const discoveryReliable = browserBridge.getExtensionStatus().authenticated
@@ -1491,14 +1535,20 @@ export class DesktopConsoleService {
         this.cancelDisconnectedMonitorRemoval(tableId);
       }
     }
-    const selectedTableIds = new Set(this.currentMonitorTableIds());
+    const selectedTableIds = new Set(this.observedTableIds());
+    this.browserBridge?.setSelectedTableIds([...selectedTableIds]);
     for (const room of rooms) {
       for (const table of room.tables) {
         // The service is the final allowlist boundary; never rely solely on a bridge cache.
-        if (!selectedTableIds.has(table.tableId) || !this.isMonitorTableSelected(table.tableId)) continue;
+        if (!selectedTableIds.has(table.tableId) || !this.isObservedTable(table.tableId)) continue;
         if (this.liveFeeds.has(table.tableId)) continue;
         if (!this.orchestrator.getActor(table.tableId)) {
-          this.orchestrator.registerTable(table.profile, this.liveExecutionMode, 100);
+          const profile = defaultProfile(table.tableId);
+          this.orchestrator.registerTable(
+            table.profile === undefined ? profile : { ...profile, ...table.profile, tableId: table.tableId },
+            this.liveExecutionMode,
+            100,
+          );
         }
         this.cancelDisconnectedMonitorRemoval(table.tableId);
         await this.resetMonitorExecutionState(table.tableId);
@@ -1729,7 +1779,7 @@ export class DesktopConsoleService {
       tableMetadata,
       recordCounts,
       keepalive,
-      automation: { enabled: keepalive.enabled },
+      automation: { enabled: this.automationEnabled },
       runtime: this.runtimeSnapshot(),
       operationalWagers: includeHistory ? this.ledger.listOperationalWagersTail() : [],
       events: filterToDisplayedTables(events),
@@ -1966,7 +2016,8 @@ export class DesktopConsoleService {
     this.pendingMonitorTableIds = [...nextTableIds];
     try {
       this.ensureMonitorActors(nextTableIds, inheritedSettings);
-      const outgoingFeeds = [...this.liveFeeds].filter(([tableId]) => !nextTableIdSet.has(tableId));
+      const keepFeedIds = new Set([...nextTableIds, ...this.pendingJoinTableIds()]);
+      const outgoingFeeds = [...this.liveFeeds].filter(([tableId]) => !keepFeedIds.has(tableId));
       await this.failCloseLiveExecution(outgoingFeeds.map(([tableId]) => tableId));
 
       // Stop outgoing tables before mutating the Bridge allowlist. The Bridge
@@ -1982,7 +2033,7 @@ export class DesktopConsoleService {
         }
       }
 
-      this.browserBridge?.setSelectedTableIds(nextTableIds);
+      this.browserBridge?.setSelectedTableIds(this.observedTableIds());
       await this.attachLiveTablesInner();
       this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
       this.monitorTableIds = [...nextTableIds];
@@ -1995,12 +2046,13 @@ export class DesktopConsoleService {
         const previousTableIdSet = new Set(previousTableIds);
         // Any feed created for the failed target selection is safe to clean up:
         // it remains outside the restored allowlist and will not be reopened.
+        const keepRollbackIds = new Set([...previousTableIds, ...this.pendingJoinTableIds()]);
         for (const [tableId, feed] of [...this.liveFeeds]) {
-          if (previousTableIdSet.has(tableId)) continue;
+          if (keepRollbackIds.has(tableId)) continue;
           await this.stopLiveFeed(tableId, feed);
         }
-        this.browserBridge?.setSelectedTableIds(previousTableIds);
         this.monitorTableIds = previousTableIds;
+        this.browserBridge?.setSelectedTableIds(this.observedTableIds());
         this.suppressDiscoveredMonitorAutoAdd = true;
         try {
           await this.attachLiveTablesInner();
@@ -2042,7 +2094,7 @@ export class DesktopConsoleService {
       await this.startupFailCloseTask;
       const actor = this.orchestrator.getActor(tableId);
       if (!actor) throw new Error(`unknown table ${tableId}`);
-      if (armed && !this.operationalWagers.getKeepaliveState().enabled) {
+      if (armed && !this.automationEnabled) {
         throw new Error('global automation is disabled');
       }
       await actor.setAutoBet(armed, shoeId);
@@ -2306,7 +2358,7 @@ export class DesktopConsoleService {
     });
   }
 
-  async setAutomationEnabled(enabled: boolean): Promise<DesktopConsoleSnapshot> {
+  async setKeepaliveEnabled(enabled: boolean): Promise<DesktopConsoleSnapshot> {
     if (!enabled) this.operationalWagers.disableKeepaliveImmediately();
     return await this.enqueueExecutionStateOperation(async () => {
       await this.startupFailCloseTask;
@@ -2317,6 +2369,17 @@ export class DesktopConsoleService {
         market: current.market,
         amount: current.amount,
       });
+      await this.reconcileUnattendedExecution();
+      return this.snapshot();
+    });
+  }
+
+  async setAutomationEnabled(enabled: boolean): Promise<DesktopConsoleSnapshot> {
+    return await this.enqueueExecutionStateOperation(async () => {
+      await this.startupFailCloseTask;
+      this.automationEnabled = enabled;
+      this.ledger.setConfig(AUTOMATION_CONFIG_KEY, { enabled });
+      await this.reconcilePairAutomation(enabled);
       await this.reconcileUnattendedExecution();
       return this.snapshot();
     });

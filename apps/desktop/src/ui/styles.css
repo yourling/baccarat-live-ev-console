@@ -695,6 +695,12 @@ h2 { color: #f4f7fa; font-size: 18px; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.monitor-pair-ev {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
 .monitor-table__round { display: grid; gap: 2px; min-width: 0; }
 .monitor-table__round strong {
   overflow: hidden;

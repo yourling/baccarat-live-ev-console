@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { NormalizedEvent } from '@baccarat/contracts';
-import { PragmaticRuntimeParser, pragmaticGameCountSnapshot } from '../src/pragmatic-runtime.js';
+import { PragmaticRuntimeParser, isJoinableNewShoeRoadCount, pragmaticGameCountSnapshot } from '../src/pragmatic-runtime.js';
 import { pragmaticNetworkObservation } from '../src/server.js';
 
 function snapshot(
@@ -242,13 +242,48 @@ describe('PragmaticRuntimeParser', () => {
     expect(reset?.shoeId).toBe('pragmatic-bc281koreanch281-2');
   });
 
-  it('opens a physical shoe when the road count is far behind tracked hands', () => {
+  it('treats a lagged road wrap as joinable even past #2', () => {
+    expect(isJoinableNewShoeRoadCount(48, 5)).toBe(true);
+    expect(isJoinableNewShoeRoadCount(48, 1)).toBe(true);
+    expect(isJoinableNewShoeRoadCount(34, 33)).toBe(false);
+    expect(isJoinableNewShoeRoadCount(undefined, 1)).toBe(false);
+  });
+
+  it('does not treat a one-step road-count drop as a new shoe', () => {
     const parser = new PragmaticRuntimeParser();
-    const tableId = 'spto21bctorobc21';
+    parser.parse(snapshot([{
+      tableId: 'spto43bctorobc43', roundId: 'hand-37', gameCount: 37,
+    }]));
+    const events = parser.parse(snapshot([{
+      tableId: 'spto43bctorobc43', roundId: 'hand-36', gameCount: 36,
+    }]));
+    expect(events.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+  });
+
+  it('does not open a physical shoe when the road count only lags a few hands', () => {
+    const parser = new PragmaticRuntimeParser();
+    const tableId = 'spto43bctorobc43';
     for (let index = 0; index < 8; index += 1) {
       parser.parse(snapshot([{
         tableId,
         roundId: `1640732490${index}`,
+        bettingOpen: false,
+        playerCards: ['QS', '9H'],
+        bankerCards: ['3S', '7D'],
+        source: 'protocol',
+      }]));
+    }
+    expect(parser.parse(snapshot([{ tableId, gameCount: 5 }]))
+      .filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+  });
+
+  it('opens a physical shoe when the road count is far behind tracked hands', () => {
+    const parser = new PragmaticRuntimeParser();
+    const tableId = 'spto21bctorobc21';
+    for (let index = 0; index < 24; index += 1) {
+      parser.parse(snapshot([{
+        tableId,
+        roundId: `164073249${String(index).padStart(2, '0')}`,
         bettingOpen: false,
         playerCards: ['QS', '9H'],
         bankerCards: ['3S', '7D'],

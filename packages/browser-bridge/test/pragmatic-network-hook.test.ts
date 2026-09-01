@@ -34,6 +34,10 @@ class FakeWebSocket extends FakeEventTarget {
   constructor(readonly url: string) {
     super();
   }
+
+  close(): void {
+    this.readyState = FakeWebSocket.CLOSED;
+  }
 }
 
 class FakeWorker extends FakeEventTarget {
@@ -54,7 +58,10 @@ class FakeMessageChannel {
   readonly port2 = new FakeMessagePort();
 }
 
-function runHook(posted: unknown[]): {
+function runHook(posted: unknown[], page: {
+  readonly pathname?: string;
+  readonly referrer?: string;
+} = {}): {
   readonly testWindow: FakeEventTarget & {
     WebSocket: typeof FakeWebSocket;
     Worker: typeof FakeWorker;
@@ -73,7 +80,13 @@ function runHook(posted: unknown[]): {
   const context = vm.createContext({
     window: testWindow,
     globalThis: testWindow,
-    location: { hostname: 'client.pragmaticplaylive.net', origin: 'https://client.pragmaticplaylive.net' },
+    location: {
+      hostname: 'client.pragmaticplaylive.net',
+      origin: 'https://client.pragmaticplaylive.net',
+      pathname: page.pathname ?? '/desktop/multibaccarat/',
+    },
+    document: { referrer: page.referrer ?? '' },
+    URL,
     WebSocket: FakeWebSocket,
     Worker: FakeWorker,
     MessageChannel: FakeMessageChannel,
@@ -194,22 +207,181 @@ describe('Pragmatic passive network hook', () => {
       && data.includes('bc="1"')
       && data.includes('amt="10"')
     )).toBe(true);
+    socket.emit('message', {
+      data: '<command channel="table-speedbca14gesbc1"><timer table="speedbca14gesbc1" value="8"/></command>',
+    });
     expect(channel?.placeBet({
       tableId: 'speedbca14gesbc1',
       roundId: '16387259910',
       amount: 10,
       code: '1',
     })).toEqual({ ok: true });
-    const afterSecond = posted
+    const laterSends = posted
       .filter(message => (message as { direction?: string }).direction === 'send')
       .map(message => String((message as { data?: string }).data));
-    expect(afterSecond.some(data =>
-      data.includes('<lpbet')
-      && data.includes('channel="table-speedbca14gesbc1"')
-      && data.includes('gId="16387259910"')
-      && data.includes('bc="1"')
+    expect(laterSends.some(data => data.includes('channel="table-speedbca14gesbc1"') && data.includes('<lpbet'))).toBe(true);
+    expect(laterSends.some(data => data.includes('<autoBet></autoBet>'))).toBe(false);
+  });
+
+  it('does not close the previous same-frame game socket during reconnect', () => {
+    const posted: unknown[] = [];
+    const { testWindow, windowEvents } = runHook(posted);
+    signalContentReady(testWindow, windowEvents);
+    const first = new testWindow.WebSocket('wss://gs10.pragmaticplaylive.net/game');
+    first.readyState = FakeWebSocket.OPEN;
+    const second = new testWindow.WebSocket('wss://gs24.pragmaticplaylive.net/game');
+    second.readyState = FakeWebSocket.OPEN;
+
+    expect(first.readyState).toBe(FakeWebSocket.OPEN);
+    expect(second.readyState).toBe(FakeWebSocket.OPEN);
+  });
+
+  it('keeps capturing from the previous socket after a same-frame reconnect and bets on the latest open socket', () => {
+    const posted: unknown[] = [];
+    const { testWindow, windowEvents } = runHook(posted);
+    signalContentReady(testWindow, windowEvents);
+    const first = new testWindow.WebSocket('wss://gs10.pragmaticplaylive.net/game');
+    first.readyState = FakeWebSocket.OPEN;
+    first.send(
+      '<command channel="table-h22z8qhp17sa0vkh"><lpbet gm="mtb_desktop" gId="16387255610" uId="ppc1735377833837" ck="1" ><bet amt="10" bc="0" ck="1"/></lpbet></command>',
+    );
+    const second = new testWindow.WebSocket('wss://gs24.pragmaticplaylive.net/game');
+    second.readyState = FakeWebSocket.OPEN;
+
+    first.emit('message', {
+      data: '<command channel="table-h22z8qhp17sa0vkh"><timer table="h22z8qhp17sa0vkh" value="8"/></command>',
+    });
+    expect(first.readyState).toBe(FakeWebSocket.OPEN);
+    expect(posted.some(message =>
+      String((message as { data?: string }).data || '').includes('table-h22z8qhp17sa0vkh')
+      && (message as { direction?: string }).direction !== 'send',
     )).toBe(true);
-    expect(afterSecond.some(data => data.includes('<autoBet></autoBet>'))).toBe(false);
+
+    const channel = (testWindow as {
+      __baccaratPragmaticBetChannel?: {
+        placeBet(command: Record<string, unknown>): { ok: boolean };
+      };
+    }).__baccaratPragmaticBetChannel;
+    expect(channel?.placeBet({
+      tableId: 'h22z8qhp17sa0vkh',
+      roundId: '16387259910',
+      amount: 10,
+      code: '1',
+    })).toEqual({ ok: true });
+    const lpbetSends = posted
+      .filter(message => (message as { direction?: string }).direction === 'send')
+      .map(message => String((message as { data?: string }).data || ''));
+    expect(lpbetSends.some(data => data.includes('<lpbet') && data.includes('gId="16387259910"'))).toBe(true);
+    expect(first.readyState).toBe(FakeWebSocket.OPEN);
+
+    second.emit('message', {
+      data: '<command channel="table-h22z8qhp17sa0vkh"><timer table="h22z8qhp17sa0vkh" value="7"/></command>',
+    });
+    expect(first.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(second.readyState).toBe(FakeWebSocket.OPEN);
+  });
+
+  it('closes the game socket and blocks new ones after releaseSession', () => {
+    const posted: unknown[] = [];
+    const { testWindow, windowEvents } = runHook(posted);
+    signalContentReady(testWindow, windowEvents);
+    const socket = new testWindow.WebSocket('wss://gs10.pragmaticplaylive.net/game');
+    socket.readyState = FakeWebSocket.OPEN;
+    socket.emit('message', {
+      data: '<command channel="table-bcpirpmfpeobc198"><timer table="bcpirpmfpeobc198" value="8"/></command>',
+    });
+    const channel = (testWindow as {
+      __baccaratPragmaticBetChannel?: {
+        releaseSession(): { ok: boolean };
+        placeBet(command: Record<string, unknown>): { ok: boolean; reason?: string };
+        status(): { hasSocket: boolean };
+      };
+    }).__baccaratPragmaticBetChannel;
+
+    expect(channel?.releaseSession()).toEqual({ ok: true });
+    expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(channel?.status()).toEqual(expect.objectContaining({ hasSocket: false }));
+    expect(channel?.placeBet({
+      tableId: 'bcpirpmfpeobc198',
+      roundId: '16426491510',
+      amount: 10,
+      code: '0',
+    })).toEqual({ ok: false, reason: 'session-released' });
+
+    const next = new testWindow.WebSocket('wss://gs10.pragmaticplaylive.net/game');
+    expect(next.readyState).toBe(FakeWebSocket.CLOSED);
+  });
+
+  it('refuses dedicated-frame lpbet for a table other than the referrer-bound table', () => {
+    const posted: unknown[] = [];
+    const { testWindow, windowEvents } = runHook(posted, {
+      pathname: '/desktop/baccarat/',
+      referrer: 'https://client.pragmaticplaylive.net/desktop/launcher/?table_id=bc392chromabc392',
+    });
+    signalContentReady(testWindow, windowEvents);
+    const socket = new testWindow.WebSocket('wss://gs10.pragmaticplaylive.net/game');
+    socket.readyState = FakeWebSocket.OPEN;
+    socket.emit('message', {
+      data: '<command channel="table-bc392chromabc392"><timer table="bc392chromabc392" value="8"/></command>',
+    });
+    socket.emit('message', {
+      data: '<command channel="table-bcpirpmfpeobc198"><timer table="bcpirpmfpeobc198" value="7"/></command>',
+    });
+    const channel = (testWindow as {
+      __baccaratPragmaticBetChannel?: {
+        placeBet(command: Record<string, unknown>): { ok: boolean; reason?: string };
+        status(): {
+          framePath?: string;
+          boundTableId?: string;
+          tableIds?: readonly string[];
+        };
+      };
+    }).__baccaratPragmaticBetChannel;
+
+    expect(channel?.status()).toEqual(expect.objectContaining({
+      framePath: '/desktop/baccarat/',
+      boundTableId: 'bc392chromabc392',
+    }));
+    expect(channel?.placeBet({
+      tableId: 'bcpirpmfpeobc198',
+      roundId: '16413832010',
+      amount: 10,
+      code: '0',
+    })).toEqual({ ok: false, reason: 'table-not-in-current-session' });
+    expect(posted.some(message =>
+      String((message as { data?: string }).data || '').includes('gId="16413832010"'),
+    )).toBe(false);
+  });
+
+  it('refuses to send lpbet on a socket that has never seen the target table', () => {
+    const posted: unknown[] = [];
+    const { testWindow, windowEvents } = runHook(posted);
+    signalContentReady(testWindow, windowEvents);
+    const socket = new testWindow.WebSocket('wss://gs10.pragmaticplaylive.net/game');
+    socket.readyState = FakeWebSocket.OPEN;
+    socket.emit('message', {
+      data: '<command channel="table-bc392chromabc392"><timer table="bc392chromabc392" value="8"/></command>',
+    });
+    const channel = (testWindow as {
+      __baccaratPragmaticBetChannel?: {
+        placeBet(command: Record<string, unknown>): { ok: boolean; reason?: string };
+        status(): { hasSocket: boolean; tableIds?: readonly string[] };
+      };
+    }).__baccaratPragmaticBetChannel;
+
+    expect(channel?.status()).toEqual(expect.objectContaining({
+      hasSocket: true,
+      tableIds: ['bc392chromabc392'],
+    }));
+    expect(channel?.placeBet({
+      tableId: 'bcpirpmfpeobc198',
+      roundId: '16413832010',
+      amount: 10,
+      code: '0',
+    })).toEqual({ ok: false, reason: 'table-not-in-current-session' });
+    expect(posted.some(message =>
+      String((message as { data?: string }).data || '').includes('bcpirpmfpeobc198'),
+    )).toBe(false);
   });
 
   it('does not capture binary WebSocket frames or video sockets', () => {

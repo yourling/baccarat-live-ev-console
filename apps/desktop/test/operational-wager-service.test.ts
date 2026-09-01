@@ -300,7 +300,7 @@ describe('DesktopConsoleService operational wagers', () => {
         market: 'player',
         amount: 20,
       });
-      await service.setAutomationEnabled(true);
+      await service.setKeepaliveEnabled(true);
       const settings = await service.updateKeepaliveSettings({
         intervalMinutes: 5,
         market: 'banker',
@@ -760,7 +760,7 @@ describe('DesktopConsoleService operational wagers', () => {
         baseline: 'unknown-monitor-session',
       });
 
-      await service.setAutomationEnabled(true);
+      await service.setKeepaliveEnabled(true);
       expect(requestOperationalWager).not.toHaveBeenCalled();
 
       // When: a protocol-backed window opens before a physical-shoe confirmation.
@@ -819,7 +819,7 @@ describe('DesktopConsoleService operational wagers', () => {
         ...physicalShoe('bc281koreanch281'),
         baseline: 'unknown-monitor-session',
       });
-      await service.setAutomationEnabled(true);
+      await service.setKeepaliveEnabled(true);
       await service.injectEvent(openWindow('bc281koreanch281'));
       await waitFor(() => requestOperationalWager.mock.calls.length > 0);
 

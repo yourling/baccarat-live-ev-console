@@ -80,9 +80,6 @@ export async function executeControlledOperationalWager(
   });
   if (!isOperationalWagerMarket(command.market)) return rejected('unsupported-market');
   if (!Number.isFinite(command.amount) || command.amount <= 0) return rejected('invalid-amount');
-  if (command.source === 'keepalive' && !context.canExecuteAutomaticBets()) {
-    return rejected('global-automation-disabled');
-  }
   if (context.executionMode !== 'live') {
     return rejected('live-execution-required');
   }

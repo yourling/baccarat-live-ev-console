@@ -4,9 +4,10 @@
  * This hook mirrors received *game protocol* WebSocket frames to the isolated
  * content script and, when a previous real bet send has been observed, can
  * replay a mutated copy of that send for request-path betting.
- * It never sends <autoBet> and never sits a table. Multi-baccarat already
- * lets lpbet target any tile on the page; joining is what triggers
- * Pragmatic's "joined from another device" toast.
+ * It never sends <autoBet>. Multiplay already lets lpbet target any visible
+ * tile. Same-frame reconnects must wait for the new game socket to receive
+ * before retiring the old one. The official client can keep a dedicated table
+ * and multibaccarat open together; do not treat that as a conflict.
  * It does not observe fetch/XHR/Worker/MessageChannel/video sockets.
  */
 (function () {
@@ -38,12 +39,22 @@
   }
 
   const liveSockets = [];
+  const seenTableIds = new Set();
   let lastBetTemplate = '';
   let lastUid = '';
   let lastGm = 'mtb_desktop';
+  let sessionReleased = false;
+
+  function pruneDeadSockets() {
+    for (let index = liveSockets.length - 1; index >= 0; index -= 1) {
+      const socket = liveSockets[index] && liveSockets[index].socket;
+      if (!socket || socket.readyState > 1) liveSockets.splice(index, 1);
+    }
+  }
 
   function rememberSocket(socket, url) {
     if (!socket) return;
+    pruneDeadSockets();
     const href = String(url || '');
     for (const entry of liveSockets) {
       if (entry.socket === socket) {
@@ -52,6 +63,34 @@
       }
     }
     liveSockets.push({ socket, url: href });
+    if (typeof socket.addEventListener === 'function') {
+      socket.addEventListener('close', pruneDeadSockets);
+      socket.addEventListener('error', pruneDeadSockets);
+    }
+  }
+
+  // Close previous same-frame game sockets only after the new one is actually
+  // receiving. Closing on construct kills the live feed; leaving two live
+  // sockets in this same multi frame makes that page reconnect by itself.
+  function adoptGameSocket(socket, url) {
+    if (sessionReleased || !isGameProtocolSocket(url)) return;
+    let newest = null;
+    for (let index = liveSockets.length - 1; index >= 0; index -= 1) {
+      const entry = liveSockets[index];
+      if (entry && isGameProtocolSocket(entry.url)) {
+        newest = entry;
+        break;
+      }
+    }
+    if (!newest || newest.socket !== socket) return;
+    for (let index = liveSockets.length - 1; index >= 0; index -= 1) {
+      const entry = liveSockets[index];
+      if (!entry || entry.socket === socket || !isGameProtocolSocket(entry.url)) continue;
+      if (entry.socket && entry.socket.readyState < 2) {
+        try { entry.socket.close(); } catch (_) {}
+      }
+      liveSockets.splice(index, 1);
+    }
   }
 
   function sendText(data) {
@@ -77,9 +116,58 @@
     return typeof tableId === 'string' && /^[a-z0-9]{8,32}$/i.test(tableId);
   }
 
+  function rememberTableId(value) {
+    let tableId = String(value || '').trim();
+    if (/^table-/i.test(tableId)) tableId = tableId.slice('table-'.length);
+    if (isBettableTableId(tableId)) seenTableIds.add(tableId.toLowerCase());
+  }
+
+  function rememberTablesFromJson(value, depth) {
+    if (!value || typeof value !== 'object' || depth > 5) return;
+    if (Array.isArray(value)) {
+      for (const item of value) rememberTablesFromJson(item, depth + 1);
+      return;
+    }
+    for (const key of ['table', 'tableId', 'table_id', 'channel']) {
+      const raw = value[key];
+      if (typeof raw === 'string') rememberTableId(raw);
+    }
+    for (const nested of Object.values(value)) {
+      if (nested && typeof nested === 'object') rememberTablesFromJson(nested, depth + 1);
+    }
+  }
+
+  function rememberTablesFromText(text) {
+    if (!text) return;
+    for (const match of String(text).matchAll(/\b(?:channel|table|tableId|table_id)="([^"]+)"/gi)) {
+      rememberTableId(match[1]);
+    }
+    try {
+      rememberTablesFromJson(JSON.parse(text), 0);
+    } catch (_) {}
+  }
+
+  function dedicatedBoundTableId() {
+    try {
+      if (String(location.pathname || '') !== '/desktop/baccarat/') return '';
+      const tableId = new URL(document.referrer).searchParams.get('table_id') || '';
+      return isBettableTableId(tableId) ? tableId.toLowerCase() : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function knownTableIds() {
+    const tableIds = new Set(seenTableIds);
+    const bound = dedicatedBoundTableId();
+    if (bound) tableIds.add(bound);
+    return [...tableIds];
+  }
+
   function rememberSession(data) {
     const text = sendText(data);
     if (!text) return;
+    rememberTablesFromText(text);
     const uId = xmlAttr(text, 'uId');
     if (uId) lastUid = uId;
     const gm = xmlAttr(text, 'gm');
@@ -161,12 +249,34 @@
     return fallback;
   }
 
+  function releaseGameSession() {
+    sessionReleased = true;
+    for (const entry of liveSockets.slice()) {
+      try {
+        if (entry && entry.socket && entry.socket.readyState < 2) entry.socket.close();
+      } catch (_) {}
+    }
+    liveSockets.length = 0;
+    lastUid = '';
+    lastBetTemplate = '';
+    return { ok: true };
+  }
+
   function placePragmaticBet(command) {
-    const payload = mutateBetTemplate(command);
-    if (!payload) return { ok: false, reason: 'bet-template-missing' };
+    if (sessionReleased) return { ok: false, reason: 'session-released' };
     if (!isBettableTableId(command && command.tableId)) {
       return { ok: false, reason: 'invalid-table-id' };
     }
+    const tableId = String(command.tableId).toLowerCase();
+    const bound = dedicatedBoundTableId();
+    if (bound && bound !== tableId) {
+      return { ok: false, reason: 'table-not-in-current-session' };
+    }
+    if (!knownTableIds().includes(tableId)) {
+      return { ok: false, reason: 'table-not-in-current-session' };
+    }
+    const payload = mutateBetTemplate(command);
+    if (!payload) return { ok: false, reason: 'bet-template-missing' };
     const socket = pickGameSocket();
     if (!socket) return { ok: false, reason: 'bet-socket-not-open' };
     try {
@@ -179,11 +289,18 @@
 
   globalThis.__baccaratPragmaticBetChannel = {
     placeBet: placePragmaticBet,
+    releaseSession: releaseGameSession,
     hasTemplate() { return lastBetTemplate.length > 0 || lastUid.length > 0; },
     status() {
+      const boundTableId = dedicatedBoundTableId();
       return {
         hasUser: Boolean(lastUid || xmlAttr(lastBetTemplate, 'uId')),
-        hasSocket: Boolean(pickGameSocket()),
+        hasSocket: !sessionReleased && Boolean(pickGameSocket()),
+        framePath: String(location.pathname || ''),
+        gm: lastGm || 'mtb_desktop',
+        tableIds: knownTableIds(),
+        released: sessionReleased,
+        ...(boundTableId ? { boundTableId } : {}),
       };
     },
     templatePreview() { return lastBetTemplate.slice(0, 400); },
@@ -209,6 +326,7 @@
   window.addEventListener('message', event => {
     if (event.source !== window || event.origin !== location.origin) return;
     if (!event.data || event.data.source !== 'baccarat-bridge-pragmatic-restore-bet-template') return;
+    if (sessionReleased) return;
     if (event.data.uId) lastUid = String(event.data.uId);
     if (event.data.gm) lastGm = String(event.data.gm);
     rememberSession(event.data.template);
@@ -221,10 +339,15 @@
         ? new OriginalWebSocket(url)
         : new OriginalWebSocket(url, protocols);
       try {
+        if (sessionReleased && isGameProtocolSocket(url)) {
+          try { socket.close(); } catch (_) {}
+          return socket;
+        }
         rememberSocket(socket, url);
         if (!isGameProtocolSocket(url)) return socket;
         socket.addEventListener('message', event => {
           if (typeof event.data !== 'string') return;
+          adoptGameSocket(socket, url);
           captureGameSocket(url, event.data);
           rememberSession(event.data);
         });

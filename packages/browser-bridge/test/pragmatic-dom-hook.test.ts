@@ -13,6 +13,88 @@ const source = readFileSync(
 );
 
 describe('Pragmatic DOM hook', () => {
+  it('does not pause or mute live table videos', () => {
+    expect(source).not.toMatch(/video\.pause\s*\(/);
+    expect(source).not.toMatch(/video\.muted\s*=/);
+  });
+
+  it.each([
+    ['在其他地方启动了会话', 'https://client.pragmaticplaylive.net/desktop/baccarat/?table_id=bc281koreanch281'],
+    ['在其他地方启动了对话', 'https://client.pragmaticplaylive.net/desktop/multibaccarat/'],
+  ])('does not click continue on a session-conflict dialog: %s', (copy, url) => {
+    const dom = new JSDOM(
+      `<body><div role="dialog"><p>${copy}</p><button>继续游戏</button></div></body>`,
+      { url },
+    );
+    Object.defineProperty(dom.window.Element.prototype, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({ width: 120, height: 36, top: 0, left: 0, right: 120, bottom: 36 }),
+    });
+    const button = dom.window.document.querySelector('button')!;
+    const click = vi.fn();
+    button.click = click;
+    const sendMessage = vi.fn();
+    const context = vm.createContext({
+      chrome: { runtime: { sendMessage } },
+      document: dom.window.document,
+      location: dom.window.location,
+      URL,
+      Date,
+      JSON,
+      Number,
+      String,
+      Object,
+      Array,
+      setInterval: vi.fn(),
+      getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+      globalThis: null,
+    });
+    context.globalThis = context;
+
+    vm.runInContext(source, context, { filename: 'pragmatic-dom-hook.js' });
+
+    expect(click).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'sessionAction',
+      action: 'session-conflict-dialog',
+      detail: expect.stringContaining('其他地方'),
+    }));
+  });
+
+  it('does not click the multibaccarat reconnect banner', () => {
+    const dom = new JSDOM(
+      '<body><p>重新连接以重返游戏</p><button>重新连接</button></body>',
+      { url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/' },
+    );
+    Object.defineProperty(dom.window.Element.prototype, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({ width: 120, height: 36, top: 0, left: 0, right: 120, bottom: 36 }),
+    });
+    const button = dom.window.document.querySelector('button')!;
+    const click = vi.fn();
+    button.click = click;
+    const sendMessage = vi.fn();
+    const context = vm.createContext({
+      chrome: { runtime: { sendMessage } },
+      document: dom.window.document,
+      location: dom.window.location,
+      URL,
+      Date,
+      JSON,
+      Number,
+      String,
+      Object,
+      Array,
+      setInterval: vi.fn(),
+      getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+      globalThis: null,
+    });
+    context.globalThis = context;
+    vm.runInContext(source, context, { filename: 'pragmatic-dom-hook.js' });
+    expect(click).not.toHaveBeenCalled();
+    expect(sendMessage.mock.calls.some(call => call[0]?.kind === 'sessionExpired')).toBe(false);
+  });
+
   it('uses the native continue-game dialog for idle keepalive', () => {
     const dom = new JSDOM('<body><div role="dialog"><button>继续游戏</button></div></body>', {
       url: 'https://client.pragmaticplaylive.net/desktop/launcher/?table_id=bc281koreanch281',

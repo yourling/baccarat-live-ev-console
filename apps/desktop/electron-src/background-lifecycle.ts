@@ -6,8 +6,8 @@ export interface RestorableMainWindow {
   focus(): void;
 }
 
-export function shouldHideMainWindowOnClose(appQuitting: boolean): boolean {
-  return !appQuitting;
+export function shouldHideMainWindowOnClose(_appQuitting: boolean): boolean {
+  return false;
 }
 
 export async function restoreOrCreateMainWindow(

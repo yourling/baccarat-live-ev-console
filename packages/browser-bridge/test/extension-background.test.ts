@@ -165,6 +165,99 @@ describe('extension background multitable command', () => {
     }));
   });
 
+  it('does not navigate a dedicated table frame when multiplay is already open', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+      pragmaticFrameRoutes: [
+        {
+          frameId: 11,
+          result: {
+            pathname: '/desktop/multibaccarat/',
+            frameUrl: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/',
+          },
+        },
+        {
+          frameId: 12,
+          result: {
+            pathname: '/desktop/baccarat/',
+            frameUrl: 'https://client.pragmaticplaylive.net/desktop/baccarat/?table_id=bc281koreanch281',
+          },
+        },
+      ],
+    });
+
+    harness.socket.emit('message', {
+      data: JSON.stringify({
+        kind: 'command',
+        name: 'openMultiView',
+        tableIds: ['bc281koreanch281', 'tobcbaccaragen92'],
+      }),
+    });
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes('pragmatic-frame-routes'),
+    )).toBe(true);
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes("location.pathname = '/desktop/multibaccarat/'")
+        && Array.isArray(injection.target?.frameIds),
+    )).toBe(false);
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes("location.replace('about:blank')"),
+    )).toBe(false);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'sessionAction',
+      action: 'dual-game-session',
+      detail: expect.stringContaining('multibaccarat'),
+    }));
+  });
+
+  it('does not blank multiplay when a dedicated table frame is also present', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+    });
+    const listeners = harness.chrome.runtime.onMessage.addListener.mock.calls.map(([listener]) => listener);
+    const popup = {
+      tab: { id: 42, url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat' },
+    };
+    const emit = (message, sender) => {
+      for (const listener of listeners) listener(message, sender);
+    };
+
+    emit({
+      kind: 'sessionAction',
+      action: 'native-idle-keepalive-armed',
+      url: 'https://client.pragmaticplaylive.net/desktop/baccarat/?table_id=bc281koreanch281',
+      frame: 'iframe',
+      timestamp: '2026-09-01T00:00:00.000Z',
+    }, { ...popup, frameId: 12, url: 'https://client.pragmaticplaylive.net/desktop/baccarat/?table_id=bc281koreanch281' });
+    emit({
+      kind: 'sessionAction',
+      action: 'native-idle-keepalive-armed',
+      url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/',
+      frame: 'iframe',
+      timestamp: '2026-09-01T00:00:01.000Z',
+    }, { ...popup, frameId: 11, url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/' });
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes("location.replace('about:blank')"),
+    )).toBe(false);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'sessionAction',
+      action: 'dual-game-session',
+      detail: expect.stringContaining('autonomous'),
+    }));
+  });
+
   it('does not forward HTTP, Worker, or CDP captures to the bridge', async () => {
     const harness = await createHarness();
     for (const source of [

@@ -191,7 +191,10 @@ export class OperationalWagerCoordinator {
     if (!Number.isFinite(input.amount) || input.amount <= 0) {
       return { status: 'REJECTED', tableId: input.tableId, reason: 'invalid-amount' };
     }
-    if (!this.options.monitorTableIds().includes(input.tableId)) {
+    const allowedTableIds = input.source === 'keepalive'
+      ? (this.options.keepaliveTableIds?.() ?? this.options.monitorTableIds())
+      : this.options.monitorTableIds();
+    if (!allowedTableIds.includes(input.tableId)) {
       return { status: 'REJECTED', tableId: input.tableId, reason: 'table-not-monitored' };
     }
     const runtimeBlockReason = this.options.runtimeBlockReason?.(input.tableId, input.source);
