@@ -14,7 +14,7 @@ import type {
   ShoeStateProjection,
   TableStatus,
 } from '@baccarat/contracts';
-import { isVerifiedPhysicalShoeReason, type DecisionHandRecord, type OperationalWagerRecord } from '@baccarat/ledger-state';
+import type { DecisionHandRecord, OperationalWagerRecord } from '@baccarat/ledger-state';
 import type {
   DesktopConsoleSnapshot,
   DesktopKeepaliveState,
@@ -2210,6 +2210,10 @@ function safeEvaluate(
   } catch {
     return null;
   }
+}
+
+function isVerifiedPhysicalShoeReason(reason: string | undefined): boolean {
+  return reason === 'protocol-shuffle' || reason === 'road-wrap' || reason === 'manual-confirm';
 }
 
 function isDisplayedPhysicalShoe(
