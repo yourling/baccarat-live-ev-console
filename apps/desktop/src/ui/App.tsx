@@ -1402,7 +1402,7 @@ function DecisionTable({ decisions, totalCount, tableLabel }: { decisions: Decis
           <thead><tr><th>时间</th><th>牌桌 / 牌靴 / 牌局</th><th>策略选择</th><th>概率均值</th><th>概率下界</th><th>平均 EV</th><th>资格</th><th>实际结果</th><th>原因</th></tr></thead>
           <tbody>{decisions.map(decision => {
             return <tr key={`${decision.tableId}|${decision.shoeId}|${decision.handId}`}>
-              <td data-label="时间">{formatTime(decision.createdAt)}</td>
+              <td data-label="时间">{formatDateTime(decision.createdAt)}</td>
               <td data-label="牌桌 / 牌局"><strong>{tableLabel(decision.tableId)}</strong><br /><span className="muted" title={`${decision.shoeId} / ${decision.handId}`}>{shortId(decision.shoeId)} / {shortId(decision.handId)}</span></td>
               <td data-label="策略">{decisionChoiceLabel(decision)}</td>
               <td data-label="概率均值">{formatPercent(decision.pMean)}</td>
@@ -1428,7 +1428,7 @@ function EventTable({ events, totalCount, tableLabel }: { events: NormalizedEven
         <table className="record-table record-table--events">
           <thead><tr><th>时间</th><th>牌桌</th><th>牌靴 / 牌局</th><th>事件</th><th>详情</th></tr></thead>
           <tbody>{events.map(event => <tr key={event.eventId}>
-            <td data-label="时间">{formatTime(event.timestamp)}</td>
+            <td data-label="时间">{formatDateTime(event.timestamp)}</td>
             <td data-label="牌桌">{tableLabel(event.tableId)}</td>
             <td data-label="牌靴 / 牌局"><span title={eventShoeId(event)}>{shortId(eventShoeId(event))}</span><br /><span className="muted">{shortId(eventHandId(event))}</span></td>
             <td data-label="事件"><Badge label={EVENT_LABELS[event.type]} tone={event.type === 'connectionLost' || event.type === 'shoeInvalidated' ? 'danger' : 'neutral'} /></td>
@@ -1612,14 +1612,14 @@ function BetLedgerView(props: {
         <section className="record-section">
           <div className="record-heading">
             <h2>账本</h2>
-            <span className="record-count">共 {props.totalCount} 条</span>
+            <span className="record-count">共 {props.totalCount} 条 · 仅中控实际下过的注，最新在上</span>
           </div>
           <div className="table-scroll">
             <table className="record-table ledger-table record-table--ledger">
               <thead><tr><th>时间</th><th>牌桌 / 牌局</th><th>下注对象</th><th>下注时 EV</th><th>下注金额</th><th>期望盈利</th><th>回执</th><th>实际结果</th><th>净盈亏</th></tr></thead>
               <tbody>{props.rows.map(row => (
                 <tr key={row.reservation.reservationId}>
-                  <td data-label="时间">{formatTime(row.createdAt)}</td>
+                  <td data-label="时间">{formatDateTime(row.createdAt)}</td>
                   <td data-label="牌桌 / 牌局"><strong>{props.tableLabel(row.reservation.tableId)}</strong><br /><span className="muted" title={row.reservation.handId}>{shortId(row.reservation.handId)}</span></td>
                   <td data-label="下注对象">{MARKET_LABELS[row.reservation.market]}</td>
                   <td data-label="下注时 EV" className={row.decision ? evTone(row.decision.evMean) : 'text--muted'}>{row.decision ? formatSignedPercent(row.decision.evMean) : '-'}</td>
@@ -2012,6 +2012,16 @@ function buildBetLedgerRows(snapshot: DesktopConsoleSnapshot | null): BetLedgerR
   }).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
+function ledgerRowCreatedAt(row: Pick<LedgerPageRow, 'reservation' | 'decision' | 'operationalWager'>): string {
+  return [
+    row.operationalWager?.wager.createdAt,
+    row.reservation.createdAt,
+    row.decision?.createdAt,
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0)
+    .sort((left, right) => right.localeCompare(left))[0]
+    ?? row.reservation.createdAt;
+}
+
 function ledgerPageRowsToView(rows: LedgerPageRow[]): BetLedgerRow[] {
   return rows.map(row => {
     const result = ledgerResult(row.reservation, row.receipt, [], row.outcome, row.operationalWager);
@@ -2020,13 +2030,13 @@ function ledgerPageRowsToView(rows: LedgerPageRow[]): BetLedgerRow[] {
       decision: row.decision,
       receipt: row.receipt,
       operationalWager: row.operationalWager,
-      createdAt: row.decision?.createdAt ?? row.reservation.createdAt,
+      createdAt: ledgerRowCreatedAt(row),
       resultLabel: result.label,
       resultTone: result.tone,
       realizedPnl: row.reservation.realizedPnl,
       expectedPnl: row.decision ? row.reservation.amount * row.decision.evMean : undefined,
     };
-  });
+  }).sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 }
 
 function ledgerResult(

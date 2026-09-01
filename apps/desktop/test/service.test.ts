@@ -2972,6 +2972,31 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('keeps ledger bets after a table leaves the live monitor list', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      expect(service['ledger'].saveReservation({
+        reservationId: 'rv-keep-ledger',
+        intentId: 'i-keep-ledger',
+        tableId: 'P001',
+        shoeId: 's1',
+        handId: 'h1',
+        market: 'player',
+        amount: 10,
+        maxLoss: 10,
+        maxProfit: 10,
+        status: 'SETTLED',
+        createdAt: '2026-09-01T18:00:00.000Z',
+      })).toBe(true);
+      await service.updateMonitorTableIds(['D055']);
+      await service.startLiveRoomMonitor(0);
+      const page = service.queryRecords({ kind: 'ledger', page: 1, pageSize: 20 });
+      expect(page.ledger?.map(row => row.reservation.tableId)).toContain('P001');
+    } finally {
+      await service.close();
+    }
+  });
+
   it('filters record pagination to the configured monitor tables', async () => {
     const service = new DesktopConsoleService(':memory:');
     try {

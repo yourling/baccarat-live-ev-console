@@ -1972,9 +1972,10 @@ export class DesktopConsoleService {
     }
 
   queryRecords(query: DesktopRecordQuery): DesktopRecordPage {
-    // Record pages are part of the live dashboard surface. Apply the same monitor-table
-    // scope before pagination so unrelated historical tables cannot inflate totals or rows.
-    const scopedQuery = this.liveMonitorActivated
+    // Events/decisions stay scoped to the live monitor list so demo tables do not
+    // inflate those pages. Ledger is money history: keep rows after a table leaves
+    // the monitor list, otherwise real bets vanish from 账本.
+    const scopedQuery = this.liveMonitorActivated && query.kind !== 'ledger'
       ? { ...query, tableIds: this.displayedTableIds(this.orchestrator.snapshot()) }
       : query;
     if (query.kind === 'events') {
