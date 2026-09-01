@@ -230,6 +230,55 @@ describe('Pragmatic DOM hook', () => {
     expect(snapshot.tables[0]?.gameCount).toBe(64);
   });
 
+  it('does not replace a deep road # with a timer 8', () => {
+    const dom = new JSDOM(`
+      <body>
+        <div id="TileHeight-bc281koreanch281">
+          <span>韩语百家乐2</span>
+          <span class="game-count"><span>#</span><span>51</span></span>
+          <div class="game-countdown" data-testid="timer-countdown-8">8</div>
+        </div>
+      </body>
+    `, { url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/' });
+    Object.defineProperty(dom.window.Element.prototype, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({ width: 237, height: 201, top: 0, left: 0, right: 237, bottom: 201 }),
+    });
+    const sendMessage = vi.fn();
+    const context = vm.createContext({
+      chrome: { runtime: { sendMessage } },
+      document: dom.window.document,
+      location: dom.window.location,
+      URL,
+      Date,
+      JSON,
+      Number,
+      String,
+      Object,
+      Array,
+      setInterval: vi.fn(),
+      getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+      globalThis: null,
+    });
+    context.globalThis = context;
+    vm.runInContext(source, context, { filename: 'pragmatic-dom-hook.js' });
+    const discovery = sendMessage.mock.calls
+      .map(([message]) => message)
+      .find(message => message && message.kind === 'roomDiscovered');
+    expect(discovery?.room?.tables?.[0]?.gameCount).toBe(51);
+
+    dom.window.document.querySelector('.game-count span:last-child').textContent = '8';
+    sendMessage.mockClear();
+    context.__baccaratPragmaticReplay();
+    const capture = sendMessage.mock.calls
+      .map(([message]) => message)
+      .find(message => message && message.source === 'baccarat-bridge-pragmatic-state');
+    const snapshot = JSON.parse(String(capture?.data ?? '{}')) as {
+      tables: Array<{ gameCount?: number }>;
+    };
+    expect(snapshot.tables[0]?.gameCount).toBe(51);
+  });
+
   it('discovers all tables and groups multitable cards by player and banker market', () => {
     const dom = new JSDOM(`
       <body>

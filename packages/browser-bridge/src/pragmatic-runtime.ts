@@ -63,7 +63,7 @@ function isPhysicalShoeFromRoadCount(
   previous: number | undefined,
   gameCount: number,
 ): boolean {
-  return isJoinableNewShoeRoadCount(previous, gameCount);
+  return isRoadWrapToNewShoe(previous, gameCount);
 }
 
 export type ParserShoeReason = 'attach' | 'protocol-shuffle' | 'road-wrap' | 'manual-confirm';
@@ -230,6 +230,7 @@ export class PragmaticRuntimeParser {
   private readonly shoeIdByTable = new Map<string, string>();
   private readonly lastShoeResetByTable = new Map<string, string>();
   private readonly lastGameCountByTable = new Map<string, number>();
+  private readonly pendingRoadWrapByTable = new Map<string, number>();
   private readonly handsThisShoeByTable = new Map<string, number>();
   private readonly lastRoundByTable = new Map<string, string>();
   private readonly cardBoundaryByHand = new Set<string>();
@@ -300,6 +301,7 @@ export class PragmaticRuntimeParser {
     this.shoeIdByTable.delete(tableId);
     this.lastShoeResetByTable.delete(tableId);
     this.lastGameCountByTable.delete(tableId);
+    this.pendingRoadWrapByTable.delete(tableId);
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
     this.evidenceByTable.delete(tableId);
@@ -329,14 +331,22 @@ export class PragmaticRuntimeParser {
       const previous = this.lastGameCountByTable.get(tableId);
       const gameCount = table.gameCount!;
       if (isPhysicalShoeFromRoadCount(previous, gameCount)) {
-        this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
-        this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', {
-          reason: 'road-wrap',
-          previousGameCount: previous,
-          gameCount,
-        });
+        if (this.pendingRoadWrapByTable.get(tableId) === gameCount) {
+          this.pendingRoadWrapByTable.delete(tableId);
+          this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
+          this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', {
+            reason: 'road-wrap',
+            previousGameCount: previous,
+            gameCount,
+          });
+          this.lastGameCountByTable.set(tableId, gameCount);
+        } else {
+          this.pendingRoadWrapByTable.set(tableId, gameCount);
+        }
+      } else {
+        this.pendingRoadWrapByTable.delete(tableId);
+        this.lastGameCountByTable.set(tableId, gameCount);
       }
-      this.lastGameCountByTable.set(tableId, gameCount);
     }
 
     const handId = typeof table.roundId === 'string' ? table.roundId.trim() : '';
@@ -450,6 +460,7 @@ export class PragmaticRuntimeParser {
 
   private clearShoeTracking(tableId: string): void {
     this.lastGameCountByTable.delete(tableId);
+    this.pendingRoadWrapByTable.delete(tableId);
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
     this.evidenceByTable.delete(tableId);

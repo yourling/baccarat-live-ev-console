@@ -1661,7 +1661,7 @@ export class BrowserBridgeServer implements RoomMonitor {
   }
 
   private ingestPragmaticGameCountsFromRoom(room: BridgeRoomDescriptor): void {
-    const tables = room.tables.filter(table => Number.isInteger(table.gameCount) && (table.gameCount ?? -1) >= 0);
+    const tables = room.tables.filter(table => Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1);
     if (tables.length === 0) return;
     this.ingestParsedEvents(this.pragmaticParser.parse(
       JSON.stringify({

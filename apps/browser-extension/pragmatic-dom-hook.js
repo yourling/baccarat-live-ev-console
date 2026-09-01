@@ -24,6 +24,7 @@
   let continuePending = false;
   let conflictReported = false;
   const lastGameCountByTable = new Map();
+  const pendingGameCountByTable = new Map();
 
   function clean(value) {
     return String(value || '').replace(/\s+/g, ' ').trim();
@@ -155,19 +156,58 @@
     return value >= 1 && value <= 150 ? value : undefined;
   }
 
+  function classText(node) {
+    return String(node.getAttribute && node.getAttribute('class') || '');
+  }
+
+  function isGameCountLabel(value) {
+    const text = String(value || '');
+    if (/countdown|timer/i.test(text)) return false;
+    return /(?:^|[\s_-])game-?count(?:$|[\s_-])/i.test(text);
+  }
+
+  function findGameCountNode(root) {
+    if (!root || !root.querySelector) return null;
+    const exact = root.querySelector('.game-count');
+    if (exact) return exact;
+    for (const node of root.querySelectorAll('[class], [data-testid]')) {
+      const testid = node.getAttribute && node.getAttribute('data-testid') || '';
+      if (isGameCountLabel(classText(node)) || isGameCountLabel(testid)) return node;
+    }
+    return null;
+  }
+
   function parseGameCount(root) {
-    const labeled = root.querySelector('.game-count, [class*="game-count" i], [data-testid*="game-count"]');
-    if (labeled) return parseGameCountText(labeled.innerText || labeled.textContent);
-    return parseGameCountText(root.innerText || root.textContent);
+    const labeled = findGameCountNode(root);
+    if (!labeled) return undefined;
+    return parseGameCountText(labeled.innerText || labeled.textContent);
+  }
+
+  function isSequentialGameCount(previous, next) {
+    return next === previous || (next > previous && next - previous <= 8);
+  }
+
+  function isConfirmedWrapGameCount(previous, next) {
+    return previous >= 10 && next >= 1 && next <= 2 && previous - next >= 8;
   }
 
   function stableGameCount(tableId, root) {
     const parsed = parseGameCount(root);
-    if (parsed !== undefined) {
+    const previous = lastGameCountByTable.get(tableId);
+    if (parsed === undefined) return previous;
+    if (previous === undefined || isSequentialGameCount(previous, parsed)) {
+      pendingGameCountByTable.delete(tableId);
       lastGameCountByTable.set(tableId, parsed);
       return parsed;
     }
-    return lastGameCountByTable.get(tableId);
+    const pending = pendingGameCountByTable.get(tableId);
+    if (pending === parsed && isConfirmedWrapGameCount(previous, parsed)) {
+      pendingGameCountByTable.delete(tableId);
+      lastGameCountByTable.set(tableId, parsed);
+      return parsed;
+    }
+    pendingGameCountByTable.set(tableId, parsed);
+    return previous;
   }
 
   function parseMinimum(root) {

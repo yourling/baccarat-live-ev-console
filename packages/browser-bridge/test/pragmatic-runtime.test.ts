@@ -207,11 +207,30 @@ describe('PragmaticRuntimeParser', () => {
     parser.parse(snapshot([{
       tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 1,
     }]));
+    expect(parser.shoeEvidence('bc281koreanch281')?.reason).not.toBe('road-wrap');
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 1,
+    }]));
     expect(parser.shoeEvidence('bc281koreanch281')).toEqual({
       reason: 'road-wrap',
       previousGameCount: 51,
       gameCount: 1,
     });
+  });
+
+  it('does not treat a one-off drop to #8 as a shuffled shoe', () => {
+    expect(isRoadWrapToNewShoe(51, 8)).toBe(false);
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-1', gameCount: 51,
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 8,
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 8,
+    }]));
+    expect(parser.shoeEvidence('bc281koreanch281')?.reason).not.toBe('road-wrap');
   });
 
   it('opens both pair markets from a live single-table snapshot', () => {
@@ -338,6 +357,10 @@ describe('PragmaticRuntimeParser', () => {
     parser.parse(snapshot([{
       tableId: 'bc281koreanch281', roundId: 'hand-1', gameCount: 51,
     }]));
+    const first = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 1,
+    }]));
+    expect(first.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
     const events = parser.parse(snapshot([{
       tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 1,
     }]));
