@@ -20,6 +20,8 @@ import {
   type MonitorSummary,
   type MonitorSummaryOptions,
   effectiveShoeBaseline,
+  explainShoeBaseline,
+  shoeBaselineReasonLabel,
 } from '@baccarat/ledger-state';
 import {
   Orchestrator,
@@ -59,6 +61,7 @@ import {
   type DesktopRuntimeState,
   type DesktopPendingSettlementCommand,
   type DesktopUnknownWagerReconciliationCommand,
+  type DesktopShoeEvidence,
   type MonitorTableCandidate,
   type OneShotLiveBetCommand,
   type OneShotLiveBetResult,
@@ -1728,15 +1731,28 @@ export class DesktopConsoleService {
     const usingLiveMonitor = this.liveMonitorActivated;
     const displayedTableIds = this.displayedTableIds(fullSnapshot);
     const activeTableIds = new Set(displayedTableIds);
+    const shoeEvidence: Record<string, DesktopShoeEvidence> = {};
     const tables = Object.fromEntries(
       displayedTableIds.flatMap(tableId => {
         const table = fullSnapshot.tables[tableId];
         if (table === undefined) return [];
         const gameCount = this.tableMetadata.get(tableId)?.gameCount;
-        const baseline = effectiveShoeBaseline(table.projection, gameCount);
-        const next = baseline === table.projection.shoeBaseline
+        const explained = explainShoeBaseline(
+          table.projection,
+          gameCount,
+          this.browserBridge?.shoeEvidence(tableId),
+        );
+        shoeEvidence[tableId] = {
+          reason: explained.evidence.reason,
+          label: shoeBaselineReasonLabel(explained.evidence),
+          ...(explained.evidence.previousGameCount === undefined
+            ? {}
+            : { previousGameCount: explained.evidence.previousGameCount }),
+          ...(explained.evidence.gameCount === undefined ? {} : { gameCount: explained.evidence.gameCount }),
+        };
+        const next = explained.baseline === table.projection.shoeBaseline
           ? table
-          : { ...table, projection: { ...table.projection, shoeBaseline: baseline } };
+          : { ...table, projection: { ...table.projection, shoeBaseline: explained.baseline } };
         return [[tableId, next]];
       }),
     );
@@ -1768,6 +1784,7 @@ export class DesktopConsoleService {
       monitorTableIds: [...this.monitorTableIds],
       monitorCandidates,
       tableMetadata,
+      shoeEvidence,
       recordCounts,
       keepalive,
       automation: { enabled: this.automationEnabled },

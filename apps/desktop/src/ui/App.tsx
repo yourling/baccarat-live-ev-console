@@ -21,6 +21,7 @@ import type {
   DesktopRecordPage,
   DesktopRecordQuery,
   DesktopRuntimeIncident,
+  DesktopShoeEvidence,
   LedgerPageRow,
   MonitorTableCandidate,
   ReceiptRow,
@@ -1001,6 +1002,7 @@ export function App() {
                         actor={table}
                         metadata={monitorMetadata.get(table.tableId)}
                         runtime={snapshot?.runtime.tables[table.tableId]}
+                        evidence={snapshot?.shoeEvidence?.[table.tableId]}
                         events={snapshot?.events ?? []}
                         onSnapshot={setSnapshot}
                         onOpenSettings={() => setSelectedMonitorTableId(table.tableId)}
@@ -1036,6 +1038,7 @@ export function App() {
                 <div>
                   <strong>{candidate.displayName ?? candidate.tableId}</strong>
                   <span>{candidate.displayName ? candidate.tableId : candidate.roomName ?? candidate.roomId}</span>
+                  <span className="muted">#{candidate.gameCount ?? '?'} · 等待洗牌证据</span>
                 </div>
                 <button className="button button--small button--primary" onClick={() => void addMonitorCandidate(candidate.tableId)}>加入监控</button>
               </div>
@@ -1101,6 +1104,7 @@ export function App() {
 function TableMonitorRow(props: {
   actor: TableActorSnapshot;
   metadata?: MonitorTableCandidate;
+  evidence?: DesktopShoeEvidence;
   runtime?: DesktopConsoleSnapshot['runtime']['tables'][string];
   events: readonly NormalizedEvent[];
   onSnapshot: (snapshot: DesktopConsoleSnapshot) => void;
@@ -1186,7 +1190,7 @@ function TableMonitorRow(props: {
         </strong>
       </td>
       <td data-label="自动"><strong>{shortAutoBetLabel(projection.autoBetStatus)}</strong></td>
-      <td data-label="剩余"><strong>{physicalShoeKnown ? `${projection.remainingTotal} 张` : '未知'}</strong><br /><span className="muted">{physicalShoeKnown ? '实体新靴' : '待牌靴'}</span></td>
+      <td data-label="剩余"><strong>{physicalShoeKnown ? `${projection.remainingTotal} 张` : '未知'}</strong><br /><span className="muted">{physicalShoeKnown ? '实体新靴' : '待牌靴'}{props.evidence ? ` · ${props.evidence.label}` : ''}</span></td>
       <td data-label="对子 EV">
         {bankerPair && playerPair
           ? <span className="monitor-pair-ev">

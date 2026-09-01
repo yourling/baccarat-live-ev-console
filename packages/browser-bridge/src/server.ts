@@ -1143,6 +1143,10 @@ export class BrowserBridgeServer implements RoomMonitor {
     return this.pragmaticParser.currentShoeId(tableId);
   }
 
+  shoeEvidence(tableId: string) {
+    return this.pragmaticParser.shoeEvidence(tableId);
+  }
+
   openPhysicalShoe(tableId: string): void {
     if (!this.isTableSelected(tableId)) return;
     this.ingestParsedEvents(this.pragmaticParser.openPhysicalShoe(tableId, new Date().toISOString()));
@@ -1182,6 +1186,7 @@ export class BrowserBridgeServer implements RoomMonitor {
 
   confirmPhysicalShoe(tableId: string): void {
     if (!this.isTableSelected(tableId)) throw new Error(`table ${tableId} is not selected`);
+    this.pragmaticParser.recordShoeEvidence(tableId, { reason: 'manual-confirm' });
     const shoeId = `pragmatic-${tableId}-operator`;
     this.ingestParsedEvents([{
       type: 'newShoeSignal',

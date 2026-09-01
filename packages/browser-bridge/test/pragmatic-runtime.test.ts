@@ -145,6 +145,40 @@ describe('PragmaticRuntimeParser', () => {
       | undefined;
     expect(shoe?.baseline).toBe('unknown-monitor-session');
     expect(events.filter(event => event.type === 'newShoeSignal')).toHaveLength(1);
+    expect(parser.shoeEvidence('bc281koreanch281')).toEqual({ reason: 'attach' });
+  });
+
+  it('records protocol-shuffle evidence when the shoeReset token changes', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh',
+      roundId: '16387761010',
+      source: 'protocol',
+      shoeReset: 'protocol:h22z8qhp17sa0vkh:10',
+    }]));
+    expect(parser.shoeEvidence('h22z8qhp17sa0vkh')?.reason).toBe('attach');
+    parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh',
+      roundId: '16387766710',
+      source: 'protocol',
+      shoeReset: 'protocol:h22z8qhp17sa0vkh:20',
+    }]));
+    expect(parser.shoeEvidence('h22z8qhp17sa0vkh')).toEqual({ reason: 'protocol-shuffle' });
+  });
+
+  it('records road-wrap evidence on a large gameCount drop', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-1', gameCount: 51,
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 1,
+    }]));
+    expect(parser.shoeEvidence('bc281koreanch281')).toEqual({
+      reason: 'road-wrap',
+      previousGameCount: 51,
+      gameCount: 1,
+    });
   });
 
   it('opens both pair markets from a live single-table snapshot', () => {

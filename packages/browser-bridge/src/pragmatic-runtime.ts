@@ -64,6 +64,14 @@ function isPhysicalShoeFromRoadCount(
   return isJoinableNewShoeRoadCount(previous, gameCount);
 }
 
+export type ParserShoeReason = 'attach' | 'protocol-shuffle' | 'road-wrap' | 'manual-confirm';
+
+export interface ParserShoeEvidence {
+  readonly reason: ParserShoeReason;
+  readonly previousGameCount?: number;
+  readonly gameCount?: number;
+}
+
 type SnapshotSource = 'dom' | 'protocol';
 type HandCards = { playerCards: Card[]; bankerCards: Card[]; source?: SnapshotSource };
 
@@ -231,6 +239,7 @@ export class PragmaticRuntimeParser {
   private readonly lastWindowEmitAtMs = new Map<string, number>();
   private readonly settledHands = new Set<string>();
   private readonly finishedHands = new Set<string>();
+  private readonly evidenceByTable = new Map<string, ParserShoeEvidence>();
 
   parse(raw: string, isSelected: (tableId: string) => boolean = () => true): NormalizedEvent[] {
     let snapshot: unknown;
@@ -267,9 +276,18 @@ export class PragmaticRuntimeParser {
     return this.shoeIdByTable.get(tableId);
   }
 
+  shoeEvidence(tableId: string): ParserShoeEvidence | undefined {
+    const evidence = this.evidenceByTable.get(tableId);
+    return evidence === undefined ? undefined : { ...evidence };
+  }
+
+  recordShoeEvidence(tableId: string, evidence: ParserShoeEvidence): void {
+    this.evidenceByTable.set(tableId, evidence);
+  }
+
   openPhysicalShoe(tableId: string, timestamp: string): NormalizedEvent[] {
     const events: NormalizedEvent[] = [];
-    this.beginNewShoe(tableId, timestamp, events, 'physical-shoe');
+    this.beginNewShoe(tableId, timestamp, events, 'physical-shoe', { reason: 'manual-confirm' });
     return events;
   }
 
@@ -282,6 +300,7 @@ export class PragmaticRuntimeParser {
     this.lastGameCountByTable.delete(tableId);
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
+    this.evidenceByTable.delete(tableId);
     this.clearHandState(tableId);
   }
 
@@ -299,7 +318,7 @@ export class PragmaticRuntimeParser {
         this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
         // First token is attach, not a shuffle. Only a later token change is physical.
         if (previousToken !== undefined) {
-          this.beginNewShoe(tableId, observedAt, events, 'physical-shoe');
+          this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
         }
       }
     }
@@ -309,7 +328,11 @@ export class PragmaticRuntimeParser {
       const gameCount = table.gameCount!;
       if (isPhysicalShoeFromRoadCount(previous, gameCount)) {
         this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
-        this.beginNewShoe(tableId, observedAt, events, 'physical-shoe');
+        this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', {
+          reason: 'road-wrap',
+          previousGameCount: previous,
+          gameCount,
+        });
       }
       this.lastGameCountByTable.set(tableId, gameCount);
     }
@@ -405,6 +428,7 @@ export class PragmaticRuntimeParser {
   ): void {
     if (this.shoeIdByTable.has(tableId)) return;
     this.shoeSeqByTable.set(tableId, 1);
+    if (!this.evidenceByTable.has(tableId)) this.evidenceByTable.set(tableId, { reason: 'attach' });
     this.emitShoe(tableId, 1, baseline, timestamp, events);
   }
 
@@ -413,10 +437,12 @@ export class PragmaticRuntimeParser {
     timestamp: string,
     events: NormalizedEvent[],
     baseline: ShoeBaseline,
+    evidence?: ParserShoeEvidence,
   ): void {
     this.clearShoeTracking(tableId);
     const sequence = (this.shoeSeqByTable.get(tableId) ?? 1) + 1;
     this.shoeSeqByTable.set(tableId, sequence);
+    if (evidence !== undefined) this.evidenceByTable.set(tableId, evidence);
     this.emitShoe(tableId, sequence, baseline, timestamp, events);
   }
 
@@ -424,6 +450,7 @@ export class PragmaticRuntimeParser {
     this.lastGameCountByTable.delete(tableId);
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
+    this.evidenceByTable.delete(tableId);
     this.clearHandState(tableId);
   }
 
