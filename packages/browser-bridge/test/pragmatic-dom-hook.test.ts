@@ -18,6 +18,15 @@ describe('Pragmatic DOM hook', () => {
     expect(source).not.toMatch(/video\.muted\s*=/);
   });
 
+  it('content script does not treat the reconnect banner as try-again', () => {
+    const content = readFileSync(
+      new URL('../../../apps/browser-extension/content.js', import.meta.url),
+      'utf8',
+    );
+    expect(content).toMatch(/if \(\/重新连接中\/\.test\(text\)\) continue;/);
+    expect(content).not.toMatch(/reconnect\|重试\|重新尝试\|再次尝试\|重新连接/);
+  });
+
   it.each([
     ['在其他地方启动了会话', 'https://client.pragmaticplaylive.net/desktop/baccarat/?table_id=bc281koreanch281'],
     ['在其他地方启动了对话', 'https://client.pragmaticplaylive.net/desktop/multibaccarat/'],
@@ -59,6 +68,33 @@ describe('Pragmatic DOM hook', () => {
       action: 'session-conflict-dialog',
       detail: expect.stringContaining('其他地方'),
     }));
+  });
+
+  it('does not click a reconnecting overlay', () => {
+    const dom = new JSDOM(
+      '<body><p>重新连接中</p></body>',
+      { url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/' },
+    );
+    const sendMessage = vi.fn();
+    const context = vm.createContext({
+      chrome: { runtime: { sendMessage } },
+      document: dom.window.document,
+      location: dom.window.location,
+      URL,
+      Date,
+      JSON,
+      Number,
+      String,
+      Object,
+      Array,
+      setInterval: vi.fn(),
+      getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+      globalThis: null,
+    });
+    context.globalThis = context;
+    vm.runInContext(source, context, { filename: 'pragmatic-dom-hook.js' });
+    expect(sendMessage.mock.calls.some(call => call[0]?.kind === 'sessionExpired')).toBe(false);
+    expect(sendMessage.mock.calls.some(call => call[0]?.action === 'inline-recovery-click')).toBe(false);
   });
 
   it('does not click the multibaccarat reconnect banner', () => {
