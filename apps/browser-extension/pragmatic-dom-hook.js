@@ -184,11 +184,19 @@
   }
 
   function isSequentialGameCount(previous, next) {
-    return next === previous || (next > previous && next - previous <= 8);
+    return next === previous || (next > previous && next - previous <= 2);
   }
 
   function isConfirmedWrapGameCount(previous, next) {
     return previous >= 10 && next >= 1 && next <= 2 && previous - next >= 8;
+  }
+
+  function isConfirmedCatchUpGameCount(previous, next) {
+    return next > previous && next - previous <= 5;
+  }
+
+  function isConfirmedEarlyShoeCorrection(previous, next) {
+    return previous <= 8 && next >= 1 && next < previous;
   }
 
   function stableGameCount(tableId, root) {
@@ -201,7 +209,14 @@
       return parsed;
     }
     const pending = pendingGameCountByTable.get(tableId);
-    if (pending === parsed && isConfirmedWrapGameCount(previous, parsed)) {
+    if (
+      pending === parsed
+      && (
+        isConfirmedWrapGameCount(previous, parsed)
+        || isConfirmedCatchUpGameCount(previous, parsed)
+        || isConfirmedEarlyShoeCorrection(previous, parsed)
+      )
+    ) {
       pendingGameCountByTable.delete(tableId);
       lastGameCountByTable.set(tableId, parsed);
       return parsed;

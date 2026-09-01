@@ -513,6 +513,14 @@ export class DesktopConsoleService {
     return this.observedTableIds().includes(tableId);
   }
 
+  private clearStaleRoadCount(tableId: string): void {
+    const existing = this.tableMetadata.get(tableId);
+    if (existing?.gameCount === undefined) return;
+    const { gameCount: _ignored, ...rest } = existing;
+    this.tableMetadata.set(tableId, { ...rest, updatedAt: new Date().toISOString() });
+    this.persistTableMetadata();
+  }
+
   private promotePendingTable(tableId: string): void {
     if (this.monitorTableIds.includes(tableId)) return;
     if (this.monitorTableIds.length >= MAX_LIVE_MONITOR_TABLES) return;
@@ -1144,7 +1152,10 @@ export class DesktopConsoleService {
       // Only protocol-shuffle, road-wrap, or manual-confirm may promote a pending
       // table. A physical label without that evidence is attach/restart noise.
       const evidence = this.browserBridge?.shoeEvidence(event.tableId);
-      if (isVerifiedPhysicalShoeEvidence(evidence)) this.promotePendingTable(event.tableId);
+      if (isVerifiedPhysicalShoeEvidence(evidence)) {
+        this.promotePendingTable(event.tableId);
+        this.clearStaleRoadCount(event.tableId);
+      }
     }
     this.cachedLightSnapshot = undefined;
     await this.orchestrator.enqueue(event.tableId, event);

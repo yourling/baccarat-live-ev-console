@@ -1239,7 +1239,12 @@ function TableMonitorRow(props: {
   const alerts = tableAlerts(actor);
   const displayName = props.metadata?.displayName ?? tableName(actor.tableId);
   const displayedRoundId = projection.currentHandId ?? props.metadata?.roundId;
-  const displayedGameCount = props.metadata?.gameCount;
+  const displayedGameCount = monitorDisplayedGameCount(
+    props.metadata?.gameCount,
+    projection.handNumber,
+    physicalShoeKnown,
+    props.evidence?.reason,
+  );
   const bettingPhase = bettingPhaseLabel(actor, props.now);
   const windowOpen = bettingPhase.open;
   const handCards = resolveVisibleHandCards(
@@ -2335,6 +2340,23 @@ function safeEvaluate(
   } catch {
     return null;
   }
+}
+
+function monitorDisplayedGameCount(
+  roadCount: number | undefined,
+  handNumber: number,
+  physicalShoeKnown: boolean,
+  evidenceReason?: string,
+): number | undefined {
+  if (!physicalShoeKnown) return roadCount;
+  const hands = handNumber >= 1 ? handNumber : undefined;
+  if (evidenceReason !== 'protocol-shuffle' && evidenceReason !== 'road-wrap' && evidenceReason !== 'manual-confirm') {
+    return roadCount ?? hands;
+  }
+  if (roadCount === undefined) return hands;
+  if (hands !== undefined && roadCount > 8 && roadCount - hands >= 8) return hands;
+  if (hands !== undefined && roadCount <= 8 && hands > roadCount) return hands;
+  return roadCount;
 }
 
 function isVerifiedPhysicalShoeReason(reason: string | undefined, gameCount?: number): boolean {
