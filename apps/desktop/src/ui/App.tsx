@@ -46,7 +46,9 @@ import './styles.css';
 
 type View = ConsoleView;
 type FilterValue = 'all';
-type MarketFilter = FilterValue | BettingMarket;
+type MarketFilter = FilterValue | ExecutionMarket;
+type MonitorSortKey = 'name' | 'status' | 'round' | 'betting' | 'connection' | 'auto' | 'remaining' | 'ev';
+type MonitorSort = { readonly key: MonitorSortKey; readonly dir: 'asc' | 'desc' };
 type DecisionFilter = FilterValue | 'eligible' | 'ineligible';
 type EventFilter = FilterValue | NormalizedEvent['type'];
 type MonitorDropTarget = {
@@ -217,6 +219,7 @@ export function App() {
   const [monitorTableSaving, setMonitorTableSaving] = useState(false);
   const [reconcilingReservationId, setReconcilingReservationId] = useState<string | null>(null);
   const [selectedMonitorTableId, setSelectedMonitorTableId] = useState<string | null>(null);
+  const [monitorSort, setMonitorSort] = useState<MonitorSort | null>(null);
   const [pendingLiveExecutionTableId, setPendingLiveExecutionTableId] = useState<string | null>(null);
   const [alertCenterOpen, setAlertCenterOpen] = useState(false);
   const [acknowledgingIncidentId, setAcknowledgingIncidentId] = useState<string | null>(null);
@@ -414,6 +417,12 @@ export function App() {
     setPage(1);
   }, [view, tableFilter, query, marketFilter, statusFilter, connectionFilter, autoBetFilter, decisionFilter, eventFilter, startTime, endTime, pageSize]);
 
+  useEffect(() => {
+    if (view !== 'ledger' && view !== 'overview' && (marketFilter === 'banker' || marketFilter === 'player')) {
+      setMarketFilter('all');
+    }
+  }, [view, marketFilter]);
+
   const tables = useMemo(() => {
     if (!snapshot) return [];
     const monitorOrder = new Map(snapshot.monitorTableIds.map((tableId, index) => [tableId, index]));
@@ -450,6 +459,22 @@ export function App() {
         && queryMatch;
     });
   }, [tables, view, tableFilter, query, statusFilter, connectionFilter, autoBetFilter, tableLabel]);
+
+  const displayedMonitorTables = useMemo(() => {
+    if (view !== 'monitor' || monitorSort === null) return visibleTables;
+    const direction = monitorSort.dir === 'asc' ? 1 : -1;
+    return [...visibleTables].sort((left, right) => (
+      compareMonitorTables(left, right, monitorSort.key, tableLabel, monitorMetadata.get(left.tableId), monitorMetadata.get(right.tableId), snapshot?.shoeEvidence) * direction
+    ));
+  }, [view, visibleTables, monitorSort, tableLabel, monitorMetadata, snapshot?.shoeEvidence]);
+
+  function toggleMonitorSort(key: MonitorSortKey): void {
+    setMonitorSort(current => {
+      if (current?.key !== key) return { key, dir: 'asc' };
+      if (current.dir === 'asc') return { key, dir: 'desc' };
+      return null;
+    });
+  }
 
   const persistMonitorTableIds = useCallback(async (tableIds: readonly string[]): Promise<DesktopConsoleSnapshot | null> => {
     if (!window.desktop) return null;
@@ -933,9 +958,15 @@ export function App() {
           <FilterControl label="牌靴 / 牌局">
             <input value={query} onChange={event => setQuery(event.target.value)} placeholder="输入编号筛选" />
           </FilterControl>
-          <FilterControl label="市场">
+          <FilterControl label={view === 'ledger' ? '下注对象' : '市场'}>
             <select value={marketFilter} onChange={event => setMarketFilter(event.target.value as MarketFilter)}>
-              <option value="all">庄对与闲对</option>
+              <option value="all">{view === 'ledger' ? '全部对象' : '全部市场'}</option>
+              {view === 'ledger' || view === 'overview' ? (
+                <>
+                  <option value="banker">庄</option>
+                  <option value="player">闲</option>
+                </>
+              ) : null}
               <option value="bankerPair">庄对</option>
               <option value="playerPair">闲对</option>
             </select>
@@ -979,16 +1010,30 @@ export function App() {
             <section className="record-section monitor-section">
               <div className="table-scroll">
                 <table className="record-table monitor-table">
+                  <colgroup>
+                    <col className="monitor-col-name" />
+                    <col className="monitor-col-status" />
+                    <col className="monitor-col-round" />
+                    <col className="monitor-col-flag" />
+                    <col className="monitor-col-flag" />
+                    <col className="monitor-col-flag" />
+                    <col className="monitor-col-remain" />
+                    <col className="monitor-col-ev" />
+                    <col className="monitor-col-cards" />
+                    <col className="monitor-col-cards" />
+                    <col className="monitor-col-bet" />
+                    <col className="monitor-col-action" />
+                  </colgroup>
                   <thead>
                     <tr>
-                      <th>牌桌</th>
-                      <th>状态</th>
-                      <th>局号</th>
-                      <th>开盘</th>
-                      <th>连接</th>
-                      <th>自动</th>
-                      <th>剩余</th>
-                      <th>对子 EV</th>
+                      <MonitorSortHeader label="牌桌" sortKey="name" current={monitorSort} onToggle={toggleMonitorSort} />
+                      <MonitorSortHeader label="状态" sortKey="status" current={monitorSort} onToggle={toggleMonitorSort} />
+                      <MonitorSortHeader label="局号" sortKey="round" current={monitorSort} onToggle={toggleMonitorSort} />
+                      <MonitorSortHeader label="开盘" sortKey="betting" current={monitorSort} onToggle={toggleMonitorSort} />
+                      <MonitorSortHeader label="连接" sortKey="connection" current={monitorSort} onToggle={toggleMonitorSort} />
+                      <MonitorSortHeader label="自动" sortKey="auto" current={monitorSort} onToggle={toggleMonitorSort} />
+                      <MonitorSortHeader label="剩余" sortKey="remaining" current={monitorSort} onToggle={toggleMonitorSort} />
+                      <MonitorSortHeader label="对子 EV" sortKey="ev" current={monitorSort} onToggle={toggleMonitorSort} />
                       <th>闲</th>
                       <th>庄</th>
                       <th>下注</th>
@@ -996,7 +1041,7 @@ export function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {visibleTables.map(table => (
+                    {displayedMonitorTables.map(table => (
                       <TableMonitorRow
                         key={table.tableId}
                         actor={table}
@@ -1102,6 +1147,71 @@ export function App() {
   );
 }
 
+function MonitorSortHeader(props: {
+  label: string;
+  sortKey: MonitorSortKey;
+  current: MonitorSort | null;
+  onToggle: (key: MonitorSortKey) => void;
+}) {
+  const active = props.current?.key === props.sortKey;
+  const ariaSort = !active ? 'none' : props.current?.dir === 'asc' ? 'ascending' : 'descending';
+  return (
+    <th aria-sort={ariaSort}>
+      <button type="button" className="monitor-sort" onClick={() => props.onToggle(props.sortKey)}>
+        {props.label}
+        {active ? (props.current?.dir === 'asc' ? ' ↑' : ' ↓') : ''}
+      </button>
+    </th>
+  );
+}
+
+function compareMonitorTables(
+  left: TableActorSnapshot,
+  right: TableActorSnapshot,
+  key: MonitorSortKey,
+  labelOf: (tableId: string) => string,
+  leftMeta: MonitorTableCandidate | undefined,
+  rightMeta: MonitorTableCandidate | undefined,
+  evidence: DesktopConsoleSnapshot['shoeEvidence'] | undefined,
+): number {
+  const leftProjection = left.projection;
+  const rightProjection = right.projection;
+  switch (key) {
+    case 'name':
+      return labelOf(left.tableId).localeCompare(labelOf(right.tableId), 'zh-CN');
+    case 'status':
+      return leftProjection.status.localeCompare(rightProjection.status);
+    case 'round':
+      return (leftMeta?.gameCount ?? -1) - (rightMeta?.gameCount ?? -1);
+    case 'betting':
+      return Number(leftProjection.status === 'BETTING_WINDOW') - Number(rightProjection.status === 'BETTING_WINDOW');
+    case 'connection':
+      return leftProjection.connectionStatus.localeCompare(rightProjection.connectionStatus);
+    case 'auto':
+      return leftProjection.autoBetStatus.localeCompare(rightProjection.autoBetStatus);
+    case 'remaining': {
+      const leftKnown = isDisplayedPhysicalShoe(leftProjection, evidence?.[left.tableId]);
+      const rightKnown = isDisplayedPhysicalShoe(rightProjection, evidence?.[right.tableId]);
+      return (leftKnown ? leftProjection.remainingTotal : -1) - (rightKnown ? rightProjection.remainingTotal : -1);
+    }
+    case 'ev': {
+      const leftEv = monitorPairEv(left, evidence?.[left.tableId]);
+      const rightEv = monitorPairEv(right, evidence?.[right.tableId]);
+      return leftEv - rightEv;
+    }
+  }
+}
+
+function monitorPairEv(actor: TableActorSnapshot, evidence?: DesktopShoeEvidence): number {
+  if (!isDisplayedPhysicalShoe(actor.projection, evidence)) return Number.NEGATIVE_INFINITY;
+  return safeEvaluate(
+    actor.projection.profileSnapshot,
+    'bankerPair',
+    actor.projection.seenCards,
+    actor.projection.remainingCounts,
+  )?.evMean ?? Number.NEGATIVE_INFINITY;
+}
+
 function TableMonitorRow(props: {
   actor: TableActorSnapshot;
   metadata?: MonitorTableCandidate;
@@ -1125,9 +1235,6 @@ function TableMonitorRow(props: {
   const physicalShoeKnown = isDisplayedPhysicalShoe(projection, props.evidence);
   const bankerPair = physicalShoeKnown
     ? safeEvaluate(projection.profileSnapshot, 'bankerPair', projection.seenCards, projection.remainingCounts)
-    : null;
-  const playerPair = physicalShoeKnown
-    ? safeEvaluate(projection.profileSnapshot, 'playerPair', projection.seenCards, projection.remainingCounts)
     : null;
   const alerts = tableAlerts(actor);
   const displayName = props.metadata?.displayName ?? tableName(actor.tableId);
@@ -1193,11 +1300,8 @@ function TableMonitorRow(props: {
       <td data-label="自动"><strong>{shortAutoBetLabel(projection.autoBetStatus)}</strong></td>
       <td data-label="剩余"><strong>{physicalShoeKnown ? `${projection.remainingTotal} 张` : '未知'}</strong><br /><span className="muted">{physicalShoeKnown ? '实体新靴' : '待牌靴'}{props.evidence ? ` · ${props.evidence.label}` : ''}</span></td>
       <td data-label="对子 EV">
-        {bankerPair && playerPair
-          ? <span className="monitor-pair-ev">
-            <strong className={evTone(bankerPair.evMean)}>庄对 {formatSignedPercent(bankerPair.evMean)}</strong>
-            <span className="muted">闲对 {formatSignedPercent(playerPair.evMean)}</span>
-          </span>
+        {bankerPair
+          ? <strong className={evTone(bankerPair.evMean)}>{formatSignedPercent(bankerPair.evMean)}</strong>
           : <span className="muted" title="等待物理牌靴">待牌靴</span>}
       </td>
       <td data-label="闲"><MonitorHandCards cards={handCards.player} previous={handCards.source === 'previous-settled'} /></td>
