@@ -166,21 +166,41 @@
     return /(?:^|[\s_-])game-?count(?:$|[\s_-])/i.test(text);
   }
 
+  function isGameCountCandidate(node) {
+    if (!node || !node.getAttribute) return false;
+    if (node.classList && node.classList.contains('game-count')) return true;
+    const testid = node.getAttribute('data-testid') || '';
+    return isGameCountLabel(classText(node)) || isGameCountLabel(testid);
+  }
+
   function findGameCountNode(root) {
-    if (!root || !root.querySelector) return null;
-    const exact = root.querySelector('.game-count');
-    if (exact) return exact;
-    for (const node of root.querySelectorAll('[class], [data-testid]')) {
-      const testid = node.getAttribute && node.getAttribute('data-testid') || '';
-      if (isGameCountLabel(classText(node)) || isGameCountLabel(testid)) return node;
+    if (!root || !root.querySelectorAll) return null;
+    const nodes = root.querySelectorAll('.game-count, [class], [data-testid]');
+    let fallback = null;
+    for (const node of nodes) {
+      if (!isGameCountCandidate(node)) continue;
+      if (visible(node)) return node;
+      if (fallback === null) fallback = node;
     }
-    return null;
+    return fallback;
   }
 
   function parseGameCount(root) {
+    if (!root) return undefined;
+    const header = root.querySelector && root.querySelector('[data-testid="game-header"]');
+    if (header) {
+      const headerLabeled = findGameCountNode(header);
+      const headerValue = headerLabeled
+        ? parseGameCountText(headerLabeled.innerText || headerLabeled.textContent)
+        : parseGameCountText(header.innerText || header.textContent);
+      if (headerValue !== undefined) return headerValue;
+    }
     const labeled = findGameCountNode(root);
-    if (!labeled) return undefined;
-    return parseGameCountText(labeled.innerText || labeled.textContent);
+    if (labeled && visible(labeled)) {
+      return parseGameCountText(labeled.innerText || labeled.textContent);
+    }
+    if (labeled) return parseGameCountText(labeled.innerText || labeled.textContent);
+    return undefined;
   }
 
   function isSequentialGameCount(previous, next) {
@@ -257,9 +277,10 @@
     if (!tableId) return [];
     const timer = document.querySelector('[data-testid="round-timer"] [data-testid^="timer-countdown-"]');
     const countdown = countdownValue(timer);
-    const title = clean(document.querySelector('[data-testid="game-header"] button')?.textContent)
-      || clean(document.querySelector('[data-testid="game-header"]')?.textContent).replace(/\s*[••].*$/, '');
-    const gameCount = stableGameCount(tableId, document);
+    const header = document.querySelector('[data-testid="game-header"]');
+    const title = clean(header?.querySelector('button')?.textContent)
+      || clean(header?.textContent).replace(/\s*[••].*$/, '');
+    const gameCount = stableGameCount(tableId, header || document);
     return [{
       tableId,
       ...(title ? { displayName: title } : {}),

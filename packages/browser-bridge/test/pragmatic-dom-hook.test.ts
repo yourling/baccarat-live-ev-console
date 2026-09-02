@@ -328,6 +328,48 @@ describe('Pragmatic DOM hook', () => {
     expect(second.tables[0]?.gameCount).toBe(1);
   });
 
+  it('prefers the visible header # over a hidden leftover game-count', () => {
+    const dom = new JSDOM(`
+      <body>
+        <div id="TileHeight-tobcspbaccarat61">
+          <span>韩语极速百家乐5</span>
+          <span class="game-count" style="display:none"><span>#</span><span>78</span></span>
+          <div data-testid="game-header">韩语极速百家乐5 <span>#</span> 5 ID: 16447803910</div>
+        </div>
+      </body>
+    `, { url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/' });
+    Object.defineProperty(dom.window.Element.prototype, 'getBoundingClientRect', {
+      configurable: true,
+      value() {
+        if (this.getAttribute && this.getAttribute('style') && String(this.getAttribute('style')).includes('display:none')) {
+          return { width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
+        }
+        return { width: 237, height: 201, top: 0, left: 0, right: 237, bottom: 201 };
+      },
+    });
+    const sendMessage = vi.fn();
+    const context = vm.createContext({
+      chrome: { runtime: { sendMessage } },
+      document: dom.window.document,
+      location: dom.window.location,
+      URL,
+      Date,
+      JSON,
+      Number,
+      String,
+      Object,
+      Array,
+      setInterval: vi.fn(),
+      getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+      globalThis: null,
+    });
+    context.globalThis = context;
+    vm.runInContext(source, context, { filename: 'pragmatic-dom-hook.js' });
+    expect(sendMessage.mock.calls
+      .map(([message]) => message)
+      .find(message => message && message.kind === 'roomDiscovered')?.room?.tables?.[0]?.gameCount).toBe(5);
+  });
+
   it('accepts a wrap from #78 to #5 on the first reading', () => {
     const dom = new JSDOM(`
       <body>
