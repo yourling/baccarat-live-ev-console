@@ -448,7 +448,7 @@ describe('Pragmatic DOM hook', () => {
         <div id="TileHeight-tobcspbaccarat61">
           <span>韩语极速百家乐5</span>
           <span class="game-count" style="display:none"><span>#</span><span>78</span></span>
-          <span>#5</span>
+          <div data-testid="game-header">韩语极速百家乐5 #5 ID: 16447803910</div>
         </div>
       </body>
     `, { url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/' });

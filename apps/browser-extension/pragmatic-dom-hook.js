@@ -211,17 +211,6 @@
     return value >= 1 && value <= 150 ? value : undefined;
   }
 
-  function parseVisibleHashBadge(root) {
-    if (!root || !root.querySelectorAll) return undefined;
-    for (const node of root.querySelectorAll('*')) {
-      if (!visible(node) || insideTimer(node)) continue;
-      const text = clean(nodeText(node));
-      if (!/^#[\s\u00a0]*[1-9]\d{0,2}$/.test(text)) continue;
-      return parseGameCountText(text);
-    }
-    return undefined;
-  }
-
   function parseGameCount(root) {
     if (!root) return undefined;
     const header = root.getAttribute && root.getAttribute('data-testid') === 'game-header'
@@ -233,15 +222,10 @@
       if (fromLabeled !== undefined) return fromLabeled;
       const fromHeader = parseGameCountText(nodeText(header));
       if (fromHeader !== undefined) return fromHeader;
-      const fromBadge = parseVisibleHashBadge(header);
-      if (fromBadge !== undefined) return fromBadge;
     }
     const labeled = findVisibleGameCountNode(root);
-    if (labeled) {
-      const value = parseLabeledGameCount(labeled);
-      if (value !== undefined) return value;
-    }
-    return parseVisibleHashBadge(root);
+    if (labeled) return parseLabeledGameCount(labeled);
+    return undefined;
   }
 
   function isSequentialGameCount(previous, next) {
