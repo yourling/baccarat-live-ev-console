@@ -148,9 +148,12 @@
   }
 
   function parseRoundId(root) {
-    const text = clean(root.querySelector('[data-testid="game-header-game-id"]')?.textContent)
-      || clean(root.textContent);
-    return (text.match(/ID:\s*([0-9]+|—)/) || [])[1] || '';
+    const headerId = root.querySelector && root.querySelector('[data-testid="game-header-game-id"]');
+    const header = root.querySelector && root.querySelector('[data-testid="game-header"]');
+    const scoped = clean(headerId?.textContent || header?.textContent || '');
+    const scopedMatch = scoped.match(/ID:\s*([0-9]+|—)/);
+    if (scopedMatch) return scopedMatch[1];
+    return (clean(root.textContent).match(/ID:\s*([0-9]+|—)/) || [])[1] || '';
   }
 
   function parseGameCountText(raw) {
@@ -186,16 +189,37 @@
     return isGameCountLabel(classText(node)) || isGameCountLabel(testid);
   }
 
-  function findGameCountNode(root) {
+  function insideTimer(node) {
+    return !!(node && node.closest && node.closest('[data-testid*="timer"], [data-testid*="countdown"], .game-countdown'));
+  }
+
+  function findVisibleGameCountNode(root) {
     if (!root || !root.querySelectorAll) return null;
-    const nodes = root.querySelectorAll('.game-count, [class], [data-testid]');
-    let fallback = null;
-    for (const node of nodes) {
-      if (!isGameCountCandidate(node)) continue;
-      if (visible(node)) return node;
-      if (fallback === null) fallback = node;
+    for (const node of root.querySelectorAll('.game-count, [class], [data-testid]')) {
+      if (!isGameCountCandidate(node) || insideTimer(node) || !visible(node)) continue;
+      return node;
     }
-    return fallback;
+    return null;
+  }
+
+  function parseLabeledGameCount(node) {
+    const hashed = parseGameCountText(nodeText(node));
+    if (hashed !== undefined) return hashed;
+    const digits = /^([1-9]\d{0,2})$/.exec(clean(nodeText(node)));
+    if (!digits) return undefined;
+    const value = Number(digits[1]);
+    return value >= 1 && value <= 150 ? value : undefined;
+  }
+
+  function parseVisibleHashBadge(root) {
+    if (!root || !root.querySelectorAll) return undefined;
+    for (const node of root.querySelectorAll('*')) {
+      if (!visible(node) || insideTimer(node)) continue;
+      const text = clean(nodeText(node));
+      if (!/^#[\s\u00a0]*[1-9]\d{0,2}$/.test(text)) continue;
+      return parseGameCountText(text);
+    }
+    return undefined;
   }
 
   function parseGameCount(root) {
@@ -204,18 +228,20 @@
       ? root
       : root.querySelector && root.querySelector('[data-testid="game-header"]');
     if (header) {
-      const headerLabeled = findGameCountNode(header);
-      const headerValue = headerLabeled
-        ? parseGameCountText(nodeText(headerLabeled))
-        : parseGameCountText(nodeText(header));
-      if (headerValue !== undefined) return headerValue;
+      const headerLabeled = findVisibleGameCountNode(header);
+      const fromLabeled = headerLabeled ? parseLabeledGameCount(headerLabeled) : undefined;
+      if (fromLabeled !== undefined) return fromLabeled;
+      const fromHeader = parseGameCountText(nodeText(header));
+      if (fromHeader !== undefined) return fromHeader;
+      const fromBadge = parseVisibleHashBadge(header);
+      if (fromBadge !== undefined) return fromBadge;
     }
-    const labeled = findGameCountNode(root);
-    if (labeled && visible(labeled)) {
-      return parseGameCountText(nodeText(labeled));
+    const labeled = findVisibleGameCountNode(root);
+    if (labeled) {
+      const value = parseLabeledGameCount(labeled);
+      if (value !== undefined) return value;
     }
-    if (labeled) return parseGameCountText(nodeText(labeled));
-    return undefined;
+    return parseVisibleHashBadge(root);
   }
 
   function isSequentialGameCount(previous, next) {
