@@ -64,6 +64,28 @@ function isPhysicalShoeFromRoadCount(
   return isRoadWrapToNewShoe(previous, gameCount);
 }
 
+const GAME_COUNT_CATCH_UP_MAX = 5;
+
+export function isPlausibleGameCountAdvance(
+  previous: number | undefined,
+  gameCount: number,
+): boolean {
+  if (!Number.isInteger(gameCount) || gameCount < 1) return false;
+  if (previous === undefined) return true;
+  if (gameCount === previous) return true;
+  if (gameCount > previous && gameCount - previous <= GAME_COUNT_CATCH_UP_MAX) return true;
+  if (previous <= 8 && gameCount < previous) return true;
+  return isRoadWrapToNewShoe(previous, gameCount);
+}
+
+export function selectStableGameCount(
+  previous: number | undefined,
+  incoming: number,
+): number | undefined {
+  if (!Number.isInteger(incoming) || incoming < 1) return previous;
+  return isPlausibleGameCountAdvance(previous, incoming) ? incoming : previous;
+}
+
 export type ParserShoeReason = 'attach' | 'protocol-shuffle' | 'road-wrap' | 'manual-confirm';
 
 export interface ParserShoeEvidence {
@@ -228,7 +250,6 @@ export class PragmaticRuntimeParser {
   private readonly shoeIdByTable = new Map<string, string>();
   private readonly lastShoeResetByTable = new Map<string, string>();
   private readonly lastGameCountByTable = new Map<string, number>();
-  private readonly pendingRoadWrapByTable = new Map<string, number>();
   private readonly handsThisShoeByTable = new Map<string, number>();
   private readonly lastRoundByTable = new Map<string, string>();
   private readonly cardBoundaryByHand = new Set<string>();
@@ -299,7 +320,6 @@ export class PragmaticRuntimeParser {
     this.shoeIdByTable.delete(tableId);
     this.lastShoeResetByTable.delete(tableId);
     this.lastGameCountByTable.delete(tableId);
-    this.pendingRoadWrapByTable.delete(tableId);
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
     this.evidenceByTable.delete(tableId);
@@ -312,15 +332,17 @@ export class PragmaticRuntimeParser {
     events: NormalizedEvent[],
   ): void {
     const tableId = table.tableId;
-
     this.ingestShoeReset(table, observedAt, events);
-
 
     if (Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1) {
       const previous = this.lastGameCountByTable.get(tableId);
       const gameCount = table.gameCount!;
-      if (isPhysicalShoeFromRoadCount(previous, gameCount)) {
-        this.pendingRoadWrapByTable.delete(tableId);
+      const stalePreviousShoeRoad = this.evidenceByTable.get(tableId)?.reason === 'protocol-shuffle'
+        && previous === undefined
+        && gameCount > ROAD_WRAP_MAX;
+      if (stalePreviousShoeRoad) {
+        // Protocol shuffle and lagged DOM still carry the previous shoe's road #.
+      } else if (isPhysicalShoeFromRoadCount(previous, gameCount)) {
         this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
         this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', {
           reason: 'road-wrap',
@@ -328,11 +350,8 @@ export class PragmaticRuntimeParser {
           gameCount,
         });
         this.lastGameCountByTable.set(tableId, gameCount);
-      } else if (previous === undefined || gameCount >= previous) {
-        this.pendingRoadWrapByTable.delete(tableId);
+      } else if (isPlausibleGameCountAdvance(previous, gameCount)) {
         this.lastGameCountByTable.set(tableId, gameCount);
-      } else {
-        this.pendingRoadWrapByTable.delete(tableId);
       }
     }
 
@@ -499,7 +518,6 @@ export class PragmaticRuntimeParser {
 
   private clearShoeTracking(tableId: string): void {
     this.lastGameCountByTable.delete(tableId);
-    this.pendingRoadWrapByTable.delete(tableId);
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
     this.evidenceByTable.delete(tableId);

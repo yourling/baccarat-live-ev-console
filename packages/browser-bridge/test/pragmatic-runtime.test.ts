@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { NormalizedEvent } from '@baccarat/contracts';
-import { PragmaticRuntimeParser, isJoinableNewShoeRoadCount, isRoadWrapToNewShoe, pragmaticGameCountSnapshot } from '../src/pragmatic-runtime.js';
+import { PragmaticRuntimeParser, isJoinableNewShoeRoadCount, isPlausibleGameCountAdvance, isRoadWrapToNewShoe, pragmaticGameCountSnapshot, selectStableGameCount } from '../src/pragmatic-runtime.js';
 import { pragmaticNetworkObservation } from '../src/server.js';
 
 function snapshot(
@@ -320,6 +320,51 @@ describe('PragmaticRuntimeParser', () => {
       previousGameCount: 51,
       gameCount: 1,
     });
+  });
+
+  it('does not seed a shuffled shoe with the previous road count', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61',
+      roundId: 'hand-78',
+      gameCount: 78,
+      source: 'protocol',
+      shoeReset: 'protocol:tobcspbaccarat61:10',
+      shuffleEvent: true,
+    }]));
+    const shoe = parser.currentShoeId('tobcspbaccarat61');
+    const lagged = parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61',
+      gameCount: 78,
+    }]));
+    expect(lagged.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+    const next = parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61',
+      roundId: 'hand-5',
+      gameCount: 5,
+      source: 'protocol',
+      shoeReset: 'protocol:tobcspbaccarat61:10',
+    }]));
+    expect(next.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+    expect(parser.currentShoeId('tobcspbaccarat61')).toBe(shoe);
+  });
+
+  it('does not let a lagged multi-table road #78 overwrite a live #5', () => {
+    expect(selectStableGameCount(5, 78)).toBe(5);
+    expect(selectStableGameCount(78, 5)).toBe(5);
+    expect(isPlausibleGameCountAdvance(5, 78)).toBe(false);
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61', roundId: 'hand-5', gameCount: 5,
+    }]));
+    const lagged = parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61', roundId: 'hand-5', gameCount: 78,
+    }]));
+    expect(lagged.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+    const next = parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61', roundId: 'hand-6', gameCount: 6,
+    }]));
+    expect(next.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
   });
 
   it('opens a new physical shoe as soon as the road wraps to #5', () => {

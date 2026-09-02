@@ -361,6 +361,32 @@ describe('PragmaticProtocolState', () => {
     }));
   });
 
+  it('opens a new shoe from currentShoe after the previous shuffle leftover window', () => {
+    const protocol = new PragmaticProtocolState();
+    const table = 'tobcspbaccarat61';
+    const first = protocol.ingest(message('endshuffling', { table, seq: 10 }));
+    protocol.ingest(message('game', { table, id: '16446324710', seq: 20 }));
+    protocol.ingest(message('betsopen', { table, game: '16446324710', seq: 21 }));
+    const late = protocol.ingest(JSON.stringify({
+      currentShoe: { table, changeShoe: 'true', seq: 400 },
+    }));
+    expect(first?.tables[0]?.shoeReset).toBe('protocol:tobcspbaccarat61:10');
+    expect(late?.tables[0]?.shoeReset).toBe('protocol:tobcspbaccarat61:400');
+    expect(late?.tables[0]?.shuffleEvent).toBe(true);
+  });
+
+  it('still opens a shuffle when endshuffling arrives with an older seq', () => {
+    const protocol = new PragmaticProtocolState();
+    const table = 'tobcspbaccarat61';
+    protocol.ingest(message('game', { table, id: '16446324710', seq: 100 }));
+    const ended = protocol.ingest(message('endshuffling', { table, seq: 50 }));
+    expect(ended?.tables[0]).toEqual(expect.objectContaining({
+      tableId: table,
+      shoeReset: 'protocol:tobcspbaccarat61:50',
+      shuffleEvent: true,
+    }));
+  });
+
   it('can read a table id from a duplicate protocol frame', () => {
     expect(pragmaticProtocolTableId(message('timer', {
       table: 'h22z8qhp17sa0vkh', id: '16387766710', value: '8', seq: 1,

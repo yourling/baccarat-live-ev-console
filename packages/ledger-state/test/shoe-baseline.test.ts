@@ -70,7 +70,9 @@ describe('effectiveShoeBaseline', () => {
     expect(isVerifiedPhysicalShoeReason('attach')).toBe(false);
     expect(isVerifiedPhysicalShoeReason(undefined)).toBe(false);
     expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 1 })).toBe(true);
+    expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 12 })).toBe(true);
     expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 0 })).toBe(false);
+    expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 21 })).toBe(false);
   });
 
   it('rejects remaining 22 on road #51 as an impossible physical shoe', () => {

@@ -38,6 +38,7 @@ import {
   BrowserBridgeServer,
   isCompleteBaccaratHand,
   isJoinableNewShoeRoadCount,
+  selectStableGameCount,
   type BrowserBridgeRuntimeEvent,
 } from '@baccarat/browser-bridge';
 import {
@@ -443,6 +444,9 @@ export class DesktopConsoleService {
         const tableId = normalizeOptionalMonitorTableId(table.tableId);
         if (tableId === undefined) continue;
         const existing = this.tableMetadata.get(tableId);
+        const gameCount = table.gameCount === undefined
+          ? existing?.gameCount
+          : selectStableGameCount(existing?.gameCount, table.gameCount);
         const next: StoredTableMetadata = {
           tableId,
           roomId: room.roomId,
@@ -450,11 +454,10 @@ export class DesktopConsoleService {
           ...(existing?.roomName === undefined ? {} : { roomName: existing.roomName }),
           ...(existing?.displayName === undefined ? {} : { displayName: existing.displayName }),
           ...(existing?.roundId === undefined ? {} : { roundId: existing.roundId }),
-          ...(existing?.gameCount === undefined ? {} : { gameCount: existing.gameCount }),
           ...(room.displayName === undefined ? {} : { roomName: room.displayName }),
           ...(table.displayName === undefined ? {} : { displayName: table.displayName }),
           ...(table.roundId === undefined ? {} : { roundId: table.roundId }),
-          ...(table.gameCount === undefined ? {} : { gameCount: table.gameCount }),
+          ...(gameCount === undefined ? {} : { gameCount }),
         };
         this.tableMetadata.set(tableId, next);
         if (!samePersistentTableMetadata(existing, next)) changed = true;
@@ -542,8 +545,10 @@ export class DesktopConsoleService {
         const gameCount = table.gameCount;
         if (!Number.isInteger(gameCount) || (gameCount ?? 0) < 1) continue;
         const previous = this.pendingGameCountByTable.get(tableId);
-        this.pendingGameCountByTable.set(tableId, gameCount!);
-        if (isJoinableNewShoeRoadCount(previous, gameCount!)) this.promotePendingTable(tableId);
+        const stable = selectStableGameCount(previous, gameCount!);
+        if (stable === undefined) continue;
+        this.pendingGameCountByTable.set(tableId, stable);
+        if (isJoinableNewShoeRoadCount(previous, stable)) this.promotePendingTable(tableId);
       }
     }
   }

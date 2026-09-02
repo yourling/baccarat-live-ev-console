@@ -19,6 +19,7 @@ interface ProtocolTableState {
   rounds: Map<string, RoundCards>;
   shoeReset?: string;
   shuffleEvent?: boolean;
+  dealtSinceShuffle?: boolean;
 }
 
 interface FinishedShuffle {
@@ -26,6 +27,8 @@ interface FinishedShuffle {
   token: string;
   seq: number;
 }
+
+const CURRENT_SHOE_LEFTOVER_MAX_SEQ = 300;
 
 const TABLE_ID_PATTERN = /^[a-z0-9]{4,32}$/i;
 const ROUND_ID_PATTERN = /^[a-z0-9-]{1,64}$/i;
@@ -433,7 +436,7 @@ export class PragmaticProtocolState {
       .find(value => value !== undefined);
     if (this.shufflingTables.size === 1) return this.shufflingTables.keys().next().value;
     if (this.shufflingTables.size === 0 && this.lastFinishedShuffle !== undefined) {
-      if (seq === undefined || seq - this.lastFinishedShuffle.seq <= 300) {
+      if (seq === undefined || seq - this.lastFinishedShuffle.seq <= CURRENT_SHOE_LEFTOVER_MAX_SEQ) {
         return this.lastFinishedShuffle.tableId;
       }
     }
@@ -450,6 +453,7 @@ export class PragmaticProtocolState {
     const changed = state.shoeReset !== token;
     state.shoeReset = token;
     state.shuffleEvent = true;
+    state.dealtSinceShuffle = false;
     if (changed) this.clearRoundInventory(state);
     return { changed: true, snapshotRoundId: state.roundId };
   }
@@ -465,6 +469,7 @@ export class PragmaticProtocolState {
     const changed = state.shoeReset !== token;
     state.shoeReset = token;
     state.shuffleEvent = true;
+    state.dealtSinceShuffle = false;
     if (changed) this.clearRoundInventory(state);
     return { changed: true, snapshotRoundId: state.roundId };
   }
@@ -496,8 +501,9 @@ export class PragmaticProtocolState {
       && !targetClosed
       && !targetHasCards
       && (isNewRound || roundId === state.roundId || (roundId === undefined && state.roundId !== undefined));
+    const isShuffleKind = kind === 'startshuffling' || kind === 'endshuffling' || kind === 'currentShoe';
 
-    if (staleSeq && !allowLowerSeqWindow) {
+    if (staleSeq && !allowLowerSeqWindow && !isShuffleKind) {
       return { changed: false };
     }
     if (!isCard && seq !== undefined && !staleSeq) state.lastSeq = seq;
@@ -517,6 +523,7 @@ export class PragmaticProtocolState {
       state.roundId = roundId;
       state.bettingOpen = undefined;
       state.countdown = undefined;
+      state.dealtSinceShuffle = true;
       roundCards(state, roundId);
     }
 
@@ -573,8 +580,14 @@ export class PragmaticProtocolState {
         return { changed: true, snapshotRoundId: state.roundId };
       }
       if (this.lastFinishedShuffle?.tableId === state.tableId) {
-        state.shoeReset = this.lastFinishedShuffle.token;
-        return { changed: true, snapshotRoundId: state.roundId };
+        const seqGap = seq !== undefined ? seq - this.lastFinishedShuffle.seq : undefined;
+        const leftover = seqGap !== undefined
+          ? seqGap >= 0 && seqGap <= CURRENT_SHOE_LEFTOVER_MAX_SEQ
+          : state.dealtSinceShuffle !== true;
+        if (leftover) {
+          state.shoeReset = this.lastFinishedShuffle.token;
+          return { changed: true, snapshotRoundId: state.roundId };
+        }
       }
       return this.finishShuffle(state, seq);
     }

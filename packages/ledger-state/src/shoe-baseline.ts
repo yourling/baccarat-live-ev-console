@@ -39,7 +39,7 @@ export function isVerifiedPhysicalShoeEvidence(
   return evidence?.reason === 'road-wrap'
     && typeof evidence.gameCount === 'number'
     && evidence.gameCount >= 1
-    && evidence.gameCount <= 8;
+    && evidence.gameCount <= 20;
 }
 
 export function shoeBaselineReasonLabel(evidence: ShoeBaselineEvidence): string {

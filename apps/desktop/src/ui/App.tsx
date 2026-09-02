@@ -2356,7 +2356,7 @@ function monitorDisplayedGameCount(
 
 function isVerifiedPhysicalShoeReason(reason: string | undefined, gameCount?: number): boolean {
   if (reason === 'protocol-shuffle' || reason === 'manual-confirm') return true;
-  return reason === 'road-wrap' && typeof gameCount === 'number' && gameCount >= 1 && gameCount <= 8;
+  return reason === 'road-wrap' && typeof gameCount === 'number' && gameCount >= 1 && gameCount <= 20;
 }
 
 function isDisplayedPhysicalShoe(

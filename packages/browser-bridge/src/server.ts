@@ -34,7 +34,7 @@ import type {
   BridgeRoomDescriptor,
   BridgeServerMessage,
 } from './protocol.js';
-import { PragmaticRuntimeParser, pragmaticGameCountSnapshot, type ParserShoeEvidence } from './pragmatic-runtime.js';
+import { PragmaticRuntimeParser, pragmaticGameCountSnapshot, selectStableGameCount, type ParserShoeEvidence } from './pragmatic-runtime.js';
 import {
   PragmaticProtocolState,
   inspectPragmaticGameresult,
@@ -98,12 +98,15 @@ function mergeBridgeTableDescriptor(
   previous: BridgeRoomDescriptor['tables'][number] | undefined,
   next: BridgeRoomDescriptor['tables'][number],
 ): BridgeRoomDescriptor['tables'][number] {
+  const gameCount = next.gameCount === undefined
+    ? previous?.gameCount
+    : selectStableGameCount(previous?.gameCount, next.gameCount);
   return {
     ...(previous ?? { tableId: next.tableId }),
     tableId: next.tableId,
     ...(next.displayName === undefined ? {} : { displayName: next.displayName }),
     ...(next.roundId === undefined ? {} : { roundId: next.roundId }),
-    ...(next.gameCount === undefined ? {} : { gameCount: next.gameCount }),
+    ...(gameCount === undefined ? {} : { gameCount }),
     ...(previous?.profile === undefined && next.profile === undefined
       ? {}
       : { profile: { ...(previous?.profile ?? {}), ...(next.profile ?? {}) } }),
