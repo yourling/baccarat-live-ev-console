@@ -306,7 +306,7 @@
   // ---- 会话过期检测与自动恢复 ----
 
   function isSessionExpiredText(text) {
-    return /会话已过期|会话已经过期|再次登录|重新登录|session\s+(has\s+|may\s+be\s+|is\s+)?expired|authentication\s+failed/i.test(text);
+    return /会话无效|会话已超时|会话已过期|会话已经过期|再次登录|重新登录|session\s+(has\s+|may\s+be\s+|is\s+)?(expired|invalid)|session\s+(?:has\s+)?timed\s*out|authentication\s+failed/i.test(text);
   }
 
   /** 收集按钮,穿透开放 Shadow Root（客户端可能用 shadow DOM 渲染弹窗）。 */
