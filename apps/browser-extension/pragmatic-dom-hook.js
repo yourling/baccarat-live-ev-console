@@ -391,14 +391,10 @@
     }).filter(table => table.tableId.length > 0);
   }
 
-  function isSessionExpiredText(text) {
-    return /会话无效|您的会话已超时|会话已超时|会话已过期|会话已经过期|session\s+(has\s+|may\s+be\s+|is\s+)?(expired|invalid)|session\s+(?:has\s+)?timed\s*out/i.test(text);
-  }
-
   function recoverExpiredSession() {
     const bodyText = clean(document.body?.innerText || document.body?.textContent);
-    if (sessionConflictText(bodyText)) return false;
-    const expired = isSessionExpiredText(bodyText);
+    if (sessionConflictText(bodyText)) return;
+    const expired = /您的会话已超时|session\s+(?:has\s+)?timed\s*out/i.test(bodyText);
     if (!expired) {
       if (timeoutReported) {
         timeoutReported = false;
@@ -407,22 +403,20 @@
           frame: 'iframe', detail: 'pragmatic-keepalive', timestamp: observedAt(),
         });
       }
-      return false;
+      return;
     }
-    if (!timeoutReported) {
-      timeoutReported = true;
-      send({
-        kind: 'sessionExpired', url: location.href, frame: 'iframe',
-        textLength: bodyText.length, timestamp: observedAt(), recovering: false,
-      });
-    }
-    return true;
+    if (timeoutReported) return;
+    timeoutReported = true;
+    send({
+      kind: 'sessionExpired', url: location.href, frame: 'iframe',
+      textLength: bodyText.length, timestamp: observedAt(), recovering: false,
+    });
   }
 
   function scan(force) {
     const now = Date.now();
     continueNativeIdleSession(now);
-    if (recoverExpiredSession()) return;
+    recoverExpiredSession();
     if (!isStateFrame) return;
     const tables = isSingle ? singleSnapshot() : multiSnapshot();
     if (tables.length === 0) return;

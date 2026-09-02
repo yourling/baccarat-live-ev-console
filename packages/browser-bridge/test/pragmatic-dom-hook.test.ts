@@ -70,44 +70,6 @@ describe('Pragmatic DOM hook', () => {
     }));
   });
 
-  it('stops publishing table snapshots when the game shows 会话无效', () => {
-    const dom = new JSDOM(`
-      <body>
-        <p>会话无效</p>
-        <div id="TileHeight-tobcspbaccarat61">
-          <span>韩语极速百家乐5</span>
-          <span class="game-count"><span>#</span><span>5</span></span>
-        </div>
-      </body>
-    `, { url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/' });
-    Object.defineProperty(dom.window.Element.prototype, 'getBoundingClientRect', {
-      configurable: true,
-      value: () => ({ width: 237, height: 201, top: 0, left: 0, right: 237, bottom: 201 }),
-    });
-    const sendMessage = vi.fn();
-    const context = vm.createContext({
-      chrome: { runtime: { sendMessage } },
-      document: dom.window.document,
-      location: dom.window.location,
-      URL,
-      Date,
-      JSON,
-      Number,
-      String,
-      Object,
-      Array,
-      setInterval: vi.fn(),
-      getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
-      globalThis: null,
-    });
-    context.globalThis = context;
-    vm.runInContext(source, context, { filename: 'pragmatic-dom-hook.js' });
-    const kinds = sendMessage.mock.calls.map(([message]) => message && message.kind);
-    expect(kinds).toContain('sessionExpired');
-    expect(sendMessage.mock.calls.some(call => call[0]?.kind === 'roomDiscovered')).toBe(false);
-    expect(sendMessage.mock.calls.some(call => call[0]?.source === 'baccarat-bridge-pragmatic-state')).toBe(false);
-  });
-
   it('does not click a reconnecting overlay', () => {
     const dom = new JSDOM(
       '<body><p>重新连接中</p></body>',
