@@ -2345,18 +2345,13 @@ function safeEvaluate(
 function monitorDisplayedGameCount(
   roadCount: number | undefined,
   handNumber: number,
-  physicalShoeKnown: boolean,
-  evidenceReason?: string,
+  _physicalShoeKnown: boolean,
+  _evidenceReason?: string,
 ): number | undefined {
-  if (!physicalShoeKnown) return roadCount;
-  const hands = handNumber >= 1 ? handNumber : undefined;
-  if (evidenceReason !== 'protocol-shuffle' && evidenceReason !== 'road-wrap' && evidenceReason !== 'manual-confirm') {
-    return roadCount ?? hands;
-  }
-  if (roadCount === undefined) return hands;
-  if (hands !== undefined && roadCount > 8 && roadCount - hands >= 8) return hands;
-  if (hands !== undefined && roadCount <= 8 && hands > roadCount) return hands;
-  return roadCount;
+  // The table road is ground truth. handNumber is only how many hands this
+  // process has seen on the current shoeId; if a shuffle was missed it keeps
+  // climbing while the live road is already back at #1.
+  return roadCount ?? (handNumber >= 1 ? handNumber : undefined);
 }
 
 function isVerifiedPhysicalShoeReason(reason: string | undefined, gameCount?: number): boolean {
