@@ -123,13 +123,17 @@
     });
   }
 
-  function parseSingleTableId() {
+  function readTableIdParam(raw) {
     try {
-      const tableId = new URL(document.referrer).searchParams.get('table_id');
+      const tableId = new URL(raw, location.href).searchParams.get('table_id');
       return typeof tableId === 'string' && /^[a-z0-9]{8,32}$/i.test(tableId) ? tableId : '';
     } catch (_) {
       return '';
     }
+  }
+
+  function parseSingleTableId() {
+    return readTableIdParam(location.href) || readTableIdParam(document.referrer);
   }
 
   function countdownValue(timer) {
@@ -163,7 +167,16 @@
   function isGameCountLabel(value) {
     const text = String(value || '');
     if (/countdown|timer/i.test(text)) return false;
-    return /(?:^|[\s_-])game-?count(?:$|[\s_-])/i.test(text);
+    return String(text).split(/[\s]+/).some(token => {
+      const base = token.split('_')[0];
+      return /^(?:game-count|gameCount)$/i.test(base);
+    });
+  }
+
+  function nodeText(node) {
+    if (!node) return '';
+    if (typeof node.innerText === 'string') return node.innerText;
+    return node.textContent || '';
   }
 
   function isGameCountCandidate(node) {
@@ -187,19 +200,21 @@
 
   function parseGameCount(root) {
     if (!root) return undefined;
-    const header = root.querySelector && root.querySelector('[data-testid="game-header"]');
+    const header = root.getAttribute && root.getAttribute('data-testid') === 'game-header'
+      ? root
+      : root.querySelector && root.querySelector('[data-testid="game-header"]');
     if (header) {
       const headerLabeled = findGameCountNode(header);
       const headerValue = headerLabeled
-        ? parseGameCountText(headerLabeled.innerText || headerLabeled.textContent)
-        : parseGameCountText(header.innerText || header.textContent);
+        ? parseGameCountText(nodeText(headerLabeled))
+        : parseGameCountText(nodeText(header));
       if (headerValue !== undefined) return headerValue;
     }
     const labeled = findGameCountNode(root);
     if (labeled && visible(labeled)) {
-      return parseGameCountText(labeled.innerText || labeled.textContent);
+      return parseGameCountText(nodeText(labeled));
     }
-    if (labeled) return parseGameCountText(labeled.innerText || labeled.textContent);
+    if (labeled) return parseGameCountText(nodeText(labeled));
     return undefined;
   }
 
@@ -344,7 +359,9 @@
         && style.display !== 'none'
         && tile.getBoundingClientRect().width > 0;
       const cards = visible ? multitableCards(tile) : undefined;
-      const gameCount = stableGameCount(tableId, tile);
+      const gameCount = style.display !== 'none' && tile.getBoundingClientRect().width > 0
+        ? stableGameCount(tableId, tile)
+        : undefined;
       const minBet = parseMinimum(tile);
       return {
         tableId,

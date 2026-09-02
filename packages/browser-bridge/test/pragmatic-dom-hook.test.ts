@@ -328,6 +328,42 @@ describe('Pragmatic DOM hook', () => {
     expect(second.tables[0]?.gameCount).toBe(1);
   });
 
+  it('reads a dedicated table id from the page URL when referrer has none', () => {
+    const dom = new JSDOM(`
+      <body>
+        <div data-testid="game-header">极速百家乐12 #5 ID: 16447803910</div>
+        <div data-testid="round-timer"><div data-testid="timer-countdown-11">11</div></div>
+      </body>
+    `, { url: 'https://client.pragmaticplaylive.net/desktop/baccarat/?table_id=spto12bctorobc12' });
+    Object.defineProperty(dom.window.Element.prototype, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({ width: 237, height: 201, top: 0, left: 0, right: 237, bottom: 201 }),
+    });
+    const sendMessage = vi.fn();
+    const context = vm.createContext({
+      chrome: { runtime: { sendMessage } },
+      document: dom.window.document,
+      location: dom.window.location,
+      URL,
+      Date,
+      JSON,
+      Number,
+      String,
+      Object,
+      Array,
+      setInterval: vi.fn(),
+      getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+      globalThis: null,
+    });
+    context.globalThis = context;
+    vm.runInContext(source, context, { filename: 'pragmatic-dom-hook.js' });
+    const discovery = sendMessage.mock.calls
+      .map(([message]) => message)
+      .find(message => message && message.kind === 'roomDiscovered');
+    expect(discovery?.room?.tables?.[0]?.tableId).toBe('spto12bctorobc12');
+    expect(discovery?.room?.tables?.[0]?.gameCount).toBe(5);
+  });
+
   it('prefers the visible header # over a hidden leftover game-count', () => {
     const dom = new JSDOM(`
       <body>
