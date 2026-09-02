@@ -86,6 +86,18 @@ export function selectStableGameCount(
   return isPlausibleGameCountAdvance(previous, incoming) ? incoming : previous;
 }
 
+export function selectObservedGameCount(
+  evidenceReason: string | undefined,
+  accepted: number | undefined,
+  incoming: number | undefined,
+): number | undefined {
+  if (incoming === undefined) return accepted;
+  if (evidenceReason === 'protocol-shuffle' && accepted === undefined && incoming > ROAD_WRAP_MAX) {
+    return undefined;
+  }
+  return selectStableGameCount(accepted, incoming);
+}
+
 export type ParserShoeReason = 'attach' | 'protocol-shuffle' | 'road-wrap' | 'manual-confirm';
 
 export interface ParserShoeEvidence {
@@ -296,6 +308,10 @@ export class PragmaticRuntimeParser {
 
   currentShoeId(tableId: string): string | undefined {
     return this.shoeIdByTable.get(tableId);
+  }
+
+  acceptedGameCount(tableId: string): number | undefined {
+    return this.lastGameCountByTable.get(tableId);
   }
 
   shoeEvidence(tableId: string): ParserShoeEvidence | undefined {

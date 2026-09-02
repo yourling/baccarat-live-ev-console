@@ -682,8 +682,16 @@ describe('desktop console demo sessions', () => {
 
       const recovered = service.snapshot();
       expect(recovered.keepalive.enabled).toBe(true);
-      expect(recovered.snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
+      expect(recovered.snapshot.tables.D055?.projection.shoeBaseline).toBe('unknown-monitor-session');
+      expect(recovered.snapshot.tables.D055?.projection.autoBetStatus).toBe('DISARMED');
       expect(recovered.snapshot.tables.D066?.projection.autoBetStatus).toBe('ARMED');
+
+      await service.injectEvent({
+        ...monitorShoeEvent('D055', 'd055-reshuffled', 'physical-shoe'),
+        shoeId: 'd055-reshuffled-shoe',
+        sourceSeq: 5,
+      });
+      expect(service.snapshot().snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
 
       const stopped = await service.setAutomationEnabled(false);
 

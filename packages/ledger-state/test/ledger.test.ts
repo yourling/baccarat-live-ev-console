@@ -291,6 +291,25 @@ describe('ledger replay', () => {
     expect(state?.status).toBe('TRACKING');
   });
 
+  it('demotes a physical shoe after connectionLost until a new shuffle arrives', () => {
+    const profile = { ...defaultProfile('t1'), autoConfirmNewShoe: true };
+    const state = replayEvents([
+      ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile }, 1),
+      ev({ type: 'connectionLost', reason: 'table-feed-stale' }, 2),
+    ]).get('t1');
+    expect(state?.shoeBaseline).toBe('unknown-monitor-session');
+    expect(state?.autoBetStatus).toBe('DISARMED');
+    const restored = replayEvents([
+      ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile }, 1),
+      ev({ type: 'connectionLost', reason: 'table-feed-stale' }, 2),
+      ev({
+        type: 'connectionRestored',
+        continuityProof: `cursor-v1:${'a'.repeat(64)}`,
+      }, 3),
+    ]).get('t1');
+    expect(restored?.shoeBaseline).toBe('unknown-monitor-session');
+  });
+
   it('seals a physical shoe that can no longer deal a hand', () => {
     const ranks = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'] as const;
     const profile = {

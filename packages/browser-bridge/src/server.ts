@@ -1150,6 +1150,10 @@ export class BrowserBridgeServer implements RoomMonitor {
     return this.pragmaticParser.shoeEvidence(tableId);
   }
 
+  acceptedGameCount(tableId: string): number | undefined {
+    return this.pragmaticParser.acceptedGameCount(tableId);
+  }
+
   recordShoeEvidence(tableId: string, evidence: ParserShoeEvidence): void {
     this.pragmaticParser.recordShoeEvidence(tableId, evidence);
   }

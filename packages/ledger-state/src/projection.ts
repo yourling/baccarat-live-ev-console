@@ -366,6 +366,11 @@ export function applyEvent(
       updated.connectionStatus = 'DISCONNECTED';
       updated.autoBetStatus = 'DISARMED';
       if (!updated.sealed && updated.shoeId) updated.status = 'RESYNCING';
+      // A gap can hide startshuffling. Consecutive sourceSeq after resume
+      // does not prove the same physical shoe continued.
+      if (updated.shoeBaseline === 'physical-shoe') {
+        updated.shoeBaseline = 'unknown-monitor-session';
+      }
       break;
     }
     case 'connectionRestored': {

@@ -38,6 +38,7 @@ import {
   BrowserBridgeServer,
   isCompleteBaccaratHand,
   isJoinableNewShoeRoadCount,
+  selectObservedGameCount,
   selectStableGameCount,
   type BrowserBridgeRuntimeEvent,
 } from '@baccarat/browser-bridge';
@@ -436,6 +437,14 @@ export class DesktopConsoleService {
     for (const tableId of this.monitorTableIds) this.liveApprovals.approve(tableId);
   }
 
+  private observedGameCount(tableId: string, incoming?: number): number | undefined {
+    return selectObservedGameCount(
+      this.browserBridge?.shoeEvidence(tableId)?.reason,
+      this.browserBridge?.acceptedGameCount(tableId),
+      incoming,
+    );
+  }
+
   private refreshTableMetadataFromRooms(rooms: readonly RoomDescriptor[]): void {
     let changed = false;
     const updatedAt = new Date().toISOString();
@@ -444,9 +453,7 @@ export class DesktopConsoleService {
         const tableId = normalizeOptionalMonitorTableId(table.tableId);
         if (tableId === undefined) continue;
         const existing = this.tableMetadata.get(tableId);
-        const gameCount = table.gameCount === undefined
-          ? existing?.gameCount
-          : selectStableGameCount(existing?.gameCount, table.gameCount);
+        const gameCount = this.observedGameCount(tableId, table.gameCount ?? existing?.gameCount);
         const next: StoredTableMetadata = {
           tableId,
           roomId: room.roomId,
@@ -1707,9 +1714,9 @@ export class DesktopConsoleService {
           ...(previous.roundId !== undefined || table.roundId !== undefined
             ? { roundId: previous.roundId ?? table.roundId ?? '' }
             : {}),
-          ...(previous.gameCount !== undefined || table.gameCount !== undefined
-            ? { gameCount: previous.gameCount ?? table.gameCount ?? 0 }
-            : {}),
+          ...(this.observedGameCount(table.tableId, previous.gameCount ?? table.gameCount) === undefined
+            ? {}
+            : { gameCount: this.observedGameCount(table.tableId, previous.gameCount ?? table.gameCount) }),
         });
         continue;
       }

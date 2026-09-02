@@ -338,6 +338,7 @@ describe('PragmaticRuntimeParser', () => {
       gameCount: 78,
     }]));
     expect(lagged.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+    expect(parser.acceptedGameCount('tobcspbaccarat61')).toBeUndefined();
     const next = parser.parse(snapshot([{
       tableId: 'tobcspbaccarat61',
       roundId: 'hand-5',
@@ -347,6 +348,7 @@ describe('PragmaticRuntimeParser', () => {
     }]));
     expect(next.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
     expect(parser.currentShoeId('tobcspbaccarat61')).toBe(shoe);
+    expect(parser.acceptedGameCount('tobcspbaccarat61')).toBe(5);
   });
 
   it('does not let a lagged multi-table road #78 overwrite a live #5', () => {
