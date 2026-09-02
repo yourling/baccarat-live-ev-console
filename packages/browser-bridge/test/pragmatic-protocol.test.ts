@@ -342,6 +342,16 @@ describe('PragmaticProtocolState', () => {
     }))).toBeUndefined();
   });
 
+  it('does not reuse the previous shuffle token when a later shuffle misses startshuffling', () => {
+    const protocol = new PragmaticProtocolState();
+    const table = 'spto41bctorobc41';
+    const first = protocol.ingest(message('endshuffling', { table, seq: 10 }));
+    const second = protocol.ingest(message('endshuffling', { table, seq: 99 }));
+    expect(first?.tables[0]?.shoeReset).toBe('protocol:spto41bctorobc41:10');
+    expect(second?.tables[0]?.shoeReset).toBe('protocol:spto41bctorobc41:99');
+    expect(second?.tables[0]?.shuffleEvent).toBe(true);
+  });
+
   it('opens a physical shoe from endshuffling when startshuffling was missed', () => {
     const protocol = new PragmaticProtocolState();
     const ended = protocol.ingest(message('endshuffling', { table: 'tobc51koreanto51', seq: 12610 }));

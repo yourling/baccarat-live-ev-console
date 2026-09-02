@@ -217,6 +217,61 @@ describe('PragmaticRuntimeParser', () => {
     expect(parser.shoeEvidence('spto41bctorobc41')).toEqual({ reason: 'protocol-shuffle' });
   });
 
+  it('opens a new physical shoe when shuffle repeats after the current shoe has dealt', () => {
+    const parser = new PragmaticRuntimeParser();
+    const first = parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      roundId: 'hand-1',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+      shuffleEvent: true,
+    }]));
+    expect(first.filter(event => event.type === 'newShoeSignal' && event.baseline === 'physical-shoe')).toHaveLength(1);
+    const firstShoe = parser.currentShoeId('spto41bctorobc41');
+
+    parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      roundId: 'hand-2',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+    }]));
+
+    const reshuffled = parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      roundId: 'hand-3',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+      shuffleEvent: true,
+    }]));
+    expect(reshuffled.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({
+        type: 'newShoeSignal',
+        baseline: 'physical-shoe',
+      }),
+    ]);
+    expect(parser.currentShoeId('spto41bctorobc41')).not.toBe(firstShoe);
+    expect(parser.shoeEvidence('spto41bctorobc41')).toEqual({ reason: 'protocol-shuffle' });
+  });
+
+  it('does not open another shoe for endshuffling on the same unused shuffle token', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+      shuffleEvent: true,
+    }]));
+    const shoe = parser.currentShoeId('spto41bctorobc41');
+    const ended = parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+      shuffleEvent: true,
+    }]));
+    expect(ended.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+    expect(parser.currentShoeId('spto41bctorobc41')).toBe(shoe);
+  });
+
   it('records protocol-shuffle evidence when the shoeReset token changes', () => {
     const parser = new PragmaticRuntimeParser();
     parser.parse(snapshot([{

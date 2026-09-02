@@ -449,7 +449,21 @@ export class PragmaticRuntimeParser {
       }
       return;
     }
-    if (shuffleEvent) this.promoteProtocolShuffle(tableId, observedAt, events);
+    if (!shuffleEvent) return;
+    // Same token is reused when startshuffling is missed or endshuffling
+    // copies lastFinishedShuffle. If this shoe already dealt, that pulse is
+    // the next shuffle, not a duplicate of the current one.
+    if (this.shoeAlreadyDealt(tableId)) {
+      this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
+      return;
+    }
+    this.promoteProtocolShuffle(tableId, observedAt, events);
+  }
+
+  private shoeAlreadyDealt(tableId: string): boolean {
+    // First snapshot of a new shoe often still carries a round id, which
+    // counts as 1. A later shuffle after real play is at least a second hand.
+    return (this.handsThisShoeByTable.get(tableId) ?? 0) >= 2;
   }
 
   private promoteProtocolShuffle(

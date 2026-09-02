@@ -459,7 +459,6 @@ export class PragmaticProtocolState {
     seq: number | undefined,
   ): { changed: boolean; snapshotRoundId?: string } {
     const token = this.shufflingTables.get(state.tableId)
-      ?? (this.lastFinishedShuffle?.tableId === state.tableId ? this.lastFinishedShuffle.token : undefined)
       ?? `protocol:${state.tableId}:${seq ?? Date.now()}`;
     this.shufflingTables.delete(state.tableId);
     this.lastFinishedShuffle = { tableId: state.tableId, token, seq: seq ?? 0 };
