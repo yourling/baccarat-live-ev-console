@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { NormalizedEvent } from '@baccarat/contracts';
-import { PragmaticRuntimeParser, isJoinableNewShoeRoadCount, isPlausibleGameCountAdvance, isRoadWrapToNewShoe, pragmaticGameCountSnapshot, selectStableGameCount } from '../src/pragmatic-runtime.js';
+import { PragmaticRuntimeParser, isInternalExternalGameCountAnomaly, isJoinableNewShoeRoadCount, isPlausibleGameCountAdvance, isRoadWrapToNewShoe, pragmaticGameCountSnapshot, selectStableGameCount } from '../src/pragmatic-runtime.js';
 import { pragmaticNetworkObservation } from '../src/server.js';
 
 function snapshot(
@@ -367,6 +367,15 @@ describe('PragmaticRuntimeParser', () => {
       tableId: 'tobcspbaccarat61', roundId: 'hand-6', gameCount: 6,
     }]));
     expect(next.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+  });
+
+  it('treats a large internal/DOM game-count gap as an anomaly except wrap or shuffle lag', () => {
+    expect(isInternalExternalGameCountAnomaly(72, 83)).toBe(true);
+    expect(isInternalExternalGameCountAnomaly(8, 40)).toBe(true);
+    expect(isInternalExternalGameCountAnomaly(80, 5)).toBe(false);
+    expect(isInternalExternalGameCountAnomaly(12, 13)).toBe(false);
+    expect(isInternalExternalGameCountAnomaly(5, 83, 'protocol-shuffle')).toBe(false);
+    expect(isInternalExternalGameCountAnomaly(7, 40)).toBe(false);
   });
 
   it('opens a new physical shoe as soon as the road wraps to #5', () => {

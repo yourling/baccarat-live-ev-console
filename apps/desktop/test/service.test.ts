@@ -524,6 +524,70 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('drops a monitored table when internal hands and DOM road disagree, then rejoins on wrap', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const tableId = 'spto12bctorobc12';
+    try {
+      service['browserBridge'] = bridge;
+      service['liveMonitorActivated'] = true;
+      await service.updateMonitorTableIds([tableId]);
+      await service.injectEvent({
+        ...monitorShoeEvent(tableId, 'spto12-physical', 'physical-shoe'),
+        shoeId: 'pragmatic-spto12bctorobc12-2',
+        sourceSeq: 1,
+      });
+      for (let hand = 1; hand <= 8; hand += 1) {
+        await service.injectEvent({
+          type: 'bettingWindowOpened',
+          eventId: `spto12-open-${hand}`,
+          tableId,
+          timestamp: '2026-09-02T15:00:00.000Z',
+          sourceSeq: hand + 1,
+          source: 'pragmatic-runtime',
+          schemaVersion: EVENT_SCHEMA_VERSION,
+          shoeId: 'pragmatic-spto12bctorobc12-2',
+          handId: `hand-${hand}`,
+          market: 'bankerPair',
+        });
+      }
+      expect(service.snapshot().snapshot.tables[tableId]?.projection.handNumber).toBe(8);
+      service['tableMetadata'].set(tableId, {
+        tableId,
+        roomId: 'dafabet-pragmatic',
+        updatedAt: new Date().toISOString(),
+        gameCount: 40,
+      });
+      await service.injectEvent({
+        type: 'bettingWindowOpened',
+        eventId: 'spto12-open-9',
+        tableId,
+        timestamp: '2026-09-02T15:00:01.000Z',
+        sourceSeq: 10,
+        source: 'pragmatic-runtime',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        shoeId: 'pragmatic-spto12bctorobc12-2',
+        handId: 'hand-9',
+        market: 'bankerPair',
+      });
+      expect(service.snapshot().monitorTableIds).not.toContain(tableId);
+      expect(service['demotedPendingTableIds'].has(tableId)).toBe(true);
+
+      bridge.ingestClientMessage({
+        kind: 'roomUpdated',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId, displayName: '极速百家乐12', gameCount: 5 }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(service.snapshot().monitorTableIds).toContain(tableId);
+    } finally {
+      await service.close();
+    }
+  });
+
   it('does not auto-join a mid-shoe table when the road count only drops one hand', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();

@@ -2436,6 +2436,7 @@ function runtimeIncidentCodeLabel(code: DesktopRuntimeIncident['code']): string 
     'settlement-gap': '结算缺口',
     'scheduler-failure': '调度失败',
     'monitor-failure': '监控失败',
+    'shoe-count-mismatch': '局数与牌桌不符',
   };
   return labels[code];
 }

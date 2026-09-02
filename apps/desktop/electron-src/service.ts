@@ -37,6 +37,7 @@ import {
   BUNDLED_BROWSER_EXTENSION_TOKEN,
   BrowserBridgeServer,
   isCompleteBaccaratHand,
+  isInternalExternalGameCountAnomaly,
   isJoinableNewShoeRoadCount,
   selectObservedGameCount,
   selectStableGameCount,
@@ -328,6 +329,7 @@ export class DesktopConsoleService {
   private suppressDiscoveredMonitorAutoAdd = false;
   private automationEnabled = false;
   private readonly pendingGameCountByTable = new Map<string, number>();
+  private readonly demotedPendingTableIds = new Set<string>();
   /** The transient allowlist used only while a serialized live transition is being validated. */
   private pendingMonitorTableIds?: readonly string[];
   /** Operator-managed, persisted ordered selection; mutation is the configuration operation. */
@@ -468,6 +470,11 @@ export class DesktopConsoleService {
         };
         this.tableMetadata.set(tableId, next);
         if (!samePersistentTableMetadata(existing, next)) changed = true;
+        if (this.demoteIfGameCountAnomaly(tableId)) {
+          void this.failCloseLiveExecution([tableId]).catch(error => {
+            this.recordLiveMonitorError(error, 'shoe-count-mismatch', 'degraded', tableId);
+          });
+        }
       }
     }
     if (changed) this.persistTableMetadata();
@@ -495,11 +502,16 @@ export class DesktopConsoleService {
   private pendingJoinTableIds(): string[] {
     const monitored = new Set(this.monitorTableIds);
     const pending: string[] = [];
+    const add = (tableId: string): void => {
+      if (monitored.has(tableId) || pending.includes(tableId)) return;
+      pending.push(tableId);
+    };
+    for (const tableId of this.demotedPendingTableIds) add(tableId);
     for (const candidate of this.monitorCandidates()) {
       if (candidate.roomId !== 'dafabet-pragmatic') continue;
       const tableId = normalizeOptionalMonitorTableId(candidate.tableId);
-      if (tableId === undefined || monitored.has(tableId) || pending.includes(tableId)) continue;
-      pending.push(tableId);
+      if (tableId === undefined) continue;
+      add(tableId);
     }
     return pending;
   }
@@ -538,6 +550,8 @@ export class DesktopConsoleService {
     this.ensureMonitorActors(nextTableIds, this.currentUnifiedTableSettings());
     this.monitorTableIds = nextTableIds;
     this.pendingGameCountByTable.delete(tableId);
+    this.demotedPendingTableIds.delete(tableId);
+    this.runtimeIncidents.resolve('shoe-count-mismatch', tableId);
     this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
     this.syncLiveApprovalsToMonitorTables();
     this.browserBridge?.setSelectedTableIds(this.observedTableIds());
@@ -558,6 +572,38 @@ export class DesktopConsoleService {
         if (isJoinableNewShoeRoadCount(previous, stable)) this.promotePendingTable(tableId);
       }
     }
+  }
+
+  private demoteAnomalousMonitorTable(tableId: string, handNumber: number, roadCount: number): boolean {
+    if (!this.liveMonitorActivated) return false;
+    if (!this.monitorTableIds.includes(tableId)) return false;
+    this.pendingGameCountByTable.set(tableId, roadCount);
+    this.demotedPendingTableIds.add(tableId);
+    const nextTableIds = this.monitorTableIds.filter(candidate => candidate !== tableId);
+    this.monitorTableIds = nextTableIds;
+    this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
+    this.syncLiveApprovalsToMonitorTables();
+    this.browserBridge?.setSelectedTableIds(this.observedTableIds());
+    this.ensureRuntimeIncident({
+      code: 'shoe-count-mismatch',
+      severity: 'degraded',
+      tableId,
+      message: `内部 #${handNumber} 与牌桌路子 #${roadCount} 相差过大，已移出监控，等待下一靴`,
+    });
+    return true;
+  }
+
+  private demoteIfGameCountAnomaly(tableId: string): boolean {
+    if (!this.liveMonitorActivated) return false;
+    if (!this.monitorTableIds.includes(tableId)) return false;
+    const actor = this.orchestrator.getActor(tableId);
+    if (!actor) return false;
+    const handNumber = actor.getProjection().handNumber;
+    const roadCount = this.tableMetadata.get(tableId)?.gameCount
+      ?? this.browserBridge?.acceptedGameCount(tableId);
+    const evidence = this.browserBridge?.shoeEvidence(tableId)?.reason;
+    if (!isInternalExternalGameCountAnomaly(handNumber, roadCount, evidence)) return false;
+    return this.demoteAnomalousMonitorTable(tableId, handNumber, roadCount!);
   }
 
   private ensureMonitorActors(
@@ -1171,6 +1217,15 @@ export class DesktopConsoleService {
     }
     this.cachedLightSnapshot = undefined;
     await this.orchestrator.enqueue(event.tableId, event);
+    if (
+      event.type === 'handSettled'
+      || event.type === 'bettingWindowOpened'
+      || event.type === 'cardObserved'
+    ) {
+      if (this.demoteIfGameCountAnomaly(event.tableId)) {
+        await this.failCloseLiveExecution([event.tableId]);
+      }
+    }
     if (
       event.type === 'handSettled'
       || event.type === 'betReceipt'

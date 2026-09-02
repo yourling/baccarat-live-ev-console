@@ -98,6 +98,31 @@ export function selectObservedGameCount(
   return selectStableGameCount(accepted, incoming);
 }
 
+export const GAME_COUNT_ANOMALY_MIN_HANDS = 8;
+export const GAME_COUNT_ANOMALY_MIN_GAP = 8;
+
+/**
+ * Internal handNumber is how many hands this shoeId has seen.
+ * DOM road is what the table shows. A wrap is a new shoe, not an anomaly.
+ * A lagged high road right after protocol-shuffle is also not an anomaly.
+ * Once we have tracked a real shoe, a large mismatch means inventory/identity
+ * cannot be trusted: drop the table and wait for the next physical shoe.
+ */
+export function isInternalExternalGameCountAnomaly(
+  handNumber: number,
+  roadCount: number | undefined,
+  evidenceReason?: string,
+): boolean {
+  if (!Number.isInteger(handNumber) || handNumber < GAME_COUNT_ANOMALY_MIN_HANDS) return false;
+  if (!Number.isInteger(roadCount) || (roadCount ?? 0) < 1) return false;
+  const road = roadCount!;
+  if (isRoadWrapToNewShoe(handNumber, road)) return false;
+  if (evidenceReason === 'protocol-shuffle' && handNumber <= ROAD_WRAP_MAX && road > ROAD_WRAP_MAX) {
+    return false;
+  }
+  return Math.abs(road - handNumber) >= GAME_COUNT_ANOMALY_MIN_GAP;
+}
+
 export type ParserShoeReason = 'attach' | 'protocol-shuffle' | 'road-wrap' | 'manual-confirm';
 
 export interface ParserShoeEvidence {

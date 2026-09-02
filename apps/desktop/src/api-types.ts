@@ -180,7 +180,8 @@ export type DesktopRuntimeIncidentCode =
   | 'unknown-execution'
   | 'settlement-gap'
   | 'scheduler-failure'
-  | 'monitor-failure';
+  | 'monitor-failure'
+  | 'shoe-count-mismatch';
 
 export interface DesktopRuntimeIncident {
   readonly incidentId: string;
