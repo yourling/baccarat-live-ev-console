@@ -392,6 +392,52 @@ describe('PragmaticProtocolState', () => {
       table: 'h22z8qhp17sa0vkh', id: '16387766710', value: '8', seq: 1,
     }))).toBe('h22z8qhp17sa0vkh');
   });
+
+  it('opens a physical shoe from XML command-channel shuffling without a table attribute', () => {
+    const protocol = new PragmaticProtocolState();
+    const started = protocol.ingest(
+      '<command channel="table-tobcspbaccarat61"><startshuffling seq="10"/></command>',
+    );
+    expect(started?.tables[0]).toEqual(expect.objectContaining({
+      tableId: 'tobcspbaccarat61',
+      shoeReset: 'protocol:tobcspbaccarat61:10',
+      shuffleEvent: true,
+    }));
+    expect(pragmaticProtocolTableId(
+      '<command channel="table-tobcspbaccarat61"><endshuffling/></command>',
+    )).toBe('tobcspbaccarat61');
+  });
+
+  it('does not apply one table shuffle to another table in the same payload', () => {
+    const protocol = new PragmaticProtocolState();
+    protocol.ingest(message('game', { table: 'tobcspbaccarat61', id: 'hand-1', seq: 1 }));
+    protocol.ingest(message('game', { table: 'bc281koreanch281', id: 'hand-2', seq: 2 }));
+    const mixed = protocol.ingest(JSON.stringify({
+      timer: { table: 'tobcspbaccarat61', id: 'hand-1', value: '8', seq: 3 },
+      startshuffling: { table: 'bc281koreanch281', seq: 4 },
+    }));
+    expect(mixed?.tables.map(table => table.tableId).sort()).toEqual([
+      'bc281koreanch281',
+      'tobcspbaccarat61',
+    ]);
+    expect(mixed?.tables.find(table => table.tableId === 'bc281koreanch281')).toEqual(
+      expect.objectContaining({ shuffleEvent: true }),
+    );
+    expect(mixed?.tables.find(table => table.tableId === 'tobcspbaccarat61')?.shuffleEvent).toBeUndefined();
+    expect(mixed?.tables.find(table => table.tableId === 'tobcspbaccarat61')?.shoeReset).toBeUndefined();
+  });
+
+  it('reads a table- prefixed id and JSON array shuffle events', () => {
+    const protocol = new PragmaticProtocolState();
+    const shuffled = protocol.ingest(JSON.stringify([
+      { startshuffling: { table: 'table-tobcspbaccarat61', seq: 10 } },
+    ]));
+    expect(shuffled?.tables[0]).toEqual(expect.objectContaining({
+      tableId: 'tobcspbaccarat61',
+      shoeReset: 'protocol:tobcspbaccarat61:10',
+      shuffleEvent: true,
+    }));
+  });
 });
 
 describe('inspectPragmaticWsFrame', () => {
