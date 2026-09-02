@@ -187,8 +187,8 @@
     return next === previous || (next > previous && next - previous <= 2);
   }
 
-  function isConfirmedWrapGameCount(previous, next) {
-    return previous >= 10 && next >= 1 && next <= 7 && previous - next >= 8;
+  function isRoadWrapGameCount(previous, next) {
+    return previous >= 10 && next >= 1 && next <= 20 && previous - next >= 8;
   }
 
   function isConfirmedCatchUpGameCount(previous, next) {
@@ -208,12 +208,16 @@
       lastGameCountByTable.set(tableId, parsed);
       return parsed;
     }
+    if (isRoadWrapGameCount(previous, parsed)) {
+      pendingGameCountByTable.delete(tableId);
+      lastGameCountByTable.set(tableId, parsed);
+      return parsed;
+    }
     const pending = pendingGameCountByTable.get(tableId);
     if (
       pending === parsed
       && (
-        isConfirmedWrapGameCount(previous, parsed)
-        || isConfirmedCatchUpGameCount(previous, parsed)
+        isConfirmedCatchUpGameCount(previous, parsed)
         || isConfirmedEarlyShoeCorrection(previous, parsed)
       )
     ) {

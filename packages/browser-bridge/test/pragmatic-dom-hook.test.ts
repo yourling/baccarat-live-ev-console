@@ -267,16 +267,12 @@ describe('Pragmatic DOM hook', () => {
       .find(message => message && message.kind === 'roomDiscovered');
     expect(discovery?.room?.tables?.[0]?.gameCount).toBe(51);
 
-    dom.window.document.querySelector('.game-count span:last-child').textContent = '8';
     sendMessage.mockClear();
     context.__baccaratPragmaticReplay();
-    const capture = sendMessage.mock.calls
+    const capture = JSON.parse(String(sendMessage.mock.calls
       .map(([message]) => message)
-      .find(message => message && message.source === 'baccarat-bridge-pragmatic-state');
-    const snapshot = JSON.parse(String(capture?.data ?? '{}')) as {
-      tables: Array<{ gameCount?: number }>;
-    };
-    expect(snapshot.tables[0]?.gameCount).toBe(51);
+      .find(message => message && message.source === 'baccarat-bridge-pragmatic-state')?.data ?? '{}'));
+    expect(capture.tables[0]?.gameCount).toBe(51);
   });
 
   it('does not jump a new-shoe #1 to timer 8', () => {
@@ -332,7 +328,7 @@ describe('Pragmatic DOM hook', () => {
     expect(second.tables[0]?.gameCount).toBe(1);
   });
 
-  it('accepts a wrap from #78 to #5 after two matching readings', () => {
+  it('accepts a wrap from #78 to #5 on the first reading', () => {
     const dom = new JSDOM(`
       <body>
         <div id="TileHeight-tobcspbaccarat61">
@@ -373,14 +369,7 @@ describe('Pragmatic DOM hook', () => {
     const first = JSON.parse(String(sendMessage.mock.calls
       .map(([message]) => message)
       .find(message => message && message.source === 'baccarat-bridge-pragmatic-state')?.data ?? '{}'));
-    expect(first.tables[0]?.gameCount).toBe(78);
-
-    sendMessage.mockClear();
-    context.__baccaratPragmaticReplay();
-    const second = JSON.parse(String(sendMessage.mock.calls
-      .map(([message]) => message)
-      .find(message => message && message.source === 'baccarat-bridge-pragmatic-state')?.data ?? '{}'));
-    expect(second.tables[0]?.gameCount).toBe(5);
+    expect(first.tables[0]?.gameCount).toBe(5);
   });
 
   it('unsticks a frozen #8 after two matching early-shoe readings', () => {

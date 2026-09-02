@@ -309,13 +309,12 @@ describe('PragmaticRuntimeParser', () => {
     parser.parse(snapshot([{
       tableId: 'bc281koreanch281', roundId: 'hand-1', gameCount: 51,
     }]));
-    parser.parse(snapshot([{
+    const wrapped = parser.parse(snapshot([{
       tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 1,
     }]));
-    expect(parser.shoeEvidence('bc281koreanch281')?.reason).not.toBe('road-wrap');
-    parser.parse(snapshot([{
-      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 1,
-    }]));
+    expect(wrapped.find(event => event.type === 'newShoeSignal')).toEqual(expect.objectContaining({
+      baseline: 'physical-shoe',
+    }));
     expect(parser.shoeEvidence('bc281koreanch281')).toEqual({
       reason: 'road-wrap',
       previousGameCount: 51,
@@ -323,17 +322,13 @@ describe('PragmaticRuntimeParser', () => {
     });
   });
 
-  it('treats a wrap from a deep road to #5 as a new physical shoe', () => {
+  it('opens a new physical shoe as soon as the road wraps to #5', () => {
     expect(isRoadWrapToNewShoe(78, 5)).toBe(true);
-    expect(isRoadWrapToNewShoe(78, 8)).toBe(false);
+    expect(isRoadWrapToNewShoe(78, 8)).toBe(true);
     const parser = new PragmaticRuntimeParser();
     parser.parse(snapshot([{
       tableId: 'tobcspbaccarat61', roundId: 'hand-78', gameCount: 78,
     }]));
-    parser.parse(snapshot([{
-      tableId: 'tobcspbaccarat61', roundId: 'hand-5', gameCount: 5,
-    }]));
-    expect(parser.shoeEvidence('tobcspbaccarat61')?.reason).not.toBe('road-wrap');
     const wrapped = parser.parse(snapshot([{
       tableId: 'tobcspbaccarat61', roundId: 'hand-5', gameCount: 5,
     }]));
@@ -347,17 +342,14 @@ describe('PragmaticRuntimeParser', () => {
     });
   });
 
-  it('does not treat a one-off drop to #8 as a shuffled shoe', () => {
-    expect(isRoadWrapToNewShoe(51, 8)).toBe(false);
+  it('does not treat a small mid-shoe drop as a shuffled shoe', () => {
+    expect(isRoadWrapToNewShoe(51, 45)).toBe(false);
     const parser = new PragmaticRuntimeParser();
     parser.parse(snapshot([{
       tableId: 'bc281koreanch281', roundId: 'hand-1', gameCount: 51,
     }]));
     parser.parse(snapshot([{
-      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 8,
-    }]));
-    parser.parse(snapshot([{
-      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 8,
+      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 45,
     }]));
     expect(parser.shoeEvidence('bc281koreanch281')?.reason).not.toBe('road-wrap');
   });
@@ -486,10 +478,6 @@ describe('PragmaticRuntimeParser', () => {
     parser.parse(snapshot([{
       tableId: 'bc281koreanch281', roundId: 'hand-1', gameCount: 51,
     }]));
-    const first = parser.parse(snapshot([{
-      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 1,
-    }]));
-    expect(first.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
     const events = parser.parse(snapshot([{
       tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 1,
     }]));

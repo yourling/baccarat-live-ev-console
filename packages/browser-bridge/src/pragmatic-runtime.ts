@@ -32,10 +32,10 @@ export interface PragmaticRuntimeSnapshot {
 }
 
 /**
- * DOM lags several hands after shuffle. #8 is the common countdown false wrap.
- * A drop from a deep road to #1-#7 is a new shoe; a drop to #8 is not.
+ * Countdown is not parsed as gameCount. A deep-road drop to an early count
+ * is a new shoe; open it on the first observation.
  */
-const ROAD_WRAP_MAX = 7;
+const ROAD_WRAP_MAX = 20;
 const ROAD_WRAP_MIN_PREVIOUS = 10;
 const ROAD_WRAP_MIN_DROP = 8;
 
@@ -320,18 +320,14 @@ export class PragmaticRuntimeParser {
       const previous = this.lastGameCountByTable.get(tableId);
       const gameCount = table.gameCount!;
       if (isPhysicalShoeFromRoadCount(previous, gameCount)) {
-        if (this.pendingRoadWrapByTable.get(tableId) === gameCount) {
-          this.pendingRoadWrapByTable.delete(tableId);
-          this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
-          this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', {
-            reason: 'road-wrap',
-            previousGameCount: previous,
-            gameCount,
-          });
-          this.lastGameCountByTable.set(tableId, gameCount);
-        } else {
-          this.pendingRoadWrapByTable.set(tableId, gameCount);
-        }
+        this.pendingRoadWrapByTable.delete(tableId);
+        this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
+        this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', {
+          reason: 'road-wrap',
+          previousGameCount: previous,
+          gameCount,
+        });
+        this.lastGameCountByTable.set(tableId, gameCount);
       } else if (previous === undefined || gameCount >= previous) {
         this.pendingRoadWrapByTable.delete(tableId);
         this.lastGameCountByTable.set(tableId, gameCount);
