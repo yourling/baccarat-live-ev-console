@@ -332,6 +332,57 @@ describe('Pragmatic DOM hook', () => {
     expect(second.tables[0]?.gameCount).toBe(1);
   });
 
+  it('accepts a wrap from #78 to #5 after two matching readings', () => {
+    const dom = new JSDOM(`
+      <body>
+        <div id="TileHeight-tobcspbaccarat61">
+          <span>韩语极速百家乐5</span>
+          <span class="game-count"><span>#</span><span>78</span></span>
+        </div>
+      </body>
+    `, { url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/' });
+    Object.defineProperty(dom.window.Element.prototype, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({ width: 237, height: 201, top: 0, left: 0, right: 237, bottom: 201 }),
+    });
+    const sendMessage = vi.fn();
+    const context = vm.createContext({
+      chrome: { runtime: { sendMessage } },
+      document: dom.window.document,
+      location: dom.window.location,
+      URL,
+      Date,
+      JSON,
+      Number,
+      String,
+      Object,
+      Array,
+      setInterval: vi.fn(),
+      getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+      globalThis: null,
+    });
+    context.globalThis = context;
+    vm.runInContext(source, context, { filename: 'pragmatic-dom-hook.js' });
+    expect(sendMessage.mock.calls
+      .map(([message]) => message)
+      .find(message => message && message.kind === 'roomDiscovered')?.room?.tables?.[0]?.gameCount).toBe(78);
+
+    dom.window.document.querySelector('.game-count span:last-child').textContent = '5';
+    sendMessage.mockClear();
+    context.__baccaratPragmaticReplay();
+    const first = JSON.parse(String(sendMessage.mock.calls
+      .map(([message]) => message)
+      .find(message => message && message.source === 'baccarat-bridge-pragmatic-state')?.data ?? '{}'));
+    expect(first.tables[0]?.gameCount).toBe(78);
+
+    sendMessage.mockClear();
+    context.__baccaratPragmaticReplay();
+    const second = JSON.parse(String(sendMessage.mock.calls
+      .map(([message]) => message)
+      .find(message => message && message.source === 'baccarat-bridge-pragmatic-state')?.data ?? '{}'));
+    expect(second.tables[0]?.gameCount).toBe(5);
+  });
+
   it('unsticks a frozen #8 after two matching early-shoe readings', () => {
     const dom = new JSDOM(`
       <body>

@@ -323,6 +323,30 @@ describe('PragmaticRuntimeParser', () => {
     });
   });
 
+  it('treats a wrap from a deep road to #5 as a new physical shoe', () => {
+    expect(isRoadWrapToNewShoe(78, 5)).toBe(true);
+    expect(isRoadWrapToNewShoe(78, 8)).toBe(false);
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61', roundId: 'hand-78', gameCount: 78,
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61', roundId: 'hand-5', gameCount: 5,
+    }]));
+    expect(parser.shoeEvidence('tobcspbaccarat61')?.reason).not.toBe('road-wrap');
+    const wrapped = parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61', roundId: 'hand-5', gameCount: 5,
+    }]));
+    expect(wrapped.find(event => event.type === 'newShoeSignal')).toEqual(expect.objectContaining({
+      baseline: 'physical-shoe',
+    }));
+    expect(parser.shoeEvidence('tobcspbaccarat61')).toEqual({
+      reason: 'road-wrap',
+      previousGameCount: 78,
+      gameCount: 5,
+    });
+  });
+
   it('does not treat a one-off drop to #8 as a shuffled shoe', () => {
     expect(isRoadWrapToNewShoe(51, 8)).toBe(false);
     const parser = new PragmaticRuntimeParser();

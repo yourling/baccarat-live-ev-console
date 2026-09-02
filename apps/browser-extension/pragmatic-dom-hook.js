@@ -188,7 +188,7 @@
   }
 
   function isConfirmedWrapGameCount(previous, next) {
-    return previous >= 10 && next >= 1 && next <= 2 && previous - next >= 8;
+    return previous >= 10 && next >= 1 && next <= 7 && previous - next >= 8;
   }
 
   function isConfirmedCatchUpGameCount(previous, next) {

@@ -31,8 +31,11 @@ export interface PragmaticRuntimeSnapshot {
   readonly tables: readonly PragmaticTableSnapshot[];
 }
 
-/** DOM road count may lag several hands; only a large wrap is a new shoe. */
-const ROAD_WRAP_MAX = 2;
+/**
+ * DOM lags several hands after shuffle. #8 is the common countdown false wrap.
+ * A drop from a deep road to #1-#7 is a new shoe; a drop to #8 is not.
+ */
+const ROAD_WRAP_MAX = 7;
 const ROAD_WRAP_MIN_PREVIOUS = 10;
 const ROAD_WRAP_MIN_DROP = 8;
 
@@ -47,17 +50,11 @@ export function isRoadWrapToNewShoe(
     && previous - gameCount >= ROAD_WRAP_MIN_DROP;
 }
 
-/** DOM often lags past #2 after shuffle; still join if the road clearly wrapped. */
 export function isJoinableNewShoeRoadCount(
   previous: number | undefined,
   gameCount: number,
 ): boolean {
-  if (isRoadWrapToNewShoe(previous, gameCount)) return true;
-  return previous !== undefined
-    && previous >= ROAD_WRAP_MIN_PREVIOUS
-    && gameCount >= 1
-    && gameCount <= 8
-    && previous - gameCount >= ROAD_WRAP_MIN_DROP;
+  return isRoadWrapToNewShoe(previous, gameCount);
 }
 
 function isPhysicalShoeFromRoadCount(
@@ -335,9 +332,11 @@ export class PragmaticRuntimeParser {
         } else {
           this.pendingRoadWrapByTable.set(tableId, gameCount);
         }
-      } else {
+      } else if (previous === undefined || gameCount >= previous) {
         this.pendingRoadWrapByTable.delete(tableId);
         this.lastGameCountByTable.set(tableId, gameCount);
+      } else {
+        this.pendingRoadWrapByTable.delete(tableId);
       }
     }
 
