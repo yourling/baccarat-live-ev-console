@@ -25,6 +25,7 @@ import {
   applyEvent,
   effectiveShoeBaseline,
   emptyProjection,
+  isPhysicalShoeBettable,
   modelRevisionFor,
   operationalReceiptCommitStarted,
   profileVersionFor,
@@ -465,6 +466,10 @@ export class TableActor {
       this.observedGameCount?.(this.tableId),
       this.observedShoeEvidence?.(this.tableId),
     ) !== 'physical-shoe') {
+      this.requestKeepalive();
+      return;
+    }
+    if (!isPhysicalShoeBettable(projection)) {
       this.requestKeepalive();
       return;
     }

@@ -264,6 +264,60 @@ describe('ledger replay', () => {
     expect(state?.remainingTotal).toBe(414);
   });
 
+  it('disarms a physical shoe once remaining cards fall behind the unobserved cut', () => {
+    const ranks = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'] as const;
+    const profile = {
+      ...defaultProfile('t1'),
+      numberOfDecks: 1,
+      autoConfirmNewShoe: true,
+      autoBetArmedByDefault: true,
+    };
+    const events: NormalizedEvent[] = [
+      ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile }, 1),
+    ];
+    for (let index = 0; index < 27; index += 1) {
+      events.push(ev({
+        type: 'cardObserved',
+        shoeId: 'shoe-1',
+        handId: `h${Math.floor(index / 4) + 1}`,
+        card: { rank: ranks[index % ranks.length] },
+        position: index,
+      }, index + 2));
+    }
+    const state = replayEvents(events).get('t1');
+    expect(state?.remainingTotal).toBe(25);
+    expect(state?.autoBetStatus).toBe('DISARMED');
+    expect(state?.sealed).toBe(false);
+    expect(state?.status).toBe('TRACKING');
+  });
+
+  it('seals a physical shoe that can no longer deal a hand', () => {
+    const ranks = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'] as const;
+    const profile = {
+      ...defaultProfile('t1'),
+      numberOfDecks: 1,
+      autoConfirmNewShoe: true,
+      autoBetArmedByDefault: true,
+    };
+    const events: NormalizedEvent[] = [
+      ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile }, 1),
+    ];
+    for (let index = 0; index < 47; index += 1) {
+      events.push(ev({
+        type: 'cardObserved',
+        shoeId: 'shoe-1',
+        handId: `h${Math.floor(index / 4) + 1}`,
+        card: { rank: ranks[index % ranks.length] },
+        position: index,
+      }, index + 2));
+    }
+    const state = replayEvents(events).get('t1');
+    expect(state?.remainingTotal).toBe(5);
+    expect(state?.sealed).toBe(true);
+    expect(state?.status).toBe('WAITING_NEW_SHOE');
+    expect(state?.autoBetStatus).toBe('DISARMED');
+  });
+
   it('counts two same-rank copies with different raw shoe ids', () => {
     const profile = defaultProfile('t1');
     const events: NormalizedEvent[] = [

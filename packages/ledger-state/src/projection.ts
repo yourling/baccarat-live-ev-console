@@ -21,6 +21,16 @@ const EMPTY = {
   'A':0,'2':0,'3':0,'4':0,'5':0,'6':0,'7':0,'8':0,'9':0,'10':0,'J':0,'Q':0,'K':0
 } as Record<string, number>;
 
+/** A hand needs at least four cards, six with draws. Below this the shoe cannot deal. */
+export const PHYSICAL_SHOE_UNDEALABLE_REMAINING = 6;
+/**
+ * Live dealer shoes are cut. We never see that card. Pair EV from the last
+ * half-deck is not a betting universe — those cards will be shuffled, not dealt
+ * as a normal first-two. Physical-shoe betting stops here; observation continues
+ * until the next shuffle.
+ */
+export const PHYSICAL_SHOE_BETTABLE_REMAINING = 26;
+
 export class ProjectionError extends Error {
   constructor(message: string, readonly eventId?: string) {
     super(eventId ? `${message} (event: ${eventId})` : message);
@@ -171,6 +181,25 @@ function isCurrentShoe(eventShoeId: string, current: ShoeStateProjection): boole
   return current.shoeId !== '' && eventShoeId === current.shoeId && !current.sealed;
 }
 
+function applyPhysicalShoeLifecycle(projection: ShoeStateProjection): void {
+  if (projection.shoeBaseline !== 'physical-shoe') return;
+  if (projection.remainingTotal < PHYSICAL_SHOE_UNDEALABLE_REMAINING) {
+    projection.sealed = true;
+    projection.status = 'WAITING_NEW_SHOE';
+    projection.autoBetStatus = 'DISARMED';
+    return;
+  }
+  if (projection.remainingTotal < PHYSICAL_SHOE_BETTABLE_REMAINING && projection.autoBetStatus === 'ARMED') {
+    projection.autoBetStatus = 'DISARMED';
+  }
+}
+
+export function isPhysicalShoeBettable(projection: Pick<ShoeStateProjection, 'shoeBaseline' | 'remainingTotal' | 'sealed'>): boolean {
+  return projection.shoeBaseline === 'physical-shoe'
+    && !projection.sealed
+    && projection.remainingTotal >= PHYSICAL_SHOE_BETTABLE_REMAINING;
+}
+
 
 export function applyEvent(
   state: Map<string, ShoeStateProjection>,
@@ -239,6 +268,7 @@ export function applyEvent(
       };
       updated.remainingTotal = Math.max(0, updated.remainingTotal - 1);
       updated.seenCards.push({ ...event.card });
+      applyPhysicalShoeLifecycle(updated);
       const handState = beginHand(updated, event.handId);
       if (handState !== 'stale') updated.currentHandHasCards = true;
       if (
@@ -256,6 +286,9 @@ export function applyEvent(
       assertMarket(event.market, 'market', event);
       if (!isCurrentShoe(event.shoeId, current)) break;
       if (updated.redCardSeen || updated.status === 'INVALIDATED' || updated.status === 'RESYNCING' || updated.status === 'WAITING_CONFIRMATION') {
+        break;
+      }
+      if (updated.shoeBaseline === 'physical-shoe' && !isPhysicalShoeBettable(updated)) {
         break;
       }
       const handState = beginHand(updated, event.handId);
@@ -326,6 +359,7 @@ export function applyEvent(
       updated.remainingTotal = sumCounts(updated.remainingCounts);
       updated.modelRevision = modelRevisionFor(updated.profileSnapshot);
       updated.autoBetStatus = 'NEEDS_MANUAL_RECOVERY';
+      applyPhysicalShoeLifecycle(updated);
       break;
     }
     case 'connectionLost': {
@@ -378,6 +412,7 @@ export function applyEvent(
       updated.remainingTotal = sumCounts(updated.remainingCounts);
       updated.modelRevision = modelRevisionFor(updated.profileSnapshot);
       updated.autoBetStatus = correction.requireRearm === false ? updated.autoBetStatus : 'NEEDS_MANUAL_RECOVERY';
+      applyPhysicalShoeLifecycle(updated);
       break;
     }
     case 'autoArmChanged': {
@@ -388,6 +423,9 @@ export function applyEvent(
         break;
       }
       if (updated.redCardSeen || updated.status === 'INVALIDATED' || updated.status === 'RESYNCING' || updated.status === 'WAITING_CONFIRMATION') {
+        break;
+      }
+      if (updated.shoeBaseline === 'physical-shoe' && !isPhysicalShoeBettable(updated)) {
         break;
       }
       updated.autoBetStatus = 'ARMED';
