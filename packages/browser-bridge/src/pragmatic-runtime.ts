@@ -294,6 +294,7 @@ export class PragmaticRuntimeParser {
   private readonly seenCardsByHand = new Map<string, Set<string>>();
   private readonly openedWindows = new Set<string>();
   private readonly closedWindows = new Set<string>();
+  private readonly windowOpenCount = new Map<string, number>();
   private readonly windowClosesAtMs = new Map<string, number>();
   private readonly lastWindowEmitAtMs = new Map<string, number>();
   private readonly settledHands = new Set<string>();
@@ -572,6 +573,7 @@ export class PragmaticRuntimeParser {
     for (const key of this.cardBoundaryByHand) if (key.startsWith(prefix)) this.cardBoundaryByHand.delete(key);
     for (const key of this.openedWindows) if (key.startsWith(prefix)) this.openedWindows.delete(key);
     for (const key of this.closedWindows) if (key.startsWith(prefix)) this.closedWindows.delete(key);
+    for (const key of this.windowOpenCount.keys()) if (key.startsWith(prefix)) this.windowOpenCount.delete(key);
     for (const key of this.windowClosesAtMs.keys()) if (key.startsWith(prefix)) this.windowClosesAtMs.delete(key);
     for (const key of this.lastWindowEmitAtMs.keys()) if (key.startsWith(prefix)) this.lastWindowEmitAtMs.delete(key);
     for (const key of this.settledHands) if (key.startsWith(prefix)) this.settledHands.delete(key);
@@ -637,6 +639,7 @@ export class PragmaticRuntimeParser {
     const closesAtMs = Number.isFinite(countdown) && Number.isFinite(observedAtMs)
       ? observedAtMs + Math.max(0, countdown!) * 1000
       : undefined;
+    const shoeId = this.shoeIdByTable.get(tableId) ?? '';
     for (const market of ['bankerPair', 'playerPair'] as const) {
       const key = `${tableId}:${handId}:${market}`;
       const alreadyOpen = this.openedWindows.has(key) && !this.closedWindows.has(key);
@@ -653,11 +656,16 @@ export class PragmaticRuntimeParser {
       if (Number.isFinite(closesAtMs)) this.windowClosesAtMs.set(key, closesAtMs!);
       if (Number.isFinite(observedAtMs)) this.lastWindowEmitAtMs.set(key, observedAtMs);
       const closesAt = Number.isFinite(closesAtMs) ? new Date(closesAtMs!).toISOString() : undefined;
-      const stableKey = alreadyOpen
-        ? `open:${handId}:${market}:eta`
-        : `open:${handId}:${market}`;
+      let openCount = this.windowOpenCount.get(key) ?? 0;
+      if (!alreadyOpen) {
+        openCount += 1;
+        this.windowOpenCount.set(key, openCount);
+      }
+      const base = `open:${shoeId}:${handId}:${market}`;
+      const reopen = openCount > 1 ? `:reopen:${openCount - 1}` : '';
+      const stableKey = alreadyOpen ? `${base}${reopen}:eta` : `${base}${reopen}`;
       events.push(this.makeEvent(tableId, 'bettingWindowOpened', stableKey, timestamp, {
-        shoeId: this.shoeIdByTable.get(tableId) ?? '',
+        shoeId,
         handId,
         market,
         ...(closesAt === undefined ? {} : { closesAt }),
