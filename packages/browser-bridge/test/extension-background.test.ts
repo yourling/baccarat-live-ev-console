@@ -76,6 +76,33 @@ describe('extension background multitable command', () => {
       kind: 'heartbeat',
     }));
   });
+  it('includes socket generation and outbox depth in heartbeats', async () => {
+    const harness = await createHarness();
+    harness.socket.emit('open');
+    expect(harness.runNextTimer()).toBe(true);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'heartbeat',
+      socketGeneration: expect.any(Number),
+      pendingOutbox: expect.any(Number),
+    }));
+  });
+
+  it('sends a heartbeat on reconnect alarm ticks and keepalive port connects', async () => {
+    const harness = await createHarness();
+    harness.socket.emit('open');
+    const alarmListener = harness.chrome.alarms.onAlarm.addListener.mock.calls
+      .map(([listener]) => listener as (alarm: { readonly name: string }) => void)
+      .find(listener => String(listener).includes('BRIDGE_RECONNECT_ALARM'));
+    expect(alarmListener).toBeDefined();
+    const before = sentMessages(harness.socket).length;
+    alarmListener?.({ name: 'baccarat-bridge-reconnect' });
+    await flushBetHarnessAsyncWork();
+    expect(sentMessages(harness.socket).length).toBeGreaterThan(before);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'heartbeat',
+    }));
+  });
+
 
   it('revokes the live gate before reloading a frozen baccarat popup', async () => {
     const harness = await createHarness();

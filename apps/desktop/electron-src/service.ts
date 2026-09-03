@@ -314,6 +314,9 @@ export class DesktopConsoleService {
   private readonly runtimeObservedTableIds = new Set<string>();
   private readonly liveAuthorizationSources = new Map<string, 'manual' | 'unattended'>();
   private persistentLiveGateEnabled = false;
+  private transportDownAt?: number;
+  private recoverySuppressUntil = 0;
+  private readonly tableFlapStats = new Map<string, { disconnects: number; lastDisconnectAt: number; lastRecoveredAt?: number }>();
   private liveRoomTimer?: NodeJS.Timeout;
   private liveMonitorRetryAttempt = 0;
   private liveMonitorOperation: Promise<void> = Promise.resolve();
@@ -678,6 +681,8 @@ export class DesktopConsoleService {
       }
     }
     this.liveAuthorizationSources.clear();
+    this.transportDownAt = undefined;
+    this.recoverySuppressUntil = 0;
     this.setOrchestratorExecutor(null);
     this.setOperationalWagerExecutor(false);
   }
@@ -959,12 +964,20 @@ export class DesktopConsoleService {
       this.monitorTableIds.map(tableId => {
         const feedHealth = this.liveFeeds.get(tableId)?.health();
         const actor = this.orchestrator.getActor(tableId);
+        const active = actor !== undefined
+          && actor.peekExecutionMode() === 'live'
+          && this.liveAuthorizationSources.has(tableId);
+        const reasons = this.keepaliveTableReasons(tableId);
+        const flap = this.tableFlapStats.get(tableId);
         return [tableId, {
           approved: true,
-          active: actor !== undefined
-            && actor.peekExecutionMode() === 'live'
-            && this.liveAuthorizationSources.has(tableId),
-          reasons: this.keepaliveTableReasons(tableId),
+          active,
+          reasons,
+          linkState: this.tableLinkState(tableId, active, reasons, feedHealth?.state),
+          ...(flap === undefined ? {} : {
+            disconnects: flap.disconnects,
+            ...(flap.lastDisconnectAt === 0 ? {} : { lastDisconnectAt: new Date(flap.lastDisconnectAt).toISOString() }),
+          }),
           ...(feedHealth === undefined ? {} : {
             feedState: feedHealth.state,
             ...(feedHealth.stalenessMs === undefined ? {} : { feedStalenessMs: feedHealth.stalenessMs }),
@@ -1084,27 +1097,29 @@ export class DesktopConsoleService {
         case 'extension-authenticated':
           this.runtimeIncidents.resolveAll('bridge-auth-failed');
           this.runtimeIncidents.resolveAll('bridge-disconnected');
+          this.transportDownAt = undefined;
+          this.beginRecoverySuppression();
           await this.reconcileUnattendedExecution();
           return;
         case 'extension-disconnected':
           this.operationalWagers.disableKeepaliveImmediately();
-          this.runtimeObservedTableIds.clear();
+          this.transportDownAt = Date.now();
           this.ensureRuntimeIncident({
             code: 'bridge-disconnected',
             severity: 'blocked',
             message: event.reason,
           });
-          await this.failCloseLiveExecution(this.liveApprovals.list());
+          await this.failCloseExposedTables(this.liveApprovals.list());
           return;
         case 'continuity-invalidated':
           this.operationalWagers.disableKeepaliveImmediately();
-          this.runtimeObservedTableIds.clear();
+          this.transportDownAt = Date.now();
           this.ensureRuntimeIncident({
             code: 'continuity-invalidated',
             severity: 'blocked',
             message: event.reason,
           });
-          await this.failCloseLiveExecution(this.liveApprovals.list());
+          await this.failCloseExposedTables(this.liveApprovals.list());
           return;
         case 'execution-gate-revoked':
           this.operationalWagers.disableKeepaliveImmediately();
@@ -1113,9 +1128,10 @@ export class DesktopConsoleService {
           return;
         case 'table-disconnected':
           this.runtimeObservedTableIds.delete(event.tableId);
+          this.noteTableDisconnect(event.tableId);
           this.ensureRuntimeIncident({
             code: event.reason === 'table-feed-stale' ? 'table-feed-stale' : 'monitor-failure',
-            severity: 'blocked',
+            severity: this.suppressTableDisconnectNoise(event.reason) ? 'degraded' : 'blocked',
             tableId: event.tableId,
             message: event.reason,
           });
@@ -1134,6 +1150,8 @@ export class DesktopConsoleService {
           return;
         case 'session-recovered':
           this.runtimeIncidents.resolveAll('session-recovery-exhausted');
+          this.transportDownAt = undefined;
+          this.beginRecoverySuppression();
           await this.reconcileUnattendedExecution();
           return;
         default:
@@ -1323,6 +1341,63 @@ export class DesktopConsoleService {
     }
   }
 
+  /**
+   * 分级断联：传输抖动只冻结真正有 live 敞口的桌。
+   * 有 live 授权或 RESERVED/UNKNOWN 在途预留的桌才 fail-close；
+   * 其余监控桌只进入 DEGRADED（暂停新单），保留观察记录、武装状态与授权。
+   */
+  private hasLiveExposure(tableId: string): boolean {
+    if (this.liveAuthorizationSources.has(tableId)) return true;
+    try {
+      return this.orchestrator.getReservations(tableId).some(reservation =>
+        reservation.status === 'RESERVED' || reservation.status === 'UNKNOWN');
+    } catch {
+      return false;
+    }
+  }
+
+  private failCloseExposedTables(tableIds: readonly string[]): Promise<void> {
+    return this.failCloseLiveExecution(tableIds.filter(tableId => this.hasLiveExposure(tableId)));
+  }
+
+  private noteTableDisconnect(tableId: string): void {
+    const stats = this.tableFlapStats.get(tableId) ?? { disconnects: 0, lastDisconnectAt: 0 };
+    stats.disconnects += 1;
+    stats.lastDisconnectAt = Date.now();
+    this.tableFlapStats.set(tableId, stats);
+  }
+
+  private noteTableRecovered(tableId: string): void {
+    const stats = this.tableFlapStats.get(tableId);
+    if (stats !== undefined) stats.lastRecoveredAt = Date.now();
+  }
+
+  private flapEscalated(tableId: string, now = Date.now()): boolean {
+    const stats = this.tableFlapStats.get(tableId);
+    if (stats === undefined || stats.disconnects < 4) return false;
+    return now - stats.lastDisconnectAt < 300_000;
+  }
+
+  private beginRecoverySuppression(windowMs = 60_000): void {
+    this.recoverySuppressUntil = Math.max(this.recoverySuppressUntil, Date.now() + windowMs);
+  }
+
+  private suppressTableDisconnectNoise(reason?: string): boolean {
+    if (Date.now() >= this.recoverySuppressUntil) return false;
+    return reason === 'table-feed-stale' || reason === 'browser-extension-disconnected';
+  }
+
+
+  /** 按桌链路状态机，供 UI 做恢复清单展示。 */
+  private tableLinkState(tableId: string, active: boolean, reasons: readonly string[], feedState?: string): 'live' | 'degraded' | 'resyncing' | 'offline' {
+    if (active && reasons.length === 0) return 'live';
+    if (feedState === 'DISCONNECTED') return 'offline';
+    const actor = this.orchestrator.getActor(tableId);
+    if (feedState === undefined) return 'resyncing';
+    if (actor?.getProjection().connectionStatus !== 'CONNECTED') return 'resyncing';
+    return 'degraded';
+  }
+
   private async failCloseLiveExecution(tableIds: readonly string[]): Promise<void> {
     for (const tableId of tableIds) {
       await this.resetMonitorExecutionState(tableId);
@@ -1399,10 +1474,16 @@ export class DesktopConsoleService {
 
   private scheduleDisconnectedMonitorRemoval(tableId: string, reason?: string): void {
     if (this.closing || !this.monitorTableIds.includes(tableId)) return;
+    if (reason === 'table-not-discovered') {
+      this.noteTableDisconnect(tableId);
+      if (!this.browserBridge?.getExtensionStatus().authenticated) return;
+    }
     // Multi-table pages reconnect the game socket often. A stale/disconnected
     // feed must stay in the monitor list so the export can resume; dropping
     // the table is what leaves the console stuck on 数据流已断开 / 已过期.
-    if (reason === 'table-feed-stale' || reason === 'browser-extension-disconnected') return;
+    // Chronic flappers (4+ disconnects in 5 minutes) escalate to OPEN: schedule
+    // removal so a permanently dead table does not occupy the monitor list forever.
+    if (!this.flapEscalated(tableId) && (reason === 'table-feed-stale' || reason === 'browser-extension-disconnected')) return;
     if (this.disconnectedMonitorRemovalTimers.has(tableId)) return;
     const delayMs = DISCONNECTED_MONITOR_REMOVAL_MS;
     const timer = setTimeout(() => {
@@ -1472,6 +1553,8 @@ export class DesktopConsoleService {
     this.browserBridge = undefined;
     this.browserBridgePort = 0;
     this.liveAuthorizationSources.clear();
+    this.transportDownAt = undefined;
+    this.recoverySuppressUntil = 0;
     this.setOrchestratorExecutor(null);
     this.setOperationalWagerExecutor(false);
   }
@@ -1566,6 +1649,8 @@ export class DesktopConsoleService {
     this.disconnectedMonitorRemovalTimers.clear();
     this.liveMonitorActivated = false;
     this.liveMonitorRetryAttempt = 0;
+    this.transportDownAt = undefined;
+    this.recoverySuppressUntil = 0;
     this.runtimeObservedTableIds.clear();
     await this.enqueueLiveMonitorOperation(async () => {
       const feedEntries = [...this.liveFeeds];
@@ -1685,6 +1770,7 @@ export class DesktopConsoleService {
             onRestored: async (tableId, proof) => {
               if (!this.isCurrentLiveFeed(tableId, feed)) return;
               this.cancelDisconnectedMonitorRemoval(tableId);
+              this.noteTableRecovered(tableId);
               const sourceSeq = this.nextMonitorSourceSeq(tableId);
               await this.enqueueMonitorEvent({
                 type: 'connectionRestored',

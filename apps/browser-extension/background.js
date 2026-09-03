@@ -1192,21 +1192,30 @@ function handleBetRequest(message, generation) {
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
+  const delay = Math.round(reconnectDelay * (0.7 + Math.random() * 0.6));
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connect();
-  }, reconnectDelay);
+  }, delay);
   reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+}
+
+function sendBridgeHeartbeat() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  send({
+    kind: 'heartbeat',
+    timestamp: new Date().toISOString(),
+    socketGeneration: activeSocketGeneration,
+    pendingOutbox: outbox.length,
+  });
+  return true;
 }
 
 function scheduleBridgeHeartbeat() {
   if (heartbeatTimer) return;
   heartbeatTimer = setTimeout(() => {
     heartbeatTimer = null;
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      send({ kind: 'heartbeat', timestamp: new Date().toISOString() });
-      scheduleBridgeHeartbeat();
-    }
+    if (sendBridgeHeartbeat()) scheduleBridgeHeartbeat();
   }, BRIDGE_HEARTBEAT_INTERVAL_MS);
 }
 
@@ -1222,11 +1231,15 @@ function ensureBridgeReconnectAlarm() {
 }
 
 chrome.alarms?.onAlarm?.addListener(alarm => {
-  if (alarm?.name === BRIDGE_RECONNECT_ALARM) void connect();
+  if (alarm?.name === BRIDGE_RECONNECT_ALARM) {
+    void connect();
+    sendBridgeHeartbeat();
+  }
 });
 
 chrome.runtime.onConnect.addListener(port => {
   if (!port || port.name !== BRIDGE_KEEPALIVE_PORT) return;
+  sendBridgeHeartbeat();
 });
 
 const OUTBOX_LIMIT = 500;
