@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, type Mock } from 'vitest';
 
 const source = readFileSync(
   new URL('../../../apps/browser-extension/pragmatic-bet-runtime.js', import.meta.url),
@@ -13,7 +13,7 @@ type FakeElement = {
   disabled?: boolean;
   tagName?: string;
   parentElement?: FakeElement | null;
-  click: ReturnType<typeof vi.fn>;
+  click: Mock;
   getAttribute(name: string): string | null;
   getBoundingClientRect(): { width: number; height: number; left?: number; top?: number; x?: number; y?: number };
   contains?(node: FakeElement | null): boolean;

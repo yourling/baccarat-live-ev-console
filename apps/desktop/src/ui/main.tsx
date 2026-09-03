@@ -4,7 +4,6 @@ import { App } from './App.jsx';
 
 if (import.meta.env.DEV && import.meta.env.VITE_DISABLE_REACT_DEVTOOLS !== '1') {
   void import('react-grab');
-  void import('react-scan');
 }
 
 class RootErrorBoundary extends Component<{ children: ReactNode }, { error?: string }> {
