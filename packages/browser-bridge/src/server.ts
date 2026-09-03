@@ -803,8 +803,9 @@ class BridgeTableExport implements TableExport {
     this.paused = true;
     this.state = 'DISCONNECTED';
     this.disconnectReason = reason ?? 'table-disconnected';
+    if (!changed) return;
     this.sink?.onDisconnect?.(this.tableId, reason);
-    if (changed) this.onDisconnected?.(this.tableId, reason ?? 'table-disconnected');
+    this.onDisconnected?.(this.tableId, reason ?? 'table-disconnected');
   }
 
   async handleRestored(proof: string): Promise<void> {
@@ -881,9 +882,7 @@ class BridgeTableExport implements TableExport {
       }
     } catch (error) {
       this.error = error instanceof Error ? error : new Error(String(error));
-      this.state = 'DISCONNECTED';
-      this.paused = true;
-      this.sink?.onDisconnect?.(this.tableId, this.error.message);
+      this.handleDisconnect(this.error.message);
     } finally {
       this.processing = false;
       this.resolveFlushWaiters();

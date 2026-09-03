@@ -1734,7 +1734,8 @@ export class DesktopConsoleService {
                 if (event.tableId !== table.tableId || !this.isCurrentLiveFeed(table.tableId, feed)) continue;
                 const sourceSeq = this.nextMonitorSourceSeq(event.tableId);
                 if (!this.isCurrentLiveFeed(table.tableId, feed)) continue;
-                void this.enqueueMonitorEvent({ ...event, sourceSeq });
+                void this.enqueueMonitorEvent({ ...event, sourceSeq })
+                  .catch(error => this.recordLiveMonitorError(error, 'monitor-failure', 'degraded', event.tableId));
               }
             },
             onDisconnect: (tableId, reason) => {

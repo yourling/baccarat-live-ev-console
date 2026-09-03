@@ -584,6 +584,54 @@ describe('browser bridge server', () => {
       await server.close();
     }
   });
+  it('emits a table-disconnected runtime event when the export drain fails', async () => {
+    const events: BrowserBridgeRuntimeEvent[] = [];
+    const server = new BrowserBridgeServer({
+      port: 0,
+      onRuntimeEvent: event => events.push(event),
+    });
+    const feed = server.openTable('r1', 't1');
+    const disconnects: string[] = [];
+    await feed.start({
+      onBatch: () => { throw new Error('synthetic sink failure'); },
+      onDisconnect: (_tableId, reason) => { disconnects.push(reason ?? ''); },
+    });
+    try {
+      server.ingestClientMessage({
+        kind: 'tableEvent',
+        roomId: 'r1',
+        tableId: 't1',
+        event: bridgeEvent(),
+      });
+      await expect(feed.flush()).rejects.toThrow('synthetic sink failure');
+      expect(disconnects).toEqual(['synthetic sink failure']);
+      expect(events).toContainEqual(expect.objectContaining({
+        kind: 'table-disconnected',
+        tableId: 't1',
+      }));
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('notifies the sink only once for repeated disconnects without an intervening restore', async () => {
+    const server = new BrowserBridgeServer();
+    const feed = server.openTable('r1', 't1');
+    const disconnects: string[] = [];
+    await feed.start({
+      onBatch: () => {},
+      onDisconnect: (_tableId, reason) => { disconnects.push(reason ?? ''); },
+    });
+    try {
+      const exportInstance = feed as unknown as { handleDisconnect: (reason?: string) => void };
+      exportInstance.handleDisconnect('first');
+      exportInstance.handleDisconnect('second');
+      expect(disconnects).toEqual(['first']);
+    } finally {
+      await server.close();
+    }
+  });
+
 
   it('does not drop tables when the same extension session reconnects within the disconnect grace', async () => {
     const events: BrowserBridgeRuntimeEvent[] = [];
