@@ -203,6 +203,9 @@ export interface DesktopRuntimeTableState {
   readonly reasons: readonly string[];
   readonly feedState?: 'CONNECTED' | 'RESYNCING' | 'DISCONNECTED';
   readonly feedStalenessMs?: number;
+  readonly linkState?: 'live' | 'degraded' | 'resyncing' | 'offline';
+  readonly disconnects?: number;
+  readonly lastDisconnectAt?: string;
 }
 
 export interface DesktopRuntimeState {

@@ -238,6 +238,11 @@ const STALE_PAGE_RELOAD_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000, 30 *
 const EXTENSION_HEARTBEAT_TIMEOUT_MS = 15_000;
 const EXTENSION_DISCONNECT_GRACE_MS = 8_000;
 
+/** reload 重试退避加 ±10% 抖动，避免多桌同时重试打爆页面。 */
+function addReloadRetryJitter(delayMs: number): number {
+  return Math.max(1_000, Math.round(delayMs * (0.9 + Math.random() * 0.2)));
+}
+
 type BridgeSocketRole = 'extension' | 'observer' | 'command';
 
 function bridgeSocketRole(
@@ -971,6 +976,7 @@ export class BrowserBridgeServer implements RoomMonitor {
   private stalePageReloadAttempts = 0;
   private readonly staleTableIds = new Set<string>();
   private readonly socketLastSeenAt = new Map<WebSocket, number>();
+  private readonly socketHeartbeatStrikes = new Map<WebSocket, number>();
   private readonly socketBridgeSession = new Map<WebSocket, string>();
   private readonly lastBridgeSeqBySession = new Map<string, number>();
   private activeBridgeSessionId?: string;
@@ -1086,6 +1092,7 @@ export class BrowserBridgeServer implements RoomMonitor {
         this.rejectPendingBets(new Error(LIVE_BET_CONNECTION_LOST_ERROR), socket);
         this.sockets.delete(socket);
         this.socketLastSeenAt.delete(socket);
+        this.socketHeartbeatStrikes.delete(socket);
         this.socketBridgeSession.delete(socket);
         if (this.sockets.size === 0 && this.extensionConnected) {
           this.scheduleExtensionDisconnect(rawReason.toString() || `websocket-close-${code}`);
@@ -1118,6 +1125,7 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.observers.clear();
     this.commandClients.clear();
     this.socketLastSeenAt.clear();
+    this.socketHeartbeatStrikes.clear();
     this.socketBridgeSession.clear();
     if (this.wss) {
       const wss = this.wss;
@@ -1887,7 +1895,7 @@ export class BrowserBridgeServer implements RoomMonitor {
         Math.min(this.stalePageReloadAttempts, STALE_PAGE_RELOAD_RETRY_DELAYS_MS.length - 1)
       ];
       this.stalePageReloadAttempts += 1;
-      this.scheduleStalePageReload(retryDelay);
+      this.scheduleStalePageReload(addReloadRetryJitter(retryDelay));
     }, delayMs);
     this.stalePageReloadTimer.unref();
   }
@@ -1961,7 +1969,14 @@ export class BrowserBridgeServer implements RoomMonitor {
       const now = Date.now();
       for (const socket of this.sockets) {
         const lastSeenAt = this.socketLastSeenAt.get(socket) ?? 0;
-        if (now - lastSeenAt <= this.extensionHeartbeatTimeoutMs) continue;
+        if (now - lastSeenAt <= this.extensionHeartbeatTimeoutMs) {
+          this.socketHeartbeatStrikes.delete(socket);
+          continue;
+        }
+        const strikes = (this.socketHeartbeatStrikes.get(socket) ?? 0) + 1;
+        this.socketHeartbeatStrikes.set(socket, strikes);
+        if (strikes < 2) continue;
+        this.socketHeartbeatStrikes.delete(socket);
         socket.close(4001, 'extension heartbeat stale');
       }
       for (const exportInstance of this.exports.values()) {
