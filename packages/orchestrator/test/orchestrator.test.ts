@@ -1207,3 +1207,42 @@ describe('unknown monitor-session baseline execution', () => {
     ledger.close();
   });
 });
+
+describe('table actor dedupe key retention', () => {
+  it('retains only current-shoe dedupe keys on new shoe', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile = simProfile();
+    const actor = new TableActor({
+      tableId: 't1',
+      profile,
+      ledger,
+      riskManager: new RiskManager(ledger),
+      executor: null,
+      executionMode: 'live',
+      defaultBetAmount: 10,
+      riskLimits,
+      requestTimeoutMs: 5,
+    });
+    try {
+      const first = new FixtureBuilder('t1').newShoe('s1', profile).build();
+      await Promise.all(first.map(event => actor.enqueue(event)));
+      await actor.flush();
+      actor['placedKeys'].add('t1:s0:h0:bankerPair');
+      actor['placedHandKeys'].add('t1:s0:h0');
+      actor['reminderKeys'].add('s0:h0:rev:bankerPair');
+      actor['placedKeys'].add('t1:s1:h1:bankerPair');
+      const second = new FixtureBuilder('t1').newShoe('s2', profile).build()
+        .map(event => ({ ...event, eventId: event.eventId + "-s2", sourceSeq: ledger.allocateSourceSeq("t1") }));
+      await Promise.all(second.map(event => actor.enqueue(event)));
+      await actor.flush();
+      expect(actor.getProjection().shoeId).toBe('s2');
+      expect(actor['placedKeys'].has('t1:s0:h0:bankerPair')).toBe(false);
+      expect(actor['placedHandKeys'].has('t1:s0:h0')).toBe(false);
+      expect(actor['reminderKeys'].has('s0:h0:rev:bankerPair')).toBe(false);
+      expect(actor['placedKeys'].has('t1:s1:h1:bankerPair')).toBe(false);
+    } finally {
+      ledger.close();
+    }
+  });
+});
+
