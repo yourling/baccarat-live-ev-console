@@ -1911,6 +1911,7 @@ export class DesktopConsoleService {
     ) {
       return this.cachedLightSnapshot.value;
     }
+    if (!lightKey) this.cachedLightSnapshot = undefined;
     const fullSnapshot = this.orchestrator.snapshot();
     const usingLiveMonitor = this.liveMonitorActivated;
     const displayedTableIds = this.displayedTableIds(fullSnapshot);
