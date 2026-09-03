@@ -366,9 +366,12 @@ export function applyEvent(
       updated.connectionStatus = 'DISCONNECTED';
       updated.autoBetStatus = 'DISARMED';
       if (!updated.sealed && updated.shoeId) updated.status = 'RESYNCING';
-      // A gap can hide startshuffling. Consecutive sourceSeq after resume
-      // does not prove the same physical shoe continued.
-      if (updated.shoeBaseline === 'physical-shoe') {
+      // A transport flash of the extension bridge does not hide startshuffling.
+      // Table-feed gaps and session restarts still can, so those demote.
+      if (
+        updated.shoeBaseline === 'physical-shoe'
+        && event.reason !== 'browser-extension-disconnected'
+      ) {
         updated.shoeBaseline = 'unknown-monitor-session';
       }
       break;

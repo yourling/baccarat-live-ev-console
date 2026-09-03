@@ -9,6 +9,8 @@ const DEFAULT_BRIDGE_URL = `ws://127.0.0.1:17890/?token=${DEFAULT_BRIDGE_TOKEN}`
 const CDP_MIN_INTERVAL_MS = 60 * 1000;
 const EXTENSION_RELOAD_DELAY_MS = 1000;
 const BRIDGE_RECONNECT_ALARM = 'baccarat-bridge-reconnect';
+const BRIDGE_KEEPALIVE_PORT = 'baccarat-bridge-keepalive';
+const BRIDGE_HEARTBEAT_INTERVAL_MS = 5000;
 const DAFABET_PRAGMATIC_POPUP_PATH = '/live-dealer/popup-launch/jeju-speed-baccarat';
 const DAFABET_POPUP_QUERY = 'https://www.dafabet.net/*/live-dealer/popup-launch/jeju-speed-baccarat*';
 const GAME_TAB_URL_PATTERN = /^https?:\/\/(?:[a-z0-9-]+\.)*(?:dafabet\.net|vbgames88\.com|zavjcswh\.biz|pragmaticplaylive\.net)(?::\d+)?(?:[/?#]|$)/i;
@@ -161,6 +163,7 @@ let socket = null;
 let socketGeneration = 0;
 let activeSocketGeneration = 0;
 let reconnectTimer = null;
+let heartbeatTimer = null;
 let reconnectDelay = 1000;
 let keeperTabId = null;
 let keeperCreationPromise = null;
@@ -234,6 +237,7 @@ async function connect() {
       browser: navigator.userAgent,
       timestamp: new Date().toISOString(),
     });
+    scheduleBridgeHeartbeat();
     void replayRuntimeStateInGameFrames();
   });
 
@@ -280,6 +284,7 @@ function invalidateSocket(connection, generation) {
   liveBetSessionEnabled = false;
   activeSocketGeneration = 0;
   socket = null;
+  stopBridgeHeartbeat();
   scheduleReconnect();
   return true;
 }
@@ -1194,6 +1199,23 @@ function scheduleReconnect() {
   reconnectDelay = Math.min(reconnectDelay * 2, 15000);
 }
 
+function scheduleBridgeHeartbeat() {
+  if (heartbeatTimer) return;
+  heartbeatTimer = setTimeout(() => {
+    heartbeatTimer = null;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      send({ kind: 'heartbeat', timestamp: new Date().toISOString() });
+      scheduleBridgeHeartbeat();
+    }
+  }, BRIDGE_HEARTBEAT_INTERVAL_MS);
+}
+
+function stopBridgeHeartbeat() {
+  if (!heartbeatTimer) return;
+  clearTimeout(heartbeatTimer);
+  heartbeatTimer = null;
+}
+
 function ensureBridgeReconnectAlarm() {
   if (!chrome.alarms?.create) return;
   chrome.alarms.create(BRIDGE_RECONNECT_ALARM, { periodInMinutes: 0.5 });
@@ -1201,6 +1223,10 @@ function ensureBridgeReconnectAlarm() {
 
 chrome.alarms?.onAlarm?.addListener(alarm => {
   if (alarm?.name === BRIDGE_RECONNECT_ALARM) void connect();
+});
+
+chrome.runtime.onConnect.addListener(port => {
+  if (!port || port.name !== BRIDGE_KEEPALIVE_PORT) return;
 });
 
 const OUTBOX_LIMIT = 500;

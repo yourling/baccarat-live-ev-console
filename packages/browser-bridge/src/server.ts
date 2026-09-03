@@ -64,6 +64,7 @@ export interface BrowserBridgeServerOptions {
   tableStaleAfterMs?: number;
   stalePageReloadAfterMs?: number;
   extensionHeartbeatTimeoutMs?: number;
+  extensionDisconnectGraceMs?: number;
   requireExtensionSequence?: boolean;
   allowedExtensionId?: string;
   extensionToken?: string;
@@ -235,6 +236,7 @@ const TABLE_STALE_AFTER_MS = 45_000;
 const STALE_PAGE_RELOAD_AFTER_MS = 8 * 60_000;
 const STALE_PAGE_RELOAD_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000] as const;
 const EXTENSION_HEARTBEAT_TIMEOUT_MS = 15_000;
+const EXTENSION_DISCONNECT_GRACE_MS = 8_000;
 
 type BridgeSocketRole = 'extension' | 'observer' | 'command';
 
@@ -961,7 +963,9 @@ export class BrowserBridgeServer implements RoomMonitor {
   private readonly tableStaleAfterMs: number;
   private readonly stalePageReloadAfterMs: number;
   private readonly extensionHeartbeatTimeoutMs: number;
+  private readonly extensionDisconnectGraceMs: number;
   private readonly requireExtensionSequence: boolean;
+  private extensionDisconnectTimer?: NodeJS.Timeout;
   private freshnessTimer?: NodeJS.Timeout;
   private stalePageReloadTimer?: NodeJS.Timeout;
   private stalePageReloadAttempts = 0;
@@ -992,6 +996,10 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.extensionHeartbeatTimeoutMs = Math.max(
       1_000,
       options.extensionHeartbeatTimeoutMs ?? EXTENSION_HEARTBEAT_TIMEOUT_MS,
+    );
+    this.extensionDisconnectGraceMs = Math.max(
+      0,
+      options.extensionDisconnectGraceMs ?? EXTENSION_DISCONNECT_GRACE_MS,
     );
     this.requireExtensionSequence = options.requireExtensionSequence ?? false;
     this.configuredSelectedTables = options.selectedTableIds === undefined
@@ -1039,11 +1047,10 @@ export class BrowserBridgeServer implements RoomMonitor {
       } else if (role === 'command') {
         this.commandClients.add(socket);
       } else {
+        this.clearExtensionDisconnectGrace();
         this.sockets.add(socket);
         this.socketLastSeenAt.set(socket, Date.now());
-        if (!this.extensionConnected) {
-          this.extensionConnected = true;
-        }
+        this.extensionConnected = true;
         this.emitRuntimeEvent({
           kind: 'extension-connected',
           timestamp: new Date().toISOString(),
@@ -1080,14 +1087,8 @@ export class BrowserBridgeServer implements RoomMonitor {
         this.sockets.delete(socket);
         this.socketLastSeenAt.delete(socket);
         this.socketBridgeSession.delete(socket);
-        this.emitRuntimeEvent({
-          kind: 'extension-disconnected',
-          reason: rawReason.toString() || `websocket-close-${code}`,
-          timestamp: new Date().toISOString(),
-        });
         if (this.sockets.size === 0 && this.extensionConnected) {
-          this.extensionConnected = false;
-          this.handleBridgeDisconnect('browser-extension-disconnected');
+          this.scheduleExtensionDisconnect(rawReason.toString() || `websocket-close-${code}`);
         }
       });
       socket.send(JSON.stringify({
@@ -1103,10 +1104,14 @@ export class BrowserBridgeServer implements RoomMonitor {
   async close(): Promise<void> {
     this.clearMultiviewRecoveryTimer();
     this.clearStalePageReloadTimer();
+    this.clearExtensionDisconnectGrace();
     this.staleTableIds.clear();
     if (this.freshnessTimer) {
       clearInterval(this.freshnessTimer);
       this.freshnessTimer = undefined;
+    }
+    if (this.extensionConnected) {
+      this.finalizeExtensionDisconnect('browser-bridge-stopped');
     }
     for (const socket of [...this.sockets, ...this.observers, ...this.commandClients]) socket.close();
     this.sockets.clear();
@@ -1751,6 +1756,38 @@ export class BrowserBridgeServer implements RoomMonitor {
     for (const exportInstance of this.exports.values()) {
       exportInstance.handleDisconnect(reason);
     }
+  }
+
+  private scheduleExtensionDisconnect(reason: string): void {
+    if (this.extensionDisconnectTimer !== undefined) return;
+    if (this.extensionDisconnectGraceMs <= 0) {
+      this.finalizeExtensionDisconnect(reason);
+      return;
+    }
+    this.extensionDisconnectTimer = setTimeout(() => {
+      this.extensionDisconnectTimer = undefined;
+      if (this.sockets.size > 0) return;
+      this.finalizeExtensionDisconnect(reason);
+    }, this.extensionDisconnectGraceMs);
+    this.extensionDisconnectTimer.unref();
+  }
+
+  private clearExtensionDisconnectGrace(): void {
+    if (this.extensionDisconnectTimer === undefined) return;
+    clearTimeout(this.extensionDisconnectTimer);
+    this.extensionDisconnectTimer = undefined;
+  }
+
+  private finalizeExtensionDisconnect(reason: string): void {
+    this.clearExtensionDisconnectGrace();
+    if (!this.extensionConnected) return;
+    this.extensionConnected = false;
+    this.emitRuntimeEvent({
+      kind: 'extension-disconnected',
+      reason,
+      timestamp: new Date().toISOString(),
+    });
+    this.handleBridgeDisconnect('browser-extension-disconnected');
   }
 
   private invalidateBridgeContinuity(reason: string): void {

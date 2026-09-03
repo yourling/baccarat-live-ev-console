@@ -63,6 +63,20 @@ function isPragmaticFinalInjection(value: unknown): boolean {
 }
 
 describe('extension background multitable command', () => {
+  it('loads with a runtime connect listener for the keepalive port', async () => {
+    const harness = await createHarness();
+    expect(harness.chrome.runtime.onConnect.addListener).toHaveBeenCalled();
+  });
+
+  it('queues a bridge heartbeat after the socket opens', async () => {
+    const harness = await createHarness();
+    harness.socket.emit('open');
+    expect(harness.runNextTimer()).toBe(true);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'heartbeat',
+    }));
+  });
+
   it('revokes the live gate before reloading a frozen baccarat popup', async () => {
     const harness = await createHarness();
 

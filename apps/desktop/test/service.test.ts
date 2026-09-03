@@ -2727,6 +2727,45 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('keeps a monitored table when the browser extension bridge flashes', async () => {
+    vi.useFakeTimers();
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const stop = vi.fn(async () => undefined);
+    const feed = {
+      tableId: 'D055',
+      start: async () => undefined,
+      stop,
+      flush: async () => undefined,
+      keepAlive: async () => ({ ok: false, error: 'browser-extension-disconnected' }),
+      health: () => ({
+        tableId: 'D055',
+        state: 'DISCONNECTED',
+        lastAckedSeq: 0,
+        lastEmittedSeq: 0,
+        bufferDepth: 0,
+        reconnectCount: 1,
+        stalenessMs: 8_000,
+      }),
+    } satisfies TableExport;
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['D055']);
+      service['liveFeeds'].set('D055', feed);
+
+      service['scheduleDisconnectedMonitorRemoval']('D055', 'browser-extension-disconnected');
+      await vi.advanceTimersByTimeAsync(15_000);
+      await service['liveMonitorOperation'];
+
+      expect(service.snapshot().monitorTableIds).toEqual(['D055']);
+      expect(service['liveFeeds'].has('D055')).toBe(true);
+      expect(stop).not.toHaveBeenCalled();
+    } finally {
+      await service.close();
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps monitoring after a table-feed-stale runtime event', async () => {
     vi.useFakeTimers();
     const service = new DesktopConsoleService(':memory:');

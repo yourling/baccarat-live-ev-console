@@ -585,6 +585,154 @@ describe('browser bridge server', () => {
     }
   });
 
+  it('does not drop tables when the same extension session reconnects within the disconnect grace', async () => {
+    const events: BrowserBridgeRuntimeEvent[] = [];
+    const server = new BrowserBridgeServer({
+      port: 0,
+      requireExtensionSequence: true,
+      extensionDisconnectGraceMs: 80,
+      onRuntimeEvent: event => events.push(event),
+    });
+    const port = await server.start();
+    const feed = server.openTable('r1', 't1');
+    const disconnects: string[] = [];
+    await feed.start({
+      onBatch: () => {},
+      onDisconnect: (_tableId, reason) => disconnects.push(reason ?? ''),
+    });
+    let client = extensionClient(port);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        client.once('open', () => resolve());
+        client.once('error', reject);
+      });
+      client.send(JSON.stringify({
+        kind: 'heartbeat',
+        timestamp: new Date().toISOString(),
+        bridgeSessionId: 'bridge-session-one',
+        bridgeSeq: 1,
+      }));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const closed = new Promise<void>(resolve => client.once('close', () => resolve()));
+      client.close();
+      await closed;
+      await new Promise<void>(resolve => setImmediate(resolve));
+
+      client = extensionClient(port);
+      await new Promise<void>((resolve, reject) => {
+        client.once('open', () => resolve());
+        client.once('error', reject);
+      });
+      client.send(JSON.stringify({
+        kind: 'heartbeat',
+        timestamp: new Date().toISOString(),
+        bridgeSessionId: 'bridge-session-one',
+        bridgeSeq: 2,
+      }));
+      await new Promise<void>(resolve => setTimeout(resolve, 120));
+
+      expect(disconnects).toEqual([]);
+      expect(feed.health().state).toBe('CONNECTED');
+      expect(events.some(event => event.kind === 'extension-disconnected')).toBe(false);
+    } finally {
+      client.close();
+      await server.close();
+    }
+  });
+
+  it('disconnects tables after the extension-socket grace expires without reconnect', async () => {
+    const events: BrowserBridgeRuntimeEvent[] = [];
+    const server = new BrowserBridgeServer({
+      port: 0,
+      requireExtensionSequence: true,
+      extensionDisconnectGraceMs: 40,
+      onRuntimeEvent: event => events.push(event),
+    });
+    const port = await server.start();
+    const feed = server.openTable('r1', 't1');
+    const disconnects: string[] = [];
+    await feed.start({
+      onBatch: () => {},
+      onDisconnect: (_tableId, reason) => disconnects.push(reason ?? ''),
+    });
+    const client = extensionClient(port);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        client.once('open', () => resolve());
+        client.once('error', reject);
+      });
+      client.send(JSON.stringify({
+        kind: 'heartbeat',
+        timestamp: new Date().toISOString(),
+        bridgeSessionId: 'bridge-session-one',
+        bridgeSeq: 1,
+      }));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const closed = new Promise<void>(resolve => client.once('close', () => resolve()));
+      client.close();
+      await closed;
+      await new Promise<void>(resolve => setTimeout(resolve, 80));
+
+      expect(disconnects).toEqual(['browser-extension-disconnected']);
+      expect(events).toContainEqual(expect.objectContaining({ kind: 'extension-disconnected' }));
+    } finally {
+      client.close();
+      await server.close();
+    }
+  });
+
+  it('invalidates continuity when a new extension session connects during disconnect grace', async () => {
+    const server = new BrowserBridgeServer({
+      port: 0,
+      requireExtensionSequence: true,
+      extensionDisconnectGraceMs: 80,
+    });
+    const port = await server.start();
+    const feed = server.openTable('r1', 't1');
+    const disconnects: string[] = [];
+    await feed.start({
+      onBatch: () => {},
+      onDisconnect: (_tableId, reason) => disconnects.push(reason ?? ''),
+    });
+    let client = extensionClient(port);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        client.once('open', () => resolve());
+        client.once('error', reject);
+      });
+      client.send(JSON.stringify({
+        kind: 'heartbeat',
+        timestamp: new Date().toISOString(),
+        bridgeSessionId: 'bridge-session-one',
+        bridgeSeq: 1,
+      }));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const closed = new Promise<void>(resolve => client.once('close', () => resolve()));
+      client.close();
+      await closed;
+      await new Promise<void>(resolve => setImmediate(resolve));
+
+      client = extensionClient(port);
+      await new Promise<void>((resolve, reject) => {
+        client.once('open', () => resolve());
+        client.once('error', reject);
+      });
+      client.send(JSON.stringify({
+        kind: 'heartbeat',
+        timestamp: new Date().toISOString(),
+        bridgeSessionId: 'bridge-session-two',
+        bridgeSeq: 1,
+      }));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      await new Promise<void>(resolve => setTimeout(resolve, 30));
+
+      expect(disconnects).toEqual(['extension-session-restarted']);
+    } finally {
+      client.close();
+      await server.close();
+    }
+  });
+
   it('marks a connected table stale and reports real observation age', async () => {
     const server = new BrowserBridgeServer({ tableStaleAfterMs: 1_000 });
     const feed = server.openTable('r1', 't1');

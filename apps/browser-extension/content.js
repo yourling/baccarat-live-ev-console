@@ -17,6 +17,8 @@
 (function () {
   const SCAN_INTERVAL_MS = 2000;
   const KEEPALIVE_INTERVAL_MS = 30 * 1000;
+  const BRIDGE_KEEPALIVE_PORT = 'baccarat-bridge-keepalive';
+  const BRIDGE_KEEPALIVE_RECONNECT_MS = 1000;
   const MAX_RECOVERY_ATTEMPTS = 3;
   const RECOVERY_DELAYS_MS = [5 * 1000, 15 * 1000, 45 * 1000];
   const SUPERVISORY_RECOVERY_DELAYS_MS = [60 * 1000, 5 * 60 * 1000, 15 * 60 * 1000, 30 * 60 * 1000];
@@ -254,6 +256,27 @@
 
   function startKeepAlive() {
     setInterval(keepAliveTick, KEEPALIVE_INTERVAL_MS);
+  }
+
+  let bridgeKeepalivePort = null;
+  let bridgeKeepaliveTimer = null;
+
+  function connectBridgeKeepalivePort() {
+    if (window.top !== window) return;
+    if (bridgeKeepaliveTimer) {
+      clearTimeout(bridgeKeepaliveTimer);
+      bridgeKeepaliveTimer = null;
+    }
+    try {
+      const port = chrome.runtime.connect({ name: BRIDGE_KEEPALIVE_PORT });
+      bridgeKeepalivePort = port;
+      port.onDisconnect.addListener(() => {
+        if (bridgeKeepalivePort === port) bridgeKeepalivePort = null;
+        bridgeKeepaliveTimer = setTimeout(connectBridgeKeepalivePort, BRIDGE_KEEPALIVE_RECONNECT_MS);
+      });
+    } catch (_) {
+      bridgeKeepaliveTimer = setTimeout(connectBridgeKeepalivePort, BRIDGE_KEEPALIVE_RECONNECT_MS);
+    }
   }
 
   // ---- 闲置警告弹窗自动处理（预过期提醒，如“长时间未操作，是否继续”） ----
@@ -866,6 +889,8 @@
   }
 
   if (!GAME_PAGE) return; // 非游戏页面:内容脚本保持惰性
+
+  connectBridgeKeepalivePort();
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {

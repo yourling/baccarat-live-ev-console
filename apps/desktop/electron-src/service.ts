@@ -1402,7 +1402,7 @@ export class DesktopConsoleService {
     // Multi-table pages reconnect the game socket often. A stale/disconnected
     // feed must stay in the monitor list so the export can resume; dropping
     // the table is what leaves the console stuck on 数据流已断开 / 已过期.
-    if (reason === 'table-feed-stale') return;
+    if (reason === 'table-feed-stale' || reason === 'browser-extension-disconnected') return;
     if (this.disconnectedMonitorRemovalTimers.has(tableId)) return;
     const delayMs = DISCONNECTED_MONITOR_REMOVAL_MS;
     const timer = setTimeout(() => {

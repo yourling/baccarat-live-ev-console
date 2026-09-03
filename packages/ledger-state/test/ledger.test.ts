@@ -310,6 +310,28 @@ describe('ledger replay', () => {
     expect(restored?.shoeBaseline).toBe('unknown-monitor-session');
   });
 
+  it('keeps a physical shoe after an extension-bridge flash disconnect', () => {
+    const profile = { ...defaultProfile('t1'), autoConfirmNewShoe: true, autoBetArmedByDefault: true };
+    const state = replayEvents([
+      ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile }, 1),
+      ev({ type: 'connectionLost', reason: 'browser-extension-disconnected' }, 2),
+    ]).get('t1');
+    expect(state?.shoeBaseline).toBe('physical-shoe');
+    expect(state?.connectionStatus).toBe('DISCONNECTED');
+    expect(state?.autoBetStatus).toBe('DISARMED');
+    const restored = replayEvents([
+      ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile }, 1),
+      ev({ type: 'connectionLost', reason: 'browser-extension-disconnected' }, 2),
+      ev({
+        type: 'connectionRestored',
+        continuityProof: `cursor-v1:${'a'.repeat(64)}`,
+      }, 3),
+    ]).get('t1');
+    expect(restored?.shoeBaseline).toBe('physical-shoe');
+    expect(restored?.connectionStatus).toBe('CONNECTED');
+    expect(restored?.autoBetStatus).toBe('DISARMED');
+  });
+
   it('seals a physical shoe that can no longer deal a hand', () => {
     const ranks = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'] as const;
     const profile = {
