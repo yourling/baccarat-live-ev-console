@@ -58,11 +58,8 @@ export interface BrowserBridgeServerOptions {
   port?: number;
   host?: string;
   betTimeoutMs?: number;
-  multiviewRecoveryCooldownMs?: number;
-  multiviewOpenedGraceMs?: number;
   selectedTableIds?: readonly string[];
   tableStaleAfterMs?: number;
-  stalePageReloadAfterMs?: number;
   extensionHeartbeatTimeoutMs?: number;
   extensionDisconnectGraceMs?: number;
   requireExtensionSequence?: boolean;
@@ -227,21 +224,9 @@ const OBSERVER_PATH = '/observe';
 const COMMAND_PATH = '/command';
 const BRIDGE_DEBUG_ENABLED = process.env.BACCARAT_BRIDGE_DEBUG === '1';
 
-/** 已配置多桌在单桌回退时请求页面恢复的最短间隔。 */
-const MULTIVIEW_RECOVERY_COOLDOWN_MS = 10_000;
-
-/** 页面确认已打开多台后，留给真实页面完成加载的宽限时间。 */
-const MULTIVIEW_OPENED_GRACE_MS = 60_000;
 const TABLE_STALE_AFTER_MS = 45_000;
-const STALE_PAGE_RELOAD_AFTER_MS = 8 * 60_000;
-const STALE_PAGE_RELOAD_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000] as const;
 const EXTENSION_HEARTBEAT_TIMEOUT_MS = 15_000;
 const EXTENSION_DISCONNECT_GRACE_MS = 8_000;
-
-/** reload 重试退避加 ±10% 抖动，避免多桌同时重试打爆页面。 */
-function addReloadRetryJitter(delayMs: number): number {
-  return Math.max(1_000, Math.round(delayMs * (0.9 + Math.random() * 0.2)));
-}
 
 type BridgeSocketRole = 'extension' | 'observer' | 'command';
 
@@ -960,20 +945,12 @@ export class BrowserBridgeServer implements RoomMonitor {
   private configuredSelectedTables: ReadonlySet<string> | undefined;
   private runtimeSelectedTables: ReadonlySet<string> | undefined;
   private effectiveSelectedTables: ReadonlySet<string> | undefined;
-  private lastMultiviewRecoveryAt = 0;
-  private multiviewRecoveryTimer?: NodeJS.Timeout;
-  private readonly multiviewRecoveryCooldownMs: number;
-  private readonly multiviewOpenedGraceMs: number;
   private readonly tableStaleAfterMs: number;
-  private readonly stalePageReloadAfterMs: number;
   private readonly extensionHeartbeatTimeoutMs: number;
   private readonly extensionDisconnectGraceMs: number;
   private readonly requireExtensionSequence: boolean;
   private extensionDisconnectTimer?: NodeJS.Timeout;
   private freshnessTimer?: NodeJS.Timeout;
-  private stalePageReloadTimer?: NodeJS.Timeout;
-  private stalePageReloadAttempts = 0;
-  private readonly staleTableIds = new Set<string>();
   private readonly socketLastSeenAt = new Map<WebSocket, number>();
   private readonly socketHeartbeatStrikes = new Map<WebSocket, number>();
   private readonly socketBridgeSession = new Map<WebSocket, string>();
@@ -985,19 +962,7 @@ export class BrowserBridgeServer implements RoomMonitor {
   constructor(options: BrowserBridgeServerOptions = {}) {
     this.options = options;
     this.betTimeoutMs = options.betTimeoutMs ?? 10_000;
-    this.multiviewRecoveryCooldownMs = Math.max(
-      1,
-      options.multiviewRecoveryCooldownMs ?? MULTIVIEW_RECOVERY_COOLDOWN_MS,
-    );
-    this.multiviewOpenedGraceMs = Math.max(
-      this.multiviewRecoveryCooldownMs,
-      options.multiviewOpenedGraceMs ?? MULTIVIEW_OPENED_GRACE_MS,
-    );
     this.tableStaleAfterMs = Math.max(1_000, options.tableStaleAfterMs ?? TABLE_STALE_AFTER_MS);
-    this.stalePageReloadAfterMs = Math.max(
-      this.tableStaleAfterMs,
-      options.stalePageReloadAfterMs ?? STALE_PAGE_RELOAD_AFTER_MS,
-    );
     this.extensionHeartbeatTimeoutMs = Math.max(
       1_000,
       options.extensionHeartbeatTimeoutMs ?? EXTENSION_HEARTBEAT_TIMEOUT_MS,
@@ -1108,10 +1073,7 @@ export class BrowserBridgeServer implements RoomMonitor {
   }
 
   async close(): Promise<void> {
-    this.clearMultiviewRecoveryTimer();
-    this.clearStalePageReloadTimer();
     this.clearExtensionDisconnectGrace();
-    this.staleTableIds.clear();
     if (this.freshnessTimer) {
       clearInterval(this.freshnessTimer);
       this.freshnessTimer = undefined;
@@ -1176,9 +1138,6 @@ export class BrowserBridgeServer implements RoomMonitor {
   }
 
   beginMonitorSession(): void {
-    this.clearStalePageReloadTimer();
-    this.staleTableIds.clear();
-    this.stalePageReloadAttempts = 0;
     this.pragmaticParser = new PragmaticRuntimeParser();
     this.pragmaticProtocol.reset();
     this.parsedSourceSeqByTable.clear();
@@ -1328,9 +1287,6 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.refreshEffectiveSelectedTables();
     this.pruneUnselectedTables();
     this.refreshSelectedRoomsFromDiscovery();
-    for (const staleTableId of this.staleTableIds) {
-      if (!nextSelectedTables.has(staleTableId)) this.clearStaleTable(staleTableId);
-    }
     for (const tableId of trackedTableIds) {
       if (!nextSelectedTables.has(tableId) || !wasPreviouslySelected(tableId)) {
         this.resetTableState(tableId);
@@ -1346,14 +1302,6 @@ export class BrowserBridgeServer implements RoomMonitor {
       ));
     }
 
-    const runtimeHasNoConfiguredOverlap = this.runtimeSelectedTables !== undefined
-      && this.runtimeSelectedTables.size > 0
-      && ![...this.runtimeSelectedTables].some(tableId => nextSelectedTables.has(tableId));
-    if (this.isConfiguredMultiviewIncomplete() || runtimeHasNoConfiguredOverlap) {
-      this.requestMultiviewRecovery();
-    } else {
-      this.clearMultiviewRecoveryTimer();
-    }
     if (newlySelectedTableIds.length > 0) {
       this.broadcastToSockets({ kind: 'command', name: 'replayRuntimeState' });
     }
@@ -1520,16 +1468,7 @@ export class BrowserBridgeServer implements RoomMonitor {
         if (BRIDGE_DEBUG_ENABLED && !NOISY_SESSION_ACTIONS.has(message.action)) {
           console.log('[session-action]', JSON.stringify(redactedLifecycleMessage(message)));
         }
-        if (
-          message.action === 'command-executed'
-          && message.detail?.startsWith('reloadGameTabs:')
-        ) {
-          this.emitRuntimeEvent({
-            kind: 'execution-gate-revoked',
-            reason: 'game-tabs-reloaded',
-            timestamp: message.timestamp,
-          });
-        } else if (message.action === 'recovery-failed') {
+        if (message.action === 'recovery-failed') {
           this.emitRuntimeEvent({
             kind: 'session-recovery-exhausted',
             ...(message.detail === undefined ? {} : { detail: message.detail }),
@@ -1540,10 +1479,6 @@ export class BrowserBridgeServer implements RoomMonitor {
             kind: 'session-recovered',
             timestamp: message.timestamp,
           });
-        }
-        if (message.detail?.startsWith('openMultiView:opened:') && this.isConfiguredMultiviewIncomplete()) {
-          this.clearMultiviewRecoveryTimer();
-          this.scheduleMultiviewRecovery(this.multiviewOpenedGraceMs);
         }
         break;
       case 'command':
@@ -1594,12 +1529,6 @@ export class BrowserBridgeServer implements RoomMonitor {
       this.runtimeSelectedTables = hasConfiguredOverlap ? selected : new Set();
       this.refreshEffectiveSelectedTables();
       if (this.configuredSelectedTables === undefined) this.pruneUnselectedTables();
-
-      if (this.isConfiguredMultiviewIncomplete() || (selected.size > 0 && !hasConfiguredOverlap)) {
-        this.requestMultiviewRecovery();
-      } else {
-        this.clearMultiviewRecoveryTimer();
-      }
     } catch {
       // malformed selection notifications are ignored at the bridge boundary.
     }
@@ -1627,25 +1556,6 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.runtimeStateStaleTableIds.delete(tableId);
   }
 
-  private requestMultiviewRecovery(): void {
-    if (this.configuredSelectedTables === undefined) return;
-    const now = Date.now();
-    const elapsed = now - this.lastMultiviewRecoveryAt;
-    if (elapsed < this.multiviewRecoveryCooldownMs) {
-      this.scheduleMultiviewRecovery(this.multiviewRecoveryCooldownMs - elapsed);
-      return;
-    }
-    this.lastMultiviewRecoveryAt = now;
-    this.broadcastToSockets({
-      kind: 'command',
-      name: 'openMultiView',
-      tableIds: [...this.configuredSelectedTables],
-    });
-    if (this.isConfiguredMultiviewIncomplete()) {
-      this.scheduleMultiviewRecovery(this.multiviewRecoveryCooldownMs);
-    }
-  }
-
   private refreshSelectedRoomsFromDiscovery(): void {
     for (const [roomId, discovered] of this.discoveredRooms) {
       if (roomId !== 'dafabet-pragmatic') continue;
@@ -1654,29 +1564,6 @@ export class BrowserBridgeServer implements RoomMonitor {
         tables: discovered.tables.filter(table => this.isTableSelected(table.tableId)),
       });
     }
-  }
-
-  /** 控制台监控很多桌不等于要把它们都加入 4 格多台；只有页面掉到单桌/空桌时才恢复。 */
-  private isConfiguredMultiviewIncomplete(): boolean {
-    return this.configuredSelectedTables !== undefined
-      && this.configuredSelectedTables.size > 1
-      && this.runtimeSelectedTables !== undefined
-      && this.runtimeSelectedTables.size <= 1;
-  }
-
-  private scheduleMultiviewRecovery(delayMs: number): void {
-    if (!this.isConfiguredMultiviewIncomplete() || this.multiviewRecoveryTimer !== undefined) return;
-    this.multiviewRecoveryTimer = setTimeout(() => {
-      this.multiviewRecoveryTimer = undefined;
-      if (this.isConfiguredMultiviewIncomplete()) this.requestMultiviewRecovery();
-    }, delayMs);
-    this.multiviewRecoveryTimer.unref();
-  }
-
-  private clearMultiviewRecoveryTimer(): void {
-    if (this.multiviewRecoveryTimer === undefined) return;
-    clearTimeout(this.multiviewRecoveryTimer);
-    this.multiviewRecoveryTimer = undefined;
   }
 
   private ingestPragmaticGameCountsFromRoom(room: BridgeRoomDescriptor): void {
@@ -1855,54 +1742,12 @@ export class BrowserBridgeServer implements RoomMonitor {
       exportInstance.handleDisconnect('table-feed-stale');
     }
     if (exportFound) return;
-    this.noteStaleTable(tableId);
     this.emitRuntimeEvent({
       kind: 'table-disconnected',
       tableId,
       reason: 'table-feed-stale',
       timestamp: new Date().toISOString(),
     });
-  }
-
-  private clearStaleTable(tableId: string): void {
-    if (!this.staleTableIds.delete(tableId) || this.staleTableIds.size > 0) return;
-    this.clearStalePageReloadTimer();
-    this.stalePageReloadAttempts = 0;
-  }
-
-  private noteStaleTable(tableId: string): void {
-    const wasEmpty = this.staleTableIds.size === 0;
-    this.staleTableIds.add(tableId);
-    if (!wasEmpty || this.stalePageReloadTimer !== undefined) return;
-    this.stalePageReloadAttempts = 0;
-    this.scheduleStalePageReload(
-      Math.max(0, this.stalePageReloadAfterMs - this.tableStaleAfterMs),
-    );
-  }
-
-  private scheduleStalePageReload(delayMs: number): void {
-    if (this.stalePageReloadTimer !== undefined || this.staleTableIds.size === 0) return;
-    this.stalePageReloadTimer = setTimeout(() => {
-      this.stalePageReloadTimer = undefined;
-      if (this.staleTableIds.size === 0) return;
-      this.broadcastToSockets({
-        kind: 'command',
-        name: 'reloadGameTabs',
-        tableIds: [...this.staleTableIds].sort(),
-      });
-      const retryDelay = STALE_PAGE_RELOAD_RETRY_DELAYS_MS[
-        Math.min(this.stalePageReloadAttempts, STALE_PAGE_RELOAD_RETRY_DELAYS_MS.length - 1)
-      ];
-      this.stalePageReloadAttempts += 1;
-      this.scheduleStalePageReload(addReloadRetryJitter(retryDelay));
-    }, delayMs);
-    this.stalePageReloadTimer.unref();
-  }
-
-  private clearStalePageReloadTimer(): void {
-    if (this.stalePageReloadTimer === undefined) return;
-    clearTimeout(this.stalePageReloadTimer);
-    this.stalePageReloadTimer = undefined;
   }
 
   private acceptExtensionSequence(raw: unknown, socket: WebSocket): boolean {
@@ -2004,7 +1849,6 @@ export class BrowserBridgeServer implements RoomMonitor {
       tableId,
       this.tableStaleAfterMs,
       (disconnectedTableId, reason) => {
-        if (reason === 'table-feed-stale') this.noteStaleTable(disconnectedTableId);
         this.emitRuntimeEvent({
           kind: 'table-disconnected',
           tableId: disconnectedTableId,
@@ -2012,7 +1856,6 @@ export class BrowserBridgeServer implements RoomMonitor {
           timestamp: new Date().toISOString(),
         });
       },
-      observedTableId => this.clearStaleTable(observedTableId),
     );
     this.exports.set(key, created);
     return created;

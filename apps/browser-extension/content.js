@@ -1,6 +1,6 @@
 /**
  * Content Script：从真实页面抽取房间/牌桌数据，转发网络诊断，
- * 执行会话保活与“会话已过期”自动恢复，并执行来自后台的真实下注请求。
+ * 执行会话保活，检测“会话已过期”并上报断开，并执行来自后台的真实下注请求。
  *
  * 保活分四层，全部通过 sessionAction/keepalive 消息上报到桥接服务以便观测：
  *  1. 合成 DOM 活动（mousemove/focus/scroll）——对 isTrusted 检测无效，但零成本；
@@ -9,23 +9,14 @@
  *  4. background 可选 CDP 可信点击（storage.trustedKeepalive=true 时）。
  *  Pragmatic 游戏 iframe 只跑第 1 层，绝不点牌桌控件或「重新连接」。
  *
- * 过期恢复：检测到“会话已过期”文案后，先上报并标记牌桌断开，
- * 然后按 5s/15s/45s 退避自动 reload（每轮最多 3 次，sessionStorage 标记跨刷新计数）。
- * 一轮耗尽后上报 recovery-failed，并按 1m/5m/15m/30m（封顶）持续监督重试；
- * 恢复只上报 sessionAction:recovered，绝不伪造 tableRestored 或连续性证明。
+ * 过期处理：检测到“会话已过期”文案后上报并标记牌桌断开，不再自动 reload。
+ * 文案消失时只上报 sessionAction:recovered，绝不伪造 tableRestored 或连续性证明。
  */
 (function () {
   const SCAN_INTERVAL_MS = 2000;
   const KEEPALIVE_INTERVAL_MS = 30 * 1000;
   const BRIDGE_KEEPALIVE_PORT = 'baccarat-bridge-keepalive';
   const BRIDGE_KEEPALIVE_RECONNECT_MS = 1000;
-  const MAX_RECOVERY_ATTEMPTS = 3;
-  const RECOVERY_DELAYS_MS = [5 * 1000, 15 * 1000, 45 * 1000];
-  const SUPERVISORY_RECOVERY_DELAYS_MS = [60 * 1000, 5 * 60 * 1000, 15 * 60 * 1000, 30 * 60 * 1000];
-  const RECOVERY_CHECK_DELAY_MS = 8 * 1000;
-  const RECOVERY_COOLDOWN_MS = 15 * 60 * 1000;
-  const RECOVERY_FLAG_KEY = 'baccarat-bridge-recovering';
-  const RECOVERY_SUPERVISOR_KEY = 'baccarat-bridge-recovery-supervisor';
   const CLICK_REPORT_INTERVAL_MS = 5 * 60 * 1000;
 
   // 只在游戏相关页面上工作:其他页面(控制台/搜索引擎/追踪器)不采集、不保活、不发心跳。
@@ -36,14 +27,6 @@
   let diagnosticSent = false;
   let sessionExpiredSent = false;
   let beaconFailedSent = false;
-  let recoveryAttempts = 0;
-  let recoveryTimer = null;
-  let recoveryCheckTimer = null;
-  let inlineCheckTimer = null;
-  let supervisoryRecoveryTimer = null;
-  let supervisoryRecoveryAttempts = 0;
-  let triedInlineRecovery = false;
-  let lastHealthyAt = Date.now();
   let lastClickReportAt = 0;
   let betInFlight = 0;
   const betFrameRectResponses = new Map();
@@ -326,50 +309,10 @@
     }
   }
 
-  // ---- 会话过期检测与自动恢复 ----
+  // ---- 会话过期检测 ----
 
   function isSessionExpiredText(text) {
     return /会话已过期|会话已经过期|再次登录|重新登录|session\s+(has\s+|may\s+be\s+|is\s+)?expired|authentication\s+failed/i.test(text);
-  }
-
-  /** 收集按钮,穿透开放 Shadow Root（客户端可能用 shadow DOM 渲染弹窗）。 */
-  function collectClickables(root, out, depth) {
-    try {
-      for (const el of root.querySelectorAll('button, a, [role="button"]')) out.push(el);
-      if (depth <= 0) return;
-      for (const el of root.querySelectorAll('*')) {
-        if (el.shadowRoot) collectClickables(el.shadowRoot, out, depth - 1);
-      }
-    } catch (_) {
-      // ignore
-    }
-  }
-
-  /** 点击 EV.7 弹窗里的 “Try again / 重试” 按钮:原地重新认证,比重载页面更轻。 */
-  function clickTryAgain() {
-    if (betInFlight > 0) return false;
-    const all = [];
-    collectClickables(document, all, 6);
-    const candidates = [];
-    for (const el of all) {
-      const text = String(el.innerText || el.textContent || '').trim();
-      if (!text || text.length > 40) continue;
-      if (/重新连接中/.test(text)) continue;
-      if (/try\s+again|retry|重试|重新尝试|再次尝试/i.test(text)) {
-        candidates.push(el);
-      }
-    }
-    for (const el of candidates) {
-      if (!isVisibleElement(el)) continue;
-      try {
-        el.click();
-      } catch (_) {
-        continue;
-      }
-      sendSessionAction('inline-recovery-click', String(el.innerText || el.textContent || '').trim().slice(0, 40));
-      return true;
-    }
-    return false;
   }
 
   function notifyTablesDisconnected(reason) {
@@ -387,57 +330,25 @@
   }
 
   function checkSessionExpired(bodyText) {
-    if (isSessionConflictText(bodyText) || !isSessionExpiredText(bodyText)) {
-      if (!isSessionConflictText(bodyText)) lastHealthyAt = Date.now();
+    if (isSessionConflictText(bodyText)) return;
+    if (!isSessionExpiredText(bodyText)) {
+      if (sessionExpiredSent) {
+        sessionExpiredSent = false;
+        sendSessionAction('recovered');
+      }
       return;
     }
-    if (!sessionExpiredSent) {
-      sessionExpiredSent = true;
-      sendToBackground({
-        kind: 'sessionExpired',
-        url: location.href,
-        frame: frameKind(),
-        textLength: bodyText.length,
-        recovering: recoveryAttempts > 0,
-        timestamp: new Date().toISOString(),
-      });
-      notifyTablesDisconnected('game-session-expired');
-    }
-    maybeRecoverSession();
-  }
-
-  /** 调度一次整页 reload(退避 + 跨刷新计数),不经过原地重试判断。 */
-  function scheduleRecoveryReload() {
-    if (recoveryTimer) return;
-    // 页面健康超过冷却期后又过期，视为新一轮过期，重新计数。
-    if (Date.now() - lastHealthyAt > RECOVERY_COOLDOWN_MS) recoveryAttempts = 0;
-    if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
-      scheduleSupervisoryRecovery();
-      return;
-    }
-    const delay = RECOVERY_DELAYS_MS[Math.min(recoveryAttempts, RECOVERY_DELAYS_MS.length - 1)];
-    recoveryTimer = setTimeout(() => {
-      recoveryTimer = null;
-      recoveryAttempts += 1;
-      try {
-        sessionStorage.setItem(RECOVERY_FLAG_KEY, String(recoveryAttempts));
-      } catch (_) {
-        // sessionStorage 不可用时仍尝试恢复，只是计数不跨刷新。
-      }
-      sendToBackground({
-        kind: 'sessionAction',
-        action: 'reload-scheduled',
-        attempt: recoveryAttempts,
-        url: location.href,
-        frame: frameKind(),
-        timestamp: new Date().toISOString(),
-      });
-      if (window.top === window) {
-        location.reload();
-      }
-      // iframe 帧:不自行 reload(会把游戏框跳去 entry 页),
-      // 后台收到 reload-scheduled(frame!==top)后刷新整个标签页。
-    }, delay);
+    if (sessionExpiredSent) return;
+    sessionExpiredSent = true;
+    sendToBackground({
+      kind: 'sessionExpired',
+      url: location.href,
+      frame: frameKind(),
+      textLength: bodyText.length,
+      recovering: false,
+      timestamp: new Date().toISOString(),
+    });
+    notifyTablesDisconnected('game-session-expired');
   }
 
   function isPragmaticGameContainer() {
@@ -449,106 +360,6 @@
     } catch (_) {
       return false;
     }
-  }
-
-  function clearSupervisoryRecovery() {
-    if (supervisoryRecoveryTimer) {
-      clearTimeout(supervisoryRecoveryTimer);
-      supervisoryRecoveryTimer = null;
-    }
-    supervisoryRecoveryAttempts = 0;
-    try {
-      sessionStorage.removeItem(RECOVERY_SUPERVISOR_KEY);
-    } catch (_) {
-      // ignore
-    }
-  }
-
-  function scheduleSupervisoryRecovery() {
-    if (supervisoryRecoveryTimer) return;
-    const delay = SUPERVISORY_RECOVERY_DELAYS_MS[
-      Math.min(supervisoryRecoveryAttempts, SUPERVISORY_RECOVERY_DELAYS_MS.length - 1)
-    ];
-    supervisoryRecoveryAttempts += 1;
-    try {
-      sessionStorage.setItem(RECOVERY_SUPERVISOR_KEY, String(supervisoryRecoveryAttempts));
-    } catch (_) {
-      // sessionStorage 不可用时仍在当前页面继续监督重试。
-    }
-    supervisoryRecoveryTimer = setTimeout(() => {
-      supervisoryRecoveryTimer = null;
-      recoveryAttempts = 0;
-      triedInlineRecovery = true;
-      scheduleRecoveryReload();
-    }, delay);
-  }
-
-  /** 原地重试点击 6 秒后判定:已恢复则复位上报,仍过期则升级为 reload。 */
-  function scheduleInlineCheck() {
-    inlineCheckTimer = setTimeout(() => {
-      inlineCheckTimer = null;
-      const bodyText = document.body ? document.body.innerText : '';
-      if (!isSessionExpiredText(bodyText)) {
-        recoveryAttempts = 0;
-        triedInlineRecovery = false;
-        sessionExpiredSent = false;
-        clearSupervisoryRecovery();
-        sendSessionAction('recovered', 'inline try-again');
-        return;
-      }
-      scheduleRecoveryReload();
-    }, 6000);
-  }
-
-  function maybeRecoverSession() {
-    // 刚 reload 完的页面先等 finishRecoveryCheck 判定，避免双重调度。
-    if (recoveryCheckTimer || recoveryTimer || inlineCheckTimer) return;
-    if (betInFlight > 0) {
-      recoveryTimer = setTimeout(() => {
-        recoveryTimer = null;
-        maybeRecoverSession();
-      }, 10 * 1000);
-      return;
-    }
-    // 优先原地重试(EV.7 的 “Try again” 按钮会重新认证,无需整页刷新)。
-    if (!triedInlineRecovery && clickTryAgain()) {
-      triedInlineRecovery = true;
-      scheduleInlineCheck();
-      return;
-    }
-    triedInlineRecovery = true;
-    scheduleRecoveryReload();
-  }
-
-  /** reload 后 8 秒判定恢复结果:仍过期则先试原地重试按钮,再升级下一轮 reload。 */
-  function finishRecoveryCheck() {
-    recoveryCheckTimer = null;
-    try {
-      sessionStorage.removeItem(RECOVERY_FLAG_KEY);
-    } catch (_) {
-      // ignore
-    }
-    const bodyText = document.body ? document.body.innerText : '';
-    if (!isSessionExpiredText(bodyText)) {
-      recoveryAttempts = 0;
-      triedInlineRecovery = false;
-      sessionExpiredSent = false;
-      clearSupervisoryRecovery();
-      sendSessionAction('recovered');
-      return;
-    }
-    if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
-      sendSessionAction('recovery-failed', 'still expired after ' + recoveryAttempts + ' reload attempts');
-      scheduleSupervisoryRecovery();
-      return;
-    }
-    if (!triedInlineRecovery && clickTryAgain()) {
-      triedInlineRecovery = true;
-      scheduleInlineCheck();
-      return;
-    }
-    triedInlineRecovery = true;
-    scheduleRecoveryReload();
   }
 
   // ---- 扫描主循环 ----
@@ -870,23 +681,6 @@
       // ignore
     }
   })();
-
-  // reload 恢复判定：带恢复标记加载的页面，加载 8 秒后判定是否真正恢复。
-  let pendingFlag = null;
-  let pendingSupervisorAttempts = null;
-  try {
-    pendingFlag = sessionStorage.getItem(RECOVERY_FLAG_KEY);
-    pendingSupervisorAttempts = sessionStorage.getItem(RECOVERY_SUPERVISOR_KEY);
-  } catch (_) {
-    pendingFlag = null;
-    pendingSupervisorAttempts = null;
-  }
-  supervisoryRecoveryAttempts = Math.max(0, Number(pendingSupervisorAttempts) || 0);
-  if (pendingFlag) {
-    recoveryAttempts = Math.max(1, Number(pendingFlag) || 1);
-    sessionExpiredSent = true; // 恢复检查期间抑制重复的 sessionExpired 上报
-    recoveryCheckTimer = setTimeout(finishRecoveryCheck, RECOVERY_CHECK_DELAY_MS);
-  }
 
   if (!GAME_PAGE) return; // 非游戏页面:内容脚本保持惰性
 

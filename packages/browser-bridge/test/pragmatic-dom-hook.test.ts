@@ -18,13 +18,14 @@ describe('Pragmatic DOM hook', () => {
     expect(source).not.toMatch(/video\.muted\s*=/);
   });
 
-  it('content script does not treat the reconnect banner as try-again', () => {
+  it('content script does not auto-reload after session expiry', () => {
     const content = readFileSync(
       new URL('../../../apps/browser-extension/content.js', import.meta.url),
       'utf8',
     );
-    expect(content).toMatch(/if \(\/重新连接中\/\.test\(text\)\) continue;/);
-    expect(content).not.toMatch(/reconnect\|重试\|重新尝试\|再次尝试\|重新连接/);
+    expect(content).not.toMatch(/location\.reload\s*\(/);
+    expect(content).not.toMatch(/reload-scheduled/);
+    expect(content).not.toMatch(/clickTryAgain/);
   });
 
   it.each([

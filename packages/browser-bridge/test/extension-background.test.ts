@@ -104,44 +104,7 @@ describe('extension background multitable command', () => {
   });
 
 
-  it('revokes the live gate before reloading a frozen baccarat popup', async () => {
-    const harness = await createHarness();
-
-    harness.socket.emit('message', {
-      data: JSON.stringify({
-        kind: 'command',
-        name: 'reloadGameTabs',
-        tableIds: ['bc281koreanch281', 'tobcbaccaragen92'],
-      }),
-    });
-    await flushBetHarnessAsyncWork();
-    await flushBetHarnessAsyncWork();
-
-    expect(harness.chrome.storage.local.set).toHaveBeenCalledWith({ liveBetEnabled: false });
-    expect(harness.chrome.tabs.reload).toHaveBeenCalledOnce();
-    expect(harness.chrome.tabs.reload).toHaveBeenCalledWith(42, { bypassCache: true });
-    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
-      kind: 'sessionAction',
-      action: 'command-executed',
-      detail: 'reloadGameTabs:reloaded=1:tables=2',
-    }));
-
-    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest('blocked-after-reload')) });
-    await flushBetHarnessAsyncWork();
-    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
-      kind: 'betResult',
-      requestId: 'blocked-after-reload',
-      receipt: expect.objectContaining({
-        status: 'REJECTED',
-        raw: expect.objectContaining({
-          commitStarted: false,
-          reason: expect.stringContaining('live betting is disabled'),
-        }),
-      }),
-    }));
-  });
-
-  it('reloads the Pragmatic Jeju popup without treating unrelated popup games as baccarat', async () => {
+  it('ignores reloadGameTabs and does not reload the game popup', async () => {
     const harness = await createHarness({
       tabs: [
         { id: 42, url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat' },
@@ -153,18 +116,16 @@ describe('extension background multitable command', () => {
       data: JSON.stringify({
         kind: 'command',
         name: 'reloadGameTabs',
-        tableIds: ['bc281koreanch281'],
+        tableIds: ['bc281koreanch281', 'tobcbaccaragen92'],
       }),
     });
     await flushBetHarnessAsyncWork();
     await flushBetHarnessAsyncWork();
 
-    expect(harness.chrome.tabs.reload).toHaveBeenCalledOnce();
-    expect(harness.chrome.tabs.reload).toHaveBeenCalledWith(42, { bypassCache: true });
-    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
-      kind: 'sessionAction',
-      detail: 'reloadGameTabs:reloaded=1:tables=1',
-    }));
+    expect(harness.chrome.tabs.reload).not.toHaveBeenCalled();
+    expect(sentMessages(harness.socket).some(
+      message => String(message.detail || '').startsWith('reloadGameTabs:'),
+    )).toBe(false);
   });
 
   it('reports Pragmatic readiness without executing a wager', async () => {
@@ -206,7 +167,7 @@ describe('extension background multitable command', () => {
     }));
   });
 
-  it('does not navigate a dedicated table frame when multiplay is already open', async () => {
+  it('ignores openMultiView and does not change game frames', async () => {
     const harness = await createHarness({
       tabs: [{
         id: 42,
@@ -241,20 +202,14 @@ describe('extension background multitable command', () => {
     await flushBetHarnessAsyncWork();
 
     expect(harness.executeScript.mock.calls.some(
-      ([injection]) => String(injection.func).includes('pragmatic-frame-routes'),
-    )).toBe(true);
-    expect(harness.executeScript.mock.calls.some(
-      ([injection]) => String(injection.func).includes("location.pathname = '/desktop/multibaccarat/'")
-        && Array.isArray(injection.target?.frameIds),
+      ([injection]) => String(injection.func).includes('pragmatic-frame-routes')
+        || String(injection.func).includes("location.pathname = '/desktop/multibaccarat/'")
+        || String(injection.func).includes('control.click')
+        || String(injection.func).includes('多台'),
     )).toBe(false);
-    expect(harness.executeScript.mock.calls.some(
-      ([injection]) => String(injection.func).includes("location.replace('about:blank')"),
+    expect(sentMessages(harness.socket).some(
+      message => String(message.detail || '').startsWith('openMultiView:'),
     )).toBe(false);
-    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
-      kind: 'sessionAction',
-      action: 'dual-game-session',
-      detail: expect.stringContaining('multibaccarat'),
-    }));
   });
 
   it('does not blank multiplay when a dedicated table frame is also present', async () => {
