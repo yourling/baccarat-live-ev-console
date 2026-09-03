@@ -122,6 +122,7 @@ describe('DesktopConsoleService unattended runtime', () => {
     const directory = mkdtempSync(join(tmpdir(), 'baccarat-runtime-card-stale-'));
     const service = new DesktopConsoleService(join(directory, 'console.sqlite'));
     try {
+      await service.setKeepaliveEnabled(true);
       await service.setAutomationEnabled(true);
       service['handleBridgeRuntimeEvent']({
         kind: 'execution-gate-revoked',
@@ -550,7 +551,7 @@ describe('DesktopConsoleService unattended runtime', () => {
       });
       expect(afterRollover.runtime.tables.D055?.reasons).not.toContain('settlement-gap');
 
-      const enabled = await service.setAutomationEnabled(true);
+      const enabled = await service.setKeepaliveEnabled(true);
       expect(enabled.keepalive.enabled).toBe(true);
       expect(enabled.runtime.executionReady).toBe(true);
       expect(enabled.runtime.status).toBe('degraded');

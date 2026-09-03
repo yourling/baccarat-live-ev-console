@@ -95,13 +95,26 @@ export function computeModelComponents(
  * 精确后验边际化的普通对子概率。
  * 对未知牌面的烧牌，使用超几何期望公式，而不是机械扣除“估计烧牌数”。
  */
-export function pairProbabilityMean(
-  initialCounts: Counts,
-  burnModel: BurnModel,
-  observedCards: Card[] = [],
-): number {
-  const { base, unknownBurnCount: u } = computeModelComponents(initialCounts, burnModel, observedCards);
+export function unknownBurnCount(burnModel: BurnModel): number {
+  assertValidBurnModel(burnModel, 'burnModel');
+  switch (burnModel.kind) {
+    case 'unknown':
+      return 0;
+    case 'countKnown':
+      return burnModel.count ?? 0;
+    case 'partialKnown':
+      return Math.max(0, (burnModel.count ?? 0) - (burnModel.knownCards?.length ?? 0));
+    case 'fullyKnown':
+      return 0;
+  }
+}
+
+export function pairProbabilityOnBase(base: Counts, unknownBurn: number): number {
   assertCounts(base, 'base');
+  if (!Number.isInteger(unknownBurn) || unknownBurn < 0) {
+    throw new RangeError(`unknownBurn must be a non-negative integer, got ${unknownBurn}`);
+  }
+  const u = unknownBurn;
   const baseTotal = totalCards(base);
   if (u === 0) return exactPairProbability(base);
   const remainingTotal = baseTotal - u;
@@ -113,6 +126,29 @@ export function pairProbabilityMean(
     expectedPairs += expectedComplementPairs(a, s, u);
   }
   return expectedPairs / combinations2(remainingTotal);
+}
+
+export function pairProbabilityWorstOnBase(base: Counts, unknownBurn: number): number {
+  assertCounts(base, 'base');
+  if (!Number.isInteger(unknownBurn) || unknownBurn < 0) {
+    throw new RangeError(`unknownBurn must be a non-negative integer, got ${unknownBurn}`);
+  }
+  const counts = { ...base } as Counts;
+  for (let i = 0; i < unknownBurn; i++) {
+    let worst: CardRank = 'A';
+    for (const r of CARD_RANKS) if (counts[r] > counts[worst]) worst = r;
+    counts[worst] = Math.max(0, counts[worst] - 1);
+  }
+  return exactPairProbability(counts);
+}
+
+export function pairProbabilityMean(
+  initialCounts: Counts,
+  burnModel: BurnModel,
+  observedCards: Card[] = [],
+): number {
+  const { base, unknownBurnCount: u } = computeModelComponents(initialCounts, burnModel, observedCards);
+  return pairProbabilityOnBase(base, u);
 }
 
 function expectedComplementPairs(a: number, s: number, u: number): number {
@@ -135,14 +171,7 @@ export function pairProbabilityWorstCase(
   observedCards: Card[] = [],
 ): number {
   const { base, unknownBurnCount: u } = computeModelComponents(initialCounts, burnModel, observedCards);
-  assertCounts(base, 'base');
-  const counts = { ...base } as Counts;
-  for (let i = 0; i < u; i++) {
-    let worst: CardRank = 'A';
-    for (const r of CARD_RANKS) if (counts[r] > counts[worst]) worst = r;
-    counts[worst] = Math.max(0, counts[worst] - 1);
-  }
-  return exactPairProbability(counts);
+  return pairProbabilityWorstOnBase(base, u);
 }
 
 export function evForPair(odds: OddsConfig, p: number): number {
@@ -161,6 +190,26 @@ export function evaluatePairMarket(
   const initial = initialDeckCounts(profile.numberOfDecks);
   const pMean = pairProbabilityMean(initial, profile.burnModel, observedCards);
   const pLower = pairProbabilityWorstCase(initial, profile.burnModel, observedCards);
+  const odds = profile.odds[market];
+  return {
+    pMean,
+    pLower,
+    evMean: evForPair(odds, pMean),
+    evLower: evForPair(odds, pLower),
+  };
+}
+
+export function evaluatePairMarketFromRemaining(
+  profile: TableProfile,
+  market: BettingMarket,
+  remainingCounts: Counts,
+): { pMean: number; pLower: number; evMean: number; evLower: number } {
+  assertValidTableProfile(profile);
+  if (market !== 'bankerPair' && market !== 'playerPair') throw new RangeError(`unknown market: ${market}`);
+  assertCounts(remainingCounts, 'remainingCounts');
+  const unknownBurn = unknownBurnCount(profile.burnModel);
+  const pMean = pairProbabilityOnBase(remainingCounts, unknownBurn);
+  const pLower = pairProbabilityWorstOnBase(remainingCounts, unknownBurn);
   const odds = profile.odds[market];
   return {
     pMean,

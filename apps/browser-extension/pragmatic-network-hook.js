@@ -1,9 +1,14 @@
 /**
  * Passive Pragmatic Play transport observer (MAIN world).
  *
- * This hook mirrors received transport messages to the isolated content script
- * and, when a previous real bet send has been observed, can replay a mutated
- * copy of that send for request-path betting.
+ * This hook mirrors received *game protocol* WebSocket frames to the isolated
+ * content script and, when a previous real bet send has been observed, can
+ * replay a mutated copy of that send for request-path betting.
+ * It never sends <autoBet>. Multiplay already lets lpbet target any visible
+ * tile. Same-frame reconnects must wait for the new game socket to receive
+ * before retiring the old one. The official client can keep a dedicated table
+ * and multibaccarat open together; do not treat that as a conflict.
+ * It does not observe fetch/XHR/Worker/MessageChannel/video sockets.
  */
 (function () {
   if (!/(^|\.)(?:pragmaticplaylive\.net|vbgames88\.com|zavjcswh\.biz)$/i.test(location.hostname)) return;
@@ -12,21 +17,12 @@
 
   const MAX_PENDING_MESSAGES = 64;
   const pending = [];
-  const observedMessageTargets = new WeakSet();
   let contentReady = false;
 
-  function bufferToBase64(buffer, byteOffset, byteLength) {
-    const bytes = new Uint8Array(
-      buffer,
-      Number.isInteger(byteOffset) ? byteOffset : 0,
-      Number.isInteger(byteLength) ? byteLength : buffer.byteLength,
-    );
-    let binary = '';
-    const chunkSize = 0x8000;
-    for (let index = 0; index < bytes.length; index += chunkSize) {
-      binary += String.fromCharCode.apply(null, bytes.subarray(index, index + chunkSize));
-    }
-    return btoa(binary);
+  function isGameProtocolSocket(url) {
+    const href = String(url || '');
+    if (/video|webrtc|mediaserver|mdvuz|hls|mpegts|dash|\.m3u8/i.test(href)) return false;
+    return /pragmaticplaylive\.net\/game/i.test(href);
   }
 
   function post(message) {
@@ -43,12 +39,22 @@
   }
 
   const liveSockets = [];
+  const seenTableIds = new Set();
   let lastBetTemplate = '';
   let lastUid = '';
   let lastGm = 'mtb_desktop';
+  let sessionReleased = false;
+
+  function pruneDeadSockets() {
+    for (let index = liveSockets.length - 1; index >= 0; index -= 1) {
+      const socket = liveSockets[index] && liveSockets[index].socket;
+      if (!socket || socket.readyState > 1) liveSockets.splice(index, 1);
+    }
+  }
 
   function rememberSocket(socket, url) {
     if (!socket) return;
+    pruneDeadSockets();
     const href = String(url || '');
     for (const entry of liveSockets) {
       if (entry.socket === socket) {
@@ -57,6 +63,34 @@
       }
     }
     liveSockets.push({ socket, url: href });
+    if (typeof socket.addEventListener === 'function') {
+      socket.addEventListener('close', pruneDeadSockets);
+      socket.addEventListener('error', pruneDeadSockets);
+    }
+  }
+
+  // Close previous same-frame game sockets only after the new one is actually
+  // receiving. Closing on construct kills the live feed; leaving two live
+  // sockets in this same multi frame makes that page reconnect by itself.
+  function adoptGameSocket(socket, url) {
+    if (sessionReleased || !isGameProtocolSocket(url)) return;
+    let newest = null;
+    for (let index = liveSockets.length - 1; index >= 0; index -= 1) {
+      const entry = liveSockets[index];
+      if (entry && isGameProtocolSocket(entry.url)) {
+        newest = entry;
+        break;
+      }
+    }
+    if (!newest || newest.socket !== socket) return;
+    for (let index = liveSockets.length - 1; index >= 0; index -= 1) {
+      const entry = liveSockets[index];
+      if (!entry || entry.socket === socket || !isGameProtocolSocket(entry.url)) continue;
+      if (entry.socket && entry.socket.readyState < 2) {
+        try { entry.socket.close(); } catch (_) {}
+      }
+      liveSockets.splice(index, 1);
+    }
   }
 
   function sendText(data) {
@@ -78,9 +112,62 @@
       && /table|game|round|playtype|playType|market/i.test(text);
   }
 
+  function isBettableTableId(tableId) {
+    return typeof tableId === 'string' && /^[a-z0-9]{8,32}$/i.test(tableId);
+  }
+
+  function rememberTableId(value) {
+    let tableId = String(value || '').trim();
+    if (/^table-/i.test(tableId)) tableId = tableId.slice('table-'.length);
+    if (isBettableTableId(tableId)) seenTableIds.add(tableId.toLowerCase());
+  }
+
+  function rememberTablesFromJson(value, depth) {
+    if (!value || typeof value !== 'object' || depth > 5) return;
+    if (Array.isArray(value)) {
+      for (const item of value) rememberTablesFromJson(item, depth + 1);
+      return;
+    }
+    for (const key of ['table', 'tableId', 'table_id', 'channel']) {
+      const raw = value[key];
+      if (typeof raw === 'string') rememberTableId(raw);
+    }
+    for (const nested of Object.values(value)) {
+      if (nested && typeof nested === 'object') rememberTablesFromJson(nested, depth + 1);
+    }
+  }
+
+  function rememberTablesFromText(text) {
+    if (!text) return;
+    for (const match of String(text).matchAll(/\b(?:channel|table|tableId|table_id)="([^"]+)"/gi)) {
+      rememberTableId(match[1]);
+    }
+    try {
+      rememberTablesFromJson(JSON.parse(text), 0);
+    } catch (_) {}
+  }
+
+  function dedicatedBoundTableId() {
+    try {
+      if (String(location.pathname || '') !== '/desktop/baccarat/') return '';
+      const tableId = new URL(document.referrer).searchParams.get('table_id') || '';
+      return isBettableTableId(tableId) ? tableId.toLowerCase() : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function knownTableIds() {
+    const tableIds = new Set(seenTableIds);
+    const bound = dedicatedBoundTableId();
+    if (bound) tableIds.add(bound);
+    return [...tableIds];
+  }
+
   function rememberSession(data) {
     const text = sendText(data);
     if (!text) return;
+    rememberTablesFromText(text);
     const uId = xmlAttr(text, 'uId');
     if (uId) lastUid = uId;
     const gm = xmlAttr(text, 'gm');
@@ -162,15 +249,37 @@
     return fallback;
   }
 
+  function releaseGameSession() {
+    sessionReleased = true;
+    for (const entry of liveSockets.slice()) {
+      try {
+        if (entry && entry.socket && entry.socket.readyState < 2) entry.socket.close();
+      } catch (_) {}
+    }
+    liveSockets.length = 0;
+    lastUid = '';
+    lastBetTemplate = '';
+    return { ok: true };
+  }
+
   function placePragmaticBet(command) {
+    if (sessionReleased) return { ok: false, reason: 'session-released' };
+    if (!isBettableTableId(command && command.tableId)) {
+      return { ok: false, reason: 'invalid-table-id' };
+    }
+    const tableId = String(command.tableId).toLowerCase();
+    const bound = dedicatedBoundTableId();
+    if (bound && bound !== tableId) {
+      return { ok: false, reason: 'table-not-in-current-session' };
+    }
+    if (!knownTableIds().includes(tableId)) {
+      return { ok: false, reason: 'table-not-in-current-session' };
+    }
     const payload = mutateBetTemplate(command);
     if (!payload) return { ok: false, reason: 'bet-template-missing' };
     const socket = pickGameSocket();
     if (!socket) return { ok: false, reason: 'bet-socket-not-open' };
     try {
-      if (/<lpbet[\s>]/i.test(payload) && command && command.tableId) {
-        socket.send('<command channel="table-' + command.tableId + '"><autoBet></autoBet></command>');
-      }
       socket.send(payload);
       return { ok: true };
     } catch (_) {
@@ -180,63 +289,32 @@
 
   globalThis.__baccaratPragmaticBetChannel = {
     placeBet: placePragmaticBet,
+    releaseSession: releaseGameSession,
     hasTemplate() { return lastBetTemplate.length > 0 || lastUid.length > 0; },
     status() {
+      const boundTableId = dedicatedBoundTableId();
       return {
         hasUser: Boolean(lastUid || xmlAttr(lastBetTemplate, 'uId')),
-        hasSocket: Boolean(pickGameSocket()),
+        hasSocket: !sessionReleased && Boolean(pickGameSocket()),
+        framePath: String(location.pathname || ''),
+        gm: lastGm || 'mtb_desktop',
+        tableIds: knownTableIds(),
+        released: sessionReleased,
+        ...(boundTableId ? { boundTableId } : {}),
       };
     },
     templatePreview() { return lastBetTemplate.slice(0, 400); },
   };
 
-  function capture(source, url, value, direction) {
-    const base = {
-      source,
+  function captureGameSocket(url, value, direction) {
+    if (typeof value !== 'string' || !value || value.length > 16_384) return;
+    post({
+      source: 'baccarat-bridge-pragmatic-ws',
       url: String(url || ''),
       direction: direction === 'send' ? 'send' : 'recv',
-    };
-    if (typeof value === 'string') {
-      if (!value) return;
-      post({ ...base, encoding: 'text', data: value });
-      return;
-    }
-    if (value instanceof ArrayBuffer) {
-      post({ ...base, encoding: 'base64', data: bufferToBase64(value) });
-      return;
-    }
-    if (ArrayBuffer.isView(value)) {
-      post({
-        ...base,
-        encoding: 'base64',
-        data: bufferToBase64(value.buffer, value.byteOffset, value.byteLength),
-      });
-      return;
-    }
-    if (typeof Blob !== 'undefined' && value instanceof Blob && typeof value.arrayBuffer === 'function') {
-      value.arrayBuffer().then(buffer => capture(source, url, buffer)).catch(() => {});
-      return;
-    }
-    if (typeof value === 'object' && value !== null) {
-      try {
-        const data = JSON.stringify(value);
-        if (data && data !== '{}') post({ ...base, encoding: 'text', data });
-      } catch (_) {
-        // Cyclic structured-clone values are not useful to the JSON parser.
-      }
-    }
-  }
-
-  function observeMessageTarget(target, source, url) {
-    if (!target || typeof target.addEventListener !== 'function') return;
-    if (observedMessageTargets.has(target)) return;
-    observedMessageTargets.add(target);
-    try {
-      target.addEventListener('message', event => capture(source, url, event.data));
-      if (typeof target.start === 'function') target.start();
-    } catch (_) {
-      // A closing port is no longer a useful state source.
-    }
+      encoding: 'text',
+      data: value,
+    });
   }
 
   window.addEventListener('message', event => {
@@ -248,43 +326,11 @@
   window.addEventListener('message', event => {
     if (event.source !== window || event.origin !== location.origin) return;
     if (!event.data || event.data.source !== 'baccarat-bridge-pragmatic-restore-bet-template') return;
+    if (sessionReleased) return;
     if (event.data.uId) lastUid = String(event.data.uId);
     if (event.data.gm) lastGm = String(event.data.gm);
     rememberSession(event.data.template);
   });
-  window.addEventListener('message', event => {
-    if (event.source === window && event.data && typeof event.data === 'object') {
-      const source = event.data.source;
-      if (typeof source === 'string' && source.startsWith('baccarat-bridge-')) return;
-    }
-    for (const port of Array.from(event.ports || [])) {
-      observeMessageTarget(port, 'baccarat-bridge-pragmatic-message-port', location.href);
-    }
-    capture('baccarat-bridge-pragmatic-window', location.href, event.data);
-  });
-
-  const OriginalMessageChannel = window.MessageChannel;
-  if (typeof OriginalMessageChannel === 'function') {
-    function PragmaticObservedMessageChannel() {
-      const channel = new OriginalMessageChannel();
-      observeMessageTarget(channel.port1, 'baccarat-bridge-pragmatic-message-port', location.href);
-      observeMessageTarget(channel.port2, 'baccarat-bridge-pragmatic-message-port', location.href);
-      return channel;
-    }
-    PragmaticObservedMessageChannel.prototype = OriginalMessageChannel.prototype;
-    try { Object.setPrototypeOf(PragmaticObservedMessageChannel, OriginalMessageChannel); } catch (_) {}
-    window.MessageChannel = PragmaticObservedMessageChannel;
-  }
-
-  try {
-    observeMessageTarget(
-      navigator && navigator.serviceWorker,
-      'baccarat-bridge-pragmatic-service-worker',
-      location.href,
-    );
-  } catch (_) {
-    // Service workers are unavailable in some embedded contexts.
-  }
 
   const OriginalWebSocket = window.WebSocket;
   if (typeof OriginalWebSocket === 'function') {
@@ -293,18 +339,27 @@
         ? new OriginalWebSocket(url)
         : new OriginalWebSocket(url, protocols);
       try {
+        if (sessionReleased && isGameProtocolSocket(url)) {
+          try { socket.close(); } catch (_) {}
+          return socket;
+        }
+        rememberSocket(socket, url);
+        if (!isGameProtocolSocket(url)) return socket;
         socket.addEventListener('message', event => {
-          capture('baccarat-bridge-pragmatic-ws', url, event.data);
+          if (typeof event.data !== 'string') return;
+          adoptGameSocket(socket, url);
+          captureGameSocket(url, event.data);
           rememberSession(event.data);
         });
         const originalSend = socket.send.bind(socket);
         socket.send = function (data) {
-          capture('baccarat-bridge-pragmatic-ws', url, data, 'send');
-          rememberSession(data);
+          if (typeof data === 'string') {
+            captureGameSocket(url, data, 'send');
+            rememberSession(data);
+          }
           rememberSocket(socket, url);
           return originalSend(data);
         };
-        rememberSocket(socket, url);
       } catch (_) {
         // A native socket implementation may reject listener replacement.
       }
@@ -316,120 +371,5 @@
       try { PragmaticObservedWebSocket[key] = OriginalWebSocket[key]; } catch (_) {}
     }
     window.WebSocket = PragmaticObservedWebSocket;
-  }
-
-  const OriginalWorker = window.Worker;
-  if (typeof OriginalWorker === 'function') {
-    function PragmaticObservedWorker(url, options) {
-      const worker = options === undefined
-        ? new OriginalWorker(url)
-        : new OriginalWorker(url, options);
-      try {
-        worker.addEventListener('message', event => {
-          capture('baccarat-bridge-pragmatic-worker', url, event.data);
-        });
-      } catch (_) {
-        // A terminating Worker is retried by the next page instance.
-      }
-      return worker;
-    }
-    PragmaticObservedWorker.prototype = OriginalWorker.prototype;
-    try { Object.setPrototypeOf(PragmaticObservedWorker, OriginalWorker); } catch (_) {}
-    window.Worker = PragmaticObservedWorker;
-  }
-
-  const OriginalSharedWorker = window.SharedWorker;
-  if (typeof OriginalSharedWorker === 'function') {
-    function PragmaticObservedSharedWorker(url, options) {
-      const worker = options === undefined
-        ? new OriginalSharedWorker(url)
-        : new OriginalSharedWorker(url, options);
-      observeMessageTarget(worker.port, 'baccarat-bridge-pragmatic-shared-worker', url);
-      return worker;
-    }
-    PragmaticObservedSharedWorker.prototype = OriginalSharedWorker.prototype;
-    try { Object.setPrototypeOf(PragmaticObservedSharedWorker, OriginalSharedWorker); } catch (_) {}
-    window.SharedWorker = PragmaticObservedSharedWorker;
-  }
-
-  const OriginalEventSource = window.EventSource;
-  if (typeof OriginalEventSource === 'function') {
-    function PragmaticObservedEventSource(url, options) {
-      const source = options === undefined
-        ? new OriginalEventSource(url)
-        : new OriginalEventSource(url, options);
-      observeMessageTarget(source, 'baccarat-bridge-pragmatic-sse', url);
-      return source;
-    }
-    PragmaticObservedEventSource.prototype = OriginalEventSource.prototype;
-    try { Object.setPrototypeOf(PragmaticObservedEventSource, OriginalEventSource); } catch (_) {}
-    window.EventSource = PragmaticObservedEventSource;
-  }
-
-  const OriginalBroadcastChannel = window.BroadcastChannel;
-  if (typeof OriginalBroadcastChannel === 'function') {
-    function PragmaticObservedBroadcastChannel(name) {
-      const channel = new OriginalBroadcastChannel(name);
-      observeMessageTarget(channel, 'baccarat-bridge-pragmatic-broadcast', `broadcast:${String(name)}`);
-      return channel;
-    }
-    PragmaticObservedBroadcastChannel.prototype = OriginalBroadcastChannel.prototype;
-    try { Object.setPrototypeOf(PragmaticObservedBroadcastChannel, OriginalBroadcastChannel); } catch (_) {}
-    window.BroadcastChannel = PragmaticObservedBroadcastChannel;
-  }
-
-  const originalFetch = window.fetch;
-  if (typeof originalFetch === 'function') {
-    window.fetch = function (...args) {
-      const input = args[0];
-      const init = args[1];
-      const url = typeof input === 'string' ? input : (input && input.url) || '';
-      const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
-      if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
-        const body = init && init.body;
-        capture('baccarat-bridge-pragmatic-http', url, body || '', 'send');
-        rememberSession(body);
-      }
-      const promise = originalFetch.apply(this, args);
-      promise.then(response => {
-        try {
-          response.clone().text().then(text => {
-            if (text) capture('baccarat-bridge-pragmatic-http', url, text);
-          }).catch(() => {});
-        } catch (_) {}
-      }).catch(() => {});
-      return promise;
-    };
-  }
-
-  const OriginalXhr = window.XMLHttpRequest;
-  if (typeof OriginalXhr === 'function') {
-    function PragmaticObservedXhr() {
-      const xhr = new OriginalXhr();
-      const originalOpen = xhr.open;
-      xhr.open = function (method, url, ...rest) {
-        this.__baccaratPragmaticUrl = String(url || '');
-        this.__baccaratPragmaticMethod = String(method || 'GET').toUpperCase();
-        return originalOpen.call(this, method, url, ...rest);
-      };
-      const originalSend = xhr.send;
-      xhr.send = function (body) {
-        if (this.__baccaratPragmaticMethod === 'POST' || this.__baccaratPragmaticMethod === 'PUT' || this.__baccaratPragmaticMethod === 'PATCH') {
-          capture('baccarat-bridge-pragmatic-http', this.__baccaratPragmaticUrl, body || '', 'send');
-          rememberSession(body);
-        }
-        return originalSend.call(this, body);
-      };
-      xhr.addEventListener('load', function () {
-        try {
-          if (typeof this.responseText === 'string' && this.responseText) {
-            capture('baccarat-bridge-pragmatic-http', this.__baccaratPragmaticUrl, this.responseText);
-          }
-        } catch (_) {}
-      });
-      return xhr;
-    }
-    PragmaticObservedXhr.prototype = OriginalXhr.prototype;
-    window.XMLHttpRequest = PragmaticObservedXhr;
   }
 })();

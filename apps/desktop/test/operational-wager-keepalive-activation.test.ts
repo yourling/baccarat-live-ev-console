@@ -42,6 +42,9 @@ describe('OperationalWagerCoordinator keepalive activation', () => {
         market: 'banker',
         amount: 20,
       }, BASE_TIME);
+      await coordinator.tick(BASE_TIME, 'bc281koreanch281');
+      expect(placeOperationalWager).not.toHaveBeenCalled();
+      await coordinator.tick(BASE_TIME, 'D001');
 
       expect(placeOperationalWager).toHaveBeenCalledTimes(1);
       expect(coordinator.getKeepaliveState().lastTableId).toBe('D001');
@@ -72,11 +75,12 @@ describe('OperationalWagerCoordinator keepalive activation', () => {
         market: 'banker',
         amount: 20,
       }, BASE_TIME);
+      await coordinator.tick(BASE_TIME, 'D001');
       expect(placeOperationalWager).toHaveBeenCalledTimes(1);
       expect(coordinator.getKeepaliveState().lastAttemptAt).toBeUndefined();
 
       open = true;
-      await coordinator.tick(new Date(BASE_TIME.valueOf() + 15_000));
+      await coordinator.tick(new Date(BASE_TIME.valueOf() + 15_000), 'D001');
 
       expect(placeOperationalWager).toHaveBeenCalledTimes(2);
       expect(coordinator.getKeepaliveState()).toMatchObject({
@@ -108,6 +112,7 @@ describe('OperationalWagerCoordinator keepalive activation', () => {
         market: 'banker',
         amount: 20,
       }, BASE_TIME);
+      await coordinator.tick(BASE_TIME, 'D001');
       await coordinator.updateKeepalive({
         enabled: false,
         intervalMinutes: 10,
@@ -120,6 +125,7 @@ describe('OperationalWagerCoordinator keepalive activation', () => {
         market: 'banker',
         amount: 20,
       }, new Date(BASE_TIME.valueOf() + 2_000));
+      await coordinator.tick(new Date(BASE_TIME.valueOf() + 2_000), 'D001');
 
       expect(placeOperationalWager).toHaveBeenCalledTimes(2);
     } finally {

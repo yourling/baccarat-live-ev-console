@@ -37,6 +37,7 @@ const api = {
     ipcRenderer.invoke('console:settle-pending-operational-wager', command),
   updateKeepaliveSettings: (settings: DesktopKeepaliveStrategySettings) =>
     ipcRenderer.invoke('console:update-keepalive-settings', settings),
+  setKeepaliveEnabled: (enabled: boolean) => ipcRenderer.invoke('console:set-keepalive-enabled', enabled),
   setAutomationEnabled: (enabled: boolean) => ipcRenderer.invoke('console:set-automation-enabled', enabled),
   acknowledgeRuntimeIncident: (incidentId: string) =>
     ipcRenderer.invoke('console:acknowledge-runtime-incident', incidentId),

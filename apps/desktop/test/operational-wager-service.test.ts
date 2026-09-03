@@ -300,7 +300,7 @@ describe('DesktopConsoleService operational wagers', () => {
         market: 'player',
         amount: 20,
       });
-      await service.setAutomationEnabled(true);
+      await service.setKeepaliveEnabled(true);
       const settings = await service.updateKeepaliveSettings({
         intervalMinutes: 5,
         market: 'banker',
@@ -760,14 +760,14 @@ describe('DesktopConsoleService operational wagers', () => {
         baseline: 'unknown-monitor-session',
       });
 
-      await service.setAutomationEnabled(true);
+      await service.setKeepaliveEnabled(true);
       expect(requestOperationalWager).not.toHaveBeenCalled();
 
       // When: a protocol-backed window opens before a physical-shoe confirmation.
       await service.injectEvent(openWindow('D001'));
       await waitFor(() => requestOperationalWager.mock.calls.length > 0);
 
-      // Then: fixed keepalive uses the controlled live path, while EV pair automation can remain armed.
+      // Then: fixed keepalive uses the controlled live path; pair EV stays disarmed until the physical shoe is known.
       expect(requestOperationalWager).toHaveBeenCalledWith(expect.objectContaining({
         mode: 'live',
         wager: expect.objectContaining({
@@ -783,7 +783,7 @@ describe('DesktopConsoleService operational wagers', () => {
           source: 'keepalive',
         }),
       }));
-      expect(service.snapshot().snapshot.tables.D001?.projection.autoBetStatus).toBe('ARMED');
+      expect(service.snapshot().snapshot.tables.D001?.projection.autoBetStatus).toBe('DISARMED');
       expect(service.snapshot().runtime.reasons).not.toContain('physical-shoe-baseline-unknown');
     } finally {
       await service.close();
@@ -819,7 +819,7 @@ describe('DesktopConsoleService operational wagers', () => {
         ...physicalShoe('bc281koreanch281'),
         baseline: 'unknown-monitor-session',
       });
-      await service.setAutomationEnabled(true);
+      await service.setKeepaliveEnabled(true);
       await service.injectEvent(openWindow('bc281koreanch281'));
       await waitFor(() => requestOperationalWager.mock.calls.length > 0);
 

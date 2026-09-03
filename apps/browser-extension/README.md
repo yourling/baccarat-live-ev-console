@@ -1,24 +1,19 @@
 # Baccarat Real Room Bridge 浏览器扩展
 
-这是一个 Chrome/Edge Manifest V3 浏览器扩展骨架，用于：
+这是 Chrome/Edge Manifest V3 扩展，用于：
 
-1. 从真实游戏房间页面抽取房间/桌台数据；
+1. 从真实 Pragmatic Play 游戏页面抽取房间/桌台数据；
 2. 通过本地 WebSocket 桥接到 `@baccarat/browser-bridge`；
-3. 执行 Pragmatic Play 页面下注请求的浏览器端实现。
+3. 在页面 MAIN world 执行 `lpbet` 下注请求。
 
 **发布状态：仅限隔离、非资金的集成与长稳验证。** 扩展包含会调用页面下注方法的代码，工程侧执行链路已统一加固，但当前仍未获得真实资金发布审批或授权。
 
 当前执行实现分为两条路径：
 
 - `BetIntent`/单次下注路径仅支持 Pragmatic Play 的庄对/闲对。桌面端先经过 actor、reservation 和全局风控，再由 `background.js` 与 `pragmatic-bet-runtime.js` 执行。
-- `OperationalWager` 支持庄、闲、庄对、闲对，用于桌面端手动按钮和庄/闲保活调度。它同样经过 `TableActor`、reservation、全局风控、回执审计、结算和按桌/靴/局/市场/来源的重复保护。
+- `OperationalWager` 支持庄、闲、庄对、闲对，用于桌面端手动按钮和庄/闲保活调度。它同样经过 `TableActor`、reservation、全局风控、回执审计、结算和按桌/靴/局/市场/来源的重复保护，并要求桌面 `live`。
 
-扩展只加载 Pragmatic 钩子：`pragmatic-network-hook.js`、`pragmatic-dom-hook.js`、`pragmatic-bet-runtime.js`。Dafabet 仅保留 Jeju Speed Baccarat 弹窗启动器权限。
-
-- `matches`
-- `roomSelector` / `tableSelector`
-- `extractRooms(doc)`
-- `extractTableEvent(doc, tableId)`
+扩展只加载 Pragmatic 钩子：`pragmatic-network-hook.js`、`pragmatic-dom-hook.js`、`pragmatic-bet-runtime.js`。网络钩子只抓游戏协议 WebSocket，不再镜像 fetch / Worker / 页面 IPC。Dafabet 仅保留 Jeju Speed Baccarat 弹窗启动器权限。多台页（`/desktop/multibaccarat/`）直接发 `lpbet`，不发送 `autoBet`，也不再点视频入座（`skipped-no-join`）。
 
 ## 加载扩展
 
@@ -47,10 +42,11 @@ await server.start();
 
 ```
 真实游戏页面
-  → content.js 抽取房间/桌台/牌局事件
+  → pragmatic-network-hook.js（仅游戏协议 WebSocket）
+  → pragmatic-dom-hook.js / content.js
   → background.js WebSocket
   → BrowserBridgeServer
-  → BridgeTableExport / RoomMonitor
+  → Pragmatic 运行时归一化 / BridgeTableExport / RoomMonitor
   → ledger-state / orchestrator
 ```
 
@@ -58,7 +54,9 @@ await server.start();
 
 `background.js` 在收到执行请求后，会尝试验证当前扩展会话的 live gate，并要求浏览器中恰好存在一个 Dafabet Pragmatic 弹窗（`/live-dealer/popup-launch/jeju-speed-baccarat`），其 iframe 中恰好一个匹配目标桌台的 Pragmatic 游戏帧。满足这些浏览器端检查后，才会把一次性执行函数注入该 iframe 的 `MAIN` world。
 
-运行时 playType 映射为 `banker=1`、`player=2`、`bankerPair=4`、`playerPair=5`。`BetIntent` 会拒绝非对子市场；`OperationalWager` 接受全部四个市场。所有真实请求还必须由桌面端先建立 reservation，并通过实体牌靴、连接、下注窗口、未封靴、风控限额、重复保护和运行授权门禁。
+页面执行还会核对当前局号与协议 `betsopen` 窗口，并要求至少约 3 秒剩余时间；XML/`lpbet` 发送前若局号不匹配或窗口已关闭，返回拒绝而不是盲发。桌面 Actor 对窗口未就绪的预提交拒绝会释放 reservation，并允许同一局重试。
+
+运行时 playType 映射为 `banker=1`、`player=2`、`bankerPair=4`、`playerPair=5`。`BetIntent` 会拒绝非对子市场；`OperationalWager` 接受全部四个市场。所有真实请求还必须由桌面端先建立 reservation，并通过实体牌靴、连接、下注窗口、未封靴、风控限额、重复保护和运行授权门禁。对子自动策略在待牌靴时不会请求扩展。
 
 当前实现包含桌面端每桌 live 批准、桥接会话 live gate 和扩展 storage 的 `liveBetEnabled` 开关。桥接只接受固定扩展 ID/token、恰好一个扩展连接和当前扩展会话内连续递增的消息序号。扩展默认仍为 shadow/simulated，不会因为加载扩展而下注；在发布未批准前不要使用下列命令进行资金验证：
 
@@ -92,6 +90,8 @@ npx tsx scripts/bridge-command.ts liveOff
 4. **CDP 可信输入（可选）**：`chrome.debugger` 派发 `isTrusted=true` 的真实
    鼠标移动与点击，对校验事件可信度的站点有效。
 
+这是**页面会话保活**，与桌面端庄/闲资金保活下注不是同一件事。
+
 过期兜底：检测到“会话已过期”文案后，先上报 `sessionExpired` 并标记牌桌断开
 （桥接服务会暂停导出并失败关闭执行），然后按 5s / 15s / 45s 退避自动 reload。
 三次仍失败会上报 `recovery-failed`，持久事故进入阻断状态；扩展随后按
@@ -99,7 +99,7 @@ npx tsx scripts/bridge-command.ts liveOff
 
 桥接服务还独立监测牌桌状态是否真正推进，而不是把扩展心跳或重复快照当作新鲜数据。
 若牌桌连续 8 分钟没有状态推进，即使页面没有出现过期文案，也会请求扩展先撤销实盘
-执行资格再重载Pragmatic 弹窗；未恢复时按 1m / 5m / 15m / 30m 监督退避重试。
+执行资格再重载 Pragmatic 弹窗；未恢复时按 1m / 5m / 15m / 30m 监督退避重试。
 重载动作不会生成下注，也不会伪造恢复证明。
 
 页面不再显示过期文案时只上报 `sessionAction: recovered`。该事件本身不会生成

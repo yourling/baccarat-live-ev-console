@@ -112,8 +112,30 @@ export type HarnessOptions = {
   readonly pragmaticPhaseResult?: (
     command: Readonly<Record<string, unknown>>,
     request: Readonly<Record<string, unknown>>,
+    frameId?: number,
   ) => unknown;
   readonly pragmaticPrepareResult?: Readonly<Record<string, unknown>>;
+  readonly pragmaticFrameRoutes?: readonly {
+    readonly frameId: number;
+    readonly result: Readonly<Record<string, unknown>>;
+  }[];
+  readonly pragmaticGameFrames?: readonly {
+    readonly frameId: number;
+    readonly result: Readonly<Record<string, unknown>>;
+  }[];
+  readonly pragmaticChannelStatus?: {
+    readonly hasUser: boolean;
+    readonly hasSocket: boolean;
+    readonly tableIds?: readonly string[];
+  };
+  readonly pragmaticChannelStatuses?: readonly {
+    readonly frameId: number;
+    readonly result: {
+      readonly hasUser: boolean;
+      readonly hasSocket: boolean;
+      readonly tableIds?: readonly string[];
+    };
+  }[];
 };
 
 export async function createHarness(options: HarnessOptions = {}) {
@@ -158,6 +180,21 @@ export async function createHarness(options: HarnessOptions = {}) {
       readonly target?: { readonly frameIds?: readonly number[]; readonly allFrames?: boolean };
     },
   ) => {
+    if (String(injection.func).includes('pragmatic-frame-routes')) {
+      return options.pragmaticFrameRoutes ?? [];
+    }
+    if (String(injection.func).includes('pragmatic-duplicate-game-frames')) {
+      return options.pragmaticGameFrames ?? [];
+    }
+    if (
+      String(injection.func).includes('__baccaratPragmaticBetChannel')
+      && String(injection.func).includes('hasSocket')
+    ) {
+      if (options.pragmaticChannelStatuses) return [...options.pragmaticChannelStatuses];
+      if (options.pragmaticChannelStatus) {
+        return [{ frameId: 11, result: options.pragmaticChannelStatus }];
+      }
+    }
     if (String(injection.func).includes('probePragmaticBetTable')) {
       return options.probeResults ?? [{
         frameId: 11,
@@ -187,6 +224,14 @@ export async function createHarness(options: HarnessOptions = {}) {
       }];
     }
     if (String(injection.func).includes('executePragmaticBetOneShot') && injection.target?.allFrames === true) {
+      const command = injection.args?.[1] as Readonly<Record<string, unknown>> | undefined;
+      const request = injection.args?.[0] as Readonly<Record<string, unknown>> | undefined;
+      if (command && request && options.pragmaticPhaseResult) {
+        const overridden = options.pragmaticPhaseResult(command, request, injection.target?.frameIds?.[0]);
+        if (overridden !== undefined) {
+          return [{ frameId: injection.target?.frameIds?.[0] ?? 11, result: overridden }];
+        }
+      }
       return [{
         frameId: 11,
         result: {
@@ -204,8 +249,11 @@ export async function createHarness(options: HarnessOptions = {}) {
       const command = injection.args?.[1] as Readonly<Record<string, unknown>> | undefined;
       const request = injection.args?.[0] as Readonly<Record<string, unknown>> | undefined;
       if (command && request && options.pragmaticPhaseResult) {
-        const overridden = options.pragmaticPhaseResult(command, request);
-        if (overridden !== undefined) return [{ frameId: 11, result: overridden }];
+        const frameId = injection.target?.frameIds?.[0];
+        const overridden = options.pragmaticPhaseResult(command, request, frameId);
+        if (overridden !== undefined) {
+          return [{ frameId: frameId ?? 11, result: overridden }];
+        }
       }
       if (command?.['phase'] === 'request') {
         return [{

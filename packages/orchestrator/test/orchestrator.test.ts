@@ -1083,7 +1083,7 @@ describe('orchestrator table actor', () => {
 
 
 describe('unknown monitor-session baseline execution', () => {
-  it('allows automatic execution before a physical shoe baseline is known', async () => {
+  it('does not automatically execute pair bets before a physical shoe baseline is known', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile = simProfile();
     const requests: BetExecutionRequest[] = [];
@@ -1108,24 +1108,10 @@ describe('unknown monitor-session baseline execution', () => {
     await orchestrator.enqueue('t1', fixture[1]!);
     await actor.flush();
 
-    expect(requests).toHaveLength(1);
-    expect(ledger.listReceipts('t1')).toEqual([
-      expect.objectContaining({
-        shoeId: 'monitor-session-t1',
-        handId: 'h1',
-        market: 'bankerPair',
-        receipt: expect.objectContaining({
-          receiptId: 'live-unknown-baseline-auto',
-          status: 'ACCEPTED',
-        }),
-      }),
-    ]);
-    expect(ledger.listDecisions('t1')).toEqual([
-      expect.objectContaining({
-        eligible: true,
-        reason: expect.stringContaining('evLower='),
-      }),
-    ]);
+    expect(requests).toEqual([]);
+    expect(ledger.listReceipts('t1')).toEqual([]);
+    expect(ledger.listDecisions('t1')).toEqual([]);
+    expect(actor.getProjection().shoeBaseline).toBe('unknown-monitor-session');
     ledger.close();
   });
 });

@@ -20,9 +20,9 @@
   let lastDiscoveryHash = '';
   let lastSentAt = 0;
   let timeoutReported = false;
-  let reconnectClickedAt = 0;
   let continueClickedAt = 0;
   let continuePending = false;
+  let conflictReported = false;
   const lastGameCountByTable = new Map();
 
   function clean(value) {
@@ -77,8 +77,27 @@
     }) || null;
   }
 
+  function sessionConflictText(text) {
+    return /在其他地方启动了(?:对话|会话)|其他地方.*(?:对话|会话)|(?:对话|会话)已在其他|joined from another (?:device|location|place|window|tab)|(?:conversation|session) (?:has been |was )?started (?:elsewhere|in another)|(?:game|session) already open in another/i.test(text);
+  }
+
   function continueNativeIdleSession(now) {
+    const bodyText = clean(document.body?.innerText || document.body?.textContent);
     const button = continueGameButton();
+    const dialogText = clean(button?.closest?.('[role="dialog"],[role="alertdialog"]')?.textContent || '');
+    if (sessionConflictText(bodyText) || sessionConflictText(dialogText)) {
+      if (!conflictReported) {
+        conflictReported = true;
+        send({
+          kind: 'sessionAction', action: 'session-conflict-dialog', url: location.href,
+          frame: 'iframe',
+          detail: (dialogText || bodyText).replace(/\s+/g, ' ').trim().slice(0, 80),
+          timestamp: observedAt(),
+        });
+      }
+      return;
+    }
+    conflictReported = false;
     if (!button) {
       if (continuePending) {
         continuePending = false;
@@ -259,43 +278,32 @@
     }).filter(table => table.tableId.length > 0);
   }
 
-  function recoverExpiredSession(now) {
-    const bodyText = clean(document.body?.innerText);
-    const expired = /您的会话已超时|重新连接以重返游戏|session\s+(?:has\s+)?timed\s*out/i.test(bodyText);
+  function recoverExpiredSession() {
+    const bodyText = clean(document.body?.innerText || document.body?.textContent);
+    if (sessionConflictText(bodyText)) return;
+    const expired = /您的会话已超时|session\s+(?:has\s+)?timed\s*out/i.test(bodyText);
     if (!expired) {
       if (timeoutReported) {
         timeoutReported = false;
         send({
           kind: 'sessionAction', action: 'recovered', url: location.href,
-          frame: 'iframe', detail: 'pragmatic-reconnect', timestamp: observedAt(),
+          frame: 'iframe', detail: 'pragmatic-keepalive', timestamp: observedAt(),
         });
       }
       return;
     }
-    if (!timeoutReported) {
-      timeoutReported = true;
-      send({
-        kind: 'sessionExpired', url: location.href, frame: 'iframe',
-        textLength: bodyText.length, timestamp: observedAt(), recovering: true,
-      });
-    }
-    if (now - reconnectClickedAt < 10_000) return;
-    const reconnect = Array.from(document.querySelectorAll('button')).find(
-      button => clean(button.textContent) === '重新连接' && button.getBoundingClientRect().width > 0,
-    );
-    if (!reconnect) return;
-    reconnectClickedAt = now;
-    reconnect.click();
+    if (timeoutReported) return;
+    timeoutReported = true;
     send({
-      kind: 'sessionAction', action: 'inline-recovery-click', url: location.href,
-      frame: 'iframe', detail: 'pragmatic-reconnect', timestamp: observedAt(),
+      kind: 'sessionExpired', url: location.href, frame: 'iframe',
+      textLength: bodyText.length, timestamp: observedAt(), recovering: false,
     });
   }
 
   function scan(force) {
     const now = Date.now();
     continueNativeIdleSession(now);
-    recoverExpiredSession(now);
+    recoverExpiredSession();
     if (!isStateFrame) return;
     const tables = isSingle ? singleSnapshot() : multiSnapshot();
     if (tables.length === 0) return;
@@ -316,7 +324,14 @@
     }
 
     const snapshot = { version: 1, view: isSingle ? 'single' : 'multi', observedAt: observedAt(), tables };
-    const stateHash = JSON.stringify({ ...snapshot, observedAt: '' });
+    const stateHash = JSON.stringify({
+      version: snapshot.version,
+      view: snapshot.view,
+      tables: snapshot.tables.map(table => {
+        const { countdown, ...rest } = table;
+        return rest;
+      }),
+    });
     if (!force && stateHash === lastSnapshotHash && now - lastSentAt < HEARTBEAT_INTERVAL_MS) return;
     lastSnapshotHash = stateHash;
     lastSentAt = now;

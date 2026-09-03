@@ -35,7 +35,7 @@ export type BridgeClientMessage = (
   | { kind: 'networkCapture'; source: string; url: string; data: string; encoding?: string; direction?: string }
   | { kind: 'keepalive'; url: string; frame: string; timestamp: string; vw?: number; vh?: number; target?: { x: number; y: number; width: number; height: number } }
   | { kind: 'sessionExpired'; url: string; frame: string; textLength?: number; textPreview?: string; timestamp: string; recovering?: boolean }
-  | { kind: 'sessionAction'; action: 'keepalive-click' | 'trusted-activity' | 'idle-dialog-dismissed' | 'inline-recovery-click' | 'reload-scheduled' | 'recovered' | 'recovery-failed' | 'beacon-failed' | 'socket-closed' | 'calibrated' | 'command-executed'; url: string; frame: string; detail?: string; attempt?: number; timestamp: string }
+  | { kind: 'sessionAction'; action: 'keepalive-click' | 'trusted-activity' | 'idle-dialog-dismissed' | 'inline-recovery-click' | 'reload-scheduled' | 'recovered' | 'recovery-failed' | 'beacon-failed' | 'socket-closed' | 'calibrated' | 'command-executed' | 'dual-game-session' | 'session-conflict-dialog' | 'pragmatic-outbound-send' | 'native-idle-keepalive-armed' | 'native-idle-continue-cleared' | 'native-idle-continue-click'; url: string; frame: string; detail?: string; attempt?: number; timestamp: string }
   | { kind: 'heartbeat'; timestamp: string }
   | { kind: 'command'; name: string; tableIds?: readonly string[] }
 ) & {

@@ -39,6 +39,7 @@ import {
 import { KeepaliveSettings } from './keepalive-settings';
 import { resolveVisibleHandCards } from './hand-cards';
 import { selectPragmaticMonitorTableIds } from './monitor-table-selection';
+import { evaluateProjectionPairMarket } from './pair-evaluation';
 import { decisionHandExplanation, planRecordViewChange, recordKindForView, recordTabCount, type ConsoleView } from './record-view';
 import './styles.css';
 
@@ -55,7 +56,6 @@ type SnapshotRequestToken = {
   readonly sequence: number;
   readonly monitorMutationSequence: number;
 };
-type Counts = Record<CardRank, number>;
 type MarketEvaluation = { pMean: number; pLower: number; evMean: number; evLower: number };
 
 interface OverviewTableRow {
@@ -177,9 +177,6 @@ const RECEIPT_STATUS_LABELS: Record<string, string> = {
   REJECTED: '已拒绝',
   UNKNOWN: '状态未知',
 };
-const DEFAULT_PAIR_PROBABILITY = exactPairProbabilityLocal(initialCounts(8));
-const DEFAULT_PAIR_EV = evForPairLocal({ netWin: 11, loss: 1 }, DEFAULT_PAIR_PROBABILITY);
-
 export function App() {
   const { confirm, dialog } = useConfirmationDialog();
   const [snapshot, setSnapshot] = useState<DesktopConsoleSnapshot | null>(null);
@@ -187,6 +184,7 @@ export function App() {
   const [recordLoading, setRecordLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [automationSaving, setAutomationSaving] = useState(false);
+  const [keepaliveSaving, setKeepaliveSaving] = useState(false);
   const [demoSpeed, setDemoSpeed] = useState(1);
   const [error, setError] = useState<string | null>(null);
   const [deckInputs, setDeckInputs] = useState<Record<string, string>>({});
@@ -344,7 +342,7 @@ export function App() {
 
   useEffect(() => {
     void refresh();
-    const intervalMs = view === 'monitor' ? 300 : 2_000;
+    const intervalMs = view === 'monitor' ? 1_000 : 2_000;
     timerRef.current = window.setInterval(() => void refresh(), intervalMs);
     return () => {
       if (timerRef.current !== null) window.clearInterval(timerRef.current);
@@ -436,7 +434,8 @@ export function App() {
   const monitorCandidates = (snapshot?.monitorCandidates ?? []).filter(candidate => !monitoredTableIds.has(candidate.tableId));
   const selectedMonitorTable = selectedMonitorTableId === null ? undefined : tableMap.get(selectedMonitorTableId);
   const automationEnabled = snapshot?.automation.enabled ?? false;
-  const monitorNow = useNow(250);
+  const keepaliveEnabled = snapshot?.keepalive.enabled ?? false;
+  const monitorNow = useNow(1_000);
   const visibleTables = useMemo(() => {
     if (view === 'monitor') return tables;
     return tables.filter(table => {
@@ -701,6 +700,20 @@ export function App() {
     }
   }
 
+  async function toggleKeepalive() {
+    if (!window.desktop) return;
+    const enabled = !(snapshot?.keepalive.enabled ?? false);
+    setKeepaliveSaving(true);
+    setError(null);
+    try {
+      setSnapshot(await window.desktop.setKeepaliveEnabled(enabled));
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setKeepaliveSaving(false);
+    }
+  }
+
   async function toggleAutomation() {
     if (!window.desktop) return;
     const enabled = !(snapshot?.automation.enabled ?? false);
@@ -708,7 +721,7 @@ export function App() {
     if (enabled && liveTableIds.length > 0) {
       const confirmed = await confirm({
         title: '开启实盘自动投注',
-        description: '当前存在实盘牌桌。开启后，保活和对子策略会按已保存设置自动执行。',
+        description: '当前存在实盘牌桌。开启后，对子策略会按已保存设置自动执行，不影响保活。',
         details: [
           { label: '实盘牌桌', value: liveTableIds.join('、') },
         ],
@@ -834,6 +847,13 @@ export function App() {
           <h1>百家乐实时监控</h1>
         </div>
         <div className="header-actions">
+          <button
+            className={cx('button', keepaliveEnabled ? 'button--danger-ghost' : 'button--primary')}
+            onClick={() => void toggleKeepalive()}
+            disabled={!desktopReady || keepaliveSaving}
+          >
+            {keepaliveSaving ? (keepaliveEnabled ? '正在停止保活' : '正在开启保活') : (keepaliveEnabled ? '停止保活' : '开启保活')}
+          </button>
           <button
             className={cx('button', automationEnabled ? 'button--danger-ghost' : 'button--primary')}
             onClick={() => void toggleAutomation()}
@@ -1008,7 +1028,7 @@ export function App() {
       {view === 'monitor' && monitorCandidates.length > 0 && (
         <section className="monitor-candidates" aria-labelledby="monitor-candidates-title">
           <div className="section-heading">
-            <span id="monitor-candidates-title">可加入牌桌</span>
+            <span id="monitor-candidates-title">待加入牌桌</span>
           </div>
           <div className="monitor-candidates__list">
             {monitorCandidates.map(candidate => (
@@ -1098,11 +1118,11 @@ function TableMonitorRow(props: {
   const { actor } = props;
   const projection = actor.projection;
   const physicalShoeKnown = projection.shoeId.length > 0 && projection.shoeBaseline === 'physical-shoe';
-  const pair = physicalShoeKnown
-    ? combinePairEvaluations(
-      safeEvaluate(projection.profileSnapshot, 'bankerPair', projection.seenCards),
-      safeEvaluate(projection.profileSnapshot, 'playerPair', projection.seenCards),
-    )
+  const bankerPair = physicalShoeKnown
+    ? safeEvaluate(projection.profileSnapshot, 'bankerPair', projection.seenCards, projection.remainingCounts)
+    : null;
+  const playerPair = physicalShoeKnown
+    ? safeEvaluate(projection.profileSnapshot, 'playerPair', projection.seenCards, projection.remainingCounts)
     : null;
   const alerts = tableAlerts(actor);
   const displayName = props.metadata?.displayName ?? tableName(actor.tableId);
@@ -1168,8 +1188,11 @@ function TableMonitorRow(props: {
       <td data-label="自动"><strong>{shortAutoBetLabel(projection.autoBetStatus)}</strong></td>
       <td data-label="剩余"><strong>{physicalShoeKnown ? `${projection.remainingTotal} 张` : '未知'}</strong></td>
       <td data-label="对子 EV">
-        {pair
-          ? <><strong className={evTone(pair.evMean)}>{formatSignedPercent(pair.evMean)}</strong><span className="muted"> P {formatPercent(pair.pMean)}</span></>
+        {bankerPair && playerPair
+          ? <span className="monitor-pair-ev">
+            <strong className={evTone(bankerPair.evMean)}>庄对 {formatSignedPercent(bankerPair.evMean)}</strong>
+            <span className="muted">闲对 {formatSignedPercent(playerPair.evMean)}</span>
+          </span>
           : <span className="muted" title="等待物理牌靴">待牌靴</span>}
       </td>
       <td data-label="闲"><MonitorHandCards cards={handCards.player} previous={handCards.source === 'previous-settled'} /></td>
@@ -2166,91 +2189,14 @@ function EmptyState({ title, detail }: { title: string; detail: string }) {
   return <div className="empty-state"><strong>{title}</strong>{detail && <span>{detail}</span>}</div>;
 }
 
-function emptyCounts(): Counts {
-  return { A: 0, '2': 0, '3': 0, '4': 0, '5': 0, '6': 0, '7': 0, '8': 0, '9': 0, '10': 0, J: 0, Q: 0, K: 0 };
-}
-
-function initialCounts(decks: number): Counts {
-  const counts = emptyCounts();
-  for (const rank of CARD_RANKS) counts[rank] = 4 * decks;
-  return counts;
-}
-
-function totalCounts(counts: Counts): number {
-  return CARD_RANKS.reduce((total, rank) => total + counts[rank], 0);
-}
-
-function combinations2Local(value: number): number {
-  return value < 2 ? 0 : value * (value - 1) / 2;
-}
-
-function exactPairProbabilityLocal(counts: Counts): number {
-  const total = totalCounts(counts);
-  if (total < 2) return 0;
-  const pairs = CARD_RANKS.reduce((sum, rank) => sum + combinations2Local(counts[rank]), 0);
-  return pairs / combinations2Local(total);
-}
-
-function cardCountsLocal(cards: Card[]): Counts {
-  const counts = emptyCounts();
-  for (const card of cards) counts[card.rank] += 1;
-  return counts;
-}
-
-function pairProbabilityMeanLocal(base: Counts, unknownBurnCount: number): number {
-  const baseTotal = totalCounts(base);
-  if (unknownBurnCount === 0) return exactPairProbabilityLocal(base);
-  const remainingTotal = baseTotal - unknownBurnCount;
-  if (remainingTotal < 2) return 0;
-  let expectedPairs = 0;
-  for (const rank of CARD_RANKS) {
-    const amount = base[rank];
-    if (amount < 2) continue;
-    const p = amount / baseTotal;
-    const expectedRemoved = unknownBurnCount * p;
-    const variance = unknownBurnCount * p * (1 - p) * ((baseTotal - unknownBurnCount) / (baseTotal - 1));
-    const expectedRemovedSquared = variance + expectedRemoved * expectedRemoved;
-    expectedPairs += combinations2Local(amount) - (amount - 0.5) * expectedRemoved + 0.5 * expectedRemovedSquared;
-  }
-  return expectedPairs / combinations2Local(remainingTotal);
-}
-
-function pairProbabilityWorstCaseLocal(base: Counts, unknownBurnCount: number): number {
-  const counts = { ...base };
-  for (let index = 0; index < unknownBurnCount; index += 1) {
-    let worst: CardRank = 'A';
-    for (const rank of CARD_RANKS) if (counts[rank] > counts[worst]) worst = rank;
-    counts[worst] = Math.max(0, counts[worst] - 1);
-  }
-  return exactPairProbabilityLocal(counts);
-}
-
-function evForPairLocal(odds: { netWin: number; loss: number }, probability: number): number {
-  return odds.netWin * probability - odds.loss * (1 - probability);
-}
-
-function evaluatePairMarketLocal(
+function safeEvaluate(
   profile: ShoeStateProjection['profileSnapshot'],
   market: BettingMarket,
-  observedCards: Card[],
-): MarketEvaluation {
-  const initial = initialCounts(profile.numberOfDecks);
-  const observed = cardCountsLocal(observedCards);
-  const knownBurn = cardCountsLocal(profile.burnModel.knownCards ?? []);
-  const base = emptyCounts();
-  for (const rank of CARD_RANKS) base[rank] = Math.max(0, initial[rank] - observed[rank] - knownBurn[rank]);
-  let unknownBurnCount = 0;
-  if (profile.burnModel.kind === 'countKnown') unknownBurnCount = profile.burnModel.count ?? 0;
-  if (profile.burnModel.kind === 'partialKnown') unknownBurnCount = Math.max(0, (profile.burnModel.count ?? 0) - (profile.burnModel.knownCards ?? []).length);
-  const pMean = pairProbabilityMeanLocal(base, unknownBurnCount);
-  const pLower = pairProbabilityWorstCaseLocal(base, unknownBurnCount);
-  const odds = profile.odds[market];
-  return { pMean, pLower, evMean: evForPairLocal(odds, pMean), evLower: evForPairLocal(odds, pLower) };
-}
-
-function safeEvaluate(profile: ShoeStateProjection['profileSnapshot'], market: BettingMarket, seenCards: Card[]): MarketEvaluation | null {
+  seenCards: ShoeStateProjection['seenCards'],
+  remainingCounts?: ShoeStateProjection['remainingCounts'],
+): MarketEvaluation | null {
   try {
-    return evaluatePairMarketLocal(profile, market, seenCards);
+    return evaluateProjectionPairMarket(profile, market, seenCards, remainingCounts);
   } catch {
     return null;
   }

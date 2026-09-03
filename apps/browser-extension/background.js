@@ -15,6 +15,12 @@ const GAME_TAB_URL_PATTERN = /^https?:\/\/(?:[a-z0-9-]+\.)*(?:dafabet\.net|vbgam
 const PRAGMATIC_FRAME_HOST_PATTERN = /(^|\.)client\.pragmaticplaylive\.net$/i;
 const PRAGMATIC_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
 const PRAGMATIC_BET_RUNTIME_REVISION = 'pragmatic-bet-runtime/2026-08-30.21';
+const PROTOCOL_CAPTURE_SOURCES = new Set([
+  'baccarat-bridge-pragmatic-ws',
+  'baccarat-bridge-pragmatic-state',
+  'baccarat-bridge-runtime-selection',
+  'baccarat-bridge-runtime-state',
+]);
 const betRequests = new Map();
 const pragmaticProtocolWindows = new Map();
 let liveBetSessionEnabled = false;
@@ -36,7 +42,8 @@ function notePragmaticOutboundSend(message) {
   ) return;
   const data = String(message.data || '');
   if (data.length < 8) return;
-  if (!/bet|betcode|"bc"|stake|amount|amt/i.test(data)) return;
+  if (/<autoBet[\s>/]/i.test(data) && !/<lpbet[\s>]/i.test(data)) return;
+  if (!/(<lpbet[\s>]|betcode|"bc"=)/i.test(data)) return;
   if (/<lpbet[\s>]/i.test(data) || /\buId="/.test(data)) {
     const uId = (data.match(/\buId="([^"]+)"/) || [])[1];
     const gm = (data.match(/\bgm="([^"]+)"/) || [])[1];
@@ -137,6 +144,12 @@ if (typeof importScripts === 'function') {
 
 function isGameTabUrl(url) {
   return GAME_TAB_URL_PATTERN.test(String(url || ''));
+}
+
+function isReloadableGameTabUrl(url) {
+  if (exactSupportedBaccaratPopup(url)) return true;
+  const href = String(url || '');
+  return /(?:^|\.)(?:pragmaticplaylive\.net|vbgames88\.com|zavjcswh\.biz)(?::\d+)?(?:[/?#]|$)/i.test(href);
 }
 
 function isTrustedGameSender(sender) {
@@ -445,6 +458,7 @@ function validateLiveBetMessage(message) {
   }
   return { requestId: message.requestId, request, tableId, platform };
 }
+/** 只读取多台页上该桌自己的下注按钮；绝不点视频入座。 */
 async function preparePragmaticTable(tabId, tableId, market) {
   const protocolWindow = pragmaticProtocolWindow(tableId);
   return await chrome.scripting.executeScript({
@@ -461,77 +475,22 @@ async function preparePragmaticTable(tabId, tableId, market) {
       }
       delete globalThis.__baccaratPragmaticPreparedTable;
       const targetId = `TileHeight-${targetTableId}`;
-      let root = document.getElementById(targetId);
+      const root = document.getElementById(targetId);
       if (!root) {
-        const scrollables = [document.scrollingElement, ...document.querySelectorAll('*')]
-          .filter((element, index, values) => element
-            && values.indexOf(element) === index
-            && (
-              Number(element.scrollHeight) > Number(element.clientHeight) + 80
-              || Number(element.scrollWidth) > Number(element.clientWidth) + 80
-            ))
-          .sort((left, right) => {
-            const leftRange = Math.max(
-              Number(left.scrollHeight) - Number(left.clientHeight),
-              Number(left.scrollWidth) - Number(left.clientWidth),
-            );
-            const rightRange = Math.max(
-              Number(right.scrollHeight) - Number(right.clientHeight),
-              Number(right.scrollWidth) - Number(right.clientWidth),
-            );
-            return rightRange - leftRange;
-          })
-          .slice(0, 8);
-        let scanSteps = 0;
-        for (const scrollable of scrollables) {
-          const originalTop = Number(scrollable.scrollTop) || 0;
-          const originalLeft = Number(scrollable.scrollLeft) || 0;
-          const verticalMax = Math.max(0, Number(scrollable.scrollHeight) - Number(scrollable.clientHeight));
-          const horizontalMax = Math.max(0, Number(scrollable.scrollWidth) - Number(scrollable.clientWidth));
-          const verticalStep = Math.max(240, Math.floor(Number(scrollable.clientHeight) * 0.8));
-          const horizontalStep = Math.max(240, Math.floor(Number(scrollable.clientWidth) * 0.8));
-          const positions = [];
-          for (let top = 0; top <= verticalMax && positions.length < 24; top += verticalStep) {
-            positions.push([Math.min(top, verticalMax), originalLeft]);
-          }
-          for (let left = 0; left <= horizontalMax && positions.length < 32; left += horizontalStep) {
-            positions.push([originalTop, Math.min(left, horizontalMax)]);
-          }
-          for (const [top, left] of positions) {
-            try {
-              if (typeof scrollable.scrollTo === 'function') scrollable.scrollTo({ top, left, behavior: 'instant' });
-              else {
-                scrollable.scrollTop = top;
-                scrollable.scrollLeft = left;
-              }
-            } catch (_) {
-              continue;
-            }
-            scanSteps += 1;
-            await new Promise(resolve => setTimeout(resolve, 80));
-            root = document.getElementById(targetId);
-            if (root || scanSteps >= 64) break;
-          }
-          if (root || scanSteps >= 64) break;
-          try {
-            scrollable.scrollTop = originalTop;
-            scrollable.scrollLeft = originalLeft;
-          } catch (_) {}
-        }
-        if (!root) {
-          const tableIds = Array.from(document.querySelectorAll('[id^="TileHeight-"]'))
-            .map(element => String(element.id || '').slice('TileHeight-'.length))
-            .filter(Boolean)
-            .slice(0, 80);
-          return { status: 'not-found-after-scroll', frameUrl, scanSteps, tableIds };
-        }
+        return { status: 'not-seated', frameUrl };
       }
       try {
-        root.scrollIntoView({ block: 'center', inline: 'center' });
+        const rect = root.getBoundingClientRect();
+        const seated = rect.width > 0
+          && rect.height > 0
+          && !!(
+            root.querySelector('[data-betcode="0"]')
+            || root.querySelector('[data-testid^="timer-countdown-"]')
+          );
+        if (!seated) return { status: 'not-seated', frameUrl };
       } catch (_) {
-        return { status: 'scroll-failed', frameUrl };
+        return { status: 'not-seated', frameUrl };
       }
-      await new Promise(resolve => setTimeout(resolve, 250));
       const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
       const roundIdentity = clean(root.textContent);
       const roundId = (roundIdentity.match(/(?:ID|局号|游戏编号|牌局)\s*[:：#]?\s*(\d{8,20})/i) || [])[1] || '';
@@ -555,17 +514,6 @@ async function preparePragmaticTable(tabId, tableId, market) {
       if (!Number.isFinite(countdown) || countdown < 1) {
         return { status: 'betting-window-closed', frameUrl, roundId: effectiveRoundId, domRoundId: roundId };
       }
-      const videoIcon = root.querySelector('[data-testid="icon-Video"]');
-      const activator = videoIcon?.closest?.('button, [role="button"], a') || videoIcon?.parentElement;
-      if (!activator || activator.querySelector?.('[data-betcode]') || activator.hasAttribute?.('data-betcode')) {
-        return { status: 'activation-control-missing', frameUrl };
-      }
-      try {
-        activator.click();
-      } catch (_) {
-        return { status: 'activation-failed', frameUrl };
-      }
-      await new Promise(resolve => setTimeout(resolve, 500));
       const visible = element => {
         if (!element || element.disabled === true) return false;
         try {
@@ -582,8 +530,7 @@ async function preparePragmaticTable(tabId, tableId, market) {
       const marketControls = {};
       const marketCounts = {};
       for (const [market, code] of Object.entries(marketCodes)) {
-        const candidates = Array.from(document.querySelectorAll(`[data-betcode="${code}"]`))
-          .filter(element => visible(element) && !element.closest?.('[id^="TileHeight-"]'));
+        const candidates = Array.from(root.querySelectorAll(`[data-betcode="${code}"]`)).filter(visible);
         marketCounts[market] = candidates.length;
         if (candidates.length === 1) marketControls[market] = candidates[0];
       }
@@ -601,6 +548,45 @@ async function preparePragmaticTable(tabId, tableId, market) {
       return { status: 'activated', frameUrl, roundId: effectiveRoundId, domRoundId: roundId, countdown };
     },
   });
+}
+
+function channelServesTable(status, tableId) {
+  if (!status || status.hasSocket !== true) return false;
+  const wanted = String(tableId || '').toLowerCase();
+  const path = String(status.framePath || '');
+  const bound = String(status.boundTableId || '').toLowerCase();
+  const tableIds = Array.isArray(status.tableIds) ? status.tableIds : [];
+  const mentionsTable = tableIds.some(id => String(id || '').toLowerCase() === wanted);
+  if (path === '/desktop/baccarat/') {
+    if (bound) return bound === wanted;
+    return tableIds.length === 1 && mentionsTable;
+  }
+  if (path === '/desktop/multibaccarat/') return mentionsTable;
+  if (bound) return bound === wanted;
+  return mentionsTable;
+}
+
+function selectPragmaticRequestChannel(channelStatus, tableId) {
+  const wanted = String(tableId || '').toLowerCase();
+  const matching = (Array.isArray(channelStatus) ? channelStatus : []).filter(entry =>
+    entry
+    && Number.isInteger(entry.frameId)
+    && channelServesTable(entry.result, tableId),
+  );
+  const withUser = matching.filter(entry => entry.result && entry.result.hasUser === true);
+  const candidates = withUser.length > 0 ? withUser : matching;
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+  const dedicated = candidates.filter(entry =>
+    String(entry.result.framePath || '') === '/desktop/baccarat/'
+    && String(entry.result.boundTableId || '').toLowerCase() === wanted,
+  );
+  const multi = candidates.filter(entry =>
+    String(entry.result.framePath || '') === '/desktop/multibaccarat/',
+  );
+  if (dedicated.length === 1 && multi.length === 0) return dedicated[0];
+  if (multi.length === 1) return multi[0];
+  return null;
 }
 
 function selectPragmaticReadyFrame(probes, tableId) {
@@ -768,17 +754,27 @@ async function executeUniquePragmaticBet(message, generation) {
         const channel = globalThis.__baccaratPragmaticBetChannel;
         return channel && typeof channel.status === 'function'
           ? channel.status()
-          : { hasUser: false, hasSocket: false };
+          : { hasUser: false, hasSocket: false, tableIds: [] };
       },
     });
-    const readyChannel = channelStatus.find(entry =>
-      entry && entry.result && entry.result.hasSocket === true && entry.result.hasUser === true)
-      || channelStatus.find(entry => entry && entry.result && entry.result.hasSocket === true);
+    const anySocket = channelStatus.some(entry =>
+      entry && entry.result && entry.result.hasSocket === true);
+    const readyChannel = selectPragmaticRequestChannel(channelStatus, parsed.tableId);
+    const protocolWindow = pragmaticProtocolWindow(parsed.tableId);
     const requestHits = readyChannel && Number.isInteger(readyChannel.frameId)
       ? await chrome.scripting.executeScript({
         target: { tabId, frameIds: [readyChannel.frameId] },
         world: 'MAIN',
-        args: [parsed.request, { phase: 'request', expectedRoundId: expectedHandId }],
+        args: [parsed.request, {
+          phase: 'request',
+          expectedRoundId: expectedHandId,
+          ...(protocolWindow
+            ? {
+              protocolCountdown: protocolWindow.countdown,
+              protocolRoundId: protocolWindow.roundId,
+            }
+            : {}),
+        }],
         func: globalThis.executePragmaticBetOneShot,
       })
       : [];
@@ -796,6 +792,13 @@ async function executeUniquePragmaticBet(message, generation) {
       if (requestMiss) {
         frameId = requestMiss.frameId;
         requestResult = requestMiss.result;
+      } else if (anySocket) {
+        requestResult = {
+          phase: 'request-unavailable',
+          runtimeRevision: PRAGMATIC_BET_RUNTIME_REVISION,
+          reason: 'table-not-in-current-session',
+          currentRoundId: expectedHandId,
+        };
       } else {
     const preparations = await preparePragmaticTable(tabId, parsed.tableId, requestedMarket);
     const multitableResults = preparations.filter(entry =>
@@ -1014,20 +1017,8 @@ async function probePragmaticBetReadiness(tableIds, generation) {
 
   for (const tableId of requestedTableIds) {
     let probes;
-    let preparationSummary = '';
+    const preparationSummary = 'skipped-no-join';
     try {
-      const preparations = await preparePragmaticTable(targets[0].id, tableId);
-      preparationSummary = preparations
-        .filter(entry => entry && entry.result && entry.result.status !== 'skipped')
-        .map(entry => [
-          `id=${Number.isInteger(entry.frameId) ? entry.frameId : ''}`,
-          `status=${String(entry.result.status || '')}`,
-          `round=${String(entry.result.roundId || '')}`,
-          `countdown=${Number.isFinite(entry.result.countdown) ? entry.result.countdown : ''}`,
-          `tables=${Array.isArray(entry.result.tableIds) ? entry.result.tableIds.join(',') : ''}`,
-        ].join(','))
-        .join('|');
-      if (generation !== activeSocketGeneration) return;
       probes = await chrome.scripting.executeScript({
         target: { tabId: targets[0].id, allFrames: true },
         world: 'MAIN',
@@ -1231,8 +1222,17 @@ function sendBetResult(message, generation) {
   }
 }
 
+function isProtocolNetworkCapture(message) {
+  if (!message || message.kind !== 'networkCapture') return false;
+  if (message.encoding === 'base64') return false;
+  if (typeof message.data === 'string' && message.data.length > 16_384) return false;
+  if (PROTOCOL_CAPTURE_SOURCES.has(message.source)) return true;
+  return /pragmaticplaylive\.net\/game/i.test(String(message.url || ''));
+}
+
 function send(message) {
   if (message && message.kind === 'betResult') return;
+  if (message && message.kind === 'networkCapture' && !isProtocolNetworkCapture(message)) return;
   const sequenced = withBridgeSequence(message);
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify(sequenced));
@@ -1256,6 +1256,7 @@ function flushOutbox() {
   while (outbox.length > 0) {
     const message = outbox.shift();
     if (message && message.kind === 'betResult') continue;
+    if (message && message.kind === 'networkCapture' && !isProtocolNetworkCapture(message)) continue;
     try {
       socket.send(JSON.stringify(message));
     } catch (_) {
@@ -1358,35 +1359,12 @@ async function replayRuntimeStateInGameFrames() {
 async function handleRemoteCommand(name, tableIds = [], generation) {
   if (generation !== activeSocketGeneration) return;
   if (name === 'startPragmaticNetworkCapture') {
-    const tabs = await chrome.tabs.query({ url: [DAFABET_POPUP_QUERY] });
-    const targets = tabs.filter(tab => tab.id && exactDafabetPragmaticPopup(tab.url));
-    let enabled = false;
-    if (targets.length === 1 && await ensureCdpAttached(targets[0].id)) {
-      await chrome.debugger.sendCommand({ tabId: targets[0].id }, 'Network.enable', {
-        maxTotalBufferSize: 10_000_000,
-        maxResourceBufferSize: 2_000_000,
-        maxPostDataSize: 0,
-      });
-      await chrome.debugger.sendCommand({ tabId: targets[0].id }, 'Target.setAutoAttach', {
-        autoAttach: true,
-        waitForDebuggerOnStart: false,
-        flatten: true,
-        filter: [
-          { type: 'iframe', exclude: false },
-          { type: 'worker', exclude: false },
-          { type: 'shared_worker', exclude: false },
-          { type: 'service_worker', exclude: false },
-        ],
-      });
-      pragmaticCdpTabs.add(targets[0].id);
-      enabled = true;
-    }
     send({
       kind: 'sessionAction',
       action: 'command-executed',
       url: '',
       frame: '',
-      detail: `startPragmaticNetworkCapture:enabled=${enabled}:targets=${targets.length}`,
+      detail: 'startPragmaticNetworkCapture:enabled=page-hook',
       timestamp: new Date().toISOString(),
     });
     return;
@@ -1471,11 +1449,11 @@ async function handleRemoteCommand(name, tableIds = [], generation) {
     // reloading so a stale page cannot retain authorization across recovery.
     liveBetSessionEnabled = false;
     await chrome.storage.local.set({ liveBetEnabled: false });
-    const tabs = await chrome.tabs.query({ url: [DAFABET_POPUP_QUERY] });
+    const tabs = await chrome.tabs.query({});
     if (generation !== activeSocketGeneration) return;
     let reloaded = 0;
     for (const tab of tabs) {
-      if (!tab.id || !exactSupportedBaccaratPopup(tab.url)) continue;
+      if (!tab.id || !isReloadableGameTabUrl(tab.url)) continue;
       try {
         await chrome.tabs.reload(tab.id, { bypassCache: true });
         reloaded += 1;
@@ -1576,54 +1554,113 @@ async function openActiveGameTabInMultiplay(tableIds = []) {
       return;
     }
 
+    const routes = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, allFrames: true },
+      world: 'MAIN',
+      func: () => ({
+        marker: 'pragmatic-frame-routes',
+        pathname: String(location.pathname || ''),
+        frameUrl: String(location.href || ''),
+        host: String(location.hostname || ''),
+      }),
+    });
+    const pragmaticRoutes = (routes || []).filter(entry => {
+      if (!entry || !entry.result) return false;
+      const host = String(entry.result.host || '');
+      if (/(^|\.)client\.pragmaticplaylive\.net$/i.test(host)) return true;
+      try {
+        return /(^|\.)client\.pragmaticplaylive\.net$/i.test(new URL(String(entry.result.frameUrl || '')).hostname);
+      } catch (_) {
+        return false;
+      }
+    });
+    const multi = pragmaticRoutes.filter(entry => entry.result.pathname === '/desktop/multibaccarat/');
+    const dedicated = pragmaticRoutes.filter(entry => entry.result.pathname === '/desktop/baccarat/');
+    if (multi.length > 0) {
+      if (dedicated.length > 0) {
+        send({
+          kind: 'sessionAction',
+          action: 'dual-game-session',
+          url: String(tab.url || ''),
+          frame: 'allFrames',
+          detail: `multibaccarat=${multi.length}:baccarat=${dedicated.length}`,
+          timestamp: new Date().toISOString(),
+        });
+      }
+      send({
+        kind: 'sessionAction',
+        action: 'command-executed',
+        url: '',
+        frame: 'allFrames',
+        detail: `openMultiView:opened:${multi.length}:pragmatic-already-open`,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+    if (dedicated.length === 1 && Number.isInteger(dedicated[0].frameId)) {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id, frameIds: [dedicated[0].frameId] },
+        world: 'MAIN',
+        func: () => {
+          location.pathname = '/desktop/multibaccarat/';
+          return { status: 'opened', frameUrl: String(location.href || ''), state: 'pragmatic-direct-route' };
+        },
+      });
+      send({
+        kind: 'sessionAction',
+        action: 'command-executed',
+        url: '',
+        frame: 'allFrames',
+        detail: 'openMultiView:opened:1:pragmatic-direct-route',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id, allFrames: true },
       world: 'MAIN',
       args: [tableIds],
       func: requestedTableIds => {
         const frameUrl = String(location.href || '');
-        if (/(^|\.)client\.pragmaticplaylive\.net$/i.test(location.hostname)) {
-          if (location.pathname === '/desktop/multibaccarat/') {
-            return { status: 'opened', frameUrl, state: 'pragmatic-already-open' };
-          }
-          if (location.pathname === '/desktop/baccarat/') {
-            // This is Pragmatic's own sibling route. Changing only pathname keeps
-            // the authenticated launch query and never touches a betting control.
-            location.pathname = '/desktop/multibaccarat/';
-            return { status: 'opened', frameUrl, state: 'pragmatic-direct-route' };
-          }
-          const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
-          const roots = [document];
-          const controls = [];
-          for (let rootIndex = 0; rootIndex < roots.length && rootIndex < 200; rootIndex += 1) {
-            const root = roots[rootIndex];
-            try {
-              controls.push(...root.querySelectorAll('a[href], button, [role="button"]'));
-              for (const element of root.querySelectorAll('*')) {
-                if (element.shadowRoot) roots.push(element.shadowRoot);
-              }
-            } catch (_) {}
-          }
-          const control = controls.find(element => {
-            const href = String(element.getAttribute && element.getAttribute('href') || '');
-            const text = clean(element.textContent || element.getAttribute?.('aria-label'));
-            const exactTarget = /\/desktop\/multibaccarat\//i.test(href)
-              || /^(?:多桌|多台|多桌百家乐|multi\s*(?:table|baccarat|play))$/i.test(text);
-            if (!exactTarget || element.disabled === true) return false;
-            try {
-              const rect = element.getBoundingClientRect();
-              return rect.width > 0 && rect.height > 0;
-            } catch (_) {
-              return true;
-            }
-          });
-          if (control && typeof control.click === 'function') {
-            control.click();
-            return { status: 'opened', frameUrl, state: 'pragmatic-native-control' };
-          }
-          return { status: 'not-ready', frameUrl, state: `pragmatic-control-missing:${location.pathname}` };
+        if (!/(^|\.)client\.pragmaticplaylive\.net$/i.test(location.hostname)) {
+          return { status: 'skipped', frameUrl };
         }
-        return { status: 'skipped', frameUrl };
+        const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+        const roots = [document];
+        const controls = [];
+        for (let rootIndex = 0; rootIndex < roots.length && rootIndex < 200; rootIndex += 1) {
+          const root = roots[rootIndex];
+          try {
+            controls.push(...root.querySelectorAll('a[href], button, [role="button"]'));
+            for (const element of root.querySelectorAll('*')) {
+              if (element.shadowRoot) roots.push(element.shadowRoot);
+            }
+          } catch (_) {}
+        }
+        const alreadyEmbedded = Array.from(document.querySelectorAll('iframe')).some(iframe =>
+          /\/desktop\/multibaccarat\//i.test(String(iframe.getAttribute?.('src') || iframe.src || '')));
+        if (alreadyEmbedded) {
+          return { status: 'opened', frameUrl, state: 'pragmatic-already-embedded' };
+        }
+        const control = controls.find(element => {
+          const href = String(element.getAttribute && element.getAttribute('href') || '');
+          const text = clean(element.textContent || element.getAttribute?.('aria-label'));
+          const exactTarget = /\/desktop\/multibaccarat\//i.test(href)
+            || /^(?:多桌|多台|多桌百家乐|multi\s*(?:table|baccarat|play))$/i.test(text);
+          if (!exactTarget || element.disabled === true) return false;
+          try {
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          } catch (_) {
+            return true;
+          }
+        });
+        if (control && typeof control.click === 'function') {
+          control.click();
+          return { status: 'opened', frameUrl, state: 'pragmatic-native-control' };
+        }
+        return { status: 'not-ready', frameUrl, state: `pragmatic-control-missing:${location.pathname}` };
       },
     });
     const opened = results.filter(result => result && result.result && result.result.status === 'opened').length;
@@ -1686,16 +1723,7 @@ async function ensureCdpAttached(tabId) {
 chrome.debugger.onEvent?.addListener((source, method, params) => {
   const tabId = source && source.tabId;
   if (!Number.isInteger(tabId) || !pragmaticCdpTabs.has(tabId)) return;
-  if (method === 'Target.attachedToTarget') {
-    const sessionId = params && typeof params.sessionId === 'string' ? params.sessionId : '';
-    if (!sessionId) return;
-    void chrome.debugger.sendCommand({ tabId, sessionId }, 'Network.enable', {
-      maxTotalBufferSize: 10_000_000,
-      maxResourceBufferSize: 2_000_000,
-      maxPostDataSize: 0,
-    }).catch(() => {});
-    return;
-  }
+  if (method === 'Target.attachedToTarget') return;
   const requestId = params && typeof params.requestId === 'string' ? params.requestId : '';
   const sessionId = source && typeof source.sessionId === 'string' ? source.sessionId : 'root';
   const key = `${tabId}:${sessionId}:${requestId}`;
@@ -1730,13 +1758,17 @@ chrome.debugger.onEvent?.addListener((source, method, params) => {
     const response = params && params.response;
     const payload = response && typeof response.payloadData === 'string' ? response.payloadData : '';
     if (!payload) return;
+    if (Number(response && response.opcode) === 2) return;
+    if (payload.length > 8_192) return;
+    const url = pragmaticCdpSocketUrls.get(key) || '';
+    if (url && !/pragmaticplaylive\.net\/game|\/game(?:\?|$)/i.test(url)) return;
     send({
       kind: 'networkCapture',
       source: 'baccarat-bridge-pragmatic-cdp-ws',
-      url: pragmaticCdpSocketUrls.get(key) || '',
+      url,
       direction: 'recv',
-      encoding: response.opcode === 2 ? 'base64' : 'text',
-      data: payload.slice(0, 120000),
+      encoding: 'text',
+      data: payload,
     });
     return;
   }
@@ -1834,13 +1866,15 @@ function sendPragmaticCdpBody(url, payload, base64Encoded, resourceType, phase) 
       }
     } catch (_) {}
   }
+  const text = String(data || '');
+  if (text.length > 8_192) return;
   send({
     kind: 'networkCapture',
     source: 'baccarat-bridge-pragmatic-cdp-body',
     url,
     direction: 'recv',
     encoding,
-    data: String(data || '').slice(0, 120000),
+    data: text,
     resourceType,
     phase,
   });
@@ -2051,6 +2085,42 @@ async function ensureKeeperTab(url) {
 }
 
 let lastTabReloadAt = 0;
+const pragmaticFramesByTab = new Map();
+
+function notePragmaticFrame(tabId, frameId, url) {
+  if (!Number.isInteger(tabId) || !Number.isInteger(frameId) || typeof url !== 'string') return;
+  let pathname = '';
+  try {
+    pathname = new URL(url).pathname;
+  } catch (_) {
+    return;
+  }
+  if (pathname !== '/desktop/baccarat/' && pathname !== '/desktop/multibaccarat/') {
+    pragmaticFramesByTab.get(tabId)?.delete(frameId);
+    return;
+  }
+  let frames = pragmaticFramesByTab.get(tabId);
+  if (!frames) {
+    frames = new Map();
+    pragmaticFramesByTab.set(tabId, frames);
+  }
+  frames.set(frameId, { pathname, url });
+  const multi = [];
+  const dedicated = [];
+  for (const info of frames.values()) {
+    if (info.pathname === '/desktop/multibaccarat/') multi.push(info);
+    if (info.pathname === '/desktop/baccarat/') dedicated.push(info);
+  }
+  if (multi.length === 0 || dedicated.length === 0) return;
+  send({
+    kind: 'sessionAction',
+    action: 'dual-game-session',
+    url: '',
+    frame: 'allFrames',
+    detail: `autonomous:multibaccarat=${multi.length}:baccarat=${dedicated.length}`,
+    timestamp: new Date().toISOString(),
+  });
+}
 
 chrome.runtime.onMessage.addListener((message, sender, _sendResponse) => {
   if (!message || typeof message.kind !== 'string' || !isTrustedGameSender(sender)) return;
@@ -2058,6 +2128,7 @@ chrome.runtime.onMessage.addListener((message, sender, _sendResponse) => {
   ingestPragmaticProtocolWindow(message);
   notePragmaticOutboundSend(message);
   send(message);
+  notePragmaticFrame(sender.tab && sender.tab.id, sender.frameId, message.url || sender.url || '');
   const senderTabId = sender && sender.tab ? sender.tab.id : null;
   if (message.kind === 'keepalive') {
     if (autoKeeperEnabled && message.frame === 'top') {
@@ -2116,6 +2187,7 @@ chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
+  pragmaticFramesByTab.delete(tabId);
   if (tabId === keeperTabId) {
     keeperTabId = null;
     void chrome.storage.local.remove('keeperTabId');
@@ -2132,7 +2204,7 @@ async function reloadPendingGameTabs() {
   await chrome.storage.local.remove('reloadGameTabsAfterExtensionReload');
   const tabs = await chrome.tabs.query({});
   for (const tab of tabs) {
-    if (!tab.id || !isGameTabUrl(tab.url)) continue;
+    if (!tab.id || !isReloadableGameTabUrl(tab.url)) continue;
     try {
       await chrome.tabs.reload(tab.id);
       setTimeout(() => { void replayRuntimeStateInGameFrames(); }, 3000);

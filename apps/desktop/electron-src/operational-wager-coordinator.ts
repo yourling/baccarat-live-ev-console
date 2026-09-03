@@ -112,18 +112,21 @@ export class OperationalWagerCoordinator {
     return this.getKeepaliveState();
   }
 
-  async tick(now = new Date()): Promise<void> {
+  async tick(now = new Date(), tableId?: string): Promise<void> {
     await this.options.serialize(async () => {
-      await this.tickInner(now);
+      await this.tickInner(now, tableId);
     });
   }
 
-  private async tickInner(now: Date): Promise<void> {
+  private async tickInner(now: Date, tableId?: string): Promise<void> {
     if (!this.state.enabled || this.running || !keepaliveDue(this.state, now)) return;
+    if (tableId === undefined) return;
+    const seated = this.options.keepaliveTableIds?.() ?? this.options.monitorTableIds();
+    if (!seated.includes(tableId)) return;
     this.running = true;
     try {
       const result = await tryKeepaliveInOrder({
-        tableIds: this.options.keepaliveTableIds?.() ?? this.options.monitorTableIds(),
+        tableIds: [tableId],
         market: this.state.market,
         amount: this.state.amount,
         requestWager: async (tableId, market, amount) => {
@@ -188,7 +191,10 @@ export class OperationalWagerCoordinator {
     if (!Number.isFinite(input.amount) || input.amount <= 0) {
       return { status: 'REJECTED', tableId: input.tableId, reason: 'invalid-amount' };
     }
-    if (!this.options.monitorTableIds().includes(input.tableId)) {
+    const allowedTableIds = input.source === 'keepalive'
+      ? (this.options.keepaliveTableIds?.() ?? this.options.monitorTableIds())
+      : this.options.monitorTableIds();
+    if (!allowedTableIds.includes(input.tableId)) {
       return { status: 'REJECTED', tableId: input.tableId, reason: 'table-not-monitored' };
     }
     const runtimeBlockReason = this.options.runtimeBlockReason?.(input.tableId, input.source);

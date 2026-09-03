@@ -26,6 +26,11 @@ describe('extension background live bet routing', () => {
     harness.socket.emit('message', { data: JSON.stringify(pragmaticOperationalRequest()) });
     for (let tick = 0; tick < 4; tick += 1) await flushAsyncWork();
 
+    const preparation = harness.executeScript.mock.calls.find(
+      ([injection]) => String(injection.func).includes('shared-market-controls-ambiguous'),
+    );
+    expect(String(preparation?.[0].func)).toContain('not-seated');
+    expect(String(preparation?.[0].func)).not.toContain('not-found-after-scroll');
     expect(harness.executeScript.mock.calls.some(
       ([injection]) => String(injection.func).includes('executePragmaticBetOneShot')
         && Array.isArray(injection.target?.frameIds),
@@ -37,6 +42,265 @@ describe('extension background live bet routing', () => {
         raw: expect.objectContaining({
           commitStarted: false,
           reason: expect.stringContaining('Pragmatic target table preparation failed: activation-control-missing'),
+        }),
+      }),
+    }));
+  });
+
+  it('does not send a multiplay table lpbet on a dedicated frame even if that socket mentioned the table id', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+      pragmaticChannelStatuses: [
+        {
+          frameId: 12,
+          result: {
+            hasUser: true,
+            hasSocket: true,
+            framePath: '/desktop/baccarat/',
+            boundTableId: 'bc392chromabc392',
+            gm: 'baccarat_desktop',
+            tableIds: [
+              'bc392chromabc392',
+              'bcpirpmfpeobc198',
+              'tobcbaccaragen92',
+              'bc281koreanch281',
+              'cbcf6qas8fscb221',
+            ],
+          },
+        },
+        {
+          frameId: 11,
+          result: {
+            hasUser: true,
+            hasSocket: true,
+            framePath: '/desktop/multibaccarat/',
+            gm: 'mtb_desktop',
+            tableIds: ['bcpirpmfpeobc198', 'bc392chromabc392'],
+          },
+        },
+      ],
+      pragmaticPhaseResult: (command, _request, frameId) => {
+        if (command['phase'] === 'request') {
+          return {
+            phase: 'requested',
+            runtimeRevision: 'pragmatic-bet-runtime/2026-08-30.21',
+            requestSent: true,
+            frameId,
+          };
+        }
+        if (command['phase'] === 'observe') {
+          return {
+            receiptId: 'pragmatic-operational-receipt-speed8',
+            wagerId: 'pragmatic-wager-1',
+            tableId: 'bcpirpmfpeobc198',
+            handId: '16413832010',
+            market: 'player',
+            amount: 10,
+            source: 'keepalive',
+            status: 'ACCEPTED',
+            createdAt: '2026-08-31T19:22:40.693Z',
+            raw: {
+              runtimeRevision: 'pragmatic-bet-runtime/2026-08-30.21',
+              commitStarted: true,
+              frameId,
+            },
+          };
+        }
+        return undefined;
+      },
+    });
+    const request = pragmaticOperationalRequest();
+    request.request.wager.tableId = 'bcpirpmfpeobc198';
+    request.request.wager.shoeId = 'pragmatic-bcpirpmfpeobc198-1';
+    request.request.wager.handId = '16413832010';
+    request.request.wager.market = 'player';
+    request.request.wager.source = 'keepalive';
+
+    harness.socket.emit('message', { data: JSON.stringify(request) });
+    for (let tick = 0; tick < 6; tick += 1) await flushAsyncWork();
+
+    const requestExecution = harness.executeScript.mock.calls.find(
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot')
+        && Array.isArray(injection.target?.frameIds)
+        && (injection.args?.[1] as { phase?: string } | undefined)?.phase === 'request',
+    );
+    expect(requestExecution?.[0].target).toEqual({ tabId: 42, frameIds: [11] });
+  });
+
+  it('sends lpbet on the socket that already saw the target table, not the first game socket', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+      pragmaticChannelStatuses: [
+        {
+          frameId: 12,
+          result: {
+            hasUser: true,
+            hasSocket: true,
+            tableIds: ['bc392chromabc392'],
+          },
+        },
+        {
+          frameId: 11,
+          result: {
+            hasUser: true,
+            hasSocket: true,
+            tableIds: ['bcpirpmfpeobc198', 'bc392chromabc392'],
+          },
+        },
+      ],
+      pragmaticPhaseResult: (command, _request, frameId) => {
+        if (command['phase'] === 'request') {
+          return {
+            phase: 'requested',
+            runtimeRevision: 'pragmatic-bet-runtime/2026-08-30.21',
+            tableId: 'bcpirpmfpeobc198',
+            handId: '16413832010',
+            market: 'player',
+            amount: 10,
+            currentRoundId: '16413832010',
+            beforeTotal: 0,
+            beforeTotalObserved: true,
+            requestSent: true,
+            frameId,
+          };
+        }
+        if (command['phase'] === 'observe') {
+          return {
+            receiptId: 'pragmatic-operational-receipt-speed8',
+            wagerId: 'pragmatic-wager-1',
+            tableId: 'bcpirpmfpeobc198',
+            shoeId: 'pragmatic-bcpirpmfpeobc198-1',
+            handId: '16413832010',
+            market: 'player',
+            amount: 10,
+            source: 'keepalive',
+            status: 'ACCEPTED',
+            createdAt: '2026-08-31T19:22:40.693Z',
+            raw: {
+              runtimeRevision: 'pragmatic-bet-runtime/2026-08-30.21',
+              commitPoint: 'market-click',
+              commitStarted: true,
+              trustedInput: true,
+              frameId,
+            },
+          };
+        }
+        return undefined;
+      },
+    });
+    const request = pragmaticOperationalRequest();
+    request.request.wager.tableId = 'bcpirpmfpeobc198';
+    request.request.wager.shoeId = 'pragmatic-bcpirpmfpeobc198-1';
+    request.request.wager.handId = '16413832010';
+    request.request.wager.market = 'player';
+    request.request.wager.source = 'keepalive';
+
+    harness.socket.emit('message', { data: JSON.stringify(request) });
+    for (let tick = 0; tick < 6; tick += 1) await flushAsyncWork();
+
+    const requestExecution = harness.executeScript.mock.calls.find(
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot')
+        && Array.isArray(injection.target?.frameIds)
+        && (injection.args?.[1] as { phase?: string } | undefined)?.phase === 'request',
+    );
+    expect(requestExecution?.[0].target).toEqual({ tabId: 42, frameIds: [11] });
+    expect(harness.chrome.debugger.sendCommand.mock.calls.filter(
+      ([, method]) => method === 'Input.dispatchMouseEvent',
+    )).toHaveLength(0);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      receipt: expect.objectContaining({
+        tableId: 'bcpirpmfpeobc198',
+        status: 'ACCEPTED',
+        raw: expect.objectContaining({ frameId: 11 }),
+      }),
+    }));
+  });
+
+  it('rejects without clicking when no game socket has seen the target table', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+      pragmaticChannelStatuses: [{
+        frameId: 12,
+        result: {
+          hasUser: true,
+          hasSocket: true,
+          tableIds: ['bc392chromabc392'],
+        },
+      }],
+    });
+    const request = pragmaticOperationalRequest();
+    request.request.wager.tableId = 'bcpirpmfpeobc198';
+    request.request.wager.shoeId = 'pragmatic-bcpirpmfpeobc198-1';
+    request.request.wager.handId = '16413832010';
+    request.request.wager.market = 'player';
+    request.request.wager.source = 'keepalive';
+
+    harness.socket.emit('message', { data: JSON.stringify(request) });
+    for (let tick = 0; tick < 6; tick += 1) await flushAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes('executePragmaticBetOneShot')
+        && Array.isArray(injection.target?.frameIds),
+    )).toBe(false);
+    expect(harness.chrome.debugger.sendCommand.mock.calls.filter(
+      ([, method]) => method === 'Input.dispatchMouseEvent',
+    )).toHaveLength(0);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      receipt: expect.objectContaining({
+        status: 'REJECTED',
+        tableId: 'bcpirpmfpeobc198',
+        raw: expect.objectContaining({
+          commitStarted: false,
+          reason: expect.stringContaining('table-not-in-current-session'),
+        }),
+      }),
+    }));
+  });
+
+  it('rejects without clicking a tile when the request path is unavailable', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+      pragmaticChannelStatus: { hasUser: true, hasSocket: true },
+      pragmaticPhaseResult: command => {
+        if (command['phase'] === 'request') {
+          return {
+            phase: 'request-unavailable',
+            runtimeRevision: 'pragmatic-bet-runtime/2026-08-30.21',
+            reason: 'table-not-in-current-session',
+            currentRoundId: '1726012345',
+          };
+        }
+        return undefined;
+      },
+    });
+
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticOperationalRequest()) });
+    for (let tick = 0; tick < 6; tick += 1) await flushAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes('shared-market-controls-ambiguous'),
+    )).toBe(false);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      receipt: expect.objectContaining({
+        status: 'REJECTED',
+        raw: expect.objectContaining({
+          commitStarted: false,
+          reason: expect.stringContaining('request-unavailable:table-not-in-current-session'),
         }),
       }),
     }));

@@ -148,15 +148,11 @@ describe('extension background multitable command', () => {
       ([injection]) => isPragmaticProbeInjection(injection.func),
     )).toBe(true);
     expect(harness.executeScript.mock.calls.some(
-      ([injection]) => String(injection.func).includes('scrollIntoView'),
-    )).toBe(true);
+      ([injection]) => String(injection.func).includes('icon-Video'),
+    )).toBe(false);
     expect(harness.executeScript.mock.calls.some(
-      ([injection]) => String(injection.func).includes('icon-Video'),
-    )).toBe(true);
-    const preparation = harness.executeScript.mock.calls.find(
-      ([injection]) => String(injection.func).includes('icon-Video'),
-    );
-    expect(preparation?.[0].args?.[2]).toBeNull();
+      ([injection]) => String(injection.func).includes('not-found-after-scroll'),
+    )).toBe(false);
     expect(harness.executeScript.mock.calls.some(
       ([injection]) => isPragmaticFinalInjection(injection.func),
     )).toBe(false);
@@ -167,6 +163,139 @@ describe('extension background multitable command', () => {
         'probeBetReadiness:bc281koreanch281:candidates=1:status=ready:readyCandidates=1:authority=unique-ready:roundId=1726012345',
       ),
     }));
+  });
+
+  it('does not navigate a dedicated table frame when multiplay is already open', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+      pragmaticFrameRoutes: [
+        {
+          frameId: 11,
+          result: {
+            pathname: '/desktop/multibaccarat/',
+            frameUrl: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/',
+          },
+        },
+        {
+          frameId: 12,
+          result: {
+            pathname: '/desktop/baccarat/',
+            frameUrl: 'https://client.pragmaticplaylive.net/desktop/baccarat/?table_id=bc281koreanch281',
+          },
+        },
+      ],
+    });
+
+    harness.socket.emit('message', {
+      data: JSON.stringify({
+        kind: 'command',
+        name: 'openMultiView',
+        tableIds: ['bc281koreanch281', 'tobcbaccaragen92'],
+      }),
+    });
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes('pragmatic-frame-routes'),
+    )).toBe(true);
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes("location.pathname = '/desktop/multibaccarat/'")
+        && Array.isArray(injection.target?.frameIds),
+    )).toBe(false);
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes("location.replace('about:blank')"),
+    )).toBe(false);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'sessionAction',
+      action: 'dual-game-session',
+      detail: expect.stringContaining('multibaccarat'),
+    }));
+  });
+
+  it('does not blank multiplay when a dedicated table frame is also present', async () => {
+    const harness = await createHarness({
+      tabs: [{
+        id: 42,
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+      }],
+    });
+    const listeners = harness.chrome.runtime.onMessage.addListener.mock.calls.map(([listener]) => listener);
+    const popup = {
+      tab: { id: 42, url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat' },
+    };
+    const emit = (message, sender) => {
+      for (const listener of listeners) listener(message, sender);
+    };
+
+    emit({
+      kind: 'sessionAction',
+      action: 'native-idle-keepalive-armed',
+      url: 'https://client.pragmaticplaylive.net/desktop/baccarat/?table_id=bc281koreanch281',
+      frame: 'iframe',
+      timestamp: '2026-09-01T00:00:00.000Z',
+    }, { ...popup, frameId: 12, url: 'https://client.pragmaticplaylive.net/desktop/baccarat/?table_id=bc281koreanch281' });
+    emit({
+      kind: 'sessionAction',
+      action: 'native-idle-keepalive-armed',
+      url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/',
+      frame: 'iframe',
+      timestamp: '2026-09-01T00:00:01.000Z',
+    }, { ...popup, frameId: 11, url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/' });
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => String(injection.func).includes("location.replace('about:blank')"),
+    )).toBe(false);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'sessionAction',
+      action: 'dual-game-session',
+      detail: expect.stringContaining('autonomous'),
+    }));
+  });
+
+  it('does not forward HTTP, Worker, or CDP captures to the bridge', async () => {
+    const harness = await createHarness();
+    for (const source of [
+      'baccarat-bridge-pragmatic-http',
+      'baccarat-bridge-pragmatic-worker',
+      'baccarat-bridge-pragmatic-window',
+      'baccarat-bridge-pragmatic-cdp-body',
+    ]) {
+      vm.runInContext(
+        `send(${JSON.stringify({
+          kind: 'networkCapture',
+          source,
+          url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/',
+          direction: 'recv',
+          encoding: 'text',
+          data: '{"ok":true}',
+        })})`,
+        harness.context,
+      );
+    }
+    vm.runInContext(
+      `send(${JSON.stringify({
+        kind: 'networkCapture',
+        source: 'baccarat-bridge-pragmatic-ws',
+        url: 'wss://gs24.pragmaticplaylive.net/game',
+        direction: 'recv',
+        encoding: 'text',
+        data: '{"timer":{"table":"tobcbaccaragen92","value":"9"}}',
+      })})`,
+      harness.context,
+    );
+    const captures = sentMessages(harness.socket).filter(message => message.kind === 'networkCapture');
+    expect(captures).toEqual([
+      expect.objectContaining({
+        source: 'baccarat-bridge-pragmatic-ws',
+        url: 'wss://gs24.pragmaticplaylive.net/game',
+      }),
+    ]);
   });
 
   it('maintains a fresh per-table Pragmatic protocol betting window', async () => {

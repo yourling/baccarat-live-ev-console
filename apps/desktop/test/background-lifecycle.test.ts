@@ -5,8 +5,8 @@ import {
 } from '../electron-src/background-lifecycle.js';
 
 describe('desktop background lifecycle', () => {
-  it('keeps the service alive when the operator closes the main window', () => {
-    expect(shouldHideMainWindowOnClose(false)).toBe(true);
+  it('lets closing the main window quit the app', () => {
+    expect(shouldHideMainWindowOnClose(false)).toBe(false);
     expect(shouldHideMainWindowOnClose(true)).toBe(false);
   });
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { NormalizedEvent } from '@baccarat/contracts';
-import { PragmaticRuntimeParser } from '../src/pragmatic-runtime.js';
+import { PragmaticRuntimeParser, isJoinableNewShoeRoadCount, pragmaticGameCountSnapshot } from '../src/pragmatic-runtime.js';
 import { pragmaticNetworkObservation } from '../src/server.js';
 
 function snapshot(
@@ -67,7 +67,7 @@ describe('PragmaticRuntimeParser', () => {
         countdown: 2,
       }],
     }));
-    expect(laterTick.filter(event => event.type === 'bettingWindowOpened')).toHaveLength(2);
+    expect(laterTick.filter(event => event.type === 'bettingWindowOpened')).toHaveLength(0);
   });
 
   it('promotes an attached monitor session to a physical shoe on protocol shuffle', () => {
@@ -240,6 +240,155 @@ describe('PragmaticRuntimeParser', () => {
       | undefined;
     expect(reset?.baseline).toBe('physical-shoe');
     expect(reset?.shoeId).toBe('pragmatic-bc281koreanch281-2');
+  });
+
+  it('treats a lagged road wrap as joinable even past #2', () => {
+    expect(isJoinableNewShoeRoadCount(48, 5)).toBe(true);
+    expect(isJoinableNewShoeRoadCount(48, 1)).toBe(true);
+    expect(isJoinableNewShoeRoadCount(34, 33)).toBe(false);
+    expect(isJoinableNewShoeRoadCount(undefined, 1)).toBe(false);
+  });
+
+  it('does not treat a one-step road-count drop as a new shoe', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'spto43bctorobc43', roundId: 'hand-37', gameCount: 37,
+    }]));
+    const events = parser.parse(snapshot([{
+      tableId: 'spto43bctorobc43', roundId: 'hand-36', gameCount: 36,
+    }]));
+    expect(events.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+  });
+
+  it('does not open a physical shoe when the road count only lags a few hands', () => {
+    const parser = new PragmaticRuntimeParser();
+    const tableId = 'spto43bctorobc43';
+    for (let index = 0; index < 8; index += 1) {
+      parser.parse(snapshot([{
+        tableId,
+        roundId: `1640732490${index}`,
+        bettingOpen: false,
+        playerCards: ['QS', '9H'],
+        bankerCards: ['3S', '7D'],
+        source: 'protocol',
+      }]));
+    }
+    expect(parser.parse(snapshot([{ tableId, gameCount: 5 }]))
+      .filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+  });
+
+  it('opens a physical shoe when the road count is far behind tracked hands', () => {
+    const parser = new PragmaticRuntimeParser();
+    const tableId = 'spto21bctorobc21';
+    for (let index = 0; index < 24; index += 1) {
+      parser.parse(snapshot([{
+        tableId,
+        roundId: `164073249${String(index).padStart(2, '0')}`,
+        bettingOpen: false,
+        playerCards: ['QS', '9H'],
+        bankerCards: ['3S', '7D'],
+        source: 'protocol',
+      }]));
+    }
+
+    const reset = parser.parse(snapshot([{ tableId, gameCount: 5 }]));
+    expect(reset).toEqual([
+      expect.objectContaining({
+        type: 'newShoeSignal',
+        baseline: 'physical-shoe',
+        shoeId: `pragmatic-${tableId}-2`,
+      }),
+    ]);
+
+    expect(parser.parse(snapshot([{ tableId, gameCount: 5 }]))).toEqual([]);
+    expect(parser.parse(snapshot([{ tableId, roundId: '16407324910', gameCount: 5 }]))
+      .filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+
+    const dealt = parser.parse(snapshot([{
+      tableId,
+      roundId: '16407324910',
+      gameCount: 5,
+      bettingOpen: false,
+      playerCards: ['2C', '2S'],
+      bankerCards: ['AH', '6D'],
+      source: 'protocol',
+    }]));
+    const cards = dealt.filter(event => event.type === 'cardObserved');
+    expect(cards).toHaveLength(4);
+    expect(cards.every(event => event.shoeId === `pragmatic-${tableId}-2`)).toBe(true);
+  });
+
+  it('does not treat a nearby road count as a missed shuffle', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-1', gameCount: 35, bettingOpen: true,
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 36, bettingOpen: true,
+    }]));
+    const next = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-3', gameCount: 36, bettingOpen: true,
+    }]));
+    expect(next.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+  });
+
+  it('can force a physical shoe that later cards attach to', () => {
+    const parser = new PragmaticRuntimeParser();
+    const tableId = 'spto21bctorobc21';
+    parser.parse(snapshot([{
+      tableId, roundId: '16407324001', playerCards: ['QS', '9H'], bankerCards: ['3S', '7D'], source: 'protocol',
+    }]));
+    const forced = parser.openPhysicalShoe(tableId, '2026-08-31T12:00:00.000Z');
+    expect(forced).toEqual([
+      expect.objectContaining({
+        type: 'newShoeSignal',
+        baseline: 'physical-shoe',
+        shoeId: `pragmatic-${tableId}-2`,
+      }),
+    ]);
+    expect(parser.currentShoeId(tableId)).toBe(`pragmatic-${tableId}-2`);
+
+    const dealt = parser.parse(snapshot([{
+      tableId,
+      roundId: '16407324910',
+      playerCards: ['2C', '2S'],
+      bankerCards: ['AH', '6D'],
+      source: 'protocol',
+    }]));
+    expect(dealt.filter(event => event.type === 'cardObserved')
+      .every(event => event.shoeId === `pragmatic-${tableId}-2`)).toBe(true);
+  });
+
+  it('does not open a shoe from a game-count-only snapshot on a fresh table', () => {
+    const parser = new PragmaticRuntimeParser();
+    expect(parser.parse(snapshot([{
+      tableId: 'spto21bctorobc21',
+      gameCount: 5,
+    }]))).toEqual([]);
+  });
+
+  it('keeps only tableId and gameCount when stripping a DOM snapshot', () => {
+    const stripped = pragmaticGameCountSnapshot(snapshot([{
+      tableId: 'spto21bctorobc21',
+      roundId: '16407324910',
+      gameCount: 5,
+      bettingOpen: true,
+      countdown: 6,
+      playerCards: ['QS', '9H'],
+      bankerCards: ['3S', '7D'],
+      source: 'dom',
+    }]));
+    expect(JSON.parse(stripped ?? '{}')).toEqual({
+      version: 1,
+      view: 'single',
+      observedAt: '2026-08-29T01:00:00.000Z',
+      tables: [{ tableId: 'spto21bctorobc21', gameCount: 5 }],
+    });
+    expect(pragmaticGameCountSnapshot(snapshot([{
+      tableId: 'spto21bctorobc21',
+      roundId: '16407324910',
+      bettingOpen: true,
+    }]))).toBeUndefined();
   });
 
   it('tracks simultaneous multitable rounds independently', () => {

@@ -15,7 +15,7 @@ type FakeElement = {
   parentElement?: FakeElement | null;
   click: ReturnType<typeof vi.fn>;
   getAttribute(name: string): string | null;
-  getBoundingClientRect(): { width: number; height: number; left?: number; top?: number };
+  getBoundingClientRect(): { width: number; height: number; left?: number; top?: number; x?: number; y?: number };
   contains?(node: FakeElement | null): boolean;
   closest?(selector: string): FakeElement | null;
   querySelector(selector: string): FakeElement | null;
@@ -289,6 +289,60 @@ describe('Pragmatic bet runtime', () => {
     expect(Number(closing.countdown)).toBeLessThanOrEqual(2);
   });
 
+  it('treats a multi-table tile with its own bet buttons as ready without sitting', () => {
+    const runtime = exportedRuntime();
+    const timer = element('8');
+    const header = element('ID: 17260578524');
+    const player = element('闲家');
+    const banker = element('庄家');
+    const root = element('粤语极速百家乐¥ 10ID: 17260578524');
+    root.querySelector = (selector: string): FakeElement | null => {
+      if (selector.includes('game-header-game-id')) return header;
+      if (selector.includes('timer-countdown')) return timer;
+      if (selector === '[data-betcode="0"]') return player;
+      if (selector === '[data-betcode="1"]') return banker;
+      return null;
+    };
+    root.querySelectorAll = (selector: string): FakeElement[] => {
+      if (selector === '[data-betcode="0"]') return [player];
+      if (selector === '[data-betcode="1"]') return [banker];
+      if (selector.includes('data-betcode="0"') && selector.includes('data-betcode="1"')) return [player, banker];
+      return [];
+    };
+    const result = runInNewContext(
+      `(${String(runtime.probe)})('tobcbaccaragen92')`,
+      {
+        document: {
+          referrer: '',
+          querySelector: () => null,
+          querySelectorAll: () => [],
+          getElementById: (id: string) => id === 'TileHeight-tobcbaccaragen92' ? root : null,
+        },
+        location: {
+          pathname: '/desktop/multibaccarat/',
+          hostname: 'client.pragmaticplaylive.net',
+        },
+        URL,
+        Date,
+        Number,
+        Object,
+        Array,
+        String,
+        Promise,
+        setTimeout,
+        innerWidth: 1280,
+        innerHeight: 720,
+      },
+    ) as Record<string, unknown>;
+
+    expect(result).toEqual(expect.objectContaining({
+      status: 'ready',
+      tableId: 'tobcbaccaragen92',
+      routingAuthority: 'table-root',
+      roundId: '17260578524',
+    }));
+  });
+
   it('requires a fresh prepared-table lease for the shared multitable betting panel', () => {
     const runtime = exportedRuntime();
     const wrongTable = multitablePageContext(8, 'otherpragmatictable');
@@ -536,7 +590,7 @@ describe('Pragmatic bet runtime', () => {
     }));
   });
 
-  it('does not send a request-path wager when the page round id cannot be read', async () => {
+  it('still sends a request-path wager when the tile round id cannot be scraped', async () => {
     const runtime = exportedRuntime();
     const page = pageContext(true, 'no-round-header');
     const placeBet = vi.fn(() => ({ ok: true }));
@@ -547,10 +601,10 @@ describe('Pragmatic bet runtime', () => {
       phase: 'request',
       expectedRoundId: '17260230224',
     });
-    expect(placeBet).not.toHaveBeenCalled();
+    expect(placeBet).toHaveBeenCalled();
     expect(requested).toEqual(expect.objectContaining({
-      phase: 'request-unavailable',
-      reason: 'round-id-unreadable',
+      phase: 'requested',
+      requestSent: true,
     }));
   });
 
@@ -574,6 +628,70 @@ describe('Pragmatic bet runtime', () => {
       reason: 'round-not-current',
       currentRoundId: '17260230224',
       expectedRoundId: '17260239999',
+    }));
+  });
+
+  it('still sends a multiplay request-path wager when the tile round label differs from the protocol hand', async () => {
+    const runtime = exportedRuntime();
+    const page = multitablePageContext(8, 'tobcbaccaragen92', Date.now() - 6_000);
+    const placeBet = vi.fn(() => ({ ok: true }));
+    page.context.__baccaratPragmaticBetChannel = { placeBet };
+    const execute = runInNewContext(`(${String(runtime.execute)})`, page.context) as
+      (request: unknown, command: unknown) => Promise<Record<string, unknown>>;
+    const requested = await execute({
+      mode: 'live',
+      wager: {
+        wagerId: 'wager-multitable-round-label',
+        tableId: 'tobcbaccaragen92',
+        shoeId: 'pragmatic-tobcbaccaragen92-1',
+        handId: '16418031910',
+        market: 'player',
+        amount: 10,
+        source: 'manual',
+      },
+    }, {
+      phase: 'request',
+      expectedRoundId: '16418031910',
+    });
+    expect(placeBet).toHaveBeenCalledWith(expect.objectContaining({
+      tableId: 'tobcbaccaragen92',
+      roundId: '16418031910',
+    }));
+    expect(requested).toEqual(expect.objectContaining({
+      phase: 'requested',
+      requestSent: true,
+    }));
+  });
+
+  it('still sends a multiplay request-path wager when the target tile timer is stale', async () => {
+    const runtime = exportedRuntime();
+    const page = multitablePageContext(8, 'tobcbaccaragen92', Date.now() - 6_000);
+    const placeBet = vi.fn(() => ({ ok: true }));
+    page.context.__baccaratPragmaticBetChannel = { placeBet };
+    const execute = runInNewContext(`(${String(runtime.execute)})`, page.context) as
+      (request: unknown, command: unknown) => Promise<Record<string, unknown>>;
+    const requested = await execute({
+      mode: 'live',
+      wager: {
+        wagerId: 'wager-multitable-stale-timer',
+        tableId: 'tobcbaccaragen92',
+        shoeId: 'pragmatic-tobcbaccaragen92-1',
+        handId: '17260578524',
+        market: 'player',
+        amount: 10,
+        source: 'manual',
+      },
+    }, {
+      phase: 'request',
+      expectedRoundId: '17260578524',
+    });
+    expect(placeBet).toHaveBeenCalledWith(expect.objectContaining({
+      tableId: 'tobcbaccaragen92',
+      roundId: '17260578524',
+    }));
+    expect(requested).toEqual(expect.objectContaining({
+      phase: 'requested',
+      requestSent: true,
     }));
   });
 
@@ -614,6 +732,97 @@ describe('Pragmatic bet runtime', () => {
     }));
     expect(receipt).not.toHaveProperty('status', 'ACCEPTED');
     expect(page.playerPair.click).not.toHaveBeenCalled();
+  });
+
+  it('does not send lpbet from a dedicated frame bound to a different table', async () => {
+    const runtime = exportedRuntime();
+    const page = pageContext(true);
+    const placeBet = vi.fn(() => ({ ok: true }));
+    page.context.__baccaratPragmaticBetChannel = { placeBet };
+    const execute = runInNewContext(`(${String(runtime.execute)})`, page.context) as
+      (request: unknown, command: unknown) => Promise<Record<string, unknown>>;
+    const requested = await execute({
+      mode: 'live',
+      wager: {
+        wagerId: 'wager-wrong-dedicated',
+        tableId: 'bcpirpmfpeobc198',
+        shoeId: 'pragmatic-bcpirpmfpeobc198-1',
+        handId: '16413832010',
+        market: 'player',
+        amount: 10,
+        source: 'keepalive',
+      },
+    }, {
+      phase: 'request',
+      expectedRoundId: '16413832010',
+    });
+
+    expect(placeBet).not.toHaveBeenCalled();
+    expect(requested).toEqual(expect.objectContaining({
+      phase: 'request-unavailable',
+      reason: 'table-not-in-current-session',
+    }));
+  });
+
+  it('targets the prepared tile market instead of a unique shared panel from another table', async () => {
+    const runtime = exportedRuntime();
+    const page = multitablePageContext(8);
+    const tile = page.context.document.getElementById('TileHeight-tobcbaccaragen92');
+    const sharedMarkets = new Map([
+      ['0', element('共享闲家')],
+      ['1', element('共享庄家')],
+      ['3', element('共享闲对')],
+      ['4', element('共享庄对')],
+    ]);
+    for (const shared of sharedMarkets.values()) {
+      shared.closest = () => null;
+      shared.getBoundingClientRect = () => ({ x: 20, y: 20, width: 80, height: 40, left: 20, top: 20 });
+    }
+    for (const [code, tileMarket] of page.markets) {
+      tileMarket.closest = () => tile;
+      if (code === '0') {
+        tileMarket.getBoundingClientRect = () => ({ x: 400, y: 300, width: 80, height: 40, left: 400, top: 300 });
+      }
+    }
+    const document = page.context.document as {
+      querySelectorAll(selector: string): FakeElement[];
+    };
+    const originalQuery = document.querySelectorAll.bind(document);
+    document.querySelectorAll = (selector: string) => {
+      const code = selector.match(/^\[data-betcode="([0-4])"\]$/)?.[1];
+      if (code) {
+        return [sharedMarkets.get(code), page.markets.get(code)].filter(
+          (entry): entry is FakeElement => Boolean(entry),
+        );
+      }
+      return originalQuery(selector);
+    };
+    const execute = runInNewContext(`(${String(runtime.execute)})`, page.context) as
+      (request: unknown, command: unknown) => Promise<Record<string, unknown>>;
+    const request = {
+      mode: 'live',
+      wager: {
+        wagerId: 'wager-tile-not-shared',
+        tableId: 'tobcbaccaragen92',
+        shoeId: 'pragmatic-tobcbaccaragen92-1',
+        handId: '17260578524',
+        market: 'player',
+        amount: 10,
+        source: 'keepalive',
+      },
+    };
+    const marketTarget = await execute(request, {
+      phase: 'target',
+      action: 'market',
+      expectedRoundId: '17260578524',
+    });
+
+    expect(marketTarget).toEqual(expect.objectContaining({
+      phase: 'target',
+      action: 'market',
+      point: expect.objectContaining({ x: 440, y: 320 }),
+    }));
+    expect(sharedMarkets.get('0')?.click).not.toHaveBeenCalled();
   });
 
   it('reports that request betting is unavailable until a real send template exists', async () => {

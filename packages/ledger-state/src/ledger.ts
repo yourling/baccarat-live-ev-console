@@ -423,12 +423,41 @@ export type AppendEventResult = 'appended' | 'duplicate';
 const SCHEMA_VERSION = '5';
 const MONITOR_HISTORY_HANDS_PER_TABLE = 12;
 const MONITOR_WINDOW_EVENT_TYPES = "('bettingWindowOpened','bettingWindowClosed')";
+const MONITOR_TRANSIENT_TYPES = [
+  'connectionLost',
+  'connectionRestored',
+  'autoArmChanged',
+  'autoDisarmChanged',
+] as const;
 const MONITOR_TRANSIENT_EVENT_TYPES = "('connectionLost','connectionRestored','autoArmChanged','autoDisarmChanged')";
+const MONITOR_TRANSIENT_KEEP = 8;
+const HOT_CARD_KEEP = 36;
+const HOT_WINDOW_KEEP = 8;
+const EPHEMERAL_EVENT_TYPES = new Set([
+  'cardObserved',
+]);
+
+function mergeLedgerEvents(
+  persisted: readonly NormalizedEvent[],
+  ephemeral: readonly NormalizedEvent[],
+): NormalizedEvent[] {
+  if (ephemeral.length === 0) return [...persisted];
+  const byId = new Map<string, NormalizedEvent>();
+  for (const event of persisted) byId.set(event.eventId, event);
+  for (const event of ephemeral) byId.set(event.eventId, event);
+  return [...byId.values()].sort((left, right) =>
+    left.tableId.localeCompare(right.tableId)
+    || left.sourceSeq - right.sourceSeq
+    || left.timestamp.localeCompare(right.timestamp)
+    || left.eventId.localeCompare(right.eventId));
+}
 
 // allow: SIZE_OK — SQLite schema, atomic persistence, and read projections share one transaction boundary.
 export class SqliteLedger {
   private db: Database.Database;
   private readonly allocatedSourceSeqByTable = new Map<string, number>();
+  private readonly ephemeralEventsByTable = new Map<string, NormalizedEvent[]>();
+  private readonly ephemeralEventIds = new Set<string>();
 
   constructor(dbPath: string = ':memory:') {
     if (dbPath !== ':memory:') {
@@ -440,6 +469,10 @@ export class SqliteLedger {
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('busy_timeout = 5000');
+    this.db.pragma('wal_autocheckpoint = 1000');
+    this.db.pragma('cache_size = -32768');
+    this.db.pragma('mmap_size = 67108864');
+    this.db.pragma('temp_store = MEMORY');
     this.migrate();
   }
 
@@ -602,7 +635,13 @@ export class SqliteLedger {
   }
 
   close(): void {
-    if (this.db.open) this.db.close();
+    if (!this.db.open) return;
+    try {
+      this.db.pragma('wal_checkpoint(PASSIVE)');
+    } catch {
+      // :memory: and already-closing handles cannot checkpoint.
+    }
+    this.db.close();
   }
 
   transaction<T>(fn: () => T): T {
@@ -610,6 +649,8 @@ export class SqliteLedger {
   }
 
   clearMonitorData(): void {
+    this.ephemeralEventsByTable.clear();
+    this.ephemeralEventIds.clear();
     this.transaction(() => {
       this.db.prepare('DELETE FROM events').run();
       this.db.prepare('DELETE FROM decisions').run();
@@ -626,6 +667,12 @@ export class SqliteLedger {
     // sourceSeq is scoped to tableId, so only the SQLite insertion id is globally chronological.
     const rows = this.db.prepare('SELECT payload FROM events ORDER BY id DESC LIMIT ?').all(limit) as unknown as { payload: string }[];
     return rows.reverse().map(row => JSON.parse(row.payload) as NormalizedEvent);
+  }
+
+  listRecentDisplayEvents(tableId: string, limit = 24): NormalizedEvent[] {
+    return this.listEvents(tableId)
+      .filter(event => event.type === 'cardObserved' || event.type === 'handSettled')
+      .slice(-Math.max(1, limit));
   }
 
   listDecisionsTail(limit = 200): DecisionSnapshot[] {
@@ -1056,6 +1103,10 @@ export class SqliteLedger {
 
   appendEvent(event: NormalizedEvent): AppendEventResult {
     assertValidEventEnvelope(event);
+    if (EPHEMERAL_EVENT_TYPES.has(event.type)) {
+      return this.appendEphemeralEvent(event);
+    }
+    if (this.ephemeralEventIds.has(event.eventId)) return 'duplicate';
     const payload = stableStringify(event);
     const hash = sha256(payload);
     const semanticPayload = semanticEventPayload(event);
@@ -1067,6 +1118,9 @@ export class SqliteLedger {
       }
       return 'duplicate';
     }
+    if (this.ephemeralSeqUsed(event.tableId, event.sourceSeq)) {
+      throw new LedgerConflictError(`sourceSeq ${event.sourceSeq} for table ${event.tableId} already used by an in-memory event`);
+    }
     const result = this.db.prepare(
       'INSERT OR IGNORE INTO events (event_id, table_id, seq, type, payload, payload_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
     ).run(event.eventId, event.tableId, event.sourceSeq, event.type, payload, hash, event.timestamp);
@@ -1077,12 +1131,26 @@ export class SqliteLedger {
       }
       throw new LedgerConflictError(`could not append event ${event.eventId}`);
     }
+    if ((MONITOR_TRANSIENT_TYPES as readonly string[]).includes(event.type)) {
+      this.pruneTransientEvents(event.tableId);
+    }
+    if (event.type === 'newShoeSignal') {
+      this.clearEphemeralTable(event.tableId);
+    }
+    if (event.type === 'handSettled') {
+      this.pruneEventsByType(event.tableId, 'bettingWindowOpened', HOT_WINDOW_KEEP);
+      this.pruneEventsByType(event.tableId, 'bettingWindowClosed', HOT_WINDOW_KEEP);
+    }
     return 'appended';
   }
 
   nextSourceSeq(tableId: string): number {
     const row = this.db.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM events WHERE table_id = ?').get(tableId) as { next_seq: number };
-    return row.next_seq;
+    const ephemeralMax = this.ephemeralEventsByTable.get(tableId)?.reduce(
+      (max, event) => Math.max(max, event.sourceSeq),
+      0,
+    ) ?? 0;
+    return Math.max(row.next_seq, ephemeralMax + 1);
   }
 
   allocateSourceSeq(tableId: string, minimum = 0): number {
@@ -1097,7 +1165,10 @@ export class SqliteLedger {
     const row = tableId
       ? (this.db.prepare('SELECT COUNT(*) AS c FROM events WHERE table_id = ?').get(tableId) as { c: number })
       : (this.db.prepare('SELECT COUNT(*) AS c FROM events').get() as { c: number });
-    return row.c;
+    const ephemeral = tableId
+      ? (this.ephemeralEventsByTable.get(tableId)?.length ?? 0)
+      : [...this.ephemeralEventsByTable.values()].reduce((total, events) => total + events.length, 0);
+    return row.c + ephemeral;
   }
 
   listEvents(tableId?: string): NormalizedEvent[] {
@@ -1106,7 +1177,23 @@ export class SqliteLedger {
       : 'SELECT payload FROM events ORDER BY seq ASC, id ASC';
     const params = tableId ? [tableId] : [];
     const rows = this.db.prepare(sql).all(...params) as unknown as { payload: string }[];
-    return rows.map(r => JSON.parse(r.payload) as NormalizedEvent);
+    const persisted = rows.map(r => JSON.parse(r.payload) as NormalizedEvent);
+    const ephemeral = tableId
+      ? (this.ephemeralEventsByTable.get(tableId) ?? [])
+      : [...this.ephemeralEventsByTable.values()].flat();
+    return mergeLedgerEvents(persisted, ephemeral);
+  }
+
+  listEventsFromLatestShoe(tableId: string): NormalizedEvent[] {
+    const events = this.listEvents(tableId);
+    let start = 0;
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      if (events[index]?.type === 'newShoeSignal') {
+        start = index;
+        break;
+      }
+    }
+    return events.slice(start);
   }
 
   listEventsPage(options: RecordPageOptions): RecordPage<NormalizedEvent> {
@@ -1299,10 +1386,18 @@ export class SqliteLedger {
     return undefined;
   }
 
-  replay(tableId?: string): { state: Map<string, ShoeStateProjection>; hash: string } {
-    const events = this.listEvents(tableId);
+  replay(
+    tableId?: string,
+    options?: { latestShoeOnly?: boolean },
+  ): { state: Map<string, ShoeStateProjection>; hash: string } {
+    const events = options?.latestShoeOnly && tableId
+      ? this.listEventsFromLatestShoe(tableId)
+      : this.listEvents(tableId);
     const state = replayEvents(events.map(storedEventForReplay));
-    return { state, hash: sha256(stableStringify(events)) };
+    return {
+      state,
+      hash: options?.latestShoeOnly ? '' : sha256(stableStringify(events)),
+    };
   }
 
   saveDecision(decision: DecisionSnapshot): boolean {
@@ -1350,15 +1445,10 @@ export class SqliteLedger {
     playerCards: Array<{ rank: string }>;
     bankerCards: Array<{ rank: string }>;
   } {
-    const rows = this.db.prepare(`
-      SELECT payload FROM events
-      WHERE table_id = ? AND type = 'cardObserved' AND json_extract(payload, '$.handId') = ?
-      ORDER BY id ASC
-    `).all(tableId, handId) as { payload: string }[];
     const playerCards: Array<{ rank: string }> = [];
     const bankerCards: Array<{ rank: string }> = [];
-    for (const row of rows) {
-      const event = JSON.parse(row.payload) as Extract<NormalizedEvent, { type: 'cardObserved' }>;
+    for (const event of this.listEvents(tableId)) {
+      if (event.type !== 'cardObserved' || event.handId !== handId) continue;
       if (event.position === 'player' && playerCards.length < 3) playerCards.push(event.card);
       if (event.position === 'banker' && bankerCards.length < 3) bankerCards.push(event.card);
     }
@@ -1384,6 +1474,7 @@ export class SqliteLedger {
     }
 
     const pruneTable = this.db.transaction((tableId: string) => {
+      this.pruneTransientEvents(tableId);
       const hands = this.db.prepare(`
         SELECT json_extract(payload, '$.handId') AS handId, MAX(id) AS lastId
         FROM events
@@ -1396,6 +1487,13 @@ export class SqliteLedger {
         if (typeof hand.handId === 'string' && hand.handId.length > 0) keep.add(hand.handId);
       }
       for (const handId of reservedByTable.get(tableId) ?? []) keep.add(handId);
+      const keepDecisions = new Set(keep);
+      const sqliteHands = new Set(
+        hands.map(hand => hand.handId).filter((handId): handId is string => typeof handId === 'string' && handId.length > 0),
+      );
+      for (const handId of this.ephemeralHandIds(tableId)) {
+        if (!sqliteHands.has(handId)) keepDecisions.add(handId);
+      }
       const latestShoe = this.db.prepare(`
         SELECT json_extract(payload, '$.shoeId') AS shoeId
         FROM events
@@ -1415,11 +1513,12 @@ export class SqliteLedger {
               OR json_extract(payload, '$.handId') NOT IN (${placeholders})
             )
         `).run(tableId, ...keep);
+        const decisionPlaceholders = [...keepDecisions].map(() => '?').join(',');
         this.db.prepare(`
           DELETE FROM decisions
           WHERE table_id = ?
-            AND hand_id NOT IN (${placeholders})
-        `).run(tableId, ...keep);
+            AND hand_id NOT IN (${decisionPlaceholders})
+        `).run(tableId, ...keepDecisions);
       }
 
       if (typeof latestShoe?.shoeId === 'string' && latestShoe.shoeId.length > 0) {
@@ -1456,22 +1555,151 @@ export class SqliteLedger {
           )
       `).run(tableId, tableId);
 
-      this.db.prepare(`
-        DELETE FROM events
-        WHERE table_id = ?
-          AND type IN ${MONITOR_TRANSIENT_EVENT_TYPES}
-          AND id NOT IN (
-            SELECT id FROM (
-              SELECT id FROM events
-              WHERE table_id = ? AND type IN ${MONITOR_TRANSIENT_EVENT_TYPES}
-              ORDER BY id DESC
-              LIMIT 8
-            )
-          )
-      `).run(tableId, tableId);
+      this.pruneTransientEvents(tableId);
+      this.pruneEphemeralEvents(
+        tableId,
+        typeof latestShoe?.shoeId === 'string' ? latestShoe.shoeId : undefined,
+      );
     });
 
     for (const row of tableRows) pruneTable(row.tableId);
+  }
+
+  pruneTransientHistory(): void {
+    const tableRows = this.db.prepare(`
+      SELECT DISTINCT table_id AS tableId
+      FROM events
+      WHERE type IN ${MONITOR_TRANSIENT_EVENT_TYPES}
+    `).all() as Array<{ tableId: string }>;
+    const prune = this.db.transaction(() => {
+      for (const row of tableRows) this.pruneTransientEvents(row.tableId);
+    });
+    prune();
+  }
+
+  checkpoint(): void {
+    this.db.pragma('wal_checkpoint(PASSIVE)');
+  }
+
+  compactStorage(): void {
+    this.pruneTransientHistory();
+    this.pruneMonitorHistory();
+    this.db.pragma('wal_checkpoint(TRUNCATE)');
+    this.db.pragma('auto_vacuum = INCREMENTAL');
+    this.db.exec('VACUUM');
+    this.db.pragma('incremental_vacuum');
+  }
+
+  listRecentDisplayEventsForTables(tableIds: readonly string[], limitPerTable = 24): NormalizedEvent[] {
+    if (tableIds.length === 0) return [];
+    const limit = Math.max(1, limitPerTable);
+    const events: NormalizedEvent[] = [];
+    for (const tableId of tableIds) {
+      events.push(...this.listRecentDisplayEvents(tableId, limit));
+    }
+    return events;
+  }
+
+  private appendEphemeralEvent(event: NormalizedEvent): AppendEventResult {
+    if (this.ephemeralEventIds.has(event.eventId)) return 'duplicate';
+    if (this.ephemeralSeqUsed(event.tableId, event.sourceSeq)) return 'duplicate';
+    const events = this.ephemeralEventsByTable.get(event.tableId) ?? [];
+    events.push(event);
+    this.ephemeralEventsByTable.set(event.tableId, events);
+    this.ephemeralEventIds.add(event.eventId);
+    this.trimEphemeralEvents(event.tableId);
+    return 'appended';
+  }
+
+  private ephemeralSeqUsed(tableId: string, sourceSeq: number): boolean {
+    return this.ephemeralEventsByTable.get(tableId)?.some(event => event.sourceSeq === sourceSeq) === true;
+  }
+
+  private ephemeralHandIds(tableId: string): string[] {
+    const handIds: string[] = [];
+    for (const event of this.ephemeralEventsByTable.get(tableId) ?? []) {
+      if ('handId' in event && typeof event.handId === 'string' && event.handId.length > 0) {
+        handIds.push(event.handId);
+      }
+    }
+    return handIds;
+  }
+
+  private clearEphemeralTable(tableId: string): void {
+    const events = this.ephemeralEventsByTable.get(tableId);
+    if (events === undefined) return;
+    for (const event of events) this.ephemeralEventIds.delete(event.eventId);
+    this.ephemeralEventsByTable.delete(tableId);
+  }
+
+  private pruneEphemeralEvents(
+    tableId: string,
+    latestShoeId: string | undefined,
+  ): void {
+    const events = this.ephemeralEventsByTable.get(tableId);
+    if (events === undefined) return;
+    const kept = events.filter(event => {
+      const shoeId = 'shoeId' in event && typeof event.shoeId === 'string' ? event.shoeId : undefined;
+      if (latestShoeId !== undefined && shoeId !== undefined && shoeId !== latestShoeId) return false;
+      return true;
+    });
+    const keptIds = new Set(kept.map(event => event.eventId));
+    for (const event of events) {
+      if (!keptIds.has(event.eventId)) this.ephemeralEventIds.delete(event.eventId);
+    }
+    if (kept.length === 0) this.ephemeralEventsByTable.delete(tableId);
+    else this.ephemeralEventsByTable.set(tableId, kept);
+  }
+
+  private trimEphemeralEvents(tableId: string): void {
+    const events = this.ephemeralEventsByTable.get(tableId);
+    if (events === undefined || events.length === 0) return;
+    const kept = events
+      .filter(event => event.type === 'cardObserved')
+      .slice(-HOT_CARD_KEEP);
+    const keptIds = new Set(kept.map(event => event.eventId));
+    for (const event of events) {
+      if (!keptIds.has(event.eventId)) this.ephemeralEventIds.delete(event.eventId);
+    }
+    this.ephemeralEventsByTable.set(tableId, kept);
+  }
+
+  private pruneHotEvents(tableId: string): void {
+    this.pruneEventsByType(tableId, 'cardObserved', HOT_CARD_KEEP);
+    this.pruneEventsByType(tableId, 'bettingWindowOpened', HOT_WINDOW_KEEP);
+    this.pruneEventsByType(tableId, 'bettingWindowClosed', HOT_WINDOW_KEEP);
+  }
+
+  private pruneEventsByType(tableId: string, type: string, keep: number): void {
+    this.db.prepare(`
+      DELETE FROM events
+      WHERE table_id = ?
+        AND type = ?
+        AND id NOT IN (
+          SELECT id FROM (
+            SELECT id FROM events
+            WHERE table_id = ? AND type = ?
+            ORDER BY id DESC
+            LIMIT ?
+          )
+        )
+    `).run(tableId, type, tableId, type, keep);
+  }
+
+  private pruneTransientEvents(tableId: string, keep = MONITOR_TRANSIENT_KEEP): void {
+    this.db.prepare(`
+      DELETE FROM events
+      WHERE table_id = ?
+        AND type IN ${MONITOR_TRANSIENT_EVENT_TYPES}
+        AND id NOT IN (
+          SELECT id FROM (
+            SELECT id FROM events
+            WHERE table_id = ? AND type IN ${MONITOR_TRANSIENT_EVENT_TYPES}
+            ORDER BY id DESC
+            LIMIT ?
+          )
+        )
+    `).run(tableId, tableId, keep);
   }
 
   listDecisions(tableId?: string): DecisionSnapshot[] {
