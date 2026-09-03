@@ -205,6 +205,7 @@ function multitablePageContext(
           ['bankerPair', markets.get('4')],
         ]),
       },
+      __baccaratPragmaticBetChannel: undefined as { placeBet: () => { ok: boolean } } | undefined,
     },
     chip,
     markets,
