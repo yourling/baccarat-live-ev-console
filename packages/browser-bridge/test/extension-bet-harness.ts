@@ -127,6 +127,9 @@ export type HarnessOptions = {
     readonly hasUser: boolean;
     readonly hasSocket: boolean;
     readonly tableIds?: readonly string[];
+    readonly framePath?: string;
+    readonly boundTableId?: string;
+    readonly gm?: string;
   };
   readonly pragmaticChannelStatuses?: readonly {
     readonly frameId: number;
@@ -134,6 +137,9 @@ export type HarnessOptions = {
       readonly hasUser: boolean;
       readonly hasSocket: boolean;
       readonly tableIds?: readonly string[];
+      readonly framePath?: string;
+      readonly boundTableId?: string;
+      readonly gm?: string;
     };
   }[];
 };

@@ -241,7 +241,7 @@ describe('extension background multitable command', () => {
     const popup = {
       tab: { id: 42, url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat' },
     };
-    const emit = (message, sender) => {
+    const emit = (message: any, sender: any) => {
       for (const listener of listeners) listener(message, sender);
     };
 

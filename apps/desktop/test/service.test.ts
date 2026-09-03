@@ -1439,7 +1439,7 @@ describe('desktop console demo sessions', () => {
     const service = new DesktopConsoleService(':memory:');
     try {
       await service.setAutomationEnabled(true);
-      const first = await service.runDemo(42);
+      const first = await service.runDemo(25);
       expect(first.receipts.length).toBeGreaterThan(0);
       const light = service.snapshot({ includeHistory: false });
       expect(light.events.length).toBeLessThan(first.events.length);
@@ -1465,7 +1465,7 @@ describe('desktop console demo sessions', () => {
   it('returns one decision row per hand, applies the eligibility filter, and exposes actual results', async () => {
     const service = new DesktopConsoleService(':memory:');
     try {
-      const snapshot = await service.runDemo(42);
+      const snapshot = await service.runDemo(25);
       const eligiblePage = service.queryRecords({
         kind: 'decisions',
         page: 1,
@@ -3023,7 +3023,7 @@ describe('desktop console demo sessions', () => {
     const service = new DesktopConsoleService(':memory:');
     try {
       await service.setAutomationEnabled(true);
-      const historical = await service.runDemo(42);
+      const historical = await service.runDemo(25);
       expect(historical.receipts.some(receipt => receipt.tableId !== 'D055')).toBe(true);
 
       await service.startLiveRoomMonitor(0);
