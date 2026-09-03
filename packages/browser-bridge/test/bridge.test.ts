@@ -807,50 +807,10 @@ describe('browser bridge server', () => {
     expect(feed.health().state).toBe('CONNECTED');
   });
 
-  it('requests a fail-closed game-page reload after feed progress remains stale', async () => {
+  it('does not request a whole-page reload after feed progress remains stale', async () => {
     const server = new BrowserBridgeServer({
       port: 0,
       tableStaleAfterMs: 1_000,
-      stalePageReloadAfterMs: 1_000,
-    });
-    const port = await server.start();
-    const extension = extensionClient(port);
-    const feed = server.openTable('r1', 't1');
-    await feed.start({ onBatch: () => {} });
-    try {
-      await new Promise<void>((resolve, reject) => {
-        extension.once('open', resolve);
-        extension.once('error', reject);
-      });
-      const reload = new Promise<{ readonly name?: string; readonly tableIds?: readonly string[] }>(resolve => {
-        extension.on('message', data => {
-          const message = JSON.parse(data.toString()) as {
-            readonly kind?: string;
-            readonly name?: string;
-            readonly tableIds?: readonly string[];
-          };
-          if (message.kind === 'command' && message.name === 'reloadGameTabs') resolve(message);
-        });
-      });
-      const checkFreshness = Reflect.get(feed, 'checkFreshness');
-      if (typeof checkFreshness !== 'function') throw new Error('freshness watchdog unavailable');
-      Reflect.apply(checkFreshness, feed, [Date.now() + 2_000]);
-
-      await expect(reload).resolves.toEqual(expect.objectContaining({
-        name: 'reloadGameTabs',
-        tableIds: ['t1'],
-      }));
-    } finally {
-      extension.close();
-      await server.close();
-    }
-  });
-
-  it('cancels a pending stale-page reload when any real table observation resumes', async () => {
-    const server = new BrowserBridgeServer({
-      port: 0,
-      tableStaleAfterMs: 1_000,
-      stalePageReloadAfterMs: 1_000,
     });
     const port = await server.start();
     const extension = extensionClient(port);
@@ -869,13 +829,7 @@ describe('browser bridge server', () => {
       const checkFreshness = Reflect.get(feed, 'checkFreshness');
       if (typeof checkFreshness !== 'function') throw new Error('freshness watchdog unavailable');
       Reflect.apply(checkFreshness, feed, [Date.now() + 2_000]);
-      server.ingestClientMessage({
-        kind: 'tableEvent',
-        roomId: 'r1',
-        tableId: 't1',
-        event: bridgeEvent(),
-      });
-      await new Promise<void>(resolve => setTimeout(resolve, 20));
+      await new Promise<void>(resolve => setTimeout(resolve, 30));
 
       expect(commands).not.toContain('reloadGameTabs');
     } finally {
@@ -910,7 +864,7 @@ describe('browser bridge server', () => {
             name: message.name,
             ...(message.tableIds === undefined ? {} : { tableIds: message.tableIds }),
           });
-          if (message.name === 'openMultiView') resolve();
+          if (message.name === 'replayRuntimeState') resolve();
         });
       });
 
@@ -918,7 +872,7 @@ describe('browser bridge server', () => {
       observer.send(JSON.stringify({ kind: 'command', name: 'liveOn' }));
       command.send(JSON.stringify({
         kind: 'command',
-        name: 'openMultiView',
+        name: 'replayRuntimeState',
         tableIds: ['D066', 'D067'],
       }));
       await receivedCommand;
@@ -926,7 +880,7 @@ describe('browser bridge server', () => {
 
       // Then: only the dedicated command client reaches the extension.
       expect(commands).toEqual([{
-        name: 'openMultiView',
+        name: 'replayRuntimeState',
         tableIds: ['D066', 'D067'],
       }]);
     } finally {
@@ -1523,11 +1477,10 @@ describe('browser bridge server', () => {
     await server.close();
   });
 
-  it('does not recover multi-view while the page already shows multiple seated tables', async () => {
+  it('does not request openMultiView when the page falls back to a single table', async () => {
     const server = new BrowserBridgeServer({
       port: 0,
-      selectedTableIds: ['tableaaaaaa01', 'tableaaaaaa02', 'tableaaaaaa03', 'tableaaaaaa04', 'tableaaaaaa05'],
-      multiviewRecoveryCooldownMs: 1,
+      selectedTableIds: ['tableaaaaaa01', 'tableaaaaaa02'],
     });
     const port = await server.start();
     const extension = extensionClient(port);
@@ -1544,53 +1497,13 @@ describe('browser bridge server', () => {
       server.ingestClientMessage({
         kind: 'networkCapture',
         source: 'baccarat-bridge-runtime-selection',
-        url: 'https://client.pragmaticplaylive.net/desktop/multibaccarat/',
-        direction: 'recv',
-        encoding: 'text',
-        data: JSON.stringify({
-          tableIds: ['tableaaaaaa01', 'tableaaaaaa02', 'tableaaaaaa03', 'tableaaaaaa04'],
-        }),
-      });
-      await new Promise(resolve => setTimeout(resolve, 30));
-      expect(commands).not.toContain('openMultiView');
-    } finally {
-      extension.close();
-      await server.close();
-    }
-  });
-
-  it('recovers multi-view only after the page falls back to a single table', async () => {
-    const server = new BrowserBridgeServer({
-      port: 0,
-      selectedTableIds: ['tableaaaaaa01', 'tableaaaaaa02'],
-      multiviewRecoveryCooldownMs: 1,
-    });
-    const port = await server.start();
-    const extension = extensionClient(port);
-    const opened = new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('openMultiView was not requested')), 1_000);
-      extension.on('message', data => {
-        const message = JSON.parse(data.toString()) as { readonly kind?: string; readonly name?: string };
-        if (message.kind === 'command' && message.name === 'openMultiView') {
-          clearTimeout(timer);
-          resolve(message.name);
-        }
-      });
-    });
-    try {
-      await new Promise<void>((resolve, reject) => {
-        extension.once('open', resolve);
-        extension.once('error', reject);
-      });
-      server.ingestClientMessage({
-        kind: 'networkCapture',
-        source: 'baccarat-bridge-runtime-selection',
         url: 'https://client.pragmaticplaylive.net/desktop/baccarat/',
         direction: 'recv',
         encoding: 'text',
         data: JSON.stringify({ tableIds: ['tableaaaaaa01'] }),
       });
-      await expect(opened).resolves.toBe('openMultiView');
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(commands).not.toContain('openMultiView');
     } finally {
       extension.close();
       await server.close();
@@ -1816,38 +1729,6 @@ describe('browser bridge runtime supervision', () => {
       expect.objectContaining({ kind: 'session-recovery-exhausted' }),
       expect.objectContaining({ kind: 'session-recovered' }),
     ]));
-  });
-
-  it('revokes the execution gate when the extension reloads game tabs', () => {
-    const events: BrowserBridgeRuntimeEvent[] = [];
-    const server = new BrowserBridgeServer({
-      onRuntimeEvent: event => events.push(event),
-    });
-
-    server.ingestClientMessage({
-      kind: 'sessionAction',
-      action: 'command-executed',
-      url: 'chrome-extension://test/background.js',
-      frame: 'background',
-      detail: 'reloadGameTabs:reloaded=1:tables=4',
-      timestamp: '2026-08-27T01:02:00.000Z',
-    });
-    server.ingestClientMessage({
-      kind: 'sessionAction',
-      action: 'command-executed',
-      url: 'chrome-extension://test/background.js',
-      frame: 'background',
-      detail: 'reloadExtension:completed',
-      timestamp: '2026-08-27T01:03:00.000Z',
-    });
-
-    expect(events.filter(event => event.kind === 'execution-gate-revoked')).toEqual([
-      expect.objectContaining({
-        kind: 'execution-gate-revoked',
-        reason: 'game-tabs-reloaded',
-        timestamp: '2026-08-27T01:02:00.000Z',
-      }),
-    ]);
   });
 
   it('redacts diagnostic URLs and never retains title, body, or HTML previews', () => {

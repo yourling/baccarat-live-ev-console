@@ -98,7 +98,13 @@
       }
       return;
     }
-    conflictReported = false;
+    if (conflictReported) {
+      conflictReported = false;
+      send({
+        kind: 'sessionAction', action: 'session-conflict-cleared', url: location.href,
+        frame: 'iframe', detail: 'pragmatic-session-conflict-cleared', timestamp: observedAt(),
+      });
+    }
     if (!button) {
       if (continuePending) {
         continuePending = false;

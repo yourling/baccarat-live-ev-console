@@ -927,7 +927,133 @@ describe('PragmaticRuntimeParser', () => {
     expectLedgerAppend([...opened, ...closed, ...reopened]);
   });
 
-  it('isolates lifecycle state for forty simultaneously monitored tables', () => {
+  it('uses a new bettingWindowClosed eventId after an unopened close then a later observed close', () => {
+    const tableId = 'oq808ojps709qqaf';
+    const roundId = '17727829622';
+    const parser = new PragmaticRuntimeParser();
+    const firstClosed = parser.parse(snapshot([{
+      tableId,
+      roundId,
+      bettingOpen: false,
+      source: 'protocol',
+    }]));
+    const firstWindows = firstClosed.filter(event => event.type === 'bettingWindowClosed') as Array<
+      Extract<NormalizedEvent, { type: 'bettingWindowClosed' }>
+    >;
+    expect(firstWindows.map(event => event.openingObserved)).toEqual([false, false]);
+
+    const opened = parser.parse(snapshot([{
+      tableId,
+      roundId,
+      bettingOpen: true,
+      countdown: 8,
+      source: 'protocol',
+    }]));
+    const secondClosed = parser.parse(snapshot([{
+      tableId,
+      roundId,
+      bettingOpen: false,
+      source: 'protocol',
+    }]));
+    const secondWindows = secondClosed.filter(event => event.type === 'bettingWindowClosed') as Array<
+      Extract<NormalizedEvent, { type: 'bettingWindowClosed' }>
+    >;
+    expect(secondWindows.map(event => event.openingObserved)).toEqual([true, true]);
+
+    for (const market of ['bankerPair', 'playerPair'] as const) {
+      const firstClose = firstWindows.find(event => event.market === market);
+      const secondClose = secondWindows.find(event => event.market === market);
+      expect(firstClose?.eventId).toContain(`:close:${firstClose?.shoeId}:${roundId}:${market}:unopened`);
+      expect(secondClose?.eventId).toContain(`:close:${secondClose?.shoeId}:${roundId}:${market}`);
+      expect(secondClose?.eventId).not.toContain(':unopened');
+      expect(secondClose?.eventId).not.toBe(firstClose?.eventId);
+    }
+
+    expectLedgerAppend([...firstClosed, ...opened, ...secondClosed]);
+  });
+
+  it('uses a new bettingWindowClosed eventId after shoe promote on the same closed round', () => {
+    const tableId = 'oq808ojps709qqaf';
+    const roundId = '17727829622';
+    const parser = new PragmaticRuntimeParser();
+    const first = parser.parse(snapshot([{
+      tableId,
+      roundId,
+      bettingOpen: false,
+      source: 'protocol',
+      shoeReset: 'protocol:oq808ojps709qqaf:10',
+    }]));
+    const firstWindows = first.filter(event => event.type === 'bettingWindowClosed') as Array<
+      Extract<NormalizedEvent, { type: 'bettingWindowClosed' }>
+    >;
+    expect(firstWindows).toHaveLength(2);
+
+    const promoted = parser.parse(snapshot([{
+      tableId,
+      roundId,
+      bettingOpen: false,
+      source: 'protocol',
+      shoeReset: 'protocol:oq808ojps709qqaf:20',
+    }]));
+    expect(promoted.find(event => event.type === 'newShoeSignal')).toEqual(expect.objectContaining({
+      type: 'newShoeSignal',
+      baseline: 'physical-shoe',
+      shoeId: `pragmatic-${tableId}-2`,
+    }));
+    const secondWindows = promoted.filter(event => event.type === 'bettingWindowClosed') as Array<
+      Extract<NormalizedEvent, { type: 'bettingWindowClosed' }>
+    >;
+    expect(secondWindows).toHaveLength(2);
+
+    for (const market of ['bankerPair', 'playerPair'] as const) {
+      const firstClose = firstWindows.find(event => event.market === market);
+      const secondClose = secondWindows.find(event => event.market === market);
+      expect(firstClose?.shoeId).toBe(`pragmatic-${tableId}-1`);
+      expect(secondClose?.shoeId).toBe(`pragmatic-${tableId}-2`);
+      expect(secondClose?.eventId).not.toBe(firstClose?.eventId);
+      expect(firstClose?.eventId).toContain(`:close:${firstClose?.shoeId}:${roundId}:${market}`);
+      expect(secondClose?.eventId).toContain(`:close:${secondClose?.shoeId}:${roundId}:${market}`);
+    }
+
+    expectLedgerAppend([...first, ...promoted]);
+  });
+
+  it('uses a new bettingWindowClosed eventId after close then reopen then close', () => {
+    const parser = new PragmaticRuntimeParser();
+    const opened = parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1', roundId: 'round-open', bettingOpen: true, countdown: 8,
+    }]));
+    const closed = parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1', roundId: 'round-open', bettingOpen: false,
+    }]));
+    const firstWindows = closed.filter(event => event.type === 'bettingWindowClosed') as Array<
+      Extract<NormalizedEvent, { type: 'bettingWindowClosed' }>
+    >;
+    expect(firstWindows).toHaveLength(2);
+
+    const reopened = parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1', roundId: 'round-open', bettingOpen: true, countdown: 6,
+    }]));
+    const closedAgain = parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1', roundId: 'round-open', bettingOpen: false,
+    }]));
+    const secondWindows = closedAgain.filter(event => event.type === 'bettingWindowClosed') as Array<
+      Extract<NormalizedEvent, { type: 'bettingWindowClosed' }>
+    >;
+    expect(secondWindows).toHaveLength(2);
+
+    for (const market of ['bankerPair', 'playerPair'] as const) {
+      const firstClose = firstWindows.find(event => event.market === market);
+      const secondClose = secondWindows.find(event => event.market === market);
+      expect(secondClose?.eventId).not.toBe(firstClose?.eventId);
+      expect(secondClose?.eventId).toContain(':reopen:1');
+    }
+
+    expectLedgerAppend([...opened, ...closed, ...reopened, ...closedAgain]);
+  });
+
+  it('isolates lifecycle state for forty simultaneously monitored tables'
+, () => {
     const parser = new PragmaticRuntimeParser();
     const tables = Array.from({ length: 40 }, (_, index) => ({
       tableId: `pragmatictable${String(index).padStart(2, '0')}`,

@@ -679,13 +679,17 @@ export class PragmaticRuntimeParser {
     timestamp: string,
     events: NormalizedEvent[],
   ): void {
+    const shoeId = this.shoeIdByTable.get(tableId) ?? '';
     for (const market of ['bankerPair', 'playerPair'] as const) {
       const key = `${tableId}:${handId}:${market}`;
       if (this.closedWindows.has(key)) continue;
       this.closedWindows.add(key);
       this.windowClosesAtMs.delete(key);
-      events.push(this.makeEvent(tableId, 'bettingWindowClosed', `close:${handId}:${market}`, timestamp, {
-        shoeId: this.shoeIdByTable.get(tableId) ?? '',
+      const openCount = this.windowOpenCount.get(key) ?? 0;
+      const reopen = openCount > 1 ? `:reopen:${openCount - 1}` : '';
+      const unopened = openCount === 0 ? ':unopened' : '';
+      events.push(this.makeEvent(tableId, 'bettingWindowClosed', `close:${shoeId}:${handId}:${market}${reopen}${unopened}`, timestamp, {
+        shoeId,
         handId,
         market,
         openingObserved: this.openedWindows.has(key),

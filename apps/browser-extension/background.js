@@ -148,12 +148,6 @@ function isGameTabUrl(url) {
   return GAME_TAB_URL_PATTERN.test(String(url || ''));
 }
 
-function isReloadableGameTabUrl(url) {
-  if (exactSupportedBaccaratPopup(url)) return true;
-  const href = String(url || '');
-  return /(?:^|\.)(?:pragmaticplaylive\.net|vbgames88\.com|zavjcswh\.biz)(?::\d+)?(?:[/?#]|$)/i.test(href);
-}
-
 function isTrustedGameSender(sender) {
   return !!sender
     && !!sender.tab
@@ -312,10 +306,6 @@ function exactDafabetPragmaticPopup(url) {
   } catch (_) {
     return false;
   }
-}
-
-function exactSupportedBaccaratPopup(url) {
-  return exactDafabetPragmaticPopup(url);
 }
 
 function betErrorMessage(error) {
@@ -1470,7 +1460,6 @@ async function handleRemoteCommand(name, tableIds = [], generation) {
     return;
   }
   if (name === 'reloadExtension') {
-    await chrome.storage.local.set({ reloadGameTabsAfterExtensionReload: true });
     send({
       kind: 'sessionAction',
       action: 'command-executed',
@@ -1481,37 +1470,6 @@ async function handleRemoteCommand(name, tableIds = [], generation) {
     });
     // 给确认消息留出发送时间，再由扩展自己重载；不依赖 chrome://extensions 页面。
     setTimeout(() => chrome.runtime.reload(), EXTENSION_RELOAD_DELAY_MS);
-    return;
-  }
-  if (name === 'reloadGameTabs') {
-    // A frozen feed is a fail-closed boundary. Revoke the execution gate before
-    // reloading so a stale page cannot retain authorization across recovery.
-    liveBetSessionEnabled = false;
-    await chrome.storage.local.set({ liveBetEnabled: false });
-    const tabs = await chrome.tabs.query({});
-    if (generation !== activeSocketGeneration) return;
-    let reloaded = 0;
-    for (const tab of tabs) {
-      if (!tab.id || !isReloadableGameTabUrl(tab.url)) continue;
-      try {
-        await chrome.tabs.reload(tab.id, { bypassCache: true });
-        reloaded += 1;
-      } catch (_) {
-        // A tab may close while recovery is being scheduled.
-      }
-    }
-    send({
-      kind: 'sessionAction',
-      action: 'command-executed',
-      url: '',
-      frame: 'allFrames',
-      detail: `reloadGameTabs:reloaded=${reloaded}:tables=${tableIds.length}`,
-      timestamp: new Date().toISOString(),
-    });
-    return;
-  }
-  if (name === 'openMultiView') {
-    await openActiveGameTabInMultiplay(tableIds);
     return;
   }
   if (name === 'probeBetReadiness') {
@@ -1571,164 +1529,6 @@ async function handleRemoteCommand(name, tableIds = [], generation) {
   }
 }
 
-/**
- * 在当前 Dafabet Pragmatic 弹窗的游戏 iframe 内打开 Pragmatic 多桌路由。
- * 这是一次性的显式远程命令；不会触发下注，也不会写入任何下注开关。
- */
-async function openActiveGameTabInMultiplay(tableIds = []) {
-  try {
-    const tabs = await chrome.tabs.query({});
-    const tab = tabs.find(candidate => candidate.active && exactDafabetPragmaticPopup(candidate.url))
-      || tabs.find(candidate => exactDafabetPragmaticPopup(candidate.url))
-      || tabs.find(candidate => isGameTabUrl(candidate && candidate.url));
-    if (!tab || !tab.id) {
-      send({
-        kind: 'sessionAction',
-        action: 'command-executed',
-        url: '',
-        frame: '',
-        detail: 'openMultiView:no-active-game-tab',
-        timestamp: new Date().toISOString(),
-      });
-      return;
-    }
-
-    const routes = await chrome.scripting.executeScript({
-      target: { tabId: tab.id, allFrames: true },
-      world: 'MAIN',
-      func: () => ({
-        marker: 'pragmatic-frame-routes',
-        pathname: String(location.pathname || ''),
-        frameUrl: String(location.href || ''),
-        host: String(location.hostname || ''),
-      }),
-    });
-    const pragmaticRoutes = (routes || []).filter(entry => {
-      if (!entry || !entry.result) return false;
-      const host = String(entry.result.host || '');
-      if (/(^|\.)client\.pragmaticplaylive\.net$/i.test(host)) return true;
-      try {
-        return /(^|\.)client\.pragmaticplaylive\.net$/i.test(new URL(String(entry.result.frameUrl || '')).hostname);
-      } catch (_) {
-        return false;
-      }
-    });
-    const multi = pragmaticRoutes.filter(entry => entry.result.pathname === '/desktop/multibaccarat/');
-    const dedicated = pragmaticRoutes.filter(entry => entry.result.pathname === '/desktop/baccarat/');
-    if (multi.length > 0) {
-      if (dedicated.length > 0) {
-        send({
-          kind: 'sessionAction',
-          action: 'dual-game-session',
-          url: String(tab.url || ''),
-          frame: 'allFrames',
-          detail: `multibaccarat=${multi.length}:baccarat=${dedicated.length}`,
-          timestamp: new Date().toISOString(),
-        });
-      }
-      send({
-        kind: 'sessionAction',
-        action: 'command-executed',
-        url: '',
-        frame: 'allFrames',
-        detail: `openMultiView:opened:${multi.length}:pragmatic-already-open`,
-        timestamp: new Date().toISOString(),
-      });
-      return;
-    }
-    if (dedicated.length === 1 && Number.isInteger(dedicated[0].frameId)) {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id, frameIds: [dedicated[0].frameId] },
-        world: 'MAIN',
-        func: () => {
-          location.pathname = '/desktop/multibaccarat/';
-          return { status: 'opened', frameUrl: String(location.href || ''), state: 'pragmatic-direct-route' };
-        },
-      });
-      send({
-        kind: 'sessionAction',
-        action: 'command-executed',
-        url: '',
-        frame: 'allFrames',
-        detail: 'openMultiView:opened:1:pragmatic-direct-route',
-        timestamp: new Date().toISOString(),
-      });
-      return;
-    }
-
-    const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id, allFrames: true },
-      world: 'MAIN',
-      args: [tableIds],
-      func: requestedTableIds => {
-        const frameUrl = String(location.href || '');
-        if (!/(^|\.)client\.pragmaticplaylive\.net$/i.test(location.hostname)) {
-          return { status: 'skipped', frameUrl };
-        }
-        const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
-        const roots = [document];
-        const controls = [];
-        for (let rootIndex = 0; rootIndex < roots.length && rootIndex < 200; rootIndex += 1) {
-          const root = roots[rootIndex];
-          try {
-            controls.push(...root.querySelectorAll('a[href], button, [role="button"]'));
-            for (const element of root.querySelectorAll('*')) {
-              if (element.shadowRoot) roots.push(element.shadowRoot);
-            }
-          } catch (_) {}
-        }
-        const alreadyEmbedded = Array.from(document.querySelectorAll('iframe')).some(iframe =>
-          /\/desktop\/multibaccarat\//i.test(String(iframe.getAttribute?.('src') || iframe.src || '')));
-        if (alreadyEmbedded) {
-          return { status: 'opened', frameUrl, state: 'pragmatic-already-embedded' };
-        }
-        const control = controls.find(element => {
-          const href = String(element.getAttribute && element.getAttribute('href') || '');
-          const text = clean(element.textContent || element.getAttribute?.('aria-label'));
-          const exactTarget = /\/desktop\/multibaccarat\//i.test(href)
-            || /^(?:多桌|多台|多桌百家乐|multi\s*(?:table|baccarat|play))$/i.test(text);
-          if (!exactTarget || element.disabled === true) return false;
-          try {
-            const rect = element.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0;
-          } catch (_) {
-            return true;
-          }
-        });
-        if (control && typeof control.click === 'function') {
-          control.click();
-          return { status: 'opened', frameUrl, state: 'pragmatic-native-control' };
-        }
-        return { status: 'not-ready', frameUrl, state: `pragmatic-control-missing:${location.pathname}` };
-      },
-    });
-    const opened = results.filter(result => result && result.result && result.result.status === 'opened').length;
-    const states = results
-      .map(result => result && result.result && result.result.state ? String(result.result.state) : '')
-      .filter(Boolean)
-      .join('|')
-      .slice(0, 80);
-    const detail = opened > 0 ? `openMultiView:opened:${opened}` : `openMultiView:not-ready${states ? `:${states}` : ''}`;
-    send({
-      kind: 'sessionAction',
-      action: 'command-executed',
-      url: '',
-      frame: 'allFrames',
-      detail,
-      timestamp: new Date().toISOString(),
-    });
-  } catch (_) {
-    send({
-      kind: 'sessionAction',
-      action: 'command-executed',
-      url: '',
-      frame: '',
-      detail: 'openMultiView:failed',
-      timestamp: new Date().toISOString(),
-    });
-  }
-}
-/** 一次性只读诊断当前游戏 frame 的页面导航对象；不读取牌面、不触发输入。 */
 async function broadcastToTabs(message) {
   const tabs = await chrome.tabs.query({});
   for (const tab of tabs) {
@@ -2123,7 +1923,6 @@ async function ensureKeeperTab(url) {
   return keeperCreationPromise;
 }
 
-let lastTabReloadAt = 0;
 const pragmaticFramesByTab = new Map();
 
 function notePragmaticFrame(tabId, frameId, url) {
@@ -2200,21 +1999,6 @@ chrome.runtime.onMessage.addListener((message, sender, _sendResponse) => {
       timestamp: new Date().toISOString(),
     });
   }
-  if (
-    message.kind === 'sessionAction'
-    && message.action === 'reload-scheduled'
-    && message.frame !== 'top'
-    && senderTabId
-    && Date.now() - lastTabReloadAt > 20000
-  ) {
-    // 游戏 iframe 内的自动恢复不自行刷新(会跳去 entry 页),改为刷新整个标签页重新进房。
-    lastTabReloadAt = Date.now();
-    try {
-      void chrome.tabs.reload(senderTabId);
-    } catch (_) {
-      // ignore
-    }
-  }
 });
 
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
@@ -2235,24 +2019,6 @@ chrome.tabs.onRemoved.addListener(tabId => {
     cdpAttachedTabId = null;
   }
 });
-async function reloadPendingGameTabs() {
-  const stored = await chrome.storage.local.get({ reloadGameTabsAfterExtensionReload: false });
-  if (!stored.reloadGameTabsAfterExtensionReload) return;
-
-  // 先清标记，防止页面重载或 Service Worker 重启形成循环。
-  await chrome.storage.local.remove('reloadGameTabsAfterExtensionReload');
-  const tabs = await chrome.tabs.query({});
-  for (const tab of tabs) {
-    if (!tab.id || !isReloadableGameTabUrl(tab.url)) continue;
-    try {
-      await chrome.tabs.reload(tab.id);
-      setTimeout(() => { void replayRuntimeStateInGameFrames(); }, 3000);
-    } catch (_) {
-      // 某个标签页关闭不影响其他游戏页刷新。
-    }
-  }
-}
-
 chrome.runtime.onInstalled.addListener(() => {
   ensureBridgeReconnectAlarm();
   void loadFlags();
@@ -2266,6 +2032,5 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 void loadFlags();
-void reloadPendingGameTabs();
 ensureBridgeReconnectAlarm();
 connect();
