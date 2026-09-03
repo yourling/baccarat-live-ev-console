@@ -318,6 +318,7 @@ export class TableActor {
 
     if (event.type === 'newShoeSignal') {
       this.evaluatedWindows.clear();
+      this.retainKeysForShoe(event.shoeId);
       if (previousProjection.shoeId && previousProjection.shoeId !== event.shoeId) {
         this.riskManager.expireOpenForShoe(this.tableId, previousProjection.shoeId, 'new-shoe-signal-received');
       }
@@ -497,6 +498,7 @@ export class TableActor {
       market: event.market,
       eventId: event.eventId,
       alternateNext: this.alternateNext,
+      handKey: `${event.shoeId}:${event.handId}`,
     });
 
     const snapshot = this.recordDecision(
@@ -728,6 +730,27 @@ export class TableActor {
     if (this.profile.betStrategy.type !== 'alternate') return;
     this.alternateNext = market === 'bankerPair' ? 'playerPair' : 'bankerPair';
   }
+
+  /**
+   * 长时间无人值守下 placed/reminder 去重集合会随手数无限增长。
+   * 每靴只保留当前靴的内存快查键：资金安全由账本收据（hasReceipt）与风控活跃键兜底，
+   * 键格式固定，按段精确匹配当前靴；格式不符的键同样丢弃，避免脏键堆积。
+   */
+  private retainKeysForShoe(shoeId: string): void {
+    for (const key of [...this.placedKeys]) {
+      const segments = key.split(':');
+      if (segments.length !== 4 || segments[1] !== shoeId) this.placedKeys.delete(key);
+    }
+    for (const key of [...this.placedHandKeys]) {
+      const segments = key.split(':');
+      if (segments.length !== 3 || segments[1] !== shoeId) this.placedHandKeys.delete(key);
+    }
+    for (const key of [...this.reminderKeys]) {
+      const segments = key.split(':');
+      if (segments.length !== 4 || segments[0] !== shoeId) this.reminderKeys.delete(key);
+    }
+  }
+
 
   private nextSyntheticSeq(): number {
     const next = this.ledger.allocateSourceSeq(
