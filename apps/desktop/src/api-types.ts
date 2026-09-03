@@ -180,7 +180,8 @@ export type DesktopRuntimeIncidentCode =
   | 'unknown-execution'
   | 'settlement-gap'
   | 'scheduler-failure'
-  | 'monitor-failure';
+  | 'monitor-failure'
+  | 'shoe-count-mismatch';
 
 export interface DesktopRuntimeIncident {
   readonly incidentId: string;
@@ -334,6 +335,13 @@ export interface MonitorTableCandidate {
   gameCount?: number;
 }
 
+export interface DesktopShoeEvidence {
+  readonly reason: string;
+  readonly label: string;
+  readonly previousGameCount?: number;
+  readonly gameCount?: number;
+}
+
 export interface DesktopRecordCounts {
   events: number;
   decisions: number;
@@ -348,6 +356,7 @@ export interface DesktopConsoleSnapshot {
   monitorTableIds: readonly string[];
   monitorCandidates: readonly MonitorTableCandidate[];
   tableMetadata: readonly MonitorTableCandidate[];
+  shoeEvidence: Readonly<Record<string, DesktopShoeEvidence>>;
   recordCounts: DesktopRecordCounts;
   keepalive: DesktopKeepaliveState;
   automation: DesktopAutomationState;

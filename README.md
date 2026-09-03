@@ -6,7 +6,7 @@
 
 **截至 2026-09-01，代码层已经形成采集、对子 EV、受控执行、保活、结算和收益统计的完整链路，但真实资金发布仍未批准。** 当前只允许隔离、非资金的集成与长稳验证；不要把 `live`、`liveOn`、页面执行器或无人值守恢复能力视为资金使用许可。
 
-- 对子 EV 策略与庄对/闲对单次 `BetIntent` 经过 `TableActor`、`RiskManager`、reservation、桥接回执、结算，以及按桌/靴/局/市场的重复保护。自动对子只在 `physical-shoe` 基线上评估；待牌靴或 `unknown-monitor-session` 时不下对子，避免假 EV 和 `UNKNOWN` 回执。
+- 对子 EV 策略与庄对/闲对单次 `BetIntent` 经过 `TableActor`、`RiskManager`、reservation、桥接回执、结算，以及按桌/靴/局/市场的重复保护。自动对子只在有效 `physical-shoe`（protocol-shuffle / road-wrap / 人工确认）上评估；第一次见到 shoeReset、待牌靴或 `unknown-monitor-session` 时不下对子，避免假 EV 和 `UNKNOWN` 回执。路子 #55 配剩余 407 张这种入桌数字不得当成 8 副新靴。
 - 四市场 `OperationalWager` 支持 `banker`、`player`、`bankerPair` 和 `playerPair`，用于手动操作与庄/闲保活。它也统一进入同一 actor/风控/reservation/结算链路，并按桌/靴/局/市场/来源防重。当前受控路径要求 `executionMode === 'live'`。
 - 页头「开启保活」与「开启自动投注」互相独立：保活只打庄/闲，对子策略只打庄对/闲对。保活不再扫完整监控列表，只在刚开盘的那一桌尝试。
 - 所有可到达平台的请求都要求 `physical-shoe`、已连接投影、当前下注窗口、未封靴和可用桥接。对子自动下注还要求窗口剩余至少 3 秒；窗口未就绪的预提交拒绝可在同一局重试。`UNKNOWN` 会保留风险敞口、关闭保活并阻断所有后续执行；新一局出现上一局未结算 reservation 时同样失败关闭。
@@ -36,7 +36,7 @@
 
 浏览器端还会检查唯一 Dafabet Pragmatic 弹窗（`/live-dealer/popup-launch/jeju-speed-baccarat`）、唯一匹配桌台的 `client.pragmaticplaylive.net` iframe、会话 live gate、平台状态、限额、余额和未确认筹码。仓库已删除 mstrom / Evolution / 旧 live-baccarat 适配器。当前标准结算条款按庄赢净利 `0.95`、闲赢净利 `1`、和局退回本金处理；对子使用桌台配置赔率（默认净利 `11`）。最终收益由对应 reservation 的 `realizedPnl` 汇总，而不是仅按平台接受回执推算。
 
-实盘最多监控 64 张桌。新会话默认不监控任何桌；只有环境变量 BACCARAT_LIVE_TABLES 才会预填桌号。大厅里尚未入监控的 Dafabet Pragmatic 桌显示为「待加入」，实体新靴或路子明显回绕后才自动晋升。断开超过 15 秒的监控桌会被移除。
+实盘最多监控 64 张桌。新会话默认不监控任何桌；只有环境变量 BACCARAT_LIVE_TABLES 才会预填桌号。大厅里尚未入监控的 Dafabet Pragmatic 桌显示为「待加入」，仅本进程见过的协议 shoeReset token 变化、路子明显回绕或人工确认后才标实体新靴并晋升；第一次见到 shoeReset 或路子 #55 配满靴库存仍为待牌靴。刚洗完的实体靴即使 DOM 路子仍停在高位，也不得被降级。断开超过 15 秒的监控桌会被移除。
 
 ## 目录
 

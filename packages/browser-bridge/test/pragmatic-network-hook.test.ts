@@ -223,6 +223,36 @@ describe('Pragmatic passive network hook', () => {
     expect(laterSends.some(data => data.includes('<autoBet></autoBet>'))).toBe(false);
   });
 
+  it('does not close a previous multibaccarat game socket after the new socket receives', () => {
+    const posted: unknown[] = [];
+    const { testWindow, windowEvents } = runHook(posted);
+    signalContentReady(testWindow, windowEvents);
+    const first = new testWindow.WebSocket('wss://gs10.pragmaticplaylive.net/game');
+    first.readyState = FakeWebSocket.OPEN;
+    const second = new testWindow.WebSocket('wss://gs24.pragmaticplaylive.net/game');
+    second.readyState = FakeWebSocket.OPEN;
+    second.emit('message', {
+      data: '<command channel="table-h22z8qhp17sa0vkh"><timer table="h22z8qhp17sa0vkh" value="8"/></command>',
+    });
+    expect(first.readyState).toBe(FakeWebSocket.OPEN);
+    expect(second.readyState).toBe(FakeWebSocket.OPEN);
+  });
+
+  it('retires the previous dedicated-table game socket after the new socket receives', () => {
+    const posted: unknown[] = [];
+    const { testWindow, windowEvents } = runHook(posted, { pathname: '/desktop/baccarat/' });
+    signalContentReady(testWindow, windowEvents);
+    const first = new testWindow.WebSocket('wss://gs10.pragmaticplaylive.net/game');
+    first.readyState = FakeWebSocket.OPEN;
+    const second = new testWindow.WebSocket('wss://gs24.pragmaticplaylive.net/game');
+    second.readyState = FakeWebSocket.OPEN;
+    second.emit('message', {
+      data: '<command channel="table-h22z8qhp17sa0vkh"><timer table="h22z8qhp17sa0vkh" value="8"/></command>',
+    });
+    expect(first.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(second.readyState).toBe(FakeWebSocket.OPEN);
+  });
+
   it('does not close the previous same-frame game socket during reconnect', () => {
     const posted: unknown[] = [];
     const { testWindow, windowEvents } = runHook(posted);
@@ -277,7 +307,7 @@ describe('Pragmatic passive network hook', () => {
     second.emit('message', {
       data: '<command channel="table-h22z8qhp17sa0vkh"><timer table="h22z8qhp17sa0vkh" value="7"/></command>',
     });
-    expect(first.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(first.readyState).toBe(FakeWebSocket.OPEN);
     expect(second.readyState).toBe(FakeWebSocket.OPEN);
   });
 

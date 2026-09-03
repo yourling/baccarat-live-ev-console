@@ -397,8 +397,95 @@ describe('desktop console demo sessions', () => {
       await service['attachLiveTables']();
       expect(service.snapshot().monitorTableIds).not.toContain('speedbca14gesbc1');
 
+      bridge.recordShoeEvidence('speedbca14gesbc1', { reason: 'protocol-shuffle' });
       await service.injectEvent(monitorShoeEvent('speedbca14gesbc1', 'speed-physical-shoe', 'physical-shoe'));
       expect(service.snapshot().monitorTableIds).toContain('speedbca14gesbc1');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('does not join a pending table from a physical label without shuffle evidence', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    try {
+      service['browserBridge'] = bridge;
+      service['liveMonitorActivated'] = true;
+      await service.updateMonitorTableIds([]);
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          tables: [{ tableId: 'bc281koreanch281', gameCount: 55 }],
+        },
+      });
+      await service['attachLiveTables']();
+      bridge.recordShoeEvidence('bc281koreanch281', { reason: 'attach' });
+      await service.injectEvent(monitorShoeEvent('bc281koreanch281', 'korean-false-physical-join', 'physical-shoe'));
+      expect(service.snapshot().monitorTableIds).not.toContain('bc281koreanch281');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('does not join a pending table from an unknown mid-shoe attach', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    try {
+      service['browserBridge'] = bridge;
+      service['liveMonitorActivated'] = true;
+      await service.updateMonitorTableIds([]);
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          tables: [{ tableId: 'bc281koreanch281', gameCount: 55 }],
+        },
+      });
+      await service['attachLiveTables']();
+      await service.injectEvent(monitorShoeEvent('bc281koreanch281', 'korean-attach', 'unknown-monitor-session'));
+      expect(service.snapshot().monitorTableIds).not.toContain('bc281koreanch281');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('does not present Korean baccarat #55 remaining 407 as a trusted physical shoe', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      await service.updateMonitorTableIds(['bc281koreanch281']);
+      service['tableMetadata'].set('bc281koreanch281', {
+        tableId: 'bc281koreanch281',
+        roomId: 'dafabet-pragmatic',
+        updatedAt: '2026-09-01T00:00:00.000Z',
+        gameCount: 55,
+      });
+      await service.injectEvent(monitorShoeEvent('bc281koreanch281', 'korean-attach-55', 'unknown-monitor-session'));
+      const snapshot = service.snapshot();
+      const projection = snapshot.snapshot.tables.bc281koreanch281?.projection;
+      expect(projection?.shoeBaseline).toBe('unknown-monitor-session');
+      expect(snapshot.shoeEvidence.bc281koreanch281).toEqual(expect.objectContaining({
+        reason: 'attach',
+        label: '入桌，未见洗牌',
+      }));
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('hides full-shoe inventory when a physical label contradicts a deep road after restart', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      await service.updateMonitorTableIds(['bc281koreanch281']);
+      service['tableMetadata'].set('bc281koreanch281', {
+        tableId: 'bc281koreanch281',
+        roomId: 'dafabet-pragmatic',
+        updatedAt: '2026-09-01T00:00:00.000Z',
+        gameCount: 55,
+      });
+      await service.injectEvent(monitorShoeEvent('bc281koreanch281', 'korean-false-physical', 'physical-shoe'));
+      const projection = service.snapshot().snapshot.tables.bc281koreanch281?.projection;
+      expect(projection?.shoeBaseline).toBe('unknown-monitor-session');
     } finally {
       await service.close();
     }
@@ -437,6 +524,70 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('drops a monitored table when internal hands and DOM road disagree, then rejoins on wrap', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const tableId = 'spto12bctorobc12';
+    try {
+      service['browserBridge'] = bridge;
+      service['liveMonitorActivated'] = true;
+      await service.updateMonitorTableIds([tableId]);
+      await service.injectEvent({
+        ...monitorShoeEvent(tableId, 'spto12-physical', 'physical-shoe'),
+        shoeId: 'pragmatic-spto12bctorobc12-2',
+        sourceSeq: 1,
+      });
+      for (let hand = 1; hand <= 8; hand += 1) {
+        await service.injectEvent({
+          type: 'bettingWindowOpened',
+          eventId: `spto12-open-${hand}`,
+          tableId,
+          timestamp: '2026-09-02T15:00:00.000Z',
+          sourceSeq: hand + 1,
+          source: 'pragmatic-runtime',
+          schemaVersion: EVENT_SCHEMA_VERSION,
+          shoeId: 'pragmatic-spto12bctorobc12-2',
+          handId: `hand-${hand}`,
+          market: 'bankerPair',
+        });
+      }
+      expect(service.snapshot().snapshot.tables[tableId]?.projection.handNumber).toBe(8);
+      service['tableMetadata'].set(tableId, {
+        tableId,
+        roomId: 'dafabet-pragmatic',
+        updatedAt: new Date().toISOString(),
+        gameCount: 40,
+      });
+      await service.injectEvent({
+        type: 'bettingWindowOpened',
+        eventId: 'spto12-open-9',
+        tableId,
+        timestamp: '2026-09-02T15:00:01.000Z',
+        sourceSeq: 10,
+        source: 'pragmatic-runtime',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        shoeId: 'pragmatic-spto12bctorobc12-2',
+        handId: 'hand-9',
+        market: 'bankerPair',
+      });
+      expect(service.snapshot().monitorTableIds).not.toContain(tableId);
+      expect(service['demotedPendingTableIds'].has(tableId)).toBe(true);
+
+      bridge.ingestClientMessage({
+        kind: 'roomUpdated',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId, displayName: '极速百家乐12', gameCount: 5 }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(service.snapshot().monitorTableIds).toContain(tableId);
+    } finally {
+      await service.close();
+    }
+  });
+
   it('does not auto-join a mid-shoe table when the road count only drops one hand', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();
@@ -465,6 +616,50 @@ describe('desktop console demo sessions', () => {
       });
       await service['attachLiveTables']();
       expect(service.snapshot().monitorTableIds).not.toContain('spto11bctorobc11');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('does not forget the previous road count when shuffle briefly reports #0', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    try {
+      service['browserBridge'] = bridge;
+      service['liveMonitorActivated'] = true;
+      await service.updateMonitorTableIds([]);
+      bridge.ingestClientMessage({
+        kind: 'roomDiscovered',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'tobcspbaccarat92', displayName: '韩语百家乐2', gameCount: 48 }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(service.snapshot().monitorTableIds).not.toContain('tobcspbaccarat92');
+
+      bridge.ingestClientMessage({
+        kind: 'roomUpdated',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'tobcspbaccarat92', displayName: '韩语百家乐2', gameCount: 0 }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(service.snapshot().monitorTableIds).not.toContain('tobcspbaccarat92');
+
+      bridge.ingestClientMessage({
+        kind: 'roomUpdated',
+        room: {
+          roomId: 'dafabet-pragmatic',
+          displayName: 'Dafabet Pragmatic Play',
+          tables: [{ tableId: 'tobcspbaccarat92', displayName: '韩语百家乐2', gameCount: 1 }],
+        },
+      });
+      await service['attachLiveTables']();
+      expect(service.snapshot().monitorTableIds).toContain('tobcspbaccarat92');
     } finally {
       await service.close();
     }
@@ -551,8 +746,16 @@ describe('desktop console demo sessions', () => {
 
       const recovered = service.snapshot();
       expect(recovered.keepalive.enabled).toBe(true);
-      expect(recovered.snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
+      expect(recovered.snapshot.tables.D055?.projection.shoeBaseline).toBe('unknown-monitor-session');
+      expect(recovered.snapshot.tables.D055?.projection.autoBetStatus).toBe('DISARMED');
       expect(recovered.snapshot.tables.D066?.projection.autoBetStatus).toBe('ARMED');
+
+      await service.injectEvent({
+        ...monitorShoeEvent('D055', 'd055-reshuffled', 'physical-shoe'),
+        shoeId: 'd055-reshuffled-shoe',
+        sourceSeq: 5,
+      });
+      expect(service.snapshot().snapshot.tables.D055?.projection.autoBetStatus).toBe('ARMED');
 
       const stopped = await service.setAutomationEnabled(false);
 
@@ -2524,6 +2727,45 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('keeps a monitored table when the browser extension bridge flashes', async () => {
+    vi.useFakeTimers();
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const stop = vi.fn(async () => undefined);
+    const feed = {
+      tableId: 'D055',
+      start: async () => undefined,
+      stop,
+      flush: async () => undefined,
+      keepAlive: async () => ({ ok: false, error: 'browser-extension-disconnected' }),
+      health: () => ({
+        tableId: 'D055',
+        state: 'DISCONNECTED',
+        lastAckedSeq: 0,
+        lastEmittedSeq: 0,
+        bufferDepth: 0,
+        reconnectCount: 1,
+        stalenessMs: 8_000,
+      }),
+    } satisfies TableExport;
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['D055']);
+      service['liveFeeds'].set('D055', feed);
+
+      service['scheduleDisconnectedMonitorRemoval']('D055', 'browser-extension-disconnected');
+      await vi.advanceTimersByTimeAsync(15_000);
+      await service['liveMonitorOperation'];
+
+      expect(service.snapshot().monitorTableIds).toEqual(['D055']);
+      expect(service['liveFeeds'].has('D055')).toBe(true);
+      expect(stop).not.toHaveBeenCalled();
+    } finally {
+      await service.close();
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps monitoring after a table-feed-stale runtime event', async () => {
     vi.useFakeTimers();
     const service = new DesktopConsoleService(':memory:');
@@ -2882,6 +3124,31 @@ describe('desktop console demo sessions', () => {
       openTable.mockRestore();
       await service.close();
       vi.useRealTimers();
+    }
+  });
+
+  it('keeps ledger bets after a table leaves the live monitor list', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    try {
+      expect(service['ledger'].saveReservation({
+        reservationId: 'rv-keep-ledger',
+        intentId: 'i-keep-ledger',
+        tableId: 'P001',
+        shoeId: 's1',
+        handId: 'h1',
+        market: 'player',
+        amount: 10,
+        maxLoss: 10,
+        maxProfit: 10,
+        status: 'SETTLED',
+        createdAt: '2026-09-01T18:00:00.000Z',
+      })).toBe(true);
+      await service.updateMonitorTableIds(['D055']);
+      await service.startLiveRoomMonitor(0);
+      const page = service.queryRecords({ kind: 'ledger', page: 1, pageSize: 20 });
+      expect(page.ledger?.map(row => row.reservation.tableId)).toContain('P001');
+    } finally {
+      await service.close();
     }
   });
 

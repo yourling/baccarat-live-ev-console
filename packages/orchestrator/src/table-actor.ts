@@ -23,10 +23,13 @@ import {
 import {
   SqliteLedger,
   applyEvent,
+  effectiveShoeBaseline,
   emptyProjection,
+  isPhysicalShoeBettable,
   modelRevisionFor,
   operationalReceiptCommitStarted,
   profileVersionFor,
+  type ShoeBaselineEvidence,
 } from '@baccarat/ledger-state';
 import { evaluatePairMarket } from '@baccarat/probability';
 import { RiskManager, emptyRiskState } from '@baccarat/risk-execution';
@@ -54,6 +57,8 @@ export interface TableActorOptions {
   operationalWagerTerms?: OperationalWagerTerms;
   canExecuteAutomaticBets?: (tableId: string) => boolean;
   onBettingWindowOpened?: (tableId: string) => void;
+  observedGameCount?: (tableId: string) => number | undefined;
+  observedShoeEvidence?: (tableId: string) => ShoeBaselineEvidence | undefined;
   executionMode: 'shadow' | 'simulated' | 'live';
   defaultBetAmount: number;
   riskLimits: RiskLimits;
@@ -84,6 +89,8 @@ export class TableActor {
   private readonly operationalWagerTerms?: OperationalWagerTerms;
   private readonly canExecuteAutomaticBets: (tableId: string) => boolean;
   private readonly onBettingWindowOpened?: (tableId: string) => void;
+  private readonly observedGameCount?: (tableId: string) => number | undefined;
+  private readonly observedShoeEvidence?: (tableId: string) => ShoeBaselineEvidence | undefined;
   private profile: TableProfile;
   private executionMode: 'shadow' | 'simulated' | 'live';
   private defaultBetAmount: number;
@@ -111,6 +118,8 @@ export class TableActor {
     this.operationalWagerTerms = options.operationalWagerTerms;
     this.canExecuteAutomaticBets = options.canExecuteAutomaticBets ?? (() => true);
     this.onBettingWindowOpened = options.onBettingWindowOpened;
+    this.observedGameCount = options.observedGameCount;
+    this.observedShoeEvidence = options.observedShoeEvidence;
     this.profile = structuredClone(options.profile);
     this.executionMode = options.executionMode;
     this.defaultBetAmount = options.defaultBetAmount;
@@ -377,6 +386,7 @@ export class TableActor {
     };
     this.riskManager.settleHand(this.tableId, event.shoeId, event.handId, settlement);
     this.settleCommittedUnknownOperationalWagers(event, settlement);
+    this.settleCommittedUnknownReceipts(event, settlement);
   }
 
   private settleCommittedUnknownOperationalWagers(
@@ -414,13 +424,52 @@ export class TableActor {
     }
   }
 
+  private settleCommittedUnknownReceipts(
+    event: Extract<NormalizedEvent, { type: 'handSettled' }>,
+    settlement: {
+      outcomes?: { bankerPair: boolean; playerPair: boolean };
+      playerCards: readonly { rank: string }[];
+      bankerCards: readonly { rank: string }[];
+    },
+  ): void {
+    for (const reservation of this.riskManager.snapshot(this.tableId)) {
+      if (reservation.status !== 'UNKNOWN') continue;
+      if (reservation.handId !== event.handId) continue;
+      const stored = this.ledger.getReceipt(
+        this.tableId,
+        reservation.shoeId,
+        reservation.handId,
+        reservation.market,
+      ) ?? (
+        reservation.shoeId === event.shoeId
+          ? undefined
+          : this.ledger.getReceipt(this.tableId, event.shoeId, event.handId, reservation.market)
+      );
+      if (stored?.receipt.status !== 'UNKNOWN') continue;
+      if (!operationalReceiptCommitStarted(stored.receipt.raw)) continue;
+      try {
+        this.riskManager.settleUnknown(reservation.reservationId, settlement, 'committed-hand-settled');
+      } catch {
+        continue;
+      }
+    }
+  }
+
   private async evaluateWindow(
     event: Extract<NormalizedEvent, { type: 'bettingWindowOpened' }>,
     projection: ShoeStateProjection,
   ): Promise<void> {
     if (event.shoeId !== projection.shoeId || projection.sealed) return;
     if (projection.status !== 'BETTING_WINDOW') return;
-    if (projection.shoeBaseline !== 'physical-shoe') {
+    if (effectiveShoeBaseline(
+      projection,
+      this.observedGameCount?.(this.tableId),
+      this.observedShoeEvidence?.(this.tableId),
+    ) !== 'physical-shoe') {
+      this.requestKeepalive();
+      return;
+    }
+    if (!isPhysicalShoeBettable(projection)) {
       this.requestKeepalive();
       return;
     }
@@ -760,6 +809,8 @@ export interface OrchestratorOptions {
   operationalWagerTerms?: OperationalWagerTerms;
   canExecuteAutomaticBets?: (tableId: string) => boolean;
   onBettingWindowOpened?: (tableId: string) => void;
+  observedGameCount?: (tableId: string) => number | undefined;
+  observedShoeEvidence?: (tableId: string) => ShoeBaselineEvidence | undefined;
 }
 
 export interface RegisteredTableConfig {
@@ -788,6 +839,8 @@ export class Orchestrator {
   private readonly operationalWagerTerms?: OperationalWagerTerms;
   private readonly canExecuteAutomaticBets: (tableId: string) => boolean;
   private readonly onBettingWindowOpened?: (tableId: string) => void;
+  private readonly observedGameCount?: (tableId: string) => number | undefined;
+  private readonly observedShoeEvidence?: (tableId: string) => ShoeBaselineEvidence | undefined;
 
   constructor(options: OrchestratorOptions) {
     this.ledger = options.ledger;
@@ -801,6 +854,8 @@ export class Orchestrator {
     this.operationalWagerTerms = options.operationalWagerTerms;
     this.canExecuteAutomaticBets = options.canExecuteAutomaticBets ?? (() => true);
     this.onBettingWindowOpened = options.onBettingWindowOpened;
+    this.observedGameCount = options.observedGameCount;
+    this.observedShoeEvidence = options.observedShoeEvidence;
     this.riskManager = new RiskManager(
       this.ledger,
       this.ledger.getRiskState() ?? emptyRiskState(todayUtc()),
@@ -1026,6 +1081,8 @@ export class Orchestrator {
       operationalWagerTerms: this.operationalWagerTerms,
       canExecuteAutomaticBets: this.canExecuteAutomaticBets,
       onBettingWindowOpened: this.onBettingWindowOpened,
+      observedGameCount: this.observedGameCount,
+      observedShoeEvidence: this.observedShoeEvidence,
       executionMode: 'live',
       defaultBetAmount: config.defaultBetAmount,
       riskLimits: this.riskLimits,

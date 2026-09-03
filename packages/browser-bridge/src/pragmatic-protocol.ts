@@ -18,6 +18,8 @@ interface ProtocolTableState {
   previousRoundIds: string[];
   rounds: Map<string, RoundCards>;
   shoeReset?: string;
+  shuffleEvent?: boolean;
+  dealtSinceShuffle?: boolean;
 }
 
 interface FinishedShuffle {
@@ -25,6 +27,8 @@ interface FinishedShuffle {
   token: string;
   seq: number;
 }
+
+const CURRENT_SHOE_LEFTOVER_MAX_SEQ = 300;
 
 const TABLE_ID_PATTERN = /^[a-z0-9]{4,32}$/i;
 const ROUND_ID_PATTERN = /^[a-z0-9-]{1,64}$/i;
@@ -55,6 +59,25 @@ function scalarString(value: unknown, pattern: RegExp): string | undefined {
   if (typeof value !== 'string' && typeof value !== 'number') return undefined;
   const text = String(value);
   return pattern.test(text) ? text : undefined;
+}
+
+function parseXmlAttributes(raw: string): Record<string, unknown> {
+  const record: Record<string, unknown> = {};
+  for (const attribute of raw.matchAll(/([a-zA-Z_:][\w:.-]*)="([^"]*)"/g)) {
+    record[attribute[1]!] = attribute[2];
+  }
+  return record;
+}
+
+function normalizeTableId(value: unknown): string | undefined {
+  if (typeof value !== 'string' && typeof value !== 'number') return undefined;
+  let text = String(value).trim();
+  if (/^table-/i.test(text)) text = text.slice('table-'.length);
+  return TABLE_ID_PATTERN.test(text) ? text : undefined;
+}
+
+function tableIdFromRecord(record: Record<string, unknown>): string | undefined {
+  return normalizeTableId(record.table ?? record.tableId ?? record.channel);
 }
 
 function finiteNumber(value: unknown): number | undefined {
@@ -114,7 +137,7 @@ function addCard(cards: string[], card: string): boolean {
 export function pragmaticProtocolTableId(raw: string): string | undefined {
   const frames = protocolFrames(raw);
   for (const frame of frames) {
-    const tableId = scalarString(frame.record.table ?? frame.record.tableId, TABLE_ID_PATTERN);
+    const tableId = tableIdFromRecord(frame.record);
     if (tableId !== undefined) return tableId;
   }
   return undefined;
@@ -324,6 +347,16 @@ export function inspectPragmaticGameresult(raw: string): Record<string, unknown>
   }
 }
 
+function objectFrames(value: unknown): Array<{ kind: ProtocolKind; record: Record<string, unknown> }> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return [];
+  const recordRoot = value as Record<string, unknown>;
+  return KIND_ORDER.flatMap(kind => {
+    const nested = recordRoot[kind];
+    if (typeof nested !== 'object' || nested === null || Array.isArray(nested)) return [];
+    return [{ kind, record: nested as Record<string, unknown> }];
+  });
+}
+
 function protocolFrames(raw: string): Array<{ kind: ProtocolKind; record: Record<string, unknown> }> {
   const trimmed = raw.trim();
   if (trimmed.startsWith('<')) return xmlFrames(trimmed);
@@ -333,25 +366,29 @@ function protocolFrames(raw: string): Array<{ kind: ProtocolKind; record: Record
   } catch {
     return [];
   }
-  if (typeof root !== 'object' || root === null || Array.isArray(root)) return [];
-  const recordRoot = root as Record<string, unknown>;
-  return KIND_ORDER.flatMap(kind => {
-    const value = recordRoot[kind];
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) return [];
-    return [{ kind, record: value as Record<string, unknown> }];
-  });
+  if (Array.isArray(root)) return root.flatMap(item => objectFrames(item));
+  return objectFrames(root);
 }
 
 function xmlFrames(raw: string): Array<{ kind: ProtocolKind; record: Record<string, unknown> }> {
   const frames: Array<{ kind: ProtocolKind; record: Record<string, unknown> }> = [];
-  const pattern = /<(cardinc|card|betsopen|betsclosed|betsclosingsoon|startDealing|gameresult|startshuffling|endshuffling|currentShoe|timer|game)\s+([^>]+)/gi;
+  const pattern = /<\/?([A-Za-z][\w:.-]*)\b([^>]*)>/g;
+  let commandTable: string | undefined;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(raw)) !== null) {
-    const kind = KIND_ORDER.find(candidate => candidate.toLowerCase() === match![1]!.toLowerCase());
+    const tag = match[1]!;
+    const attrText = match[2] ?? '';
+    const closing = match[0].startsWith('</');
+    if (tag.toLowerCase() === 'command') {
+      commandTable = closing ? undefined : normalizeTableId(parseXmlAttributes(attrText).channel);
+      continue;
+    }
+    if (closing) continue;
+    const kind = KIND_ORDER.find(candidate => candidate.toLowerCase() === tag.toLowerCase());
     if (kind === undefined) continue;
-    const record: Record<string, unknown> = {};
-    for (const attribute of match[2]!.matchAll(/([a-zA-Z_:][\w:.-]*)="([^"]*)"/g)) {
-      record[attribute[1]!] = attribute[2];
+    const record = parseXmlAttributes(attrText);
+    if (tableIdFromRecord(record) === undefined && commandTable !== undefined) {
+      record.table = commandTable;
     }
     frames.push({ kind, record });
   }
@@ -373,6 +410,7 @@ function snapshotOf(state: ProtocolTableState, roundId: string | undefined, obse
     source: 'protocol',
     ...(cards.gameSettled === true ? { gameSettled: true } : {}),
     ...(state.shoeReset === undefined ? {} : { shoeReset: state.shoeReset }),
+    ...(state.shuffleEvent === true ? { shuffleEvent: true } : {}),
   };
   return { version: 1, view: 'multi', observedAt, tables: [table] };
 }
@@ -385,28 +423,42 @@ export class PragmaticProtocolState {
   ingest(raw: string, observedAt = new Date().toISOString()): PragmaticRuntimeSnapshot | undefined {
     const frames = protocolFrames(raw);
     if (frames.length === 0) return undefined;
-    const tableId = frames
-      .map(frame => scalarString(frame.record.table ?? frame.record.tableId, TABLE_ID_PATTERN))
-      .find(value => value !== undefined)
-      ?? this.tableIdForCurrentShoe(frames);
-    if (tableId === undefined) return undefined;
-    const state = this.tables.get(tableId) ?? {
-      tableId,
-      lastSeq: -1,
-      lastCardSeq: -1,
-      previousRoundIds: [],
-      rounds: new Map<string, RoundCards>(),
-    };
-    let changed = false;
-    let snapshotRoundId = state.roundId;
+    const tablesInMessage = [...new Set(frames.map(frame => tableIdFromRecord(frame.record)).filter(
+      (tableId): tableId is string => tableId !== undefined,
+    ))];
+    const grouped = new Map<string, Array<{ kind: ProtocolKind; record: Record<string, unknown> }>>();
     for (const frame of frames) {
-      const applied = this.applyFrame(frame.kind, frame.record, state);
-      if (!applied.changed) continue;
-      changed = true;
-      if (applied.snapshotRoundId !== undefined) snapshotRoundId = applied.snapshotRoundId;
+      const tableId = this.resolveFrameTableId(frame, tablesInMessage);
+      if (tableId === undefined) continue;
+      const group = grouped.get(tableId) ?? [];
+      group.push(frame);
+      grouped.set(tableId, group);
     }
-    this.tables.set(tableId, state);
-    return changed ? snapshotOf(state, snapshotRoundId, observedAt) : undefined;
+    if (grouped.size === 0) return undefined;
+
+    const tables: PragmaticTableSnapshot[] = [];
+    for (const [tableId, tableFrames] of grouped) {
+      const state = this.tables.get(tableId) ?? {
+        tableId,
+        lastSeq: -1,
+        lastCardSeq: -1,
+        previousRoundIds: [],
+        rounds: new Map<string, RoundCards>(),
+      };
+      let changed = false;
+      let snapshotRoundId = state.roundId;
+      for (const frame of tableFrames) {
+        const applied = this.applyFrame(frame.kind, frame.record, state);
+        if (!applied.changed) continue;
+        changed = true;
+        if (applied.snapshotRoundId !== undefined) snapshotRoundId = applied.snapshotRoundId;
+      }
+      this.tables.set(tableId, state);
+      if (changed) tables.push(snapshotOf(state, snapshotRoundId, observedAt).tables[0]!);
+      if (state.shuffleEvent) state.shuffleEvent = false;
+    }
+    if (tables.length === 0) return undefined;
+    return { version: 1, view: 'multi', observedAt, tables };
   }
 
   snapshot(tableId: string, observedAt = new Date().toISOString()): PragmaticRuntimeSnapshot | undefined {
@@ -420,6 +472,22 @@ export class PragmaticProtocolState {
     this.lastFinishedShuffle = undefined;
   }
 
+  private resolveFrameTableId(
+    frame: { kind: ProtocolKind; record: Record<string, unknown> },
+    tablesInMessage: readonly string[],
+  ): string | undefined {
+    const direct = tableIdFromRecord(frame.record);
+    if (direct !== undefined) return direct;
+    if (tablesInMessage.length === 1) return tablesInMessage[0];
+    const shuffleKind = frame.kind === 'startshuffling'
+      || frame.kind === 'endshuffling'
+      || frame.kind === 'currentShoe';
+    if (shuffleKind && this.shufflingTables.size === 1) return this.shufflingTables.keys().next().value;
+    if (frame.kind === 'currentShoe') return this.tableIdForCurrentShoe([frame]);
+    if (shuffleKind && this.tables.size === 1) return this.tables.keys().next().value;
+    return undefined;
+  }
+
   private tableIdForCurrentShoe(
     frames: Array<{ kind: ProtocolKind; record: Record<string, unknown> }>,
   ): string | undefined {
@@ -429,7 +497,7 @@ export class PragmaticProtocolState {
       .find(value => value !== undefined);
     if (this.shufflingTables.size === 1) return this.shufflingTables.keys().next().value;
     if (this.shufflingTables.size === 0 && this.lastFinishedShuffle !== undefined) {
-      if (seq === undefined || seq - this.lastFinishedShuffle.seq <= 300) {
+      if (seq === undefined || seq - this.lastFinishedShuffle.seq <= CURRENT_SHOE_LEFTOVER_MAX_SEQ) {
         return this.lastFinishedShuffle.tableId;
       }
     }
@@ -445,6 +513,8 @@ export class PragmaticProtocolState {
     this.shufflingTables.set(state.tableId, token);
     const changed = state.shoeReset !== token;
     state.shoeReset = token;
+    state.shuffleEvent = true;
+    state.dealtSinceShuffle = false;
     if (changed) this.clearRoundInventory(state);
     return { changed: true, snapshotRoundId: state.roundId };
   }
@@ -454,12 +524,13 @@ export class PragmaticProtocolState {
     seq: number | undefined,
   ): { changed: boolean; snapshotRoundId?: string } {
     const token = this.shufflingTables.get(state.tableId)
-      ?? (this.lastFinishedShuffle?.tableId === state.tableId ? this.lastFinishedShuffle.token : undefined)
       ?? `protocol:${state.tableId}:${seq ?? Date.now()}`;
     this.shufflingTables.delete(state.tableId);
     this.lastFinishedShuffle = { tableId: state.tableId, token, seq: seq ?? 0 };
     const changed = state.shoeReset !== token;
     state.shoeReset = token;
+    state.shuffleEvent = true;
+    state.dealtSinceShuffle = false;
     if (changed) this.clearRoundInventory(state);
     return { changed: true, snapshotRoundId: state.roundId };
   }
@@ -491,8 +562,9 @@ export class PragmaticProtocolState {
       && !targetClosed
       && !targetHasCards
       && (isNewRound || roundId === state.roundId || (roundId === undefined && state.roundId !== undefined));
+    const isShuffleKind = kind === 'startshuffling' || kind === 'endshuffling' || kind === 'currentShoe';
 
-    if (staleSeq && !allowLowerSeqWindow) {
+    if (staleSeq && !allowLowerSeqWindow && !isShuffleKind) {
       return { changed: false };
     }
     if (!isCard && seq !== undefined && !staleSeq) state.lastSeq = seq;
@@ -512,6 +584,7 @@ export class PragmaticProtocolState {
       state.roundId = roundId;
       state.bettingOpen = undefined;
       state.countdown = undefined;
+      state.dealtSinceShuffle = true;
       roundCards(state, roundId);
     }
 
@@ -564,11 +637,18 @@ export class PragmaticProtocolState {
       const activeToken = this.shufflingTables.get(state.tableId);
       if (activeToken !== undefined) {
         state.shoeReset = activeToken;
+        state.shuffleEvent = true;
         return { changed: true, snapshotRoundId: state.roundId };
       }
       if (this.lastFinishedShuffle?.tableId === state.tableId) {
-        state.shoeReset = this.lastFinishedShuffle.token;
-        return { changed: true, snapshotRoundId: state.roundId };
+        const seqGap = seq !== undefined ? seq - this.lastFinishedShuffle.seq : undefined;
+        const leftover = seqGap !== undefined
+          ? seqGap >= 0 && seqGap <= CURRENT_SHOE_LEFTOVER_MAX_SEQ
+          : state.dealtSinceShuffle !== true;
+        if (leftover) {
+          state.shoeReset = this.lastFinishedShuffle.token;
+          return { changed: true, snapshotRoundId: state.roundId };
+        }
       }
       return this.finishShuffle(state, seq);
     }

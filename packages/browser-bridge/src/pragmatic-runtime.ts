@@ -19,6 +19,7 @@ export interface PragmaticTableSnapshot {
   readonly visible?: boolean;
   readonly minBet?: number;
   readonly shoeReset?: string;
+  readonly shuffleEvent?: boolean;
   readonly source?: 'dom' | 'protocol';
   readonly gameSettled?: boolean;
 }
@@ -30,9 +31,11 @@ export interface PragmaticRuntimeSnapshot {
   readonly tables: readonly PragmaticTableSnapshot[];
 }
 
-/** DOM road count may lag several hands; only a large gap means a missed shuffle. */
-const GAME_COUNT_SHOE_LAG = 16;
-const ROAD_WRAP_MAX = 2;
+/**
+ * Countdown is not parsed as gameCount. A deep-road drop to an early count
+ * is a new shoe; open it on the first observation.
+ */
+const ROAD_WRAP_MAX = 20;
 const ROAD_WRAP_MIN_PREVIOUS = 10;
 const ROAD_WRAP_MIN_DROP = 8;
 
@@ -42,29 +45,90 @@ export function isRoadWrapToNewShoe(
 ): boolean {
   return previous !== undefined
     && previous >= ROAD_WRAP_MIN_PREVIOUS
+    && gameCount >= 1
     && gameCount <= ROAD_WRAP_MAX
     && previous - gameCount >= ROAD_WRAP_MIN_DROP;
 }
 
-/** DOM often lags past #2 after shuffle; still join if the road clearly wrapped. */
 export function isJoinableNewShoeRoadCount(
   previous: number | undefined,
   gameCount: number,
 ): boolean {
-  if (isRoadWrapToNewShoe(previous, gameCount)) return true;
-  return previous !== undefined
-    && previous >= ROAD_WRAP_MIN_PREVIOUS
-    && gameCount <= 8
-    && previous - gameCount >= ROAD_WRAP_MIN_DROP;
+  return isRoadWrapToNewShoe(previous, gameCount);
 }
 
 function isPhysicalShoeFromRoadCount(
   previous: number | undefined,
   gameCount: number,
-  trackedHands: number,
 ): boolean {
-  if (isRoadWrapToNewShoe(previous, gameCount)) return true;
-  return gameCount <= 8 && trackedHands > gameCount + GAME_COUNT_SHOE_LAG;
+  return isRoadWrapToNewShoe(previous, gameCount);
+}
+
+const GAME_COUNT_CATCH_UP_MAX = 5;
+
+export function isPlausibleGameCountAdvance(
+  previous: number | undefined,
+  gameCount: number,
+): boolean {
+  if (!Number.isInteger(gameCount) || gameCount < 1) return false;
+  if (previous === undefined) return true;
+  if (gameCount === previous) return true;
+  if (gameCount > previous && gameCount - previous <= GAME_COUNT_CATCH_UP_MAX) return true;
+  if (previous <= 8 && gameCount < previous) return true;
+  return isRoadWrapToNewShoe(previous, gameCount);
+}
+
+export function selectStableGameCount(
+  previous: number | undefined,
+  incoming: number,
+): number | undefined {
+  if (!Number.isInteger(incoming) || incoming < 1) return previous;
+  return isPlausibleGameCountAdvance(previous, incoming) ? incoming : previous;
+}
+
+export function selectObservedGameCount(
+  evidenceReason: string | undefined,
+  accepted: number | undefined,
+  incoming: number | undefined,
+): number | undefined {
+  if (incoming === undefined) return accepted;
+  if (evidenceReason === 'protocol-shuffle' && accepted === undefined && incoming > ROAD_WRAP_MAX) {
+    return undefined;
+  }
+  return selectStableGameCount(accepted, incoming);
+}
+
+export const GAME_COUNT_ANOMALY_MIN_HANDS = 8;
+export const GAME_COUNT_ANOMALY_MIN_GAP = 8;
+
+/**
+ * Internal handNumber is how many hands this shoeId has seen.
+ * DOM road is what the table shows. A wrap is a new shoe, not an anomaly.
+ * A lagged high road right after protocol-shuffle is also not an anomaly.
+ * Once we have tracked a real shoe, a large mismatch means inventory/identity
+ * cannot be trusted: drop the table and wait for the next physical shoe.
+ */
+export function isInternalExternalGameCountAnomaly(
+  handNumber: number,
+  roadCount: number | undefined,
+  evidenceReason?: string,
+): boolean {
+  if (!Number.isInteger(handNumber) || handNumber < GAME_COUNT_ANOMALY_MIN_HANDS) return false;
+  if (!Number.isInteger(roadCount) || (roadCount ?? 0) < 1) return false;
+  const road = roadCount!;
+  if (isRoadWrapToNewShoe(handNumber, road)) return false;
+  if (evidenceReason === 'protocol-shuffle' && handNumber <= ROAD_WRAP_MAX && road > ROAD_WRAP_MAX) {
+    return false;
+  }
+  return Math.abs(road - handNumber) >= GAME_COUNT_ANOMALY_MIN_GAP;
+}
+
+export type ParserShoeReason = 'attach' | 'protocol-shuffle' | 'road-wrap' | 'manual-confirm';
+
+export interface ParserShoeEvidence {
+  readonly reason: ParserShoeReason;
+  readonly previousGameCount?: number;
+  readonly gameCount?: number;
 }
 
 type SnapshotSource = 'dom' | 'protocol';
@@ -203,7 +267,7 @@ export function pragmaticGameCountSnapshot(raw: string): string | undefined {
   const tables: Array<{ tableId: string; gameCount: number }> = [];
   for (const table of snapshot.tables) {
     if (!table || typeof table.tableId !== 'string' || table.tableId.length === 0) continue;
-    if (!Number.isInteger(table.gameCount) || (table.gameCount ?? -1) < 0) continue;
+    if (!Number.isInteger(table.gameCount) || (table.gameCount ?? 0) < 1) continue;
     tables.push({ tableId: table.tableId, gameCount: table.gameCount! });
   }
   if (tables.length === 0) return undefined;
@@ -234,6 +298,7 @@ export class PragmaticRuntimeParser {
   private readonly lastWindowEmitAtMs = new Map<string, number>();
   private readonly settledHands = new Set<string>();
   private readonly finishedHands = new Set<string>();
+  private readonly evidenceByTable = new Map<string, ParserShoeEvidence>();
 
   parse(raw: string, isSelected: (tableId: string) => boolean = () => true): NormalizedEvent[] {
     let snapshot: unknown;
@@ -270,9 +335,22 @@ export class PragmaticRuntimeParser {
     return this.shoeIdByTable.get(tableId);
   }
 
+  acceptedGameCount(tableId: string): number | undefined {
+    return this.lastGameCountByTable.get(tableId);
+  }
+
+  shoeEvidence(tableId: string): ParserShoeEvidence | undefined {
+    const evidence = this.evidenceByTable.get(tableId);
+    return evidence === undefined ? undefined : { ...evidence };
+  }
+
+  recordShoeEvidence(tableId: string, evidence: ParserShoeEvidence): void {
+    this.evidenceByTable.set(tableId, evidence);
+  }
+
   openPhysicalShoe(tableId: string, timestamp: string): NormalizedEvent[] {
     const events: NormalizedEvent[] = [];
-    this.beginNewShoe(tableId, timestamp, events);
+    this.beginNewShoe(tableId, timestamp, events, 'physical-shoe', { reason: 'manual-confirm' });
     return events;
   }
 
@@ -285,6 +363,7 @@ export class PragmaticRuntimeParser {
     this.lastGameCountByTable.delete(tableId);
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
+    this.evidenceByTable.delete(tableId);
     this.clearHandState(tableId);
   }
 
@@ -294,24 +373,27 @@ export class PragmaticRuntimeParser {
     events: NormalizedEvent[],
   ): void {
     const tableId = table.tableId;
+    this.ingestShoeReset(table, observedAt, events);
 
-    if (typeof table.shoeReset === 'string'
-      && table.shoeReset.length > 0
-      && this.lastShoeResetByTable.get(tableId) !== table.shoeReset) {
-      this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
-      this.lastShoeResetByTable.set(tableId, table.shoeReset);
-      this.beginNewShoe(tableId, observedAt, events);
-    }
-
-    if (Number.isInteger(table.gameCount) && (table.gameCount ?? -1) >= 0) {
+    if (Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1) {
       const previous = this.lastGameCountByTable.get(tableId);
-      const tracked = this.handsThisShoeByTable.get(tableId) ?? 0;
       const gameCount = table.gameCount!;
-      if (isPhysicalShoeFromRoadCount(previous, gameCount, tracked)) {
+      const stalePreviousShoeRoad = this.evidenceByTable.get(tableId)?.reason === 'protocol-shuffle'
+        && previous === undefined
+        && gameCount > ROAD_WRAP_MAX;
+      if (stalePreviousShoeRoad) {
+        // Protocol shuffle and lagged DOM still carry the previous shoe's road #.
+      } else if (isPhysicalShoeFromRoadCount(previous, gameCount)) {
         this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
-        this.beginNewShoe(tableId, observedAt, events);
+        this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', {
+          reason: 'road-wrap',
+          previousGameCount: previous,
+          gameCount,
+        });
+        this.lastGameCountByTable.set(tableId, gameCount);
+      } else if (isPlausibleGameCountAdvance(previous, gameCount)) {
+        this.lastGameCountByTable.set(tableId, gameCount);
       }
-      this.lastGameCountByTable.set(tableId, gameCount);
     }
 
     const handId = typeof table.roundId === 'string' ? table.roundId.trim() : '';
@@ -397,6 +479,58 @@ export class PragmaticRuntimeParser {
     } as NormalizedEvent;
   }
 
+  private ingestShoeReset(
+    table: PragmaticTableSnapshot,
+    observedAt: string,
+    events: NormalizedEvent[],
+  ): void {
+    const tableId = table.tableId;
+    const token = typeof table.shoeReset === 'string' && table.shoeReset.length > 0
+      ? table.shoeReset
+      : undefined;
+    const shuffleEvent = table.shuffleEvent === true;
+    if (token === undefined) {
+      if (shuffleEvent) this.promoteProtocolShuffle(tableId, observedAt, events);
+      return;
+    }
+    const previousToken = this.lastShoeResetByTable.get(tableId);
+    if (previousToken !== token) {
+      this.lastShoeResetByTable.set(tableId, token);
+      this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
+      // A leftover currentShoe token on first attach is not a shuffle.
+      // startshuffling/endshuffling sets shuffleEvent even on the first token.
+      if (previousToken !== undefined || shuffleEvent) {
+        this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
+      }
+      return;
+    }
+    if (!shuffleEvent) return;
+    // Same token is reused when startshuffling is missed or endshuffling
+    // copies lastFinishedShuffle. If this shoe already dealt, that pulse is
+    // the next shuffle, not a duplicate of the current one.
+    if (this.shoeAlreadyDealt(tableId)) {
+      this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
+      return;
+    }
+    this.promoteProtocolShuffle(tableId, observedAt, events);
+  }
+
+  private shoeAlreadyDealt(tableId: string): boolean {
+    // First snapshot of a new shoe often still carries a round id, which
+    // counts as 1. A later shuffle after real play is at least a second hand.
+    return (this.handsThisShoeByTable.get(tableId) ?? 0) >= 2;
+  }
+
+  private promoteProtocolShuffle(
+    tableId: string,
+    observedAt: string,
+    events: NormalizedEvent[],
+  ): void {
+    if (this.evidenceByTable.get(tableId)?.reason === 'protocol-shuffle') return;
+    this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
+    this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
+  }
+
   private ensureShoe(
     tableId: string,
     baseline: ShoeBaseline,
@@ -405,20 +539,29 @@ export class PragmaticRuntimeParser {
   ): void {
     if (this.shoeIdByTable.has(tableId)) return;
     this.shoeSeqByTable.set(tableId, 1);
+    if (!this.evidenceByTable.has(tableId)) this.evidenceByTable.set(tableId, { reason: 'attach' });
     this.emitShoe(tableId, 1, baseline, timestamp, events);
   }
 
-  private beginNewShoe(tableId: string, timestamp: string, events: NormalizedEvent[]): void {
+  private beginNewShoe(
+    tableId: string,
+    timestamp: string,
+    events: NormalizedEvent[],
+    baseline: ShoeBaseline,
+    evidence?: ParserShoeEvidence,
+  ): void {
     this.clearShoeTracking(tableId);
     const sequence = (this.shoeSeqByTable.get(tableId) ?? 1) + 1;
     this.shoeSeqByTable.set(tableId, sequence);
-    this.emitShoe(tableId, sequence, 'physical-shoe', timestamp, events);
+    if (evidence !== undefined) this.evidenceByTable.set(tableId, evidence);
+    this.emitShoe(tableId, sequence, baseline, timestamp, events);
   }
 
   private clearShoeTracking(tableId: string): void {
     this.lastGameCountByTable.delete(tableId);
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
+    this.evidenceByTable.delete(tableId);
     this.clearHandState(tableId);
   }
 

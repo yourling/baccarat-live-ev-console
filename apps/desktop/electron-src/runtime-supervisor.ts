@@ -13,7 +13,8 @@ export type RuntimeIncidentCode =
   | 'unknown-execution'
   | 'settlement-gap'
   | 'scheduler-failure'
-  | 'monitor-failure';
+  | 'monitor-failure'
+  | 'shoe-count-mismatch';
 
 export type RuntimeIncidentSeverity = 'degraded' | 'blocked';
 
@@ -377,7 +378,8 @@ function isRuntimeIncidentCode(value: unknown): value is RuntimeIncidentCode {
     || value === 'unknown-execution'
     || value === 'settlement-gap'
     || value === 'scheduler-failure'
-    || value === 'monitor-failure';
+    || value === 'monitor-failure'
+    || value === 'shoe-count-mismatch';
 }
 
 function readApprovedLiveTableIds(value: unknown): string[] | null {

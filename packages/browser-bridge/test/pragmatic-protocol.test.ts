@@ -311,6 +311,7 @@ describe('PragmaticProtocolState', () => {
     const started = protocol.ingest(message('startshuffling', { table, seq: 10 }));
     const token = started?.tables[0]?.shoeReset;
     expect(token).toEqual(expect.stringMatching(/^protocol:h22z8qhp17sa0vkh:10$/));
+    expect(started?.tables[0]?.shuffleEvent).toBe(true);
 
     const during = protocol.ingest(JSON.stringify({
       currentShoe: { cc: '0', code: 'blue', changeShoe: 'true', seq: 18 },
@@ -318,15 +319,18 @@ describe('PragmaticProtocolState', () => {
     expect(during?.tables[0]).toEqual(expect.objectContaining({
       tableId: table,
       shoeReset: token,
+      shuffleEvent: true,
     }));
 
     const ended = protocol.ingest(message('endshuffling', { table, game: '', seq: 40 }));
     expect(ended?.tables[0]?.shoeReset).toBe(token);
+    expect(ended?.tables[0]?.shuffleEvent).toBe(true);
 
     const after = protocol.ingest(JSON.stringify({
       currentShoe: { cc: '0', code: 'blue', changeShoe: 'true', seq: 55 },
     }));
     expect(after?.tables[0]?.shoeReset).toBe(token);
+    expect(after?.tables[0]?.shuffleEvent).toBeUndefined();
   });
 
   it('does not guess a currentShoe table while two tables are shuffling', () => {
@@ -338,6 +342,16 @@ describe('PragmaticProtocolState', () => {
     }))).toBeUndefined();
   });
 
+  it('does not reuse the previous shuffle token when a later shuffle misses startshuffling', () => {
+    const protocol = new PragmaticProtocolState();
+    const table = 'spto41bctorobc41';
+    const first = protocol.ingest(message('endshuffling', { table, seq: 10 }));
+    const second = protocol.ingest(message('endshuffling', { table, seq: 99 }));
+    expect(first?.tables[0]?.shoeReset).toBe('protocol:spto41bctorobc41:10');
+    expect(second?.tables[0]?.shoeReset).toBe('protocol:spto41bctorobc41:99');
+    expect(second?.tables[0]?.shuffleEvent).toBe(true);
+  });
+
   it('opens a physical shoe from endshuffling when startshuffling was missed', () => {
     const protocol = new PragmaticProtocolState();
     const ended = protocol.ingest(message('endshuffling', { table: 'tobc51koreanto51', seq: 12610 }));
@@ -347,10 +361,82 @@ describe('PragmaticProtocolState', () => {
     }));
   });
 
+  it('opens a new shoe from currentShoe after the previous shuffle leftover window', () => {
+    const protocol = new PragmaticProtocolState();
+    const table = 'tobcspbaccarat61';
+    const first = protocol.ingest(message('endshuffling', { table, seq: 10 }));
+    protocol.ingest(message('game', { table, id: '16446324710', seq: 20 }));
+    protocol.ingest(message('betsopen', { table, game: '16446324710', seq: 21 }));
+    const late = protocol.ingest(JSON.stringify({
+      currentShoe: { table, changeShoe: 'true', seq: 400 },
+    }));
+    expect(first?.tables[0]?.shoeReset).toBe('protocol:tobcspbaccarat61:10');
+    expect(late?.tables[0]?.shoeReset).toBe('protocol:tobcspbaccarat61:400');
+    expect(late?.tables[0]?.shuffleEvent).toBe(true);
+  });
+
+  it('still opens a shuffle when endshuffling arrives with an older seq', () => {
+    const protocol = new PragmaticProtocolState();
+    const table = 'tobcspbaccarat61';
+    protocol.ingest(message('game', { table, id: '16446324710', seq: 100 }));
+    const ended = protocol.ingest(message('endshuffling', { table, seq: 50 }));
+    expect(ended?.tables[0]).toEqual(expect.objectContaining({
+      tableId: table,
+      shoeReset: 'protocol:tobcspbaccarat61:50',
+      shuffleEvent: true,
+    }));
+  });
+
   it('can read a table id from a duplicate protocol frame', () => {
     expect(pragmaticProtocolTableId(message('timer', {
       table: 'h22z8qhp17sa0vkh', id: '16387766710', value: '8', seq: 1,
     }))).toBe('h22z8qhp17sa0vkh');
+  });
+
+  it('opens a physical shoe from XML command-channel shuffling without a table attribute', () => {
+    const protocol = new PragmaticProtocolState();
+    const started = protocol.ingest(
+      '<command channel="table-tobcspbaccarat61"><startshuffling seq="10"/></command>',
+    );
+    expect(started?.tables[0]).toEqual(expect.objectContaining({
+      tableId: 'tobcspbaccarat61',
+      shoeReset: 'protocol:tobcspbaccarat61:10',
+      shuffleEvent: true,
+    }));
+    expect(pragmaticProtocolTableId(
+      '<command channel="table-tobcspbaccarat61"><endshuffling/></command>',
+    )).toBe('tobcspbaccarat61');
+  });
+
+  it('does not apply one table shuffle to another table in the same payload', () => {
+    const protocol = new PragmaticProtocolState();
+    protocol.ingest(message('game', { table: 'tobcspbaccarat61', id: 'hand-1', seq: 1 }));
+    protocol.ingest(message('game', { table: 'bc281koreanch281', id: 'hand-2', seq: 2 }));
+    const mixed = protocol.ingest(JSON.stringify({
+      timer: { table: 'tobcspbaccarat61', id: 'hand-1', value: '8', seq: 3 },
+      startshuffling: { table: 'bc281koreanch281', seq: 4 },
+    }));
+    expect(mixed?.tables.map(table => table.tableId).sort()).toEqual([
+      'bc281koreanch281',
+      'tobcspbaccarat61',
+    ]);
+    expect(mixed?.tables.find(table => table.tableId === 'bc281koreanch281')).toEqual(
+      expect.objectContaining({ shuffleEvent: true }),
+    );
+    expect(mixed?.tables.find(table => table.tableId === 'tobcspbaccarat61')?.shuffleEvent).toBeUndefined();
+    expect(mixed?.tables.find(table => table.tableId === 'tobcspbaccarat61')?.shoeReset).toBeUndefined();
+  });
+
+  it('reads a table- prefixed id and JSON array shuffle events', () => {
+    const protocol = new PragmaticProtocolState();
+    const shuffled = protocol.ingest(JSON.stringify([
+      { startshuffling: { table: 'table-tobcspbaccarat61', seq: 10 } },
+    ]));
+    expect(shuffled?.tables[0]).toEqual(expect.objectContaining({
+      tableId: 'tobcspbaccarat61',
+      shoeReset: 'protocol:tobcspbaccarat61:10',
+      shuffleEvent: true,
+    }));
   });
 });
 

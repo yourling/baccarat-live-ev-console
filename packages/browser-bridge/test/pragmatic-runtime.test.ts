@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { NormalizedEvent } from '@baccarat/contracts';
-import { PragmaticRuntimeParser, isJoinableNewShoeRoadCount, pragmaticGameCountSnapshot } from '../src/pragmatic-runtime.js';
+import { PragmaticRuntimeParser, isInternalExternalGameCountAnomaly, isJoinableNewShoeRoadCount, isPlausibleGameCountAdvance, isRoadWrapToNewShoe, pragmaticGameCountSnapshot, selectStableGameCount } from '../src/pragmatic-runtime.js';
 import { pragmaticNetworkObservation } from '../src/server.js';
 
 function snapshot(
@@ -70,7 +70,7 @@ describe('PragmaticRuntimeParser', () => {
     expect(laterTick.filter(event => event.type === 'bettingWindowOpened')).toHaveLength(0);
   });
 
-  it('promotes an attached monitor session to a physical shoe on protocol shuffle', () => {
+  it('keeps the first shoeReset token as an unknown attach, not a physical shoe', () => {
     const parser = new PragmaticRuntimeParser();
     const attached = parser.parse(snapshot([{
       tableId: 'h22z8qhp17sa0vkh',
@@ -82,21 +82,15 @@ describe('PragmaticRuntimeParser', () => {
       baseline: 'unknown-monitor-session',
     }));
 
-    const shuffled = parser.parse(snapshot([{
+    const firstToken = parser.parse(snapshot([{
       tableId: 'h22z8qhp17sa0vkh',
       roundId: '16387766710',
       bettingOpen: true,
       source: 'protocol',
       shoeReset: 'protocol:h22z8qhp17sa0vkh:10',
+      gameCount: 55,
     }]));
-    const shoes = shuffled.filter(event => event.type === 'newShoeSignal');
-    expect(shoes).toEqual([
-      expect.objectContaining({
-        type: 'newShoeSignal',
-        baseline: 'physical-shoe',
-        shoeId: 'pragmatic-h22z8qhp17sa0vkh-2',
-      }),
-    ]);
+    expect(firstToken.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
 
     const sameCycle = parser.parse(snapshot([{
       tableId: 'h22z8qhp17sa0vkh',
@@ -104,8 +98,316 @@ describe('PragmaticRuntimeParser', () => {
       bettingOpen: true,
       source: 'protocol',
       shoeReset: 'protocol:h22z8qhp17sa0vkh:10',
+      gameCount: 55,
     }]));
     expect(sameCycle.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+  });
+
+  it('promotes to a physical shoe only after a later shoeReset token change', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh',
+      roundId: '16387761010',
+      source: 'protocol',
+      shoeReset: 'protocol:h22z8qhp17sa0vkh:10',
+      gameCount: 55,
+    }]));
+    const shuffled = parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh',
+      roundId: '16387766710',
+      bettingOpen: true,
+      source: 'protocol',
+      shoeReset: 'protocol:h22z8qhp17sa0vkh:20',
+    }]));
+    expect(shuffled.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({
+        type: 'newShoeSignal',
+        baseline: 'physical-shoe',
+        shoeId: 'pragmatic-h22z8qhp17sa0vkh-2',
+      }),
+    ]);
+  });
+
+  it('does not treat a mid-shoe attach with a shoeReset token as a full 8-deck shoe', () => {
+    const parser = new PragmaticRuntimeParser();
+    const events = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281',
+      roundId: '16428076310',
+      gameCount: 55,
+      bettingOpen: true,
+      source: 'protocol',
+      shoeReset: 'protocol:bc281koreanch281:99',
+      playerCards: ['QS', '9H'],
+      bankerCards: ['3S', '7D', '2C'],
+    }]));
+    const shoe = events.find(event => event.type === 'newShoeSignal') as
+      | Extract<NormalizedEvent, { type: 'newShoeSignal' }>
+      | undefined;
+    expect(shoe?.baseline).toBe('unknown-monitor-session');
+    expect(events.filter(event => event.type === 'newShoeSignal')).toHaveLength(1);
+    expect(parser.shoeEvidence('bc281koreanch281')).toEqual({ reason: 'attach' });
+    expect(events.filter(event => event.type === 'newShoeSignal' && event.baseline === 'physical-shoe')).toHaveLength(0);
+  });
+
+  it('keeps a first shoeReset on Korean baccarat #55 with nine visible cards as an unknown attach', () => {
+    const parser = new PragmaticRuntimeParser();
+    const events = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281',
+      roundId: '16428076310',
+      gameCount: 55,
+      bettingOpen: true,
+      source: 'protocol',
+      shoeReset: 'protocol:bc281koreanch281:99',
+      playerCards: ['QS', '9H', '4C'],
+      bankerCards: ['3S', '7D', '2C', 'AH', '6D', '9S'],
+    }]));
+    expect(events.find(event => event.type === 'newShoeSignal')).toEqual(expect.objectContaining({
+      baseline: 'unknown-monitor-session',
+    }));
+    expect(parser.shoeEvidence('bc281koreanch281')).toEqual({ reason: 'attach' });
+  });
+
+  it('promotes a watched table when the first shoeReset is a live shuffle event', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat92',
+      roundId: '16431832310',
+      source: 'protocol',
+      gameCount: 48,
+    }]));
+    expect(parser.shoeEvidence('tobcspbaccarat92')?.reason).toBe('attach');
+
+    const shuffled = parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat92',
+      roundId: '16431832310',
+      source: 'protocol',
+      shoeReset: 'protocol:tobcspbaccarat92:10',
+      shuffleEvent: true,
+    }]));
+    expect(shuffled.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({
+        type: 'newShoeSignal',
+        baseline: 'physical-shoe',
+      }),
+    ]);
+    expect(parser.shoeEvidence('tobcspbaccarat92')).toEqual({ reason: 'protocol-shuffle' });
+  });
+
+  it('promotes after an attach token when the same token later arrives as a shuffle event', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      roundId: '16432040410',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+      gameCount: 22,
+    }]));
+    expect(parser.shoeEvidence('spto41bctorobc41')?.reason).toBe('attach');
+
+    const shuffled = parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      roundId: '16432040410',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+      shuffleEvent: true,
+    }]));
+    expect(shuffled.find(event => event.type === 'newShoeSignal')).toEqual(expect.objectContaining({
+      baseline: 'physical-shoe',
+    }));
+    expect(parser.shoeEvidence('spto41bctorobc41')).toEqual({ reason: 'protocol-shuffle' });
+  });
+
+  it('opens a new physical shoe when shuffle repeats after the current shoe has dealt', () => {
+    const parser = new PragmaticRuntimeParser();
+    const first = parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      roundId: 'hand-1',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+      shuffleEvent: true,
+    }]));
+    expect(first.filter(event => event.type === 'newShoeSignal' && event.baseline === 'physical-shoe')).toHaveLength(1);
+    const firstShoe = parser.currentShoeId('spto41bctorobc41');
+
+    parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      roundId: 'hand-2',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+    }]));
+
+    const reshuffled = parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      roundId: 'hand-3',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+      shuffleEvent: true,
+    }]));
+    expect(reshuffled.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({
+        type: 'newShoeSignal',
+        baseline: 'physical-shoe',
+      }),
+    ]);
+    expect(parser.currentShoeId('spto41bctorobc41')).not.toBe(firstShoe);
+    expect(parser.shoeEvidence('spto41bctorobc41')).toEqual({ reason: 'protocol-shuffle' });
+  });
+
+  it('does not open another shoe for endshuffling on the same unused shuffle token', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+      shuffleEvent: true,
+    }]));
+    const shoe = parser.currentShoeId('spto41bctorobc41');
+    const ended = parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+      shuffleEvent: true,
+    }]));
+    expect(ended.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+    expect(parser.currentShoeId('spto41bctorobc41')).toBe(shoe);
+  });
+
+  it('records protocol-shuffle evidence when the shoeReset token changes', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh',
+      roundId: '16387761010',
+      source: 'protocol',
+      shoeReset: 'protocol:h22z8qhp17sa0vkh:10',
+    }]));
+    expect(parser.shoeEvidence('h22z8qhp17sa0vkh')?.reason).toBe('attach');
+    parser.parse(snapshot([{
+      tableId: 'h22z8qhp17sa0vkh',
+      roundId: '16387766710',
+      source: 'protocol',
+      shoeReset: 'protocol:h22z8qhp17sa0vkh:20',
+    }]));
+    expect(parser.shoeEvidence('h22z8qhp17sa0vkh')).toEqual({ reason: 'protocol-shuffle' });
+  });
+
+  it('does not treat a drop to #0 as a shuffled shoe', () => {
+    expect(isRoadWrapToNewShoe(72, 0)).toBe(false);
+    expect(isJoinableNewShoeRoadCount(72, 0)).toBe(false);
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-1', gameCount: 72,
+    }]));
+    const dropped = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 0,
+    }]));
+    expect(dropped.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+    expect(parser.shoeEvidence('bc281koreanch281')?.reason).not.toBe('road-wrap');
+  });
+
+  it('records road-wrap evidence on a large gameCount drop', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-1', gameCount: 51,
+    }]));
+    const wrapped = parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 1,
+    }]));
+    expect(wrapped.find(event => event.type === 'newShoeSignal')).toEqual(expect.objectContaining({
+      baseline: 'physical-shoe',
+    }));
+    expect(parser.shoeEvidence('bc281koreanch281')).toEqual({
+      reason: 'road-wrap',
+      previousGameCount: 51,
+      gameCount: 1,
+    });
+  });
+
+  it('does not seed a shuffled shoe with the previous road count', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61',
+      roundId: 'hand-78',
+      gameCount: 78,
+      source: 'protocol',
+      shoeReset: 'protocol:tobcspbaccarat61:10',
+      shuffleEvent: true,
+    }]));
+    const shoe = parser.currentShoeId('tobcspbaccarat61');
+    const lagged = parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61',
+      gameCount: 78,
+    }]));
+    expect(lagged.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+    expect(parser.acceptedGameCount('tobcspbaccarat61')).toBeUndefined();
+    const next = parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61',
+      roundId: 'hand-5',
+      gameCount: 5,
+      source: 'protocol',
+      shoeReset: 'protocol:tobcspbaccarat61:10',
+    }]));
+    expect(next.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+    expect(parser.currentShoeId('tobcspbaccarat61')).toBe(shoe);
+    expect(parser.acceptedGameCount('tobcspbaccarat61')).toBe(5);
+  });
+
+  it('does not let a lagged multi-table road #78 overwrite a live #5', () => {
+    expect(selectStableGameCount(5, 78)).toBe(5);
+    expect(selectStableGameCount(78, 5)).toBe(5);
+    expect(isPlausibleGameCountAdvance(5, 78)).toBe(false);
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61', roundId: 'hand-5', gameCount: 5,
+    }]));
+    const lagged = parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61', roundId: 'hand-5', gameCount: 78,
+    }]));
+    expect(lagged.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+    const next = parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61', roundId: 'hand-6', gameCount: 6,
+    }]));
+    expect(next.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+  });
+
+  it('treats a large internal/DOM game-count gap as an anomaly except wrap or shuffle lag', () => {
+    expect(isInternalExternalGameCountAnomaly(72, 83)).toBe(true);
+    expect(isInternalExternalGameCountAnomaly(8, 40)).toBe(true);
+    expect(isInternalExternalGameCountAnomaly(80, 5)).toBe(false);
+    expect(isInternalExternalGameCountAnomaly(12, 13)).toBe(false);
+    expect(isInternalExternalGameCountAnomaly(5, 83, 'protocol-shuffle')).toBe(false);
+    expect(isInternalExternalGameCountAnomaly(7, 40)).toBe(false);
+  });
+
+  it('opens a new physical shoe as soon as the road wraps to #5', () => {
+    expect(isRoadWrapToNewShoe(78, 5)).toBe(true);
+    expect(isRoadWrapToNewShoe(78, 8)).toBe(true);
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61', roundId: 'hand-78', gameCount: 78,
+    }]));
+    const wrapped = parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61', roundId: 'hand-5', gameCount: 5,
+    }]));
+    expect(wrapped.find(event => event.type === 'newShoeSignal')).toEqual(expect.objectContaining({
+      baseline: 'physical-shoe',
+    }));
+    expect(parser.shoeEvidence('tobcspbaccarat61')).toEqual({
+      reason: 'road-wrap',
+      previousGameCount: 78,
+      gameCount: 5,
+    });
+  });
+
+  it('does not treat a small mid-shoe drop as a shuffled shoe', () => {
+    expect(isRoadWrapToNewShoe(51, 45)).toBe(false);
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-1', gameCount: 51,
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'bc281koreanch281', roundId: 'hand-2', gameCount: 45,
+    }]));
+    expect(parser.shoeEvidence('bc281koreanch281')?.reason).not.toBe('road-wrap');
   });
 
   it('opens both pair markets from a live single-table snapshot', () => {
@@ -277,7 +579,7 @@ describe('PragmaticRuntimeParser', () => {
       .filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
   });
 
-  it('opens a physical shoe when the road count is far behind tracked hands', () => {
+  it('does not open a physical shoe from tracked-hand lag against a low road count', () => {
     const parser = new PragmaticRuntimeParser();
     const tableId = 'spto21bctorobc21';
     for (let index = 0; index < 24; index += 1) {
@@ -292,30 +594,7 @@ describe('PragmaticRuntimeParser', () => {
     }
 
     const reset = parser.parse(snapshot([{ tableId, gameCount: 5 }]));
-    expect(reset).toEqual([
-      expect.objectContaining({
-        type: 'newShoeSignal',
-        baseline: 'physical-shoe',
-        shoeId: `pragmatic-${tableId}-2`,
-      }),
-    ]);
-
-    expect(parser.parse(snapshot([{ tableId, gameCount: 5 }]))).toEqual([]);
-    expect(parser.parse(snapshot([{ tableId, roundId: '16407324910', gameCount: 5 }]))
-      .filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
-
-    const dealt = parser.parse(snapshot([{
-      tableId,
-      roundId: '16407324910',
-      gameCount: 5,
-      bettingOpen: false,
-      playerCards: ['2C', '2S'],
-      bankerCards: ['AH', '6D'],
-      source: 'protocol',
-    }]));
-    const cards = dealt.filter(event => event.type === 'cardObserved');
-    expect(cards).toHaveLength(4);
-    expect(cards.every(event => event.shoeId === `pragmatic-${tableId}-2`)).toBe(true);
+    expect(reset.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
   });
 
   it('does not treat a nearby road count as a missed shuffle', () => {

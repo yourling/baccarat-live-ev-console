@@ -369,6 +369,7 @@ export async function createHarness(options: HarnessOptions = {}) {
       onInstalled: eventTarget,
       onStartup: eventTarget,
       onMessage: eventTarget,
+      onConnect: eventTarget,
     },
     tabs: {
       query: vi.fn().mockResolvedValue(tabs),

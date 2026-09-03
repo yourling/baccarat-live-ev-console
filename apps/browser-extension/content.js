@@ -7,6 +7,7 @@
  *  2. 同源网络信标（HEAD/GET）——真实 HTTP 请求，重置多数站点的服务端闲置计时；
  *  3. 对局记录按钮双击（点击一次放大、再点一次缩小，恢复原状）——触发站点真实点击处理器；
  *  4. background 可选 CDP 可信点击（storage.trustedKeepalive=true 时）。
+ *  Pragmatic 游戏 iframe 只跑第 1 层，绝不点牌桌控件或「重新连接」。
  *
  * 过期恢复：检测到“会话已过期”文案后，先上报并标记牌桌断开，
  * 然后按 5s/15s/45s 退避自动 reload（每轮最多 3 次，sessionStorage 标记跨刷新计数）。
@@ -16,6 +17,8 @@
 (function () {
   const SCAN_INTERVAL_MS = 2000;
   const KEEPALIVE_INTERVAL_MS = 30 * 1000;
+  const BRIDGE_KEEPALIVE_PORT = 'baccarat-bridge-keepalive';
+  const BRIDGE_KEEPALIVE_RECONNECT_MS = 1000;
   const MAX_RECOVERY_ATTEMPTS = 3;
   const RECOVERY_DELAYS_MS = [5 * 1000, 15 * 1000, 45 * 1000];
   const SUPERVISORY_RECOVERY_DELAYS_MS = [60 * 1000, 5 * 60 * 1000, 15 * 60 * 1000, 30 * 60 * 1000];
@@ -217,7 +220,17 @@
 
   function keepAliveTick() {
     try {
-      if (isPragmaticGameContainer()) return;
+      if (isPragmaticGameContainer()) {
+        jitterDomActivity();
+        sendToBackground({
+          kind: 'keepalive',
+          url: location.href,
+          frame: frameKind(),
+          timestamp: new Date().toISOString(),
+          ...(isHttpPage() ? { vw: window.innerWidth || 0, vh: window.innerHeight || 0 } : {}),
+        });
+        return;
+      }
       jitterDomActivity();
       sendBeaconRequest();
       clickKeepAliveTarget(document);
@@ -243,6 +256,27 @@
 
   function startKeepAlive() {
     setInterval(keepAliveTick, KEEPALIVE_INTERVAL_MS);
+  }
+
+  let bridgeKeepalivePort = null;
+  let bridgeKeepaliveTimer = null;
+
+  function connectBridgeKeepalivePort() {
+    if (window.top !== window) return;
+    if (bridgeKeepaliveTimer) {
+      clearTimeout(bridgeKeepaliveTimer);
+      bridgeKeepaliveTimer = null;
+    }
+    try {
+      const port = chrome.runtime.connect({ name: BRIDGE_KEEPALIVE_PORT });
+      bridgeKeepalivePort = port;
+      port.onDisconnect.addListener(() => {
+        if (bridgeKeepalivePort === port) bridgeKeepalivePort = null;
+        bridgeKeepaliveTimer = setTimeout(connectBridgeKeepalivePort, BRIDGE_KEEPALIVE_RECONNECT_MS);
+      });
+    } catch (_) {
+      bridgeKeepaliveTimer = setTimeout(connectBridgeKeepalivePort, BRIDGE_KEEPALIVE_RECONNECT_MS);
+    }
   }
 
   // ---- 闲置警告弹窗自动处理（预过期提醒，如“长时间未操作，是否继续”） ----
@@ -320,7 +354,8 @@
     for (const el of all) {
       const text = String(el.innerText || el.textContent || '').trim();
       if (!text || text.length > 40) continue;
-      if (/try\s+again|retry|reconnect|重试|重新尝试|再次尝试|重新连接|重新加载/i.test(text)) {
+      if (/重新连接中/.test(text)) continue;
+      if (/try\s+again|retry|重试|重新尝试|再次尝试/i.test(text)) {
         candidates.push(el);
       }
     }
@@ -854,6 +889,8 @@
   }
 
   if (!GAME_PAGE) return; // 非游戏页面:内容脚本保持惰性
+
+  connectBridgeKeepalivePort();
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {

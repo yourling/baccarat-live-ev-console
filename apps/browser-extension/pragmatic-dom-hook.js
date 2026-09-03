@@ -24,6 +24,7 @@
   let continuePending = false;
   let conflictReported = false;
   const lastGameCountByTable = new Map();
+  const pendingGameCountByTable = new Map();
 
   function clean(value) {
     return String(value || '').replace(/\s+/g, ' ').trim();
@@ -122,13 +123,17 @@
     });
   }
 
-  function parseSingleTableId() {
+  function readTableIdParam(raw) {
     try {
-      const tableId = new URL(document.referrer).searchParams.get('table_id');
+      const tableId = new URL(raw, location.href).searchParams.get('table_id');
       return typeof tableId === 'string' && /^[a-z0-9]{8,32}$/i.test(tableId) ? tableId : '';
     } catch (_) {
       return '';
     }
+  }
+
+  function parseSingleTableId() {
+    return readTableIdParam(location.href) || readTableIdParam(document.referrer);
   }
 
   function countdownValue(timer) {
@@ -143,25 +148,130 @@
   }
 
   function parseRoundId(root) {
-    const text = clean(root.querySelector('[data-testid="game-header-game-id"]')?.textContent)
-      || clean(root.textContent);
-    return (text.match(/ID:\s*([0-9]+|—)/) || [])[1] || '';
+    const headerId = root.querySelector && root.querySelector('[data-testid="game-header-game-id"]');
+    const header = root.querySelector && root.querySelector('[data-testid="game-header"]');
+    const scoped = clean(headerId?.textContent || header?.textContent || '');
+    const scopedMatch = scoped.match(/ID:\s*([0-9]+|—)/);
+    if (scopedMatch) return scopedMatch[1];
+    return (clean(root.textContent).match(/ID:\s*([0-9]+|—)/) || [])[1] || '';
+  }
+
+  function parseGameCountText(raw) {
+    const match = /#[\s\u00a0]*([1-9]\d{0,2})\b/.exec(clean(raw));
+    if (!match) return undefined;
+    const value = Number(match[1]);
+    return value >= 1 && value <= 150 ? value : undefined;
+  }
+
+  function classText(node) {
+    return String(node.getAttribute && node.getAttribute('class') || '');
+  }
+
+  function isGameCountLabel(value) {
+    const text = String(value || '');
+    if (/countdown|timer/i.test(text)) return false;
+    return String(text).split(/[\s]+/).some(token => {
+      const base = token.split('_')[0];
+      return /^(?:game-count|gameCount)$/i.test(base);
+    });
+  }
+
+  function nodeText(node) {
+    if (!node) return '';
+    if (typeof node.innerText === 'string') return node.innerText;
+    return node.textContent || '';
+  }
+
+  function isGameCountCandidate(node) {
+    if (!node || !node.getAttribute) return false;
+    if (node.classList && node.classList.contains('game-count')) return true;
+    const testid = node.getAttribute('data-testid') || '';
+    return isGameCountLabel(classText(node)) || isGameCountLabel(testid);
+  }
+
+  function insideTimer(node) {
+    return !!(node && node.closest && node.closest('[data-testid*="timer"], [data-testid*="countdown"], .game-countdown'));
+  }
+
+  function findVisibleGameCountNode(root) {
+    if (!root || !root.querySelectorAll) return null;
+    for (const node of root.querySelectorAll('.game-count, [class], [data-testid]')) {
+      if (!isGameCountCandidate(node) || insideTimer(node) || !visible(node)) continue;
+      return node;
+    }
+    return null;
+  }
+
+  function parseLabeledGameCount(node) {
+    const hashed = parseGameCountText(nodeText(node));
+    if (hashed !== undefined) return hashed;
+    const digits = /^([1-9]\d{0,2})$/.exec(clean(nodeText(node)));
+    if (!digits) return undefined;
+    const value = Number(digits[1]);
+    return value >= 1 && value <= 150 ? value : undefined;
   }
 
   function parseGameCount(root) {
-    const renderedText = typeof root.innerText === 'string' ? root.innerText : '';
-    const match = /#[\s\u00a0]*(\d{1,3})(?!\d)/.exec(renderedText)
-      || /#[\s\u00a0]*(\d{1,3})(?!\d)/.exec(String(root.textContent || ''));
-    return match ? Number(match[1]) : undefined;
+    if (!root) return undefined;
+    const header = root.getAttribute && root.getAttribute('data-testid') === 'game-header'
+      ? root
+      : root.querySelector && root.querySelector('[data-testid="game-header"]');
+    if (header) {
+      const headerLabeled = findVisibleGameCountNode(header);
+      const fromLabeled = headerLabeled ? parseLabeledGameCount(headerLabeled) : undefined;
+      if (fromLabeled !== undefined) return fromLabeled;
+      const fromHeader = parseGameCountText(nodeText(header));
+      if (fromHeader !== undefined) return fromHeader;
+    }
+    const labeled = findVisibleGameCountNode(root);
+    if (labeled) return parseLabeledGameCount(labeled);
+    return undefined;
+  }
+
+  function isSequentialGameCount(previous, next) {
+    return next === previous || (next > previous && next - previous <= 2);
+  }
+
+  function isRoadWrapGameCount(previous, next) {
+    return previous >= 10 && next >= 1 && next <= 20 && previous - next >= 8;
+  }
+
+  function isConfirmedCatchUpGameCount(previous, next) {
+    return next > previous && next - previous <= 5;
+  }
+
+  function isConfirmedEarlyShoeCorrection(previous, next) {
+    return previous <= 8 && next >= 1 && next < previous;
   }
 
   function stableGameCount(tableId, root) {
     const parsed = parseGameCount(root);
-    if (parsed !== undefined) {
+    const previous = lastGameCountByTable.get(tableId);
+    if (parsed === undefined) return previous;
+    if (previous === undefined || isSequentialGameCount(previous, parsed)) {
+      pendingGameCountByTable.delete(tableId);
       lastGameCountByTable.set(tableId, parsed);
       return parsed;
     }
-    return lastGameCountByTable.get(tableId);
+    if (isRoadWrapGameCount(previous, parsed)) {
+      pendingGameCountByTable.delete(tableId);
+      lastGameCountByTable.set(tableId, parsed);
+      return parsed;
+    }
+    const pending = pendingGameCountByTable.get(tableId);
+    if (
+      pending === parsed
+      && (
+        isConfirmedCatchUpGameCount(previous, parsed)
+        || isConfirmedEarlyShoeCorrection(previous, parsed)
+      )
+    ) {
+      pendingGameCountByTable.delete(tableId);
+      lastGameCountByTable.set(tableId, parsed);
+      return parsed;
+    }
+    pendingGameCountByTable.set(tableId, parsed);
+    return previous;
   }
 
   function parseMinimum(root) {
@@ -192,9 +302,10 @@
     if (!tableId) return [];
     const timer = document.querySelector('[data-testid="round-timer"] [data-testid^="timer-countdown-"]');
     const countdown = countdownValue(timer);
-    const title = clean(document.querySelector('[data-testid="game-header"] button')?.textContent)
-      || clean(document.querySelector('[data-testid="game-header"]')?.textContent).replace(/\s*[••].*$/, '');
-    const gameCount = stableGameCount(tableId, document);
+    const header = document.querySelector('[data-testid="game-header"]');
+    const title = clean(header?.querySelector('button')?.textContent)
+      || clean(header?.textContent).replace(/\s*[••].*$/, '');
+    const gameCount = stableGameCount(tableId, header || document);
     return [{
       tableId,
       ...(title ? { displayName: title } : {}),
@@ -258,7 +369,9 @@
         && style.display !== 'none'
         && tile.getBoundingClientRect().width > 0;
       const cards = visible ? multitableCards(tile) : undefined;
-      const gameCount = stableGameCount(tableId, tile);
+      const gameCount = style.display !== 'none' && tile.getBoundingClientRect().width > 0
+        ? stableGameCount(tableId, tile)
+        : undefined;
       const minBet = parseMinimum(tile);
       return {
         tableId,

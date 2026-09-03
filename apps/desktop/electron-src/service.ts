@@ -19,6 +19,10 @@ import {
   operationalReceiptCommitStarted,
   type MonitorSummary,
   type MonitorSummaryOptions,
+  effectiveShoeBaseline,
+  explainShoeBaseline,
+  isVerifiedPhysicalShoeEvidence,
+  shoeBaselineReasonLabel,
 } from '@baccarat/ledger-state';
 import {
   Orchestrator,
@@ -33,7 +37,10 @@ import {
   BUNDLED_BROWSER_EXTENSION_TOKEN,
   BrowserBridgeServer,
   isCompleteBaccaratHand,
+  isInternalExternalGameCountAnomaly,
   isJoinableNewShoeRoadCount,
+  selectObservedGameCount,
+  selectStableGameCount,
   type BrowserBridgeRuntimeEvent,
 } from '@baccarat/browser-bridge';
 import {
@@ -58,6 +65,7 @@ import {
   type DesktopRuntimeState,
   type DesktopPendingSettlementCommand,
   type DesktopUnknownWagerReconciliationCommand,
+  type DesktopShoeEvidence,
   type MonitorTableCandidate,
   type OneShotLiveBetCommand,
   type OneShotLiveBetResult,
@@ -240,7 +248,7 @@ function defaultMonitorTableIds(): string[] {
 
 function isRetiredDefaultMonitorList(tableIds: readonly string[]): boolean {
   if (tableIds.length !== RETIRED_DEFAULT_MONITOR_TABLE_IDS.length) return false;
-  const expected = new Set(RETIRED_DEFAULT_MONITOR_TABLE_IDS);
+  const expected = new Set<string>(RETIRED_DEFAULT_MONITOR_TABLE_IDS);
   return tableIds.every(tableId => expected.has(tableId));
 }
 
@@ -321,6 +329,7 @@ export class DesktopConsoleService {
   private suppressDiscoveredMonitorAutoAdd = false;
   private automationEnabled = false;
   private readonly pendingGameCountByTable = new Map<string, number>();
+  private readonly demotedPendingTableIds = new Set<string>();
   /** The transient allowlist used only while a serialized live transition is being validated. */
   private pendingMonitorTableIds?: readonly string[];
   /** Operator-managed, persisted ordered selection; mutation is the configuration operation. */
@@ -344,6 +353,8 @@ export class DesktopConsoleService {
           this.recordLiveMonitorError(error, 'scheduler-failure', 'degraded');
         });
       },
+      observedGameCount: tableId => this.tableMetadata.get(tableId)?.gameCount,
+      observedShoeEvidence: tableId => this.browserBridge?.shoeEvidence(tableId),
     });
     for (const repair of repairedAcceptedReservations) {
       const settlement = this.ledger.getHandSettlement(
@@ -428,6 +439,14 @@ export class DesktopConsoleService {
     for (const tableId of this.monitorTableIds) this.liveApprovals.approve(tableId);
   }
 
+  private observedGameCount(tableId: string, incoming?: number): number | undefined {
+    return selectObservedGameCount(
+      this.browserBridge?.shoeEvidence(tableId)?.reason,
+      this.browserBridge?.acceptedGameCount(tableId),
+      incoming,
+    );
+  }
+
   private refreshTableMetadataFromRooms(rooms: readonly RoomDescriptor[]): void {
     let changed = false;
     const updatedAt = new Date().toISOString();
@@ -436,6 +455,7 @@ export class DesktopConsoleService {
         const tableId = normalizeOptionalMonitorTableId(table.tableId);
         if (tableId === undefined) continue;
         const existing = this.tableMetadata.get(tableId);
+        const gameCount = this.observedGameCount(tableId, table.gameCount ?? existing?.gameCount);
         const next: StoredTableMetadata = {
           tableId,
           roomId: room.roomId,
@@ -443,48 +463,28 @@ export class DesktopConsoleService {
           ...(existing?.roomName === undefined ? {} : { roomName: existing.roomName }),
           ...(existing?.displayName === undefined ? {} : { displayName: existing.displayName }),
           ...(existing?.roundId === undefined ? {} : { roundId: existing.roundId }),
-          ...(existing?.gameCount === undefined ? {} : { gameCount: existing.gameCount }),
           ...(room.displayName === undefined ? {} : { roomName: room.displayName }),
           ...(table.displayName === undefined ? {} : { displayName: table.displayName }),
           ...(table.roundId === undefined ? {} : { roundId: table.roundId }),
-          ...(table.gameCount === undefined ? {} : { gameCount: table.gameCount }),
+          ...(gameCount === undefined ? {} : { gameCount }),
         };
         this.tableMetadata.set(tableId, next);
         if (!samePersistentTableMetadata(existing, next)) changed = true;
+        if (this.demoteIfGameCountAnomaly(tableId)) {
+          void this.failCloseLiveExecution([tableId]).catch(error => {
+            this.recordLiveMonitorError(error, 'shoe-count-mismatch', 'degraded', tableId);
+          });
+        }
       }
     }
     if (changed) this.persistTableMetadata();
     this.recoverMissedShuffles(rooms);
   }
 
-  private recoverMissedShuffles(rooms: readonly RoomDescriptor[]): void {
-    if (!this.browserBridge) return;
-    const liveGameCount = new Map<string, number>();
-    for (const room of rooms) {
-      for (const table of room.tables) {
-        if (Number.isInteger(table.gameCount) && (table.gameCount ?? -1) >= 0) {
-          liveGameCount.set(table.tableId, table.gameCount!);
-        }
-      }
-    }
-    for (const tableId of this.monitorTableIds) {
-      const gameCount = liveGameCount.get(tableId);
-      if (gameCount === undefined) continue;
-      const projection = this.orchestrator.getActor(tableId)?.peekProjection();
-      if (projection === undefined || projection.shoeBaseline !== 'physical-shoe') {
-        this.missedShuffleRequested.delete(tableId);
-        continue;
-      }
-      if (!(gameCount <= 8 && projection.handNumber > gameCount + 16)) {
-        this.missedShuffleRequested.delete(tableId);
-        continue;
-      }
-      const parserShoeId = this.browserBridge.currentPragmaticShoeId(tableId);
-      if (parserShoeId !== undefined && parserShoeId !== projection.shoeId) continue;
-      if (this.missedShuffleRequested.has(tableId)) continue;
-      this.missedShuffleRequested.add(tableId);
-      this.browserBridge.openPhysicalShoe(tableId);
-    }
+  private recoverMissedShuffles(_rooms: readonly RoomDescriptor[]): void {
+    // Automatic physical shoes come only from protocol token change or road wrap
+    // in the parser. Do not invent a full 8-deck shoe from lagged DOM counts.
+    this.missedShuffleRequested.clear();
   }
 
   private persistTableMetadata(): void {
@@ -502,11 +502,16 @@ export class DesktopConsoleService {
   private pendingJoinTableIds(): string[] {
     const monitored = new Set(this.monitorTableIds);
     const pending: string[] = [];
+    const add = (tableId: string): void => {
+      if (monitored.has(tableId) || pending.includes(tableId)) return;
+      pending.push(tableId);
+    };
+    for (const tableId of this.demotedPendingTableIds) add(tableId);
     for (const candidate of this.monitorCandidates()) {
       if (candidate.roomId !== 'dafabet-pragmatic') continue;
       const tableId = normalizeOptionalMonitorTableId(candidate.tableId);
-      if (tableId === undefined || monitored.has(tableId) || pending.includes(tableId)) continue;
-      pending.push(tableId);
+      if (tableId === undefined) continue;
+      add(tableId);
     }
     return pending;
   }
@@ -530,6 +535,14 @@ export class DesktopConsoleService {
     return this.observedTableIds().includes(tableId);
   }
 
+  private clearStaleRoadCount(tableId: string): void {
+    const existing = this.tableMetadata.get(tableId);
+    if (existing?.gameCount === undefined) return;
+    const { gameCount: _ignored, ...rest } = existing;
+    this.tableMetadata.set(tableId, { ...rest, updatedAt: new Date().toISOString() });
+    this.persistTableMetadata();
+  }
+
   private promotePendingTable(tableId: string): void {
     if (this.monitorTableIds.includes(tableId)) return;
     if (this.monitorTableIds.length >= MAX_LIVE_MONITOR_TABLES) return;
@@ -537,6 +550,8 @@ export class DesktopConsoleService {
     this.ensureMonitorActors(nextTableIds, this.currentUnifiedTableSettings());
     this.monitorTableIds = nextTableIds;
     this.pendingGameCountByTable.delete(tableId);
+    this.demotedPendingTableIds.delete(tableId);
+    this.runtimeIncidents.resolve('shoe-count-mismatch', tableId);
     this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
     this.syncLiveApprovalsToMonitorTables();
     this.browserBridge?.setSelectedTableIds(this.observedTableIds());
@@ -549,12 +564,46 @@ export class DesktopConsoleService {
         const tableId = normalizeOptionalMonitorTableId(table.tableId);
         if (tableId === undefined || this.monitorTableIds.includes(tableId)) continue;
         const gameCount = table.gameCount;
-        if (!Number.isInteger(gameCount) || (gameCount ?? -1) < 0) continue;
+        if (!Number.isInteger(gameCount) || (gameCount ?? 0) < 1) continue;
         const previous = this.pendingGameCountByTable.get(tableId);
-        this.pendingGameCountByTable.set(tableId, gameCount!);
-        if (isJoinableNewShoeRoadCount(previous, gameCount!)) this.promotePendingTable(tableId);
+        const stable = selectStableGameCount(previous, gameCount!);
+        if (stable === undefined) continue;
+        this.pendingGameCountByTable.set(tableId, stable);
+        if (isJoinableNewShoeRoadCount(previous, stable)) this.promotePendingTable(tableId);
       }
     }
+  }
+
+  private demoteAnomalousMonitorTable(tableId: string, handNumber: number, roadCount: number): boolean {
+    if (!this.liveMonitorActivated) return false;
+    if (!this.monitorTableIds.includes(tableId)) return false;
+    this.pendingGameCountByTable.set(tableId, roadCount);
+    this.demotedPendingTableIds.add(tableId);
+    const nextTableIds = this.monitorTableIds.filter(candidate => candidate !== tableId);
+    this.monitorTableIds = nextTableIds;
+    this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
+    this.syncLiveApprovalsToMonitorTables();
+    this.browserBridge?.setSelectedTableIds(this.observedTableIds());
+    this.ensureRuntimeIncident({
+      code: 'shoe-count-mismatch',
+      severity: 'degraded',
+      tableId,
+      message: `内部 #${handNumber} 与牌桌路子 #${roadCount} 相差过大，已移出监控，等待下一靴`,
+    });
+    return true;
+  }
+
+  private demoteIfGameCountAnomaly(tableId: string): boolean {
+    if (!this.liveMonitorActivated) return false;
+    if (!this.monitorTableIds.includes(tableId)) return false;
+    const actor = this.orchestrator.getActor(tableId);
+    if (!actor) return false;
+    const handNumber = actor.getProjection().handNumber;
+    const roadCount = this.tableMetadata.get(tableId)?.gameCount
+      ?? this.browserBridge?.acceptedGameCount(tableId);
+    const evidence = this.browserBridge?.shoeEvidence(tableId)?.reason;
+    if (!isInternalExternalGameCountAnomaly(handNumber, roadCount, evidence)) return false;
+    return this.demoteAnomalousMonitorTable(tableId, handNumber, roadCount!);
   }
 
   private ensureMonitorActors(
@@ -814,7 +863,18 @@ export class DesktopConsoleService {
         },
       }),
       maxFeedStalenessMs: MAX_LIVE_FEED_STALENESS_MS,
-      projection: actor.peekProjection(),
+      projection: (() => {
+        const projection = actor.peekProjection();
+        const gameCount = this.tableMetadata.get(tableId)?.gameCount;
+        const baseline = effectiveShoeBaseline(
+          projection,
+          gameCount,
+          this.browserBridge?.shoeEvidence(tableId),
+        );
+        return baseline === projection.shoeBaseline
+          ? projection
+          : { ...projection, shoeBaseline: baseline };
+      })(),
       hasUnknownExecution: false,
       hasSettlementGap: this.hasSettlementGap(tableId),
     });
@@ -825,9 +885,21 @@ export class DesktopConsoleService {
     for (const reservation of this.orchestrator.getReservations()) {
       if (reservation.status !== 'UNKNOWN') continue;
       const record = records.find(candidate => candidate.reservationId === reservation.reservationId);
-      if (record === undefined || record.status !== 'UNKNOWN') continue;
-      if (record.receipt?.status !== 'UNKNOWN') continue;
-      if (!operationalReceiptCommitStarted(record.receipt?.raw)) continue;
+      const receipt = this.ledger.getReceipt(
+        reservation.tableId,
+        reservation.shoeId,
+        reservation.handId,
+        reservation.market,
+      )?.receipt;
+      const committedUnknown = (
+        record?.status === 'UNKNOWN'
+        && record.receipt?.status === 'UNKNOWN'
+        && operationalReceiptCommitStarted(record.receipt?.raw)
+      ) || (
+        receipt?.status === 'UNKNOWN'
+        && operationalReceiptCommitStarted(receipt.raw)
+      );
+      if (!committedUnknown) continue;
       const settlement = this.ledger.getHandSettlement(
         reservation.tableId,
         reservation.shoeId,
@@ -847,7 +919,7 @@ export class DesktopConsoleService {
       } catch {
         continue;
       }
-      if (record.reconciliation !== undefined) continue;
+      if (record === undefined || record.reconciliation !== undefined) continue;
       this.ledger.reconcileOperationalWager(record.wager.wagerId, {
         status: 'ACCEPTED',
         reason: 'committed-hand-settled',
@@ -1135,13 +1207,25 @@ export class DesktopConsoleService {
     }
     if (event.type === 'bettingWindowOpened') this.detectSettlementGap(event);
     if (event.type === 'newShoeSignal' && event.baseline === 'physical-shoe') {
-      // Protocol/DOM already proved a physical new shoe. Do not wait for the
-      // road # to wrap to 0-2; that count often stays on the old shoe or skips
-      // ahead to 3-8, which left shuffled tables stuck in 待加入.
-      this.promotePendingTable(event.tableId);
+      // Only protocol-shuffle, road-wrap, or manual-confirm may promote a pending
+      // table. A physical label without that evidence is attach/restart noise.
+      const evidence = this.browserBridge?.shoeEvidence(event.tableId);
+      if (isVerifiedPhysicalShoeEvidence(evidence)) {
+        this.promotePendingTable(event.tableId);
+        this.clearStaleRoadCount(event.tableId);
+      }
     }
     this.cachedLightSnapshot = undefined;
     await this.orchestrator.enqueue(event.tableId, event);
+    if (
+      event.type === 'handSettled'
+      || event.type === 'bettingWindowOpened'
+      || event.type === 'cardObserved'
+    ) {
+      if (this.demoteIfGameCountAnomaly(event.tableId)) {
+        await this.failCloseLiveExecution([event.tableId]);
+      }
+    }
     if (
       event.type === 'handSettled'
       || event.type === 'betReceipt'
@@ -1195,8 +1279,9 @@ export class DesktopConsoleService {
     const actor = this.orchestrator.getActor(tableId);
     if (!actor) return;
     const projection = actor.getProjection();
+    const gameCount = this.tableMetadata.get(tableId)?.gameCount;
     const canArm = projection.autoBetStatus === 'DISARMED'
-      && projection.shoeBaseline === 'physical-shoe'
+      && effectiveShoeBaseline(projection, gameCount, this.browserBridge?.shoeEvidence(tableId)) === 'physical-shoe'
       && projection.connectionStatus === 'CONNECTED'
       && !projection.sealed
       && (projection.status === 'TRACKING'
@@ -1317,7 +1402,7 @@ export class DesktopConsoleService {
     // Multi-table pages reconnect the game socket often. A stale/disconnected
     // feed must stay in the monitor list so the export can resume; dropping
     // the table is what leaves the console stuck on 数据流已断开 / 已过期.
-    if (reason === 'table-feed-stale') return;
+    if (reason === 'table-feed-stale' || reason === 'browser-extension-disconnected') return;
     if (this.disconnectedMonitorRemovalTimers.has(tableId)) return;
     const delayMs = DISCONNECTED_MONITOR_REMOVAL_MS;
     const timer = setTimeout(() => {
@@ -1684,9 +1769,9 @@ export class DesktopConsoleService {
           ...(previous.roundId !== undefined || table.roundId !== undefined
             ? { roundId: previous.roundId ?? table.roundId ?? '' }
             : {}),
-          ...(previous.gameCount !== undefined || table.gameCount !== undefined
-            ? { gameCount: previous.gameCount ?? table.gameCount ?? 0 }
-            : {}),
+          ...(this.observedGameCount(table.tableId, previous.gameCount ?? table.gameCount) === undefined
+            ? {}
+            : { gameCount: this.observedGameCount(table.tableId, previous.gameCount ?? table.gameCount) }),
         });
         continue;
       }
@@ -1743,10 +1828,29 @@ export class DesktopConsoleService {
     const usingLiveMonitor = this.liveMonitorActivated;
     const displayedTableIds = this.displayedTableIds(fullSnapshot);
     const activeTableIds = new Set(displayedTableIds);
+    const shoeEvidence: Record<string, DesktopShoeEvidence> = {};
     const tables = Object.fromEntries(
       displayedTableIds.flatMap(tableId => {
         const table = fullSnapshot.tables[tableId];
-        return table === undefined ? [] : [[tableId, table]];
+        if (table === undefined) return [];
+        const gameCount = this.tableMetadata.get(tableId)?.gameCount;
+        const explained = explainShoeBaseline(
+          table.projection,
+          gameCount,
+          this.browserBridge?.shoeEvidence(tableId),
+        );
+        shoeEvidence[tableId] = {
+          reason: explained.evidence.reason,
+          label: shoeBaselineReasonLabel(explained.evidence),
+          ...(explained.evidence.previousGameCount === undefined
+            ? {}
+            : { previousGameCount: explained.evidence.previousGameCount }),
+          ...(explained.evidence.gameCount === undefined ? {} : { gameCount: explained.evidence.gameCount }),
+        };
+        const next = explained.baseline === table.projection.shoeBaseline
+          ? table
+          : { ...table, projection: { ...table.projection, shoeBaseline: explained.baseline } };
+        return [[tableId, next]];
       }),
     );
     const snapshot: OrchestratorSnapshot = { ...fullSnapshot, tables };
@@ -1777,6 +1881,7 @@ export class DesktopConsoleService {
       monitorTableIds: [...this.monitorTableIds],
       monitorCandidates,
       tableMetadata,
+      shoeEvidence,
       recordCounts,
       keepalive,
       automation: { enabled: this.automationEnabled },
@@ -1957,9 +2062,10 @@ export class DesktopConsoleService {
     }
 
   queryRecords(query: DesktopRecordQuery): DesktopRecordPage {
-    // Record pages are part of the live dashboard surface. Apply the same monitor-table
-    // scope before pagination so unrelated historical tables cannot inflate totals or rows.
-    const scopedQuery = this.liveMonitorActivated
+    // Events/decisions stay scoped to the live monitor list so demo tables do not
+    // inflate those pages. Ledger is money history: keep rows after a table leaves
+    // the monitor list, otherwise real bets vanish from 账本.
+    const scopedQuery = this.liveMonitorActivated && query.kind !== 'ledger'
       ? { ...query, tableIds: this.displayedTableIds(this.orchestrator.snapshot()) }
       : query;
     if (query.kind === 'events') {
@@ -2096,6 +2202,13 @@ export class DesktopConsoleService {
       if (!actor) throw new Error(`unknown table ${tableId}`);
       if (armed && !this.automationEnabled) {
         throw new Error('global automation is disabled');
+      }
+      if (armed) {
+        const projection = actor.getProjection();
+        const gameCount = this.tableMetadata.get(tableId)?.gameCount;
+        if (effectiveShoeBaseline(projection, gameCount, this.browserBridge?.shoeEvidence(tableId)) !== 'physical-shoe') {
+          throw new Error('physical shoe baseline is unknown');
+        }
       }
       await actor.setAutoBet(armed, shoeId);
       return this.snapshot();

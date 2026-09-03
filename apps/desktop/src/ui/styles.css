@@ -659,9 +659,37 @@ h2 { color: #f4f7fa; font-size: 18px; }
 
 .monitor-section { margin-top: 10px; padding: 0; overflow: hidden; }
 .monitor-section .table-scroll { margin: 0; }
-.monitor-table { min-width: 1180px; }
-.monitor-table th { position: sticky; top: 0; z-index: 1; background: #111c26; }
-.monitor-table td { vertical-align: middle; padding: 7px 8px; }
+.monitor-table {
+  table-layout: fixed;
+  width: 100%;
+  min-width: 1180px;
+}
+.monitor-col-name { width: 160px; }
+.monitor-col-status { width: 92px; }
+.monitor-col-round { width: 148px; }
+.monitor-col-flag { width: 72px; }
+.monitor-col-remain { width: 128px; }
+.monitor-col-ev { width: 84px; }
+.monitor-col-cards { width: 108px; }
+.monitor-col-bet { width: 196px; }
+.monitor-col-action { width: 56px; }
+.monitor-table th { position: sticky; top: 0; z-index: 1; background: #111c26; overflow: hidden; }
+.monitor-table td {
+  vertical-align: middle;
+  overflow: hidden;
+  padding: 7px 8px;
+}
+.monitor-sort {
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.monitor-sort:hover { color: #e8f0f3; }
 .monitor-table tbody tr {
   position: relative;
   cursor: pointer;
@@ -695,12 +723,6 @@ h2 { color: #f4f7fa; font-size: 18px; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.monitor-pair-ev {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
 .monitor-table__round { display: grid; gap: 2px; min-width: 0; }
 .monitor-table__round strong {
   overflow: hidden;
@@ -715,10 +737,21 @@ h2 { color: #f4f7fa; font-size: 18px; }
 .monitor-table td[data-label="开盘"],
 .monitor-table td[data-label="连接"],
 .monitor-table td[data-label="自动"],
-.monitor-table td[data-label="剩余"],
 .monitor-table td[data-label="对子 EV"] {
   white-space: nowrap;
 }
+.monitor-table td[data-label="剩余"] .muted,
+.monitor-table td[data-label="牌桌"] .alert-label {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.monitor-table td[data-label="闲"],
+.monitor-table td[data-label="庄"] {
+  white-space: nowrap;
+}
+.monitor-table tbody tr { height: 52px; }
 .monitor-row__remove { flex: 0 0 auto; margin-left: auto; padding-inline: 6px; }
 .monitor-row__game-count { margin-left: auto; color: #79ceb3; font-size: 11px; }
 .alert-center-overlay {

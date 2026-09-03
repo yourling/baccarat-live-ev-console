@@ -819,6 +819,61 @@ describe('orchestrator table actor', () => {
     ledger.close();
   });
 
+  it('settles a committed unknown pair receipt from the exact hand outcome', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile = simProfile();
+    const executor = {
+      requestBet: async (request: { readonly intent: BetIntent; readonly reservationId?: string }) => ({
+        receiptId: 'committed-unknown-receipt',
+        intentId: request.intent.intentId,
+        reservationId: request.reservationId ?? '',
+        status: 'UNKNOWN' as const,
+        amount: request.intent.amount,
+        market: request.intent.market,
+        mode: request.intent.mode,
+        createdAt: new Date().toISOString(),
+        raw: { reason: 'round-advanced-before-ack', commitStarted: true },
+      }),
+    };
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor });
+    const actor = orchestrator.registerTable(profile, 'live', 10);
+    const stream = new FixtureBuilder('t1')
+      .newShoe('s1', profile)
+      .openWindow('s1', 'h1', 'bankerPair')
+      .build();
+
+    await Promise.all(stream.map(event => orchestrator.enqueue('t1', event)));
+    await actor.flush();
+    expect(orchestrator.getReservations('t1')[0]).toEqual(expect.objectContaining({
+      status: 'UNKNOWN',
+      releaseReason: 'platform-acknowledgement-unknown',
+    }));
+
+    const authoritativeSettlement: NormalizedEvent = {
+      type: 'handSettled',
+      eventId: newId('evt'),
+      tableId: 't1',
+      timestamp: '2025-01-01T00:00:31.000Z',
+      sourceSeq: ledger.nextSourceSeq('t1'),
+      shoeId: 's1',
+      handId: 'h1',
+      playerCards: [{ rank: 'K' }, { rank: 'Q' }],
+      bankerCards: [{ rank: 'A' }, { rank: 'A' }],
+      outcomes: { bankerPair: true, playerPair: false },
+    };
+    await actor.enqueue(authoritativeSettlement);
+    await actor.flush();
+
+    expect(orchestrator.getReservations('t1')[0]).toEqual(expect.objectContaining({
+      status: 'SETTLED',
+      releaseReason: 'committed-hand-settled',
+      realizedPnl: 110,
+    }));
+    expect(orchestrator.getRiskState().reservedExposure).toBe(0);
+    expect(orchestrator.getRiskState().pendingExecutions).toBe(0);
+    ledger.close();
+  });
+
   it('treats an executor timeout as unknown without disarming automatic betting', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile = simProfile();
@@ -1112,6 +1167,43 @@ describe('unknown monitor-session baseline execution', () => {
     expect(ledger.listReceipts('t1')).toEqual([]);
     expect(ledger.listDecisions('t1')).toEqual([]);
     expect(actor.getProjection().shoeBaseline).toBe('unknown-monitor-session');
+    ledger.close();
+  });
+
+  it('does not auto-bet pairs when a physical label still has empty inventory on a deep road', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile = simProfile();
+    const requests: BetExecutionRequest[] = [];
+    const executor = {
+      requestBet: async (request: BetExecutionRequest) => {
+        requests.push(request);
+        return liveReceipt(request, 'ACCEPTED', 'live-false-physical-auto');
+      },
+    };
+    const orchestrator = new Orchestrator({
+      ledger,
+      riskLimits,
+      executor,
+      observedGameCount: () => 55,
+    });
+    const actor = orchestrator.registerTable(profile, 'live', 10);
+    const fixture = new FixtureBuilder('t1')
+      .newShoe('s1', profile)
+      .openWindow('s1', 'h1', 'bankerPair')
+      .build();
+    const physicalStart = {
+      ...fixture[0],
+      baseline: 'physical-shoe',
+    } as unknown as NormalizedEvent;
+
+    await orchestrator.enqueue('t1', physicalStart);
+    await orchestrator.enqueue('t1', fixture[1]!);
+    await actor.flush();
+
+    expect(requests).toEqual([]);
+    expect(ledger.listReceipts('t1')).toEqual([]);
+    expect(ledger.listDecisions('t1')).toEqual([]);
+    expect(actor.getProjection().shoeBaseline).toBe('physical-shoe');
     ledger.close();
   });
 });

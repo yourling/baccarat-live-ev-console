@@ -5,9 +5,10 @@
  * content script and, when a previous real bet send has been observed, can
  * replay a mutated copy of that send for request-path betting.
  * It never sends <autoBet>. Multiplay already lets lpbet target any visible
- * tile. Same-frame reconnects must wait for the new game socket to receive
- * before retiring the old one. The official client can keep a dedicated table
- * and multibaccarat open together; do not treat that as a conflict.
+ * tile. Dedicated-table reconnects may retire the previous socket after the
+ * new one receives. Multibaccarat must never close a sibling game socket.
+ * The official client can keep a dedicated table and multibaccarat open
+ * together; do not treat that as a conflict.
  * It does not observe fetch/XHR/Worker/MessageChannel/video sockets.
  */
 (function () {
@@ -69,11 +70,21 @@
     }
   }
 
-  // Close previous same-frame game sockets only after the new one is actually
-  // receiving. Closing on construct kills the live feed; leaving two live
-  // sockets in this same multi frame makes that page reconnect by itself.
+  function isMultiBaccaratFrame() {
+    try {
+      return location.pathname === '/desktop/multibaccarat/';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Dedicated table: close previous same-frame game sockets only after the new
+  // one is actually receiving. Closing on construct kills the live feed.
+  // Multibaccarat: never close a sibling socket. The official client already
+  // owns reconnect; closing the old /game socket is what freezes 重新连接中.
   function adoptGameSocket(socket, url) {
     if (sessionReleased || !isGameProtocolSocket(url)) return;
+    if (isMultiBaccaratFrame()) return;
     let newest = null;
     for (let index = liveSockets.length - 1; index >= 0; index -= 1) {
       const entry = liveSockets[index];
