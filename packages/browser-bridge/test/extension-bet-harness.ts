@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
+import { createHmac, webcrypto } from 'node:crypto';
 import vm from 'node:vm';
 import { expect, vi } from 'vitest';
+import { betSignaturePayload, signExecutorPayload } from '../src/executor-lease.js';
 
 export const backgroundSource = readFileSync(
   new URL('../../../apps/browser-extension/background.js', import.meta.url),
@@ -397,6 +399,7 @@ export async function createHarness(options: HarnessOptions = {}) {
     chrome,
     WebSocket: FakeWebSocket,
     navigator: { userAgent: 'test-browser' },
+    crypto: webcrypto,
     setTimeout: setTimeoutMock,
     clearTimeout: vi.fn(),
     Date,
@@ -407,6 +410,9 @@ export async function createHarness(options: HarnessOptions = {}) {
     Promise,
     URL,
     Map,
+    Array,
+    TextEncoder,
+    Uint8Array,
     importScripts: (script: string) => {
       if (script !== 'pragmatic-bet-runtime.js') throw new Error(`unexpected script import: ${script}`);
       vm.runInContext(pragmaticRuntimeSource, context, { filename: script });
@@ -414,6 +420,13 @@ export async function createHarness(options: HarnessOptions = {}) {
   });
 
   vm.runInContext(backgroundSource, context, { filename: 'background.js' });
+  const signWithNode = (secret: string, payload: string): string =>
+    createHmac('sha256', secret).update(payload).digest('hex');
+  Reflect.set(context, '__signExecutorPayload', signWithNode);
+  vm.runInContext(
+    `hmacSha256Hex = async (secret, payload) => __signExecutorPayload(String(secret || ''), String(payload || ''));`,
+    context,
+  );
   const pragmaticProtocolRoundId = options.pragmaticProtocolRoundId === undefined
     ? '1726012345'
     : options.pragmaticProtocolRoundId;
@@ -439,6 +452,53 @@ export async function createHarness(options: HarnessOptions = {}) {
   const socket = FakeWebSocket.instances[0];
   expect(socket).toBeDefined();
   if (!socket) throw new Error('background WebSocket was not created');
+  const executorLease = {
+    leaseId: 'lease-test-harness-0001',
+    profileId: 'profile-test-harness-0001',
+    secret: 'a'.repeat(64),
+  };
+  const originalEmit = socket.emit.bind(socket);
+  socket.emit = ((name: string, event: SocketEvent = {}) => {
+    if (name === 'message' && typeof event.data === 'string') {
+      try {
+        const parsed: unknown = JSON.parse(event.data);
+        if (
+          parsed
+          && typeof parsed === 'object'
+          && !Array.isArray(parsed)
+          && Reflect.get(parsed, 'kind') === 'betRequest'
+        ) {
+          const requestId = Reflect.get(parsed, 'requestId');
+          if (typeof requestId === 'string' && requestId) {
+            const signed = {
+              ...parsed,
+              leaseId: executorLease.leaseId,
+              signature: signExecutorPayload(
+                executorLease.secret,
+                betSignaturePayload(executorLease.leaseId, requestId),
+              ),
+            };
+            originalEmit(name, { ...event, data: JSON.stringify(signed) });
+            return;
+          }
+        }
+      } catch {
+        // fall through to original emit
+      }
+    }
+    originalEmit(name, event);
+  }) as typeof socket.emit;
+  socket.emit('message', {
+    data: JSON.stringify({
+      kind: 'executorLeaseGranted',
+      leaseId: executorLease.leaseId,
+      profileId: executorLease.profileId,
+      secret: executorLease.secret,
+      reacquired: false,
+      timestamp: '2026-09-04T00:00:00.000Z',
+    }),
+  });
+  await flushAsyncWork();
   if (options.armCurrentSession ?? true) {
     socket.emit('message', { data: JSON.stringify({ kind: 'command', name: 'liveOn' }) });
     await flushAsyncWork();
@@ -451,6 +511,8 @@ export async function createHarness(options: HarnessOptions = {}) {
     receipt,
     sendMessage,
     socket,
+    executorLease,
+    emitUnsigned: originalEmit,
     runNextTimer: (): boolean => {
       const callback = scheduledTimers.shift();
       if (!callback) return false;

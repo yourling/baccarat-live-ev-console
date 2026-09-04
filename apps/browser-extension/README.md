@@ -108,8 +108,9 @@ npx tsx scripts/bridge-command.ts liveOff
 | --- | --- | --- |
 | `bridgeUrl` | 带固定 token 的 `ws://127.0.0.1:17890` | 可变的开发桥接地址；桌面桥仍校验固定扩展 ID/token，不得指向不受信任或非隔离端点。 |
 | `trustedKeepalive` | `false` | 启用 CDP 可信输入保活。需要 `debugger` 权限；首次启用时浏览器显示“正在调试”提示条，点 × 关闭会拒绝调试，自动降级为普通保活。 |
-| `autoKeeper` | `false` | 自动创建固定后台标签页防会话页被浏览器丢弃。注意：部分站点不允许同一账号开两个房间页，若开启后主页面反而掉线，请关闭。 |
+| `autoKeeper` | 强制关闭 | 已剥离：扩展不再创建 keeper 标签或 `tabs.reload` 游戏页；会话页保活由桌面端/人工持有，不在扩展内编排。 |
 | `liveBetEnabled` | `false` | 页面执行开发开关；默认关闭，不构成真实资金审批或风控。 |
+| `executorProfileId` | 自动生成 | 本 Chrome profile 的稳定 executor 身份；桥接按此发放/重绑唯一 lease。 |
 
 ### 观测方式
 
