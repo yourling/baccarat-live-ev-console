@@ -253,6 +253,60 @@ describe('Pragmatic passive network hook', () => {
     expect(second.readyState).toBe(FakeWebSocket.OPEN);
   });
 
+  it('does not close sibling game sockets on multibaccarat path without trailing slash', () => {
+    const posted: unknown[] = [];
+    const { testWindow, windowEvents } = runHook(posted, { pathname: '/desktop/multibaccarat' });
+    signalContentReady(testWindow, windowEvents);
+    const first = new testWindow.WebSocket('wss://gs10.pragmaticplaylive.net/game');
+    first.readyState = FakeWebSocket.OPEN;
+    const second = new testWindow.WebSocket('wss://gs24.pragmaticplaylive.net/game');
+    second.readyState = FakeWebSocket.OPEN;
+    second.emit('message', {
+      data: '<command channel="table-h22z8qhp17sa0vkh"><timer table="h22z8qhp17sa0vkh" value="8"/></command>',
+    });
+    expect(first.readyState).toBe(FakeWebSocket.OPEN);
+    expect(second.readyState).toBe(FakeWebSocket.OPEN);
+  });
+
+  it('keeps sibling game sockets on dedicated path when mtb_ gm was observed', () => {
+    const posted: unknown[] = [];
+    const { testWindow, windowEvents } = runHook(posted, { pathname: '/desktop/baccarat/' });
+    signalContentReady(testWindow, windowEvents);
+    const first = new testWindow.WebSocket('wss://gs10.pragmaticplaylive.net/game');
+    first.readyState = FakeWebSocket.OPEN;
+    first.send(
+      '<command channel="table-h22z8qhp17sa0vkh"><lpbet gm="mtb_desktop" gId="16387255610" uId="ppc1735377833837" ck="1" ><bet amt="10" bc="0" ck="1"/></lpbet></command>',
+    );
+    const second = new testWindow.WebSocket('wss://gs24.pragmaticplaylive.net/game');
+    second.readyState = FakeWebSocket.OPEN;
+    second.emit('message', {
+      data: '<command channel="table-h22z8qhp17sa0vkh"><timer table="h22z8qhp17sa0vkh" value="8"/></command>',
+    });
+    expect(first.readyState).toBe(FakeWebSocket.OPEN);
+    expect(second.readyState).toBe(FakeWebSocket.OPEN);
+  });
+
+  it('keeps sibling game sockets on dedicated path when multiple table ids were seen', () => {
+    const posted: unknown[] = [];
+    const { testWindow, windowEvents } = runHook(posted, { pathname: '/desktop/baccarat/' });
+    signalContentReady(testWindow, windowEvents);
+    const first = new testWindow.WebSocket('wss://gs10.pragmaticplaylive.net/game');
+    first.readyState = FakeWebSocket.OPEN;
+    first.emit('message', {
+      data: '<command channel="table-h22z8qhp17sa0vkh"><timer table="h22z8qhp17sa0vkh" value="8"/></command>',
+    });
+    first.emit('message', {
+      data: '<command channel="table-speedbca14gesbc1"><timer table="speedbca14gesbc1" value="7"/></command>',
+    });
+    const second = new testWindow.WebSocket('wss://gs24.pragmaticplaylive.net/game');
+    second.readyState = FakeWebSocket.OPEN;
+    second.emit('message', {
+      data: '<command channel="table-h22z8qhp17sa0vkh"><timer table="h22z8qhp17sa0vkh" value="6"/></command>',
+    });
+    expect(first.readyState).toBe(FakeWebSocket.OPEN);
+    expect(second.readyState).toBe(FakeWebSocket.OPEN);
+  });
+
   it('does not close the previous same-frame game socket during reconnect', () => {
     const posted: unknown[] = [];
     const { testWindow, windowEvents } = runHook(posted);

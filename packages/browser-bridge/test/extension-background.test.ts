@@ -7,7 +7,9 @@ import {
   flushAsyncWork as flushBetHarnessAsyncWork,
   pragmaticLiveRequest,
   sentMessages,
+  withExecutorSignature,
 } from './extension-bet-harness.js';
+import { betSignaturePayload, signExecutorPayload } from '../src/executor-lease.js';
 
 const backgroundSource = readFileSync(
   new URL('../../../apps/browser-extension/background.js', import.meta.url),
@@ -103,6 +105,35 @@ describe('extension background multitable command', () => {
     }));
   });
 
+
+  it('does not create keeper tabs even when keepalive arrives from a top frame', async () => {
+    const harness = await createHarness({
+      tabs: [{ id: 42, url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat' }],
+    });
+    const listener = harness.chrome.runtime.onMessage.addListener.mock.calls
+      .map(([fn]) => fn as (
+        message: Record<string, unknown>,
+        sender: { tab?: { id?: number }; url?: string; frameId?: number },
+      ) => void)
+      .at(-1);
+    expect(listener).toBeDefined();
+    listener?.(
+      {
+        kind: 'keepalive',
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+        frame: 'top',
+        timestamp: '2026-09-04T00:00:00.000Z',
+      },
+      {
+        tab: { id: 42 },
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+        frameId: 0,
+      },
+    );
+    await flushBetHarnessAsyncWork();
+    expect(harness.chrome.tabs.create).not.toHaveBeenCalled();
+    expect(harness.chrome.tabs.reload).not.toHaveBeenCalled();
+  });
 
   it('ignores reloadGameTabs and does not reload the game popup', async () => {
     const harness = await createHarness({
@@ -615,3 +646,128 @@ describe('extension background live bet gate', () => {
     );
   });
 });
+
+describe('extension executor lease gate', () => {
+  it('rejects bets that are missing a matching lease HMAC', async () => {
+    const harness = await createHarness();
+    harness.emitUnsigned('message', { data: JSON.stringify(pragmaticLiveRequest('unsigned-request')) });
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => isPragmaticFinalInjection(injection.func),
+    )).toBe(false);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      requestId: 'unsigned-request',
+      receipt: null,
+      error: expect.stringMatching(/lease signature/i),
+    }));
+  });
+
+  it('rejects bets whose HMAC does not match the granted lease', async () => {
+    const harness = await createHarness();
+    const forged = {
+      ...pragmaticLiveRequest('forged-hmac'),
+      leaseId: harness.executorLease.leaseId,
+      signature: signExecutorPayload(
+        'b'.repeat(64),
+        betSignaturePayload(harness.executorLease.leaseId, 'forged-hmac'),
+      ),
+    };
+    harness.emitUnsigned('message', { data: JSON.stringify(forged) });
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => isPragmaticFinalInjection(injection.func),
+    )).toBe(false);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      requestId: 'forged-hmac',
+      receipt: null,
+      error: expect.stringMatching(/signature invalid/i),
+    }));
+  });
+
+  it('refuses a second tab after the lease is rejected', async () => {
+    const harness = await createHarness();
+    harness.socket.emit('message', {
+      data: JSON.stringify({
+        kind: 'executorLeaseRejected',
+        reason: 'executor-lease-duplicate-claimant',
+        activeLeaseId: harness.executorLease.leaseId,
+        timestamp: '2026-09-04T00:00:00.000Z',
+      }),
+    });
+    await flushBetHarnessAsyncWork();
+    harness.socket.emit('message', {
+      data: JSON.stringify(withExecutorSignature(
+        pragmaticLiveRequest('second-tab-request'),
+        harness.executorLease,
+      )),
+    });
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => isPragmaticFinalInjection(injection.func),
+    )).toBe(false);
+    expect(sentMessages(harness.socket)).toContainEqual(expect.objectContaining({
+      kind: 'betResult',
+      requestId: 'second-tab-request',
+      receipt: null,
+      error: expect.stringMatching(/lease not granted/i),
+    }));
+  });
+
+  it('rebinds the same lease after a service-worker restart and still executes signed bets', async () => {
+    const harness = await createHarness();
+    harness.socket.close();
+    harness.socket.emit('close');
+    expect(harness.runNextTimer()).toBe(true);
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    const reconnectedSocket = BetHarnessWebSocket.instances[1];
+    expect(reconnectedSocket).toBeDefined();
+    if (!reconnectedSocket) throw new Error('reconnected WebSocket was not created');
+    reconnectedSocket.emit('open');
+    reconnectedSocket.emit('message', {
+      data: JSON.stringify({
+        kind: 'executorLeaseGranted',
+        leaseId: harness.executorLease.leaseId,
+        profileId: harness.executorLease.profileId,
+        secret: harness.executorLease.secret,
+        reacquired: true,
+        timestamp: '2026-09-04T00:00:01.000Z',
+      }),
+    });
+    reconnectedSocket.emit('message', { data: JSON.stringify({ kind: 'command', name: 'liveOn' }) });
+    await flushBetHarnessAsyncWork();
+    reconnectedSocket.emit('message', {
+      data: JSON.stringify(withExecutorSignature(
+        pragmaticLiveRequest('sw-rebind-request'),
+        harness.executorLease,
+      )),
+    });
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => isPragmaticFinalInjection(injection.func),
+    )).toBe(true);
+  });
+
+  it('still executes a correctly signed live bet', async () => {
+    const harness = await createHarness();
+    harness.socket.emit('message', { data: JSON.stringify(pragmaticLiveRequest('signed-live')) });
+    await flushBetHarnessAsyncWork();
+    await flushBetHarnessAsyncWork();
+
+    expect(harness.executeScript.mock.calls.some(
+      ([injection]) => isPragmaticFinalInjection(injection.func),
+    )).toBe(true);
+  });
+});
+

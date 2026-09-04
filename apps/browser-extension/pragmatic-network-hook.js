@@ -6,7 +6,9 @@
  * replay a mutated copy of that send for request-path betting.
  * It never sends <autoBet>. Multiplay already lets lpbet target any visible
  * tile. Dedicated-table reconnects may retire the previous socket after the
- * new one receives. Multibaccarat must never close a sibling game socket.
+ * new one receives. Keep sibling /game sockets on multibaccarat paths,
+ * observed mtb_ gm traffic, or frames that have seen multiple table ids.
+ * Only a true dedicated single-table frame should retire the previous socket.
  * The official client can keep a dedicated table and multibaccarat open
  * together; do not treat that as a conflict.
  * It does not observe fetch/XHR/Worker/MessageChannel/video sockets.
@@ -44,6 +46,7 @@
   let lastBetTemplate = '';
   let lastUid = '';
   let lastGm = 'mtb_desktop';
+  let gmObserved = false;
   let sessionReleased = false;
 
   function pruneDeadSockets() {
@@ -72,19 +75,26 @@
 
   function isMultiBaccaratFrame() {
     try {
-      return location.pathname === '/desktop/multibaccarat/';
+      return /multibaccarat/i.test(String(location.pathname || ''));
     } catch (_) {
       return false;
     }
   }
 
+  function shouldKeepSiblingGameSockets() {
+    if (isMultiBaccaratFrame()) return true;
+    if (gmObserved && /^mtb_/i.test(String(lastGm || ''))) return true;
+    if (seenTableIds.size > 1) return true;
+    return false;
+  }
+
   // Dedicated table: close previous same-frame game sockets only after the new
   // one is actually receiving. Closing on construct kills the live feed.
-  // Multibaccarat: never close a sibling socket. The official client already
-  // owns reconnect; closing the old /game socket is what freezes 重新连接中.
+  // Multi/mtb/multi-table frames: never close a sibling socket. The official
+  // client already owns reconnect; closing the old /game socket freezes 重新连接中.
   function adoptGameSocket(socket, url) {
     if (sessionReleased || !isGameProtocolSocket(url)) return;
-    if (isMultiBaccaratFrame()) return;
+    if (shouldKeepSiblingGameSockets()) return;
     let newest = null;
     for (let index = liveSockets.length - 1; index >= 0; index -= 1) {
       const entry = liveSockets[index];
@@ -182,7 +192,10 @@
     const uId = xmlAttr(text, 'uId');
     if (uId) lastUid = uId;
     const gm = xmlAttr(text, 'gm');
-    if (gm) lastGm = gm;
+    if (gm) {
+      lastGm = gm;
+      gmObserved = true;
+    }
     if (text.length < 8 || text.length > 8000) return;
     if (!looksLikeBetPayload(text) && !/<lpbet[\s>]/i.test(text)) return;
     lastBetTemplate = text;
@@ -339,7 +352,10 @@
     if (!event.data || event.data.source !== 'baccarat-bridge-pragmatic-restore-bet-template') return;
     if (sessionReleased) return;
     if (event.data.uId) lastUid = String(event.data.uId);
-    if (event.data.gm) lastGm = String(event.data.gm);
+    if (event.data.gm) {
+      lastGm = String(event.data.gm);
+      gmObserved = true;
+    }
     rememberSession(event.data.template);
   });
 

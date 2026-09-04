@@ -33,6 +33,8 @@ const BRIDGE_SESSION_ID = [
 ].join('-');
 let bridgeMessageSeq = 0;
 let pragmaticBetInputBusy = false;
+let executorProfileId = '';
+let executorLease = null; // { leaseId, profileId, secret }
 
 function notePragmaticOutboundSend(message) {
   if (
@@ -185,13 +187,61 @@ async function loadFlags() {
     trustedKeepalive: false,
     liveBetEnabled: false,
     cdpClickPoint: null,
+    executorProfileId: '',
   });
-  autoKeeperEnabled = !!stored.autoKeeper;
+  // Keeper tab create/reload is stripped: extension must not orchestrate reconnect pages.
+  autoKeeperEnabled = false;
   trustedKeepaliveEnabled = !!stored.trustedKeepalive;
   liveBetSessionEnabled = !!stored.liveBetEnabled;
   cdpClickPoint = stored.cdpClickPoint && typeof stored.cdpClickPoint.xp === 'number'
     ? { xp: stored.cdpClickPoint.xp, yp: stored.cdpClickPoint.yp }
     : null;
+  if (typeof stored.executorProfileId === 'string' && /^[a-zA-Z0-9._-]{8,128}$/.test(stored.executorProfileId)) {
+    executorProfileId = stored.executorProfileId;
+  } else if (!executorProfileId) {
+    executorProfileId = [
+      'profile',
+      Date.now().toString(36),
+      Math.random().toString(36).slice(2, 12),
+    ].join('-');
+    try {
+      await chrome.storage.local.set({ executorProfileId });
+    } catch (_) {}
+  }
+}
+
+async function hmacSha256Hex(secret, payload) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(String(secret || '')),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(String(payload || '')));
+  return Array.from(new Uint8Array(signature))
+    .map(byte => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function assertSignedExecutorBet(message) {
+  if (!executorLease || !executorLease.leaseId || !executorLease.secret) {
+    throw new Error('executor lease not granted; refusing bet');
+  }
+  const leaseId = message && typeof message.leaseId === 'string' ? message.leaseId : '';
+  const requestId = message && typeof message.requestId === 'string' ? message.requestId : '';
+  const signature = message && typeof message.signature === 'string' ? message.signature : '';
+  if (!leaseId || !requestId || !signature) {
+    throw new Error('bet request missing lease signature');
+  }
+  if (leaseId !== executorLease.leaseId) {
+    throw new Error('bet request lease_id mismatch');
+  }
+  const expected = await hmacSha256Hex(executorLease.secret, `betRequest:${leaseId}:${requestId}`);
+  if (expected !== signature) {
+    throw new Error('bet request lease signature invalid');
+  }
 }
 
 chrome.storage.onChanged.addListener((_changes, _area) => {
@@ -211,6 +261,7 @@ async function getBridgeUrl() {
 }
 
 async function connect() {
+  await loadFlags();
   const url = await getBridgeUrl();
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
     return;
@@ -230,6 +281,7 @@ async function connect() {
       extensionVersion: chrome.runtime.getManifest().version,
       browser: navigator.userAgent,
       timestamp: new Date().toISOString(),
+      ...(executorProfileId ? { executorProfileId } : {}),
     });
     scheduleBridgeHeartbeat();
     void replayRuntimeStateInGameFrames();
@@ -244,6 +296,24 @@ async function connect() {
       return;
     }
     if (!message) return;
+    if (message.kind === 'executorLeaseGranted') {
+      if (
+        typeof message.leaseId === 'string'
+        && typeof message.secret === 'string'
+        && typeof message.profileId === 'string'
+      ) {
+        executorLease = {
+          leaseId: message.leaseId,
+          profileId: message.profileId,
+          secret: message.secret,
+        };
+      }
+      return;
+    }
+    if (message.kind === 'executorLeaseRejected') {
+      executorLease = null;
+      return;
+    }
     if (message.kind === 'betRequest') {
       void handleBetRequest(message, generation);
     }
@@ -276,6 +346,7 @@ function isCurrentSocket(connection, generation) {
 function invalidateSocket(connection, generation) {
   if (!isCurrentSocket(connection, generation)) return false;
   liveBetSessionEnabled = false;
+  executorLease = null;
   activeSocketGeneration = 0;
   socket = null;
   stopBridgeHeartbeat();
@@ -1139,6 +1210,7 @@ function handleBetRequest(message, generation) {
   if (requestId && betRequests.has(requestId)) return betRequests.get(requestId);
 
   const operation = Promise.resolve()
+    .then(() => assertSignedExecutorBet(message))
     .then(() => executeUniqueLiveBet(message, generation))
     .then(receipt => {
       if (
@@ -1882,45 +1954,9 @@ async function getExistingKeeperTab() {
   return existing || null;
 }
 
-async function ensureKeeperTab(url) {
-  if (!url || !/dafabet\.net|pragmaticplaylive\.net|vbgames88\.com|zavjcswh\.biz/i.test(url)) return;
-  if (keeperCreationPromise) return keeperCreationPromise;
-
-  keeperCreationPromise = (async () => {
-    const existing = await getExistingKeeperTab();
-    if (existing?.id) {
-      try {
-        await chrome.tabs.update(existing.id, { autoDiscardable: false, active: false });
-      } catch (_) {
-        // 部分 Chrome 版本不支持 autoDiscardable 时忽略。
-      }
-      if (existing.discarded) {
-        try {
-          await chrome.tabs.reload(existing.id);
-        } catch (_) {
-          // ignore
-        }
-      }
-      return;
-    }
-
-    try {
-      const tab = await chrome.tabs.create({ url, active: false, pinned: true });
-      keeperTabId = tab.id;
-      await chrome.storage.local.set({ keeperTabId: tab.id });
-      try {
-        await chrome.tabs.update(tab.id, { autoDiscardable: false });
-      } catch (_) {
-        // 部分 Chrome 版本不支持时忽略。
-      }
-    } catch (_) {
-      // 打不开保活页时忽略。
-    }
-  })().finally(() => {
-    keeperCreationPromise = null;
-  });
-
-  return keeperCreationPromise;
+async function ensureKeeperTab(_url) {
+  // Intentionally disabled: extension must not create keeper tabs or reload game popups.
+  return undefined;
 }
 
 const pragmaticFramesByTab = new Map();
@@ -1969,9 +2005,7 @@ chrome.runtime.onMessage.addListener((message, sender, _sendResponse) => {
   notePragmaticFrame(sender.tab && sender.tab.id, sender.frameId, message.url || sender.url || '');
   const senderTabId = sender && sender.tab ? sender.tab.id : null;
   if (message.kind === 'keepalive') {
-    if (autoKeeperEnabled && message.frame === 'top') {
-      void ensureKeeperTab(message.url || '');
-    }
+    // Keeper tab create/reload stripped from extension thinning.
     // CDP 可信点击:顶层帧直接用其坐标;iframe 帧的目标坐标由 maybeTrustedActivity 合成。
     if (trustedKeepaliveEnabled && senderTabId && (message.target || cdpClickPoint)) {
       void maybeTrustedActivity(
