@@ -104,6 +104,35 @@ describe('extension background multitable command', () => {
   });
 
 
+  it('does not create keeper tabs even when keepalive arrives from a top frame', async () => {
+    const harness = await createHarness({
+      tabs: [{ id: 42, url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat' }],
+    });
+    const listener = harness.chrome.runtime.onMessage.addListener.mock.calls
+      .map(([fn]) => fn as (
+        message: Record<string, unknown>,
+        sender: { tab?: { id?: number }; url?: string; frameId?: number },
+      ) => void)
+      .at(-1);
+    expect(listener).toBeDefined();
+    listener?.(
+      {
+        kind: 'keepalive',
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+        frame: 'top',
+        timestamp: '2026-09-04T00:00:00.000Z',
+      },
+      {
+        tab: { id: 42 },
+        url: 'https://www.dafabet.net/sc/live-dealer/popup-launch/jeju-speed-baccarat',
+        frameId: 0,
+      },
+    );
+    await flushBetHarnessAsyncWork();
+    expect(harness.chrome.tabs.create).not.toHaveBeenCalled();
+    expect(harness.chrome.tabs.reload).not.toHaveBeenCalled();
+  });
+
   it('ignores reloadGameTabs and does not reload the game popup', async () => {
     const harness = await createHarness({
       tabs: [

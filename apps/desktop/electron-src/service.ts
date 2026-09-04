@@ -1101,6 +1101,22 @@ export class DesktopConsoleService {
           this.beginRecoverySuppression();
           await this.reconcileUnattendedExecution();
           return;
+        case 'executor-lease-acquired':
+          console.info('[executor-lease-acquired]', JSON.stringify({
+            leaseId: event.leaseId,
+            profileId: event.profileId,
+            reacquired: event.reacquired,
+            active_executor_count: this.browserBridge?.getExecutorStatus().active_executor_count ?? 0,
+          }));
+          return;
+        case 'executor-lease-rejected':
+          console.warn('[executor-lease-rejected]', JSON.stringify({
+            reason: event.reason,
+            profileId: event.profileId,
+            activeLeaseId: event.activeLeaseId,
+            active_executor_count: this.browserBridge?.getExecutorStatus().active_executor_count ?? 0,
+          }));
+          return;
         case 'extension-disconnected':
           this.operationalWagers.disableKeepaliveImmediately();
           this.transportDownAt = Date.now();
@@ -1530,6 +1546,10 @@ export class DesktopConsoleService {
         extensionToken: BUNDLED_BROWSER_EXTENSION_TOKEN,
         onRuntimeEvent: event => this.handleBridgeRuntimeEvent(event),
       });
+      const hostClaim = bridge.claimHostExecutionChannel('desktop-primary');
+      if (!hostClaim.ok) {
+        throw new Error(`parallel Electron execution channel rejected: ${hostClaim.activeChannelId}`);
+      }
       this.browserBridgePort = await bridge.start();
       this.browserBridge = bridge;
     }

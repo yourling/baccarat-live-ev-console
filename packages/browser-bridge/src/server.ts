@@ -43,6 +43,7 @@ import {
 } from './pragmatic-protocol.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { ExecutorLeaseRegistry } from './executor-lease.js';
 
 export const PRAGMATIC_BET_RUNTIME_REVISION = 'pragmatic-bet-runtime/2026-08-30.14';
 const PRAGMATIC_BET_RUNTIME_FAMILY = 'pragmatic-bet-runtime/';
@@ -77,12 +78,24 @@ export type BrowserBridgeRuntimeEvent =
   | { readonly kind: 'execution-gate-revoked'; readonly reason: string; readonly timestamp: string }
   | { readonly kind: 'table-disconnected'; readonly tableId: string; readonly reason: string; readonly timestamp: string }
   | { readonly kind: 'session-recovery-exhausted'; readonly detail?: string; readonly timestamp: string }
-  | { readonly kind: 'session-recovered'; readonly timestamp: string };
+  | { readonly kind: 'session-recovered'; readonly timestamp: string }
+  | { readonly kind: 'executor-lease-acquired'; readonly leaseId: string; readonly profileId: string; readonly reacquired: boolean; readonly timestamp: string }
+  | { readonly kind: 'executor-lease-rejected'; readonly reason: string; readonly profileId: string; readonly activeLeaseId?: string; readonly timestamp: string };
 
 export interface BrowserBridgeExtensionStatus {
   readonly connectionCount: number;
   readonly authenticated: boolean;
   readonly lastSeenAt?: string;
+  readonly activeExecutorCount?: number;
+  readonly executorLeaseId?: string;
+  readonly executorProfileId?: string;
+}
+
+export interface BrowserBridgeExecutorStatus {
+  readonly active_executor_count: number;
+  readonly leaseId?: string;
+  readonly profileId?: string;
+  readonly hostChannelId?: string;
 }
 
 type PendingBet = {
@@ -958,6 +971,9 @@ export class BrowserBridgeServer implements RoomMonitor {
   private activeBridgeSessionId?: string;
   private extensionConnected = false;
   private port = 0;
+  private readonly executorLeases = new ExecutorLeaseRegistry();
+  private readonly socketExecutorProfile = new Map<WebSocket, string>();
+  private readonly socketExecutorClaimant = new Map<WebSocket, string>();
 
   constructor(options: BrowserBridgeServerOptions = {}) {
     this.options = options;
@@ -1025,6 +1041,7 @@ export class BrowserBridgeServer implements RoomMonitor {
           kind: 'extension-connected',
           timestamp: new Date().toISOString(),
         });
+        this.maybeGrantLegacyExecutorLease(socket);
       }
       socket.on('message', data => {
         if (role === 'observer') return;
@@ -1054,10 +1071,14 @@ export class BrowserBridgeServer implements RoomMonitor {
           return;
         }
         this.rejectPendingBets(new Error(LIVE_BET_CONNECTION_LOST_ERROR), socket);
+        const claimantId = this.socketExecutorClaimant.get(socket);
+        if (claimantId) this.executorLeases.release(claimantId);
         this.sockets.delete(socket);
         this.socketLastSeenAt.delete(socket);
         this.socketHeartbeatStrikes.delete(socket);
         this.socketBridgeSession.delete(socket);
+        this.socketExecutorProfile.delete(socket);
+        this.socketExecutorClaimant.delete(socket);
         if (this.sockets.size === 0 && this.extensionConnected) {
           this.scheduleExtensionDisconnect(rawReason.toString() || `websocket-close-${code}`);
         }
@@ -1088,6 +1109,9 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.socketLastSeenAt.clear();
     this.socketHeartbeatStrikes.clear();
     this.socketBridgeSession.clear();
+    this.socketExecutorProfile.clear();
+    this.socketExecutorClaimant.clear();
+    this.executorLeases.clear();
     if (this.wss) {
       const wss = this.wss;
       this.wss = undefined;
@@ -1106,13 +1130,39 @@ export class BrowserBridgeServer implements RoomMonitor {
       .map(socket => this.socketLastSeenAt.get(socket))
       .filter((value): value is number => value !== undefined)
       .sort((left, right) => right - left)[0];
-    const authenticated = sockets.length === 1
-      && (!this.requireExtensionSequence || this.socketBridgeSession.has(sockets[0]!));
+    const lease = this.executorLeases.getActiveLease();
+    const leasedSocket = lease && lease.claimantId
+      ? [...this.sockets].find(socket => this.socketExecutorClaimant.get(socket) === lease.claimantId)
+      : undefined;
+    const authenticated = this.requireExtensionSequence
+      ? (
+        lease !== null
+        && !!lease.claimantId
+        && leasedSocket !== undefined
+        && this.socketBridgeSession.has(leasedSocket)
+      )
+      : sockets.length === 1;
     return {
       connectionCount: sockets.length,
       authenticated,
+      activeExecutorCount: this.executorLeases.activeExecutorCount(),
+      ...(lease ? { executorLeaseId: lease.leaseId, executorProfileId: lease.profileId } : {}),
       ...(lastSeenAt === undefined ? {} : { lastSeenAt: new Date(lastSeenAt).toISOString() }),
     };
+  }
+
+  getExecutorStatus(): BrowserBridgeExecutorStatus {
+    const lease = this.executorLeases.getActiveLease();
+    const hostChannelId = this.executorLeases.getHostExecutionChannelId();
+    return {
+      active_executor_count: this.executorLeases.activeExecutorCount(),
+      ...(lease ? { leaseId: lease.leaseId, profileId: lease.profileId } : {}),
+      ...(hostChannelId ? { hostChannelId } : {}),
+    };
+  }
+
+  claimHostExecutionChannel(channelId = 'desktop-primary'): { ok: true; channelId: string } | { ok: false; reason: string; activeChannelId: string } {
+    return this.executorLeases.claimHostExecutionChannel(channelId);
   }
 
   /** Starts an independent logical monitor session without claiming a physical shoe reset. */
@@ -1225,15 +1275,46 @@ export class BrowserBridgeServer implements RoomMonitor {
   }
 
   private async dispatchExecution(request: BridgeExecutionRequest): Promise<BridgeExecutionReceipt | null> {
-    const sockets = [...this.sockets];
+    const hostClaim = this.executorLeases.claimHostExecutionChannel('desktop-primary');
+    if (!hostClaim.ok) {
+      throw new Error(`parallel Electron execution channel rejected: ${hostClaim.activeChannelId}`);
+    }
     if (request.mode === 'live' && !this.getExtensionStatus().authenticated) {
       throw new Error(LIVE_EXTENSION_CONNECTION_ERROR);
     }
+    const sockets = [...this.sockets];
     if (sockets.length === 0) {
       throw new Error('no browser extension connected to execute bets');
     }
+    if (sockets.length === 1) {
+      this.maybeGrantLegacyExecutorLease(sockets[0]!);
+    }
+    const lease = this.executorLeases.getActiveLease();
+    if (!lease || !lease.claimantId) {
+      throw new Error(
+        request.mode === 'live'
+          ? LIVE_EXTENSION_CONNECTION_ERROR
+          : 'no executor lease acquired to execute bets',
+      );
+    }
+    const ownerSocket = sockets.find(
+      socket => this.socketExecutorClaimant.get(socket) === lease.claimantId,
+    );
+    if (!ownerSocket) {
+      throw new Error('no browser extension connected to execute bets');
+    }
     const requestId = newId('bet');
-    const message: BridgeServerMessage = { kind: 'betRequest', requestId, request };
+    const signed = this.executorLeases.signBetRequest(requestId);
+    if (!signed) {
+      throw new Error('executor lease could not sign bet request');
+    }
+    const message: BridgeServerMessage = {
+      kind: 'betRequest',
+      requestId,
+      request,
+      leaseId: signed.leaseId,
+      signature: signed.signature,
+    };
     const raw = JSON.stringify(message);
     const resultPromise = new Promise<BridgeExecutionReceipt | null>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -1244,10 +1325,11 @@ export class BrowserBridgeServer implements RoomMonitor {
         resolve,
         reject,
         timer,
-        ownerSocket: request.mode === 'live' ? sockets[0] : undefined,
+        ownerSocket: request.mode === 'live' ? ownerSocket : undefined,
       });
     });
-    for (const socket of sockets) socket.send(raw);
+    // Only the leased executor socket may receive bets.
+    ownerSocket.send(raw);
     return await resultPromise;
   }
 
@@ -1492,6 +1574,8 @@ export class BrowserBridgeServer implements RoomMonitor {
         });
         break;
       case 'hello':
+        this.handleExecutorHello(message, sourceSocket);
+        break;
       case 'heartbeat':
       case 'keepalive':
         break;
@@ -1750,7 +1834,79 @@ export class BrowserBridgeServer implements RoomMonitor {
     });
   }
 
+  private maybeGrantLegacyExecutorLease(socket: WebSocket): void {
+    if (this.requireExtensionSequence) return;
+    if (this.executorLeases.getActiveLease()?.claimantId) return;
+    if (this.sockets.size !== 1 || !this.sockets.has(socket)) return;
+    const claimantId = `legacy-${this.sockets.size}-${Date.now().toString(36)}`;
+    const profileId = `legacy-profile-${claimantId.slice(-12)}`;
+    const result = this.executorLeases.tryAcquire(profileId, claimantId);
+    if (result.status !== 'acquired') return;
+    this.socketExecutorProfile.set(socket, profileId);
+    this.socketExecutorClaimant.set(socket, claimantId);
+    this.emitRuntimeEvent({
+      kind: 'executor-lease-acquired',
+      leaseId: result.lease.leaseId,
+      profileId: result.lease.profileId,
+      reacquired: result.reacquired,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  private handleExecutorHello(
+
+    message: Extract<BridgeClientMessage, { kind: 'hello' }>,
+    sourceSocket: WebSocket | undefined,
+  ): void {
+    if (!sourceSocket) return;
+    const sessionId = this.socketBridgeSession.get(sourceSocket)
+      || (typeof message.bridgeSessionId === 'string' ? message.bridgeSessionId : '');
+    const profileId = typeof message.executorProfileId === 'string' && message.executorProfileId.trim()
+      ? message.executorProfileId.trim()
+      : (sessionId ? `profile-${sessionId}` : '');
+    if (!profileId || !sessionId) return;
+
+    const result = this.executorLeases.tryAcquire(profileId, sessionId);
+
+    if (result.status === 'rejected') {
+      this.emitRuntimeEvent({
+        kind: 'executor-lease-rejected',
+        reason: result.reason,
+        profileId,
+        ...(result.activeLeaseId ? { activeLeaseId: result.activeLeaseId } : {}),
+        timestamp: new Date().toISOString(),
+      });
+      sourceSocket.send(JSON.stringify({
+        kind: 'executorLeaseRejected',
+        reason: result.reason,
+        ...(result.activeLeaseId ? { activeLeaseId: result.activeLeaseId } : {}),
+        timestamp: new Date().toISOString(),
+      } satisfies BridgeServerMessage));
+      return;
+    }
+
+    this.socketExecutorProfile.set(sourceSocket, profileId);
+    this.socketExecutorClaimant.set(sourceSocket, sessionId);
+    // Only log acquired once per fresh lease; reacquired still grants but event marks reacquired.
+    this.emitRuntimeEvent({
+      kind: 'executor-lease-acquired',
+      leaseId: result.lease.leaseId,
+      profileId: result.lease.profileId,
+      reacquired: result.reacquired,
+      timestamp: new Date().toISOString(),
+    });
+    sourceSocket.send(JSON.stringify({
+      kind: 'executorLeaseGranted',
+      leaseId: result.lease.leaseId,
+      profileId: result.lease.profileId,
+      secret: result.lease.secret,
+      reacquired: result.reacquired,
+      timestamp: new Date().toISOString(),
+    } satisfies BridgeServerMessage));
+  }
+
   private acceptExtensionSequence(raw: unknown, socket: WebSocket): boolean {
+
     if (!this.requireExtensionSequence) return true;
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
       socket.close(1008, 'missing bridge sequence');

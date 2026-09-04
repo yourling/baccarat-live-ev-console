@@ -24,7 +24,7 @@ export interface BridgeRoomDescriptor {
 }
 
 export type BridgeClientMessage = (
-  | { kind: 'hello'; extensionVersion: string; browser: string; timestamp: string }
+  | { kind: 'hello'; extensionVersion: string; browser: string; timestamp: string; executorProfileId?: string }
   | { kind: 'roomDiscovered'; room: BridgeRoomDescriptor }
   | { kind: 'roomUpdated'; room: BridgeRoomDescriptor }
   | { kind: 'tableEvent'; roomId: string; tableId: string; event: NormalizedEvent }
@@ -46,7 +46,9 @@ export type BridgeClientMessage = (
 
 export type BridgeServerMessage =
   | { kind: 'welcome'; serverVersion: string; timestamp: string }
-  | { kind: 'betRequest'; requestId: string; request: BridgeExecutionRequest }
+  | { kind: 'betRequest'; requestId: string; request: BridgeExecutionRequest; leaseId?: string; signature?: string }
+  | { kind: 'executorLeaseGranted'; leaseId: string; profileId: string; secret: string; reacquired: boolean; timestamp: string }
+  | { kind: 'executorLeaseRejected'; reason: string; activeLeaseId?: string; timestamp: string }
   | { kind: 'ping'; timestamp: string }
   | { kind: 'observe'; message: BridgeClientMessage }
   | { kind: 'command'; name: string; tableIds?: readonly string[] };
