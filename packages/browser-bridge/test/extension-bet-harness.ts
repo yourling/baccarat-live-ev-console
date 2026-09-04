@@ -58,6 +58,20 @@ export function flushAsyncWork(): Promise<void> {
   return new Promise(resolve => setImmediate(resolve));
 }
 
+export function withExecutorSignature<T extends { readonly requestId: string }>(
+  message: T,
+  lease: { readonly leaseId: string; readonly secret: string },
+): T & { leaseId: string; signature: string } {
+  return {
+    ...message,
+    leaseId: lease.leaseId,
+    signature: signExecutorPayload(
+      lease.secret,
+      betSignaturePayload(lease.leaseId, message.requestId),
+    ),
+  };
+}
+
 export function pragmaticLiveRequest(requestId = 'pragmatic-request-1') {
   return {
     kind: 'betRequest',

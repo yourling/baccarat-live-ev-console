@@ -7,6 +7,7 @@
 * 实盘最多 64 张监控桌。大厅发现的 Dafabet Pragmatic 桌先进入待加入，只在上述三条洗牌证据后自动晋升。断开超过 15 秒的监控桌会移除。
 * Dafabet 仅作为 Pragmatic 启动器保留：`www.dafabet.net/.../live-dealer/popup-launch/jeju-speed-baccarat` 与房间 id `dafabet-pragmatic`。mstrom / Evolution / 旧 Dafabet live-baccarat 适配器已删除。
 * 区域/包边界：contracts 为冻结契约；probability 纯函数（含剩余库存评估）；ledger-state 负责事件账本、投影、配置和执行审计，`cardObserved` 走内存热路径不落 SQLite；orchestrator 负责桌台 actor 与所有受控下注入口；risk-execution 负责全局风控、reservation 和结算；room-monitor 负责游戏房间/牌桌发现、牌桌数据导出、游标/批量/健康与断点续传；browser-bridge 负责固定身份的本机 WebSocket 桥、BridgeRoomMonitor、Pragmatic 运行时归一化与实际下注请求通道；browser-extension 负责 Pragmatic 页面 DOM/游戏协议 WebSocket 采集与镜像、上送桌态，并仅在匹配的 executor lease + 签名下执行单次 `lpbet`（不发送 `autoBet`、不做 EV/策略/账本、不创建 keeper 页、不编排游戏页重连/tabs.reload，不点「重新连接」或视频入座）。本机 Electron/browser-bridge 为唯一 executor：一 Chrome profile 一 lease，`active_executor_count==1`，第二 executor 拒绝下注。
+* GPU 真人厅视频页仅限 Windows 桌面端；cos-box / Linux 不得打开视频页（仅文档与守卫，不新增 Linux GPU 视频路径）。
 * 关闭桌面窗口即退出进程，并关闭监控、桥接、保活和账本。不要再假设后台保活窗口。
 * 所有共享契约修改必须谨慎，合并前需同步测试夹具。
 * 使用 gh 管理仓库操作。
