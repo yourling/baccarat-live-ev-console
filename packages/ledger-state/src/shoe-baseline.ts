@@ -31,6 +31,9 @@ const ROAD_WRAP_MIN_PREVIOUS = 10;
 const ROAD_WRAP_MIN_DROP = 8;
 const EARLY_SHOE_ROAD_MAX = 20;
 const DEEP_SHOE_HAND_MIN = 50;
+/** Recent BG cuts land around 127-165 remaining. Above this is not a cut. */
+const PREMATURE_RESET_REMAINING_MIN = 180;
+const UNDEALABLE_REMAINING = 26;
 
 /**
  * HISTORY/DOM sometimes stays at 局 1-8 while protocol has already tracked
@@ -52,6 +55,25 @@ export function isWrapShapedRoadCount(handNumber: number, gameCount: number): bo
  * Wrap-shaped 1-8 is not this; that is either a real wrap (parser opens a new
  * shoe) or a stuck early HISTORY road (keep tracked remaining/EV).
  */
+/**
+ * A live physical shoe that still has a mid/late inventory must not be
+ * replaced by a protocol-shuffle pulse. Typical cut is 127-165 remaining.
+ * Road wrap to #1-#8 is allowed even with high remaining.
+ */
+export function isPrematurePhysicalShoeReset(
+  projection: Pick<
+    ShoeStateProjection,
+    'shoeBaseline' | 'seenCards' | 'remainingTotal' | 'handNumber' | 'sealed'
+  >,
+): boolean {
+  if (projection.shoeBaseline !== 'physical-shoe') return false;
+  if (projection.sealed) return false;
+  if (projection.seenCards.length === 0) return false;
+  if (projection.handNumber >= DEEP_SHOE_HAND_MIN) return false;
+  if (projection.remainingTotal < UNDEALABLE_REMAINING) return false;
+  return projection.remainingTotal > PREMATURE_RESET_REMAINING_MIN;
+}
+
 export function isMissedShuffleRoadCount(handNumber: number, gameCount: number): boolean {
   return Number.isInteger(handNumber)
     && Number.isInteger(gameCount)

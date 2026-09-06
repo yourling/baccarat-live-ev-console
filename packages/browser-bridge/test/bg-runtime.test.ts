@@ -594,4 +594,87 @@ describe('BgRuntimeParser', () => {
     expect(parser.parse('<gameresult table="bc281koreanch281"/>')).toEqual([]);
     expect(parser.parse(JSON.stringify({ table: 'bc281koreanch281', betsopen: {} }))).toEqual([]);
   });
+
+
+  it('does not open a new physical shoe on a mid-shoe shuffle pulse', () => {
+    const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'C02',
+      shoeReset: 'seq:100',
+      source: 'protocol',
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'C02',
+      shuffleEvent: true,
+      shoeReset: 'seq:200',
+      gameCount: 1,
+      source: 'protocol',
+    }]));
+    const shoeId = parser.currentShoeId('C02');
+    for (let i = 1; i <= 12; i += 1) {
+      parser.parse(snapshot([{
+        tableId: 'C02',
+        roundId: `R-${i}`,
+        bettingOpen: true,
+        shoeReset: 'seq:200',
+        gameCount: i,
+        source: 'protocol',
+      }]));
+    }
+    const pulsed = parser.parse(snapshot([{
+      tableId: 'C02',
+      shuffleEvent: true,
+      shoeReset: 'seq:200',
+      gameCount: 12,
+      source: 'protocol',
+    }]));
+    expect(pulsed.filter(event => event.type === 'newShoeSignal')).toEqual([]);
+    expect(parser.currentShoeId('C02')).toBe(shoeId);
+
+    const jumped = parser.parse(snapshot([{
+      tableId: 'C02',
+      shuffleEvent: true,
+      shoeReset: 'seq:300',
+      gameCount: 13,
+      source: 'protocol',
+    }]));
+    expect(jumped.filter(event => event.type === 'newShoeSignal')).toEqual([]);
+    expect(parser.currentShoeId('C02')).toBe(shoeId);
+  });
+
+  it('still opens a physical shoe when a deep tracked road wraps', () => {
+    const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'C01',
+      shoeReset: 'seq:100',
+      source: 'protocol',
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'C01',
+      shuffleEvent: true,
+      shoeReset: 'seq:200',
+      gameCount: 1,
+      source: 'protocol',
+    }]));
+    for (let i = 1; i <= 55; i += 1) {
+      parser.parse(snapshot([{
+        tableId: 'C01',
+        roundId: `R-${i}`,
+        bettingOpen: true,
+        shoeReset: 'seq:200',
+        gameCount: i,
+        source: 'protocol',
+      }]));
+    }
+    const wrapped = parser.parse(snapshot([{
+      tableId: 'C01',
+      shuffleEvent: true,
+      shoeReset: 'seq:400',
+      gameCount: 1,
+      source: 'protocol',
+    }]));
+    expect(wrapped.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({ baseline: 'physical-shoe', tableId: 'C01' }),
+    ]);
+  });
 });
