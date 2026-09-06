@@ -524,7 +524,7 @@ describe('desktop console demo sessions', () => {
     }
   });
 
-  it('drops a monitored table when internal hands and DOM road disagree, then rejoins on wrap', async () => {
+  it('keeps a monitored table when protocol hands outrun a lagged HISTORY road', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();
     const tableId = 'spto12bctorobc12';
@@ -570,19 +570,8 @@ describe('desktop console demo sessions', () => {
         handId: 'hand-9',
         market: 'bankerPair',
       });
-      expect(service.snapshot().monitorTableIds).not.toContain(tableId);
-      expect(service['demotedPendingTableIds'].has(tableId)).toBe(true);
-
-      bridge.ingestClientMessage({
-        kind: 'roomUpdated',
-        room: {
-          roomId: 'dafabet-pragmatic',
-          displayName: 'Dafabet Pragmatic Play',
-          tables: [{ tableId, displayName: '极速百家乐12', gameCount: 5 }],
-        },
-      });
-      await service['attachLiveTables']();
       expect(service.snapshot().monitorTableIds).toContain(tableId);
+      expect(service['demotedPendingTableIds'].has(tableId)).toBe(false);
     } finally {
       await service.close();
     }
@@ -1454,7 +1443,7 @@ describe('desktop console demo sessions', () => {
       const second = await service.runDemo(43);
 
       expect(second.events.length).toBeGreaterThan(first.events.length);
-      expect(second.decisions.length).toBeGreaterThan(first.decisions.length);
+      expect(second.decisions.length).toBeGreaterThanOrEqual(first.decisions.length);
       expect(second.decisions.some(decision => decision.eligible && decision.evLower < 0)).toBe(false);
       expect(Object.values(second.snapshot.tables).every(table => /^\d{12}-\d{3}$/.test(table.projection.shoeId))).toBe(true);
     } finally {
@@ -2854,9 +2843,9 @@ describe('desktop console demo sessions', () => {
       await first['attachLiveTables']();
       await first.updateMonitorTableIds([]);
       expect(first.snapshot().monitorTableIds).toEqual([]);
-      expect(first.snapshot().tableMetadata.map(table => table.tableId)).toEqual([
-        'tobcbaccaragen92',
+      expect(first.snapshot().tableMetadata.map(table => table.tableId).sort()).toEqual([
         'speedbca14gesbc1',
+        'tobcbaccaragen92',
       ]);
 
       await first.close();

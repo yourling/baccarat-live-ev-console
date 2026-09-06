@@ -781,6 +781,28 @@ describe('browser bridge server', () => {
     }
   });
 
+  it('holds a shuffled table connected through the post-shuffle quiet window', async () => {
+    const server = new BrowserBridgeServer({ tableStaleAfterMs: 1_000 });
+    const feed = server.openTable('r1', 't1');
+    const disconnects: string[] = [];
+    await feed.start({
+      onBatch: () => {},
+      onDisconnect: (_tableId, reason) => disconnects.push(reason ?? ''),
+    });
+    const ingestEvent = Reflect.get(feed, 'ingestEvent');
+    if (typeof ingestEvent !== 'function') throw new Error('ingestEvent unavailable');
+    ingestEvent.call(feed, bridgeEvent('t1', 'shuffle-1'));
+    const checkFreshness = Reflect.get(feed, 'checkFreshness');
+    if (typeof checkFreshness !== 'function') throw new Error('freshness watchdog unavailable');
+    Reflect.apply(checkFreshness, feed, [Date.now() + 2 * 60 * 1000]);
+    expect(feed.health().state).toBe('CONNECTED');
+    expect(disconnects).toEqual([]);
+    Reflect.apply(checkFreshness, feed, [Date.now() + 11 * 60 * 1000]);
+    expect(feed.health().state).toBe('DISCONNECTED');
+    expect(disconnects).toEqual(['table-feed-stale']);
+    await server.close();
+  });
+
   it('marks a connected table stale and reports real observation age', async () => {
     const server = new BrowserBridgeServer({ tableStaleAfterMs: 1_000 });
     const feed = server.openTable('r1', 't1');

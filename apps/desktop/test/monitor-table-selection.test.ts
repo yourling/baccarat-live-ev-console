@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  selectLiveMonitorTableIds,
   selectPragmaticMonitorTableIds,
 } from '../src/ui/monitor-table-selection';
 
@@ -19,5 +20,15 @@ describe('Pragmatic monitor table selection', () => {
     expect(selected).toHaveLength(48);
     expect(selected[0]).toBe('pragmatictable01');
     expect(selected.at(-1)).toBe('pragmatictable48');
+  });
+
+  it('selects BG and Pragmatic tables together and ignores other rooms', () => {
+    const selected = selectLiveMonitorTableIds([
+      { roomId: 'dafabet-live', tableId: 'D055' },
+      { roomId: 'dafabet-bg', tableId: 'B06' },
+      { roomId: 'dafabet-pragmatic', tableId: 'pragmatictable01' },
+      { roomId: 'dafabet-bg', tableId: 'B06' },
+    ]);
+    expect(selected).toEqual(['B06', 'pragmatictable01']);
   });
 });

@@ -16,6 +16,8 @@ import {
 
 const KEEPALIVE_CONFIG_KEY = 'desktop:operational-keepalive:v1';
 const KEEPALIVE_TICK_MS = 15_000;
+const KEEPALIVE_MIN_WINDOW_MS = 5_000;
+const KEEPALIVE_SHORT_COOLDOWN_MS = 10_000;
 
 type OperationalWagerActor = {
   placeOperationalWager(
@@ -50,6 +52,7 @@ export interface KeepaliveSettings extends KeepaliveStrategySettings {
 export interface KeepaliveState extends KeepaliveSettings {
   readonly lastAttemptAt?: string;
   readonly lastSuccessAt?: string;
+  readonly lastShortWindowAt?: string;
   readonly lastStatus?: 'ACCEPTED' | 'REJECTED' | 'UNKNOWN';
   readonly lastTableId?: string;
   readonly lastReason?: string;
@@ -112,17 +115,28 @@ export class OperationalWagerCoordinator {
     return this.getKeepaliveState();
   }
 
-  async tick(now = new Date(), tableId?: string): Promise<void> {
+  async tick(now = new Date(), tableId?: string, closesAt?: string): Promise<void> {
     await this.options.serialize(async () => {
-      await this.tickInner(now, tableId);
+      await this.tickInner(now, tableId, closesAt);
     });
   }
 
-  private async tickInner(now: Date, tableId?: string): Promise<void> {
+  private async tickInner(now: Date, tableId?: string, closesAt?: string): Promise<void> {
     if (!this.state.enabled || this.running || !keepaliveDue(this.state, now)) return;
     if (tableId === undefined) return;
     const seated = this.options.keepaliveTableIds?.() ?? this.options.monitorTableIds();
     if (!seated.includes(tableId)) return;
+    const remainingMs = windowRemainingMs(closesAt, now);
+    if (remainingMs === undefined || remainingMs < KEEPALIVE_MIN_WINDOW_MS) {
+      this.state = {
+        ...this.state,
+        lastShortWindowAt: now.toISOString(),
+        lastReason: remainingMs === undefined ? 'window-remaining-unknown' : 'window-too-short',
+        lastTableId: tableId,
+      };
+      this.persist();
+      return;
+    }
     this.running = true;
     try {
       const result = await tryKeepaliveInOrder({
@@ -144,10 +158,26 @@ export class OperationalWagerCoordinator {
           };
         },
       });
-      const shouldRecordAttempt = result.status !== 'REJECTED' || result.attempted;
-      if (shouldRecordAttempt) {
+      const committedReject = result.status === 'REJECTED' && result.attempted && result.reason !== 'window-too-short';
+      const recordIntervalAttempt = result.status === 'ACCEPTED'
+        || result.status === 'UNKNOWN'
+        || committedReject;
+      const shortWindow = result.status === 'REJECTED' && result.reason === 'window-too-short';
+      if (shortWindow) {
         this.state = {
           ...this.state,
+          lastShortWindowAt: now.toISOString(),
+          lastStatus: result.status,
+          lastTableId: tableId,
+          ...(result.reason === undefined ? {} : { lastReason: result.reason }),
+        };
+        this.persist();
+        return;
+      }
+      if (recordIntervalAttempt) {
+        const { lastShortWindowAt: _ignored, ...rest } = this.state;
+        this.state = {
+          ...rest,
           lastAttemptAt: now.toISOString(),
           lastStatus: result.status,
           ...(result.tableId === null ? {} : { lastTableId: result.tableId }),
@@ -267,6 +297,7 @@ function readKeepaliveState(value: unknown): PersistedKeepaliveState | null {
     ...candidate,
     ...readOptionalString(value, 'lastAttemptAt'),
     ...readOptionalString(value, 'lastSuccessAt'),
+    ...readOptionalString(value, 'lastShortWindowAt'),
     ...readOptionalStatus(value, 'lastStatus'),
     ...readOptionalString(value, 'lastTableId'),
     ...readOptionalString(value, 'lastReason'),
@@ -306,8 +337,21 @@ function assertKeepaliveSettings(settings: KeepaliveSettings): void {
 }
 
 function keepaliveDue(state: PersistedKeepaliveState, now: Date): boolean {
+  if (state.lastShortWindowAt !== undefined) {
+    const lastShort = Date.parse(state.lastShortWindowAt);
+    if (!Number.isNaN(lastShort) && now.valueOf() - lastShort < KEEPALIVE_SHORT_COOLDOWN_MS) {
+      return false;
+    }
+  }
   if (state.lastAttemptAt === undefined) return true;
   const lastAttemptAt = Date.parse(state.lastAttemptAt);
   if (Number.isNaN(lastAttemptAt)) return true;
   return now.valueOf() - lastAttemptAt >= state.intervalMinutes * 60_000;
+}
+
+function windowRemainingMs(closesAt: string | undefined, now: Date): number | undefined {
+  if (typeof closesAt !== 'string' || closesAt.length === 0) return undefined;
+  const closesAtMs = Date.parse(closesAt);
+  if (Number.isNaN(closesAtMs)) return undefined;
+  return closesAtMs - now.valueOf();
 }

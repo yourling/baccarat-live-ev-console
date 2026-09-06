@@ -38,6 +38,7 @@ function openWindow(tableId: string): Extract<NormalizedEvent, { type: 'bettingW
     shoeId: `shoe-${tableId}`,
     handId: `hand-${tableId}`,
     market: 'bankerPair',
+    closesAt: new Date(Date.now() + 12_000).toISOString(),
   };
 }
 
@@ -760,6 +761,7 @@ describe('DesktopConsoleService operational wagers', () => {
       await service.updateMonitorTableIds(['D001']);
       service['liveFeeds'].set('D001', freshFeed('D001'));
       service['liveApprovals'].approve('D001');
+      await service.setExecutionMode('D001', 'live');
       await service.injectEvent({
         ...physicalShoe('D001'),
         baseline: 'unknown-monitor-session',
@@ -820,6 +822,7 @@ describe('DesktopConsoleService operational wagers', () => {
       service['liveFeeds'].set('bc281koreanch281', freshFeed('bc281koreanch281'));
       service['liveApprovals'].approve('bc281koreanch281');
       service['liveRoomIdsByTable'].set('bc281koreanch281', 'dafabet-pragmatic');
+      await service.setExecutionMode('bc281koreanch281', 'live');
       await service.injectEvent({
         ...physicalShoe('bc281koreanch281'),
         baseline: 'unknown-monitor-session',

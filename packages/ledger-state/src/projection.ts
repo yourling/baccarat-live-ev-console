@@ -181,6 +181,66 @@ function isCurrentShoe(eventShoeId: string, current: ShoeStateProjection): boole
   return current.shoeId !== '' && eventShoeId === current.shoeId && !current.sealed;
 }
 
+function recoverLiveFeed(projection: ShoeStateProjection): void {
+  if (projection.status !== 'RESYNCING') return;
+  // A current-shoe protocol event means the feed is back. Waiting for a
+  // cursor proof here leaves auto-bet and 开盘 stuck while hands still settle.
+  projection.status = 'TRACKING';
+  projection.connectionStatus = 'CONNECTED';
+}
+
+function rejectOverdrawnRank(projection: ShoeStateProjection, rank: CardRank): boolean {
+  if (projection.shoeBaseline !== 'physical-shoe') return false;
+  if (projection.remainingCounts[rank] > 0) return false;
+  // A ghost extra copy of an exhausted rank must not kill a still-dealable
+  // +EV shoe. Only drop the physical label when the cut is already here.
+  if (projection.remainingTotal <= PHYSICAL_SHOE_BETTABLE_REMAINING) {
+    projection.shoeBaseline = 'unknown-monitor-session';
+    projection.autoBetStatus = 'DISARMED';
+  }
+  return true;
+}
+
+function cardCopyId(card: Card): string {
+  const raw = typeof card.raw === 'string' ? card.raw.trim().toUpperCase() : '';
+  if (raw.length > 0) return raw;
+  return `${card.rank}${card.suit ?? ''}`;
+}
+
+function handHasInventory(projection: ShoeStateProjection, handId: string): boolean {
+  return (projection.cardInventoryKeys ?? []).some(key => key.startsWith(`${handId}:`));
+}
+
+function consumeInventoryCard(projection: ShoeStateProjection, handId: string, card: Card, position: 'player' | 'banker'): void {
+  const copyId = cardCopyId(card);
+  const inventoryKey = `${handId}:${position}:${copyId}`;
+  projection.cardInventoryKeys = projection.cardInventoryKeys ?? [];
+  if (projection.cardInventoryKeys.includes(inventoryKey)) return;
+  projection.cardInventoryKeys.push(inventoryKey);
+  const rank = card.rank;
+  if (rejectOverdrawnRank(projection, rank)) return;
+  projection.remainingCounts = {
+    ...projection.remainingCounts,
+    [rank]: Math.max(0, projection.remainingCounts[rank] - 1),
+  };
+  projection.remainingTotal = Math.max(0, projection.remainingTotal - 1);
+  projection.seenCards.push({ ...card });
+  applyPhysicalShoeLifecycle(projection);
+}
+
+function applySettledHandCards(
+  projection: ShoeStateProjection,
+  handId: string,
+  playerCards: readonly Card[],
+  bankerCards: readonly Card[],
+): void {
+  // cardObserved is memory-only. Restart/actor rebuild only has handSettled.
+  // If this hand already consumed live observations, do not double-count.
+  if (handHasInventory(projection, handId)) return;
+  for (const card of playerCards) consumeInventoryCard(projection, handId, card, 'player');
+  for (const card of bankerCards) consumeInventoryCard(projection, handId, card, 'banker');
+}
+
 function applyPhysicalShoeLifecycle(projection: ShoeStateProjection): void {
   if (projection.shoeBaseline !== 'physical-shoe') return;
   if (projection.remainingTotal < PHYSICAL_SHOE_UNDEALABLE_REMAINING) {
@@ -250,6 +310,7 @@ export function applyEvent(
       nonEmptyString(event.handId, 'handId', event);
       assertValidCard(event.card);
       if (!isCurrentShoe(event.shoeId, current)) break;
+      recoverLiveFeed(updated);
       const copyId = typeof event.card.raw === 'string' && event.card.raw.trim().length > 0
         ? event.card.raw.trim().toUpperCase()
         : `${event.card.rank}${event.card.suit ?? ''}`;
@@ -259,9 +320,7 @@ export function applyEvent(
       updated.cardInventoryKeys.push(inventoryKey);
       const rank = event.card.rank;
       const physicalInventoryIsKnown = updated.shoeBaseline === 'physical-shoe';
-      if (physicalInventoryIsKnown && updated.remainingCounts[rank] <= 0) {
-        fail(`card rank ${rank} observed more times than remaining shoe inventory allows`, event);
-      }
+      if (rejectOverdrawnRank(updated, rank)) break;
       updated.remainingCounts = {
         ...updated.remainingCounts,
         [rank]: Math.max(0, updated.remainingCounts[rank] - 1),
@@ -285,7 +344,8 @@ export function applyEvent(
       nonEmptyString(event.handId, 'handId', event);
       assertMarket(event.market, 'market', event);
       if (!isCurrentShoe(event.shoeId, current)) break;
-      if (updated.redCardSeen || updated.status === 'INVALIDATED' || updated.status === 'RESYNCING' || updated.status === 'WAITING_CONFIRMATION') {
+      recoverLiveFeed(updated);
+      if (updated.redCardSeen || updated.status === 'INVALIDATED' || updated.status === 'WAITING_CONFIRMATION') {
         break;
       }
       if (updated.shoeBaseline === 'physical-shoe' && !isPhysicalShoeBettable(updated)) {
@@ -335,7 +395,9 @@ export function applyEvent(
         }
       }
       if (!isCurrentShoe(event.shoeId, current)) break;
+      recoverLiveFeed(updated);
       if (beginHand(updated, event.handId) === 'stale') break;
+      applySettledHandCards(updated, event.handId, event.playerCards, event.bankerCards);
       if (updated.redCardSeen) {
         updated.status = 'WAITING_NEW_SHOE';
         updated.sealed = true;
@@ -366,11 +428,14 @@ export function applyEvent(
       updated.connectionStatus = 'DISCONNECTED';
       updated.autoBetStatus = 'DISARMED';
       if (!updated.sealed && updated.shoeId) updated.status = 'RESYNCING';
-      // A transport flash of the extension bridge does not hide startshuffling.
-      // Table-feed gaps and session restarts still can, so those demote.
+      // Feed gaps and extension flashes are not reshuffles. Keep the physical
+      // shoe so remaining-card inventory survives multi-table BG silence.
       if (
         updated.shoeBaseline === 'physical-shoe'
         && event.reason !== 'browser-extension-disconnected'
+        && event.reason !== 'table-feed-stale'
+        && event.reason !== 'process-restarted'
+        && event.reason !== 'extension-session-restarted'
       ) {
         updated.shoeBaseline = 'unknown-monitor-session';
       }

@@ -1182,16 +1182,70 @@ export class SqliteLedger {
     return mergeLedgerEvents(persisted, ephemeral);
   }
 
+  listBgShoeGenerations(): ReadonlyArray<{ tableId: string; sequence: number }> {
+    const rows = this.db.prepare(
+      "SELECT table_id AS tableId, json_extract(payload, '$.shoeId') AS shoeId FROM events WHERE type = 'newShoeSignal'",
+    ).all() as Array<{ tableId: string; shoeId: string | null }>;
+    const maxByTable = new Map<string, number>();
+    for (const row of rows) {
+      const matched = /^bg-([A-Za-z]\d{2})-(\d+)$/.exec(String(row.shoeId ?? ''));
+      if (!matched) continue;
+      const tableId = matched[1]!.toUpperCase();
+      const sequence = Number(matched[2]);
+      if (!Number.isInteger(sequence) || sequence < 1) continue;
+      maxByTable.set(tableId, Math.max(maxByTable.get(tableId) ?? 0, sequence));
+    }
+    return [...maxByTable.entries()].map(([tableId, sequence]) => ({ tableId, sequence }));
+  }
+
   listEventsFromLatestShoe(tableId: string): NormalizedEvent[] {
     const events = this.listEvents(tableId);
-    let start = 0;
-    for (let index = events.length - 1; index >= 0; index -= 1) {
-      if (events[index]?.type === 'newShoeSignal') {
-        start = index;
-        break;
+    let lastAny = 0;
+    const physicalIndexes: number[] = [];
+    for (let index = 0; index < events.length; index += 1) {
+      const event = events[index];
+      if (event?.type !== 'newShoeSignal') continue;
+      lastAny = index;
+      if (event.baseline === 'physical-shoe' && typeof event.shoeId === 'string' && event.shoeId.length > 0) {
+        physicalIndexes.push(index);
       }
     }
-    return events.slice(start);
+    let start = physicalIndexes.length > 0 ? physicalIndexes[physicalIndexes.length - 1]! : lastAny;
+    const opening = events[start];
+    const openingId = opening?.type === 'newShoeSignal' && typeof opening.shoeId === 'string'
+      ? opening.shoeId
+      : undefined;
+    const openingAt = opening && Date.parse(opening.timestamp);
+    if (openingId && Number.isFinite(openingAt)) {
+      const hasHandsAfter = events.slice(start + 1).some(event => event.type === 'handSettled');
+      if (!hasHandsAfter) {
+        for (let i = physicalIndexes.length - 2; i >= 0; i -= 1) {
+          const previousIndex = physicalIndexes[i]!;
+          const previous = events[previousIndex];
+          if (previous?.type !== 'newShoeSignal' || previous.shoeId !== openingId) continue;
+          const previousAt = Date.parse(previous.timestamp);
+          if (!Number.isFinite(previousAt) || openingAt - previousAt > 3 * 60 * 1000) break;
+          start = previousIndex;
+          break;
+        }
+      }
+    }
+    const sliced = events.slice(start);
+    const physicalShoeId = openingId;
+    if (physicalShoeId === undefined) return sliced;
+    let keptOpening = false;
+    return sliced.flatMap((event): NormalizedEvent[] => {
+      if (event.type === 'newShoeSignal') {
+        if (event.shoeId !== physicalShoeId) return [];
+        if (keptOpening) return [];
+        keptOpening = true;
+        return [event];
+      }
+      if ('shoeId' in event && typeof event.shoeId === 'string' && event.shoeId !== physicalShoeId) {
+        return [{ ...event, shoeId: physicalShoeId }];
+      }
+      return [event];
+    });
   }
 
   listEventsPage(options: RecordPageOptions): RecordPage<NormalizedEvent> {
@@ -1675,9 +1729,9 @@ export class SqliteLedger {
   private trimEphemeralEvents(tableId: string): void {
     const events = this.ephemeralEventsByTable.get(tableId);
     if (events === undefined || events.length === 0) return;
-    const kept = events
-      .filter(event => event.type === 'cardObserved')
-      .slice(-HOT_CARD_KEEP);
+    // Keep the current shoe's observed cards in memory. A 36-card cap is only
+    // ~6 hands; actor rebuild then looks like 待牌靴 even though handSettled remains.
+    const kept = events.filter(event => event.type === 'cardObserved');
     const keptIds = new Set(kept.map(event => event.eventId));
     for (const event of events) {
       if (!keptIds.has(event.eventId)) this.ephemeralEventIds.delete(event.eventId);

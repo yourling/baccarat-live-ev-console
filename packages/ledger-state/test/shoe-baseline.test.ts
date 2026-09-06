@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { defaultProfile } from '@baccarat/contracts';
 import { emptyProjection } from '../src/projection.js';
-import { effectiveShoeBaseline, explainShoeBaseline, initialShoeTotal, isVerifiedPhysicalShoeEvidence, isVerifiedPhysicalShoeReason, shoeBaselineReasonLabel } from '../src/shoe-baseline.js';
+import { effectiveShoeBaseline, explainShoeBaseline, initialShoeTotal, isMissedShuffleRoadCount, isVerifiedPhysicalShoeEvidence, isVerifiedPhysicalShoeReason, isWrapShapedRoadCount, shoeBaselineReasonLabel } from '../src/shoe-baseline.js';
 
 describe('effectiveShoeBaseline', () => {
   it('keeps unknown attach unknown', () => {
@@ -33,6 +33,19 @@ describe('effectiveShoeBaseline', () => {
     expect(shoeBaselineReasonLabel(explainShoeBaseline(projection, 55).evidence)).toBe('路子已深但未见牌面');
   });
 
+  it('does not let a new-process attach token hide a ledger-rebuilt physical shoe', () => {
+    const projection = emptyProjection('B01');
+    projection.shoeBaseline = 'physical-shoe';
+    projection.profileSnapshot = defaultProfile('B01');
+    projection.remainingTotal = initialShoeTotal(8) - 80;
+    projection.seenCards = Array.from({ length: 80 }, () => ({ rank: 'A' as const }));
+    projection.handNumber = 16;
+    const explained = explainShoeBaseline(projection, 16, { reason: 'attach', gameCount: 16 });
+    expect(explained.baseline).toBe('physical-shoe');
+    expect(explained.evidence.reason).toBe('protocol-shuffle');
+    expect(effectiveShoeBaseline(projection, 16, { reason: 'attach', gameCount: 16 })).toBe('physical-shoe');
+  });
+
   it('keeps a just-shuffled physical shoe even if the DOM road has not wrapped yet', () => {
     const projection = emptyProjection('bc281koreanch281');
     projection.shoeBaseline = 'physical-shoe';
@@ -43,14 +56,23 @@ describe('effectiveShoeBaseline', () => {
     expect(effectiveShoeBaseline(projection, 55)).toBe('physical-shoe');
   });
 
-  it('does not use a lagged road #55 to demote a protocol-shuffled shoe before cards arrive', () => {
-    const projection = emptyProjection('bc281koreanch281');
+  it('redisplays a protocol-shuffled shoe after a feed-gap demotion once the road is still short', () => {
+    const projection = emptyProjection('B06');
+    projection.shoeBaseline = 'unknown-monitor-session';
+    projection.profileSnapshot = defaultProfile('B06');
+    projection.remainingTotal = initialShoeTotal(8);
+    expect(effectiveShoeBaseline(projection, 2, { reason: 'protocol-shuffle' })).toBe('physical-shoe');
+  });
+
+  it('treats a protocol-shuffled shoe with lagged deep road and no cards as 待牌靴', () => {
+    const projection = emptyProjection('B01');
     projection.shoeBaseline = 'physical-shoe';
-    projection.profileSnapshot = defaultProfile('bc281koreanch281');
+    projection.profileSnapshot = defaultProfile('B01');
     projection.remainingTotal = initialShoeTotal(8);
     projection.seenCards = [];
     projection.handNumber = 0;
-    expect(effectiveShoeBaseline(projection, 55, { reason: 'protocol-shuffle' })).toBe('physical-shoe');
+    expect(effectiveShoeBaseline(projection, 34, { reason: 'protocol-shuffle' })).toBe('unknown-monitor-session');
+    expect(explainShoeBaseline(projection, 34, { reason: 'protocol-shuffle' }).evidence.reason).toBe('restart-empty-inventory');
   });
 
   it('rejects physical inventory that did not decrease across tracked hands', () => {
@@ -73,6 +95,32 @@ describe('effectiveShoeBaseline', () => {
     expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 12 })).toBe(true);
     expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 0 })).toBe(false);
     expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 21 })).toBe(false);
+  });
+
+
+  it('does not let a stuck early HISTORY road hide a tracked deep physical shoe', () => {
+    const projection = emptyProjection('C07');
+    projection.shoeBaseline = 'physical-shoe';
+    projection.profileSnapshot = defaultProfile('C07');
+    projection.remainingTotal = 165;
+    projection.seenCards = Array.from({ length: 251 }, () => ({ rank: 'A' as const }));
+    projection.handNumber = 52;
+    expect(isWrapShapedRoadCount(52, 3)).toBe(true);
+    expect(isMissedShuffleRoadCount(52, 3)).toBe(false);
+    expect(effectiveShoeBaseline(projection, 3, { reason: 'protocol-shuffle' })).toBe('physical-shoe');
+    expect(explainShoeBaseline(projection, 3, { reason: 'protocol-shuffle' }).evidence.reason).toBe('protocol-shuffle');
+  });
+
+  it('hides exhausted inventory when the live bead plate is still early 局 18', () => {
+    const projection = emptyProjection('A05');
+    projection.shoeBaseline = 'physical-shoe';
+    projection.profileSnapshot = defaultProfile('A05');
+    projection.remainingTotal = 90;
+    projection.seenCards = Array.from({ length: 326 }, () => ({ rank: 'A' as const }));
+    projection.handNumber = 60;
+    expect(isMissedShuffleRoadCount(60, 18)).toBe(true);
+    expect(effectiveShoeBaseline(projection, 18, { reason: 'protocol-shuffle' })).toBe('unknown-monitor-session');
+    expect(explainShoeBaseline(projection, 18, { reason: 'protocol-shuffle' }).evidence.reason).toBe('inventory-contradiction');
   });
 
   it('rejects remaining 22 on road #51 as an impossible physical shoe', () => {

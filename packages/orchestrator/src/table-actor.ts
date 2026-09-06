@@ -31,7 +31,7 @@ import {
   profileVersionFor,
   type ShoeBaselineEvidence,
 } from '@baccarat/ledger-state';
-import { evaluatePairMarket } from '@baccarat/probability';
+import { evaluatePairMarket, evaluatePairMarketFromRemaining } from '@baccarat/probability';
 import { RiskManager, emptyRiskState } from '@baccarat/risk-execution';
 import {
   executeControlledOperationalWager,
@@ -56,7 +56,7 @@ export interface TableActorOptions {
   operationalExecutor?: OperationalWagerExecutor | null;
   operationalWagerTerms?: OperationalWagerTerms;
   canExecuteAutomaticBets?: (tableId: string) => boolean;
-  onBettingWindowOpened?: (tableId: string) => void;
+  onBettingWindowOpened?: (tableId: string, closesAt?: string) => void;
   observedGameCount?: (tableId: string) => number | undefined;
   observedShoeEvidence?: (tableId: string) => ShoeBaselineEvidence | undefined;
   executionMode: 'shadow' | 'simulated' | 'live';
@@ -77,9 +77,17 @@ export interface TableActorSnapshot {
   executionMode: 'shadow' | 'simulated' | 'live';
   defaultBetAmount: number;
   pendingEvents: number;
+  missingUnobservedCards: number;
 }
 
 // allow: SIZE_OK — event-sourced per-table state machine; one-shot execution is extracted.
+function bgShoeGeneration(shoeId: string): number | undefined {
+  const matched = /^bg-[A-Za-z]\d{2}-(\d+)$/.exec(shoeId);
+  if (!matched) return undefined;
+  const generation = Number(matched[1]);
+  return Number.isInteger(generation) && generation > 0 ? generation : undefined;
+}
+
 export class TableActor {
   readonly tableId: string;
   private readonly ledger: SqliteLedger;
@@ -88,7 +96,7 @@ export class TableActor {
   private operationalExecutor: OperationalWagerExecutor | null;
   private readonly operationalWagerTerms?: OperationalWagerTerms;
   private readonly canExecuteAutomaticBets: (tableId: string) => boolean;
-  private readonly onBettingWindowOpened?: (tableId: string) => void;
+  private readonly onBettingWindowOpened?: (tableId: string, closesAt?: string) => void;
   private readonly observedGameCount?: (tableId: string) => number | undefined;
   private readonly observedShoeEvidence?: (tableId: string) => ShoeBaselineEvidence | undefined;
   private profile: TableProfile;
@@ -103,6 +111,9 @@ export class TableActor {
   private readonly placedKeys = new Set<string>();
   private readonly placedHandKeys = new Set<string>();
   private readonly evaluatedWindows = new Map<string, { hadClosesAt: boolean }>();
+  private readonly pausedDecisionKeys = new Set<string>();
+  private lastSettledHandSeq: number | undefined;
+  private missingUnobservedCards = 0;
   private syntheticSeq = SYNTHETIC_SEQ_BASE;
   private alternateNext: 'bankerPair' | 'playerPair';
 
@@ -271,6 +282,7 @@ export class TableActor {
       executionMode: this.executionMode,
       defaultBetAmount: this.defaultBetAmount,
       pendingEvents: this.queue.length,
+      missingUnobservedCards: this.missingUnobservedCards,
     };
   }
 
@@ -304,7 +316,40 @@ export class TableActor {
     });
   }
 
+  private bindIncomingShoe(event: NormalizedEvent): NormalizedEvent | null {
+    const current = this.projection;
+    if (event.type === 'newShoeSignal') {
+      if (current.shoeId && event.shoeId === current.shoeId) return null;
+      const incomingBaseline = event.baseline ?? 'unknown-monitor-session';
+      if (
+        current.shoeId
+        && current.shoeBaseline === 'physical-shoe'
+        && current.seenCards.length > 0
+        && incomingBaseline !== 'physical-shoe'
+      ) {
+        // Restart attach tokens must not wipe a ledger-rebuilt physical shoe.
+        return null;
+      }
+      return event;
+    }
+    if (!('shoeId' in event) || typeof event.shoeId !== 'string' || !current.shoeId) return event;
+    if (event.shoeId === current.shoeId) return event;
+    const incomingGen = bgShoeGeneration(event.shoeId);
+    const currentGen = bgShoeGeneration(current.shoeId);
+    if (incomingGen !== undefined && currentGen !== undefined && incomingGen > currentGen) {
+      return event;
+    }
+    if (current.shoeBaseline === 'physical-shoe' && current.seenCards.length > 0) {
+      if (current.sealed || current.remainingTotal < 26) return event;
+      return { ...event, shoeId: current.shoeId };
+    }
+    return event;
+  }
+
   private async handleEvent(event: NormalizedEvent): Promise<void> {
+    const bound = this.bindIncomingShoe(event);
+    if (bound === null) return;
+    event = bound;
     const previousProjection = this.projection;
     const watermark = previousProjection.eventWatermark + 1;
     const tentativeState = applyEvent(new Map([[this.tableId, previousProjection]]), event, watermark);
@@ -318,6 +363,9 @@ export class TableActor {
 
     if (event.type === 'newShoeSignal') {
       this.evaluatedWindows.clear();
+      this.pausedDecisionKeys.clear();
+      this.lastSettledHandSeq = undefined;
+      this.missingUnobservedCards = 0;
       this.retainKeysForShoe(event.shoeId);
       if (previousProjection.shoeId && previousProjection.shoeId !== event.shoeId) {
         this.riskManager.expireOpenForShoe(this.tableId, previousProjection.shoeId, 'new-shoe-signal-received');
@@ -325,6 +373,7 @@ export class TableActor {
       return;
     }
     if (event.type === 'bettingWindowOpened') {
+      this.onBettingWindowOpened?.(this.tableId, event.closesAt);
       await this.evaluateWindow(event, this.projection);
       return;
     }
@@ -379,7 +428,18 @@ export class TableActor {
     }
   }
 
+  missingUnobservedCardCount(): number {
+    return this.missingUnobservedCards;
+  }
+
   private applyHandSettlement(event: Extract<NormalizedEvent, { type: 'handSettled' }>): void {
+    const seq = Number.parseInt(event.handId, 10);
+    if (Number.isInteger(seq) && seq > 0) {
+      if (this.lastSettledHandSeq !== undefined && seq > this.lastSettledHandSeq + 1) {
+        this.missingUnobservedCards += (seq - this.lastSettledHandSeq - 1) * 6;
+      }
+      this.lastSettledHandSeq = seq;
+    }
     const settlement = {
       outcomes: event.outcomes,
       playerCards: event.playerCards,
@@ -467,25 +527,28 @@ export class TableActor {
       this.observedGameCount?.(this.tableId),
       this.observedShoeEvidence?.(this.tableId),
     ) !== 'physical-shoe') {
-      this.requestKeepalive();
       return;
     }
     if (!isPhysicalShoeBettable(projection)) {
-      this.requestKeepalive();
       return;
     }
     const evalKey = `${event.shoeId}:${event.handId}:${event.market}`;
     const previousEval = this.evaluatedWindows.get(evalKey);
     const hasClosesAt = typeof event.closesAt === 'string' && event.closesAt.length > 0;
     if (previousEval !== undefined && (previousEval.hadClosesAt || !hasClosesAt)) return;
-    const evaluation = evaluatePairMarket(this.profile, event.market, projection.seenCards);
+    const evaluation = projection.shoeBaseline === 'physical-shoe' && projection.remainingTotal > 0
+      ? evaluatePairMarketFromRemaining(this.profile, event.market, projection.remainingCounts)
+      : evaluatePairMarket(this.profile, event.market, projection.seenCards);
     const eligible = evaluation.evLower >= this.profile.minEV;
     const reason = eligible
       ? `evLower=${evaluation.evLower.toFixed(6)} >= minEV=${this.profile.minEV}`
       : `evLower=${evaluation.evLower.toFixed(6)} < minEV=${this.profile.minEV}`;
 
     if (projection.autoBetStatus !== 'ARMED') {
-      this.requestKeepalive();
+      if (!this.pausedDecisionKeys.has(evalKey)) {
+        this.pausedDecisionKeys.add(evalKey);
+        this.recordDecision(event, projection, eligible, reason, 'auto-bet-paused');
+      }
       return;
     }
     this.evaluatedWindows.set(evalKey, { hadClosesAt: hasClosesAt || previousEval?.hadClosesAt === true });
@@ -512,12 +575,10 @@ export class TableActor {
     if (!snapshot) return;
 
     if (!eligible) {
-      this.requestKeepalive();
       return;
     }
     // 策略门控:策略未选中当前市场时,只记录决策审计,绝不创建 intent/下注。
     if (!strategyResult.selected) {
-      this.requestKeepalive();
       return;
     }
     if (this.profile.betStrategy.type === 'both') {
@@ -525,7 +586,6 @@ export class TableActor {
       const player = evaluatePairMarket(this.profile, 'playerPair', projection.seenCards);
       const preferredMarket = player.evLower > banker.evLower ? 'playerPair' : 'bankerPair';
       if (event.market !== preferredMarket) {
-        this.requestKeepalive();
         return;
       }
     }
@@ -535,7 +595,6 @@ export class TableActor {
     const liveSkewMs = Number.isFinite(eventMs) ? Math.abs(Date.now() - eventMs) : Number.POSITIVE_INFINITY;
     const windowNowMs = liveSkewMs < 60_000 ? Date.now() : eventMs;
     if (Number.isFinite(windowNowMs) && Number.isFinite(closesAtMs) && closesAtMs - windowNowMs < 3_000) {
-      this.requestKeepalive();
       return;
     }
     const handPlaced = placedHandKey(this.tableId, event.shoeId, event.handId);
@@ -565,7 +624,6 @@ export class TableActor {
 
     const reserve = this.riskManager.tryReserve(intent, this.profile, this.riskLimits);
     if (!reserve.ok) {
-      this.requestKeepalive();
       return;
     }
     const reservation = reserve.reservation!;
@@ -574,7 +632,6 @@ export class TableActor {
 
     if (!this.executor) {
       this.riskManager.release(reservation.reservationId, false, 'no-executor-configured');
-      this.requestKeepalive();
       return;
     }
 
@@ -616,10 +673,6 @@ export class TableActor {
     }
   }
 
-  private requestKeepalive(): void {
-    this.onBettingWindowOpened?.(this.tableId);
-  }
-
   private recordUnobservableWindow(
     event: Extract<NormalizedEvent, { type: 'bettingWindowClosed' }>,
     projection: ShoeStateProjection,
@@ -642,7 +695,9 @@ export class TableActor {
     auditNote?: string,
     strategyChoice?: DecisionSnapshot['strategyChoice'],
   ): DecisionSnapshot | null {
-    const result = evaluatePairMarket(this.profile, event.market, projection.seenCards);
+    const result = projection.shoeBaseline === 'physical-shoe' && projection.remainingTotal > 0
+      ? evaluatePairMarketFromRemaining(this.profile, event.market, projection.remainingCounts)
+      : evaluatePairMarket(this.profile, event.market, projection.seenCards);
     const snapshot: DecisionSnapshot = {
       snapshotId: newId('dec'),
       tableId: this.tableId,
@@ -831,7 +886,7 @@ export interface OrchestratorOptions {
   operationalExecutor?: OperationalWagerExecutor | null;
   operationalWagerTerms?: OperationalWagerTerms;
   canExecuteAutomaticBets?: (tableId: string) => boolean;
-  onBettingWindowOpened?: (tableId: string) => void;
+  onBettingWindowOpened?: (tableId: string, closesAt?: string) => void;
   observedGameCount?: (tableId: string) => number | undefined;
   observedShoeEvidence?: (tableId: string) => ShoeBaselineEvidence | undefined;
 }
@@ -861,7 +916,7 @@ export class Orchestrator {
   private operationalExecutor: OperationalWagerExecutor | null;
   private readonly operationalWagerTerms?: OperationalWagerTerms;
   private readonly canExecuteAutomaticBets: (tableId: string) => boolean;
-  private readonly onBettingWindowOpened?: (tableId: string) => void;
+  private readonly onBettingWindowOpened?: (tableId: string, closesAt?: string) => void;
   private readonly observedGameCount?: (tableId: string) => number | undefined;
   private readonly observedShoeEvidence?: (tableId: string) => ShoeBaselineEvidence | undefined;
 

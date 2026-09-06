@@ -33,18 +33,20 @@ import {
   type TableSettingsUpdate,
 } from '@baccarat/orchestrator';
 import {
-  BUNDLED_BROWSER_EXTENSION_ID,
+  BUNDLED_BROWSER_EXTENSION_IDS,
   BUNDLED_BROWSER_EXTENSION_TOKEN,
   BrowserBridgeServer,
   isCompleteBaccaratHand,
-  isInternalExternalGameCountAnomaly,
   isJoinableNewShoeRoadCount,
+  normalizeBgTableId,
+  selectBgRoadCount,
   selectObservedGameCount,
   selectStableGameCount,
   type BrowserBridgeRuntimeEvent,
 } from '@baccarat/browser-bridge';
 import {
   ShadowRoomMonitor,
+  cursorContinuityProof,
   type MonitorHealth,
   type RoomDescriptor,
   type TableExport,
@@ -86,7 +88,8 @@ const TABLE_METADATA_CONFIG_KEY = 'desktop:table-metadata:v1';
 const LEGACY_MONITOR_TABLE_ID_PATTERN = /^[A-Z]{1,4}\d{2,6}$/i;
 const PRAGMATIC_MONITOR_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
 const DISCONNECTED_MONITOR_REMOVAL_MS = 15_000;
-const MAX_LIVE_FEED_STALENESS_MS = 45_000;
+const SHUFFLE_MONITOR_HOLD_MS = 10 * 60 * 1000;
+const MAX_LIVE_FEED_STALENESS_MS = 120_000;
 const LIVE_MONITOR_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000] as const;
 const MAX_LIVE_MONITOR_TABLES = 64;
 const EMPTY_RECORD_COUNTS: DesktopRecordCounts = { events: 0, decisions: 0, ledger: 0 };
@@ -311,6 +314,8 @@ export class DesktopConsoleService {
   private readonly liveRoomIdsByTable = new Map<string, string>();
   private readonly tableMetadata: Map<string, StoredTableMetadata>;
   private readonly disconnectedMonitorRemovalTimers = new Map<string, NodeJS.Timeout>();
+  private readonly shuffleHoldUntilByTable = new Map<string, number>();
+  private readonly lastFeedDisconnectReason = new Map<string, string>();
   private readonly runtimeObservedTableIds = new Set<string>();
   private readonly liveAuthorizationSources = new Map<string, 'manual' | 'unattended'>();
   private persistentLiveGateEnabled = false;
@@ -321,6 +326,8 @@ export class DesktopConsoleService {
   private liveMonitorRetryAttempt = 0;
   private liveMonitorOperation: Promise<void> = Promise.resolve();
   private liveMonitorActivated = false;
+  private liveMonitorStartedAt = 0;
+  private readonly connectedThisProcess = new Set<string>();
   private readonly missedShuffleRequested = new Set<string>();
   private oneShotLiveBetInFlight: Promise<OneShotLiveBetResult> | null = null;
   private executionStateOperation: Promise<void> = Promise.resolve();
@@ -351,8 +358,8 @@ export class DesktopConsoleService {
       executor: null,
       operationalWagerTerms: STANDARD_COMMISSION_BACCARAT_TERMS,
       canExecuteAutomaticBets: tableId => this.canExecuteAutomaticBets(tableId),
-      onBettingWindowOpened: tableId => {
-        void this.operationalWagers.tick(undefined, tableId).catch(error => {
+      onBettingWindowOpened: (tableId, closesAt) => {
+        void this.operationalWagers.tick(new Date(), tableId, closesAt).catch(error => {
           this.recordLiveMonitorError(error, 'scheduler-failure', 'degraded');
         });
       },
@@ -443,6 +450,14 @@ export class DesktopConsoleService {
   }
 
   private observedGameCount(tableId: string, incoming?: number): number | undefined {
+    if (normalizeBgTableId(tableId) !== undefined) {
+      const accepted = this.browserBridge?.acceptedGameCount(tableId);
+      const reason = this.browserBridge?.shoeEvidence(tableId)?.reason;
+      if (reason === 'protocol-shuffle' && accepted === undefined && incoming !== undefined && incoming > 20) {
+        return undefined;
+      }
+      return selectBgRoadCount(accepted, incoming);
+    }
     return selectObservedGameCount(
       this.browserBridge?.shoeEvidence(tableId)?.reason,
       this.browserBridge?.acceptedGameCount(tableId),
@@ -511,7 +526,7 @@ export class DesktopConsoleService {
     };
     for (const tableId of this.demotedPendingTableIds) add(tableId);
     for (const candidate of this.monitorCandidates()) {
-      if (candidate.roomId !== 'dafabet-pragmatic') continue;
+      if (candidate.roomId !== 'dafabet-pragmatic' && candidate.roomId !== 'dafabet-bg') continue;
       const tableId = normalizeOptionalMonitorTableId(candidate.tableId);
       if (tableId === undefined) continue;
       add(tableId);
@@ -562,14 +577,21 @@ export class DesktopConsoleService {
 
   private promotePendingTablesFromRooms(rooms: readonly RoomDescriptor[]): void {
     for (const room of rooms) {
-      if (room.roomId !== 'dafabet-pragmatic') continue;
+      if (room.roomId !== 'dafabet-pragmatic' && room.roomId !== 'dafabet-bg') continue;
       for (const table of room.tables) {
         const tableId = normalizeOptionalMonitorTableId(table.tableId);
         if (tableId === undefined || this.monitorTableIds.includes(tableId)) continue;
+        const evidence = this.browserBridge?.shoeEvidence(tableId);
+        if (isVerifiedPhysicalShoeEvidence(evidence)) {
+          this.promotePendingTable(tableId);
+          continue;
+        }
         const gameCount = table.gameCount;
         if (!Number.isInteger(gameCount) || (gameCount ?? 0) < 1) continue;
         const previous = this.pendingGameCountByTable.get(tableId);
-        const stable = selectStableGameCount(previous, gameCount!);
+        const stable = normalizeBgTableId(tableId) !== undefined
+          ? selectBgRoadCount(previous, gameCount)
+          : selectStableGameCount(previous, gameCount!);
         if (stable === undefined) continue;
         this.pendingGameCountByTable.set(tableId, stable);
         if (isJoinableNewShoeRoadCount(previous, stable)) this.promotePendingTable(tableId);
@@ -601,12 +623,15 @@ export class DesktopConsoleService {
     if (!this.monitorTableIds.includes(tableId)) return false;
     const actor = this.orchestrator.getActor(tableId);
     if (!actor) return false;
-    const handNumber = actor.getProjection().handNumber;
-    const roadCount = this.tableMetadata.get(tableId)?.gameCount
-      ?? this.browserBridge?.acceptedGameCount(tableId);
-    const evidence = this.browserBridge?.shoeEvidence(tableId)?.reason;
-    if (!isInternalExternalGameCountAnomaly(handNumber, roadCount, evidence)) return false;
-    return this.demoteAnomalousMonitorTable(tableId, handNumber, roadCount!);
+    const missingCards = actor.missingUnobservedCardCount();
+    if (missingCards > 10) {
+      const handNumber = actor.getProjection().handNumber;
+      const roadCount = this.tableMetadata.get(tableId)?.gameCount
+        ?? this.browserBridge?.acceptedGameCount(tableId)
+        ?? handNumber;
+      return this.demoteAnomalousMonitorTable(tableId, handNumber, roadCount);
+    }
+    return false;
   }
 
   private ensureMonitorActors(
@@ -876,9 +901,17 @@ export class DesktopConsoleService {
           gameCount,
           this.browserBridge?.shoeEvidence(tableId),
         );
-        return baseline === projection.shoeBaseline
-          ? projection
-          : { ...projection, shoeBaseline: baseline };
+        const connectionStatus = this.connectedThisProcess.has(tableId)
+          ? projection.connectionStatus
+          : 'DISCONNECTED';
+        if (baseline === projection.shoeBaseline && connectionStatus === projection.connectionStatus) {
+          return projection;
+        }
+        return {
+          ...projection,
+          shoeBaseline: baseline,
+          connectionStatus,
+        };
       })(),
       hasUnknownExecution: false,
       hasSettlementGap: this.hasSettlementGap(tableId),
@@ -1071,13 +1104,14 @@ export class DesktopConsoleService {
       this.runtimeIncidents.resolveAll('bridge-auth-failed');
       this.runtimeIncidents.resolveAll('bridge-disconnected');
     }
-    const continuityReady = approvedTableIds.every(tableId => {
+    const liveApproved = approvedTableIds.filter(tableId => {
       const reasons = this.liveTableReasons(tableId);
       return !reasons.includes('table-feed-missing')
         && !reasons.includes('table-feed-disconnected')
         && !reasons.includes('table-feed-stale')
         && !reasons.includes('table-connection-not-restored');
     });
+    const continuityReady = liveApproved.length > 0 || approvedTableIds.length === 0;
     if (continuityReady) this.runtimeIncidents.resolveAll('continuity-invalidated');
   }
 
@@ -1217,6 +1251,41 @@ export class DesktopConsoleService {
     return this.isObservedTable(tableId) && this.liveFeeds.get(tableId) === feed;
   }
 
+  private isLiveTableFeedEvent(event: NormalizedEvent): boolean {
+    return event.type === 'newShoeSignal'
+      || event.type === 'cardObserved'
+      || event.type === 'bettingWindowOpened'
+      || event.type === 'bettingWindowClosed'
+      || event.type === 'handSettled'
+      || event.type === 'redCardSeen'
+      || event.type === 'shoeInvalidated';
+  }
+
+  private async restoreDisconnectedFeed(event: NormalizedEvent): Promise<NormalizedEvent> {
+    const disconnectReason = this.lastFeedDisconnectReason.get(event.tableId) ?? '';
+    const resumable = disconnectReason === 'table-feed-stale'
+      || disconnectReason.startsWith('continuity gap');
+    if (!resumable) return event;
+    const actor = this.orchestrator.getActor(event.tableId);
+    if (actor?.getProjection().connectionStatus !== 'DISCONNECTED') return event;
+    await this.orchestrator.enqueue(event.tableId, {
+      type: 'connectionRestored',
+      eventId: newId('evt'),
+      tableId: event.tableId,
+      timestamp: event.timestamp,
+      sourceSeq: event.sourceSeq,
+      source: 'room-monitor',
+      schemaVersion: EVENT_SCHEMA_VERSION,
+      continuityProof: cursorContinuityProof({
+        tableId: event.tableId,
+        reason: 'protocol-resume',
+        at: event.timestamp,
+      }),
+    });
+    this.lastFeedDisconnectReason.delete(event.tableId);
+    return { ...event, sourceSeq: this.nextMonitorSourceSeq(event.tableId) };
+  }
+
   private async enqueueMonitorEvent(event: NormalizedEvent): Promise<void> {
     if (
       event.type === 'newShoeSignal'
@@ -1228,29 +1297,48 @@ export class DesktopConsoleService {
       || event.type === 'shoeInvalidated'
     ) {
       this.cancelDisconnectedMonitorRemoval(event.tableId);
+      if (event.type === 'newShoeSignal') {
+        this.shuffleHoldUntilByTable.set(event.tableId, Date.now() + SHUFFLE_MONITOR_HOLD_MS);
+      }
       this.runtimeObservedTableIds.add(event.tableId);
       this.runtimeIncidents.resolve('table-feed-stale', event.tableId);
       this.runtimeIncidents.resolve('monitor-failure', event.tableId);
       this.runtimeIncidents.resolve('bridge-disconnected', event.tableId);
     }
     if (event.type === 'connectionRestored') {
+      this.connectedThisProcess.add(event.tableId);
       this.cancelDisconnectedMonitorRemoval(event.tableId);
       this.runtimeIncidents.resolve('table-feed-stale', event.tableId);
       this.runtimeIncidents.resolve('monitor-failure', event.tableId);
       this.runtimeIncidents.resolve('bridge-disconnected', event.tableId);
     }
-    if (event.type === 'bettingWindowOpened') this.detectSettlementGap(event);
+    if (event.type === 'bettingWindowOpened') {
+      this.connectedThisProcess.add(event.tableId);
+      this.detectSettlementGap(event);
+    }
     if (event.type === 'newShoeSignal' && event.baseline === 'physical-shoe') {
-      // Only protocol-shuffle, road-wrap, or manual-confirm may promote a pending
-      // table. A physical label without that evidence is attach/restart noise.
+      this.connectedThisProcess.add(event.tableId);
+    }
+    if (
+      (event.type === 'newShoeSignal' && event.baseline === 'physical-shoe')
+      || event.type === 'bettingWindowOpened'
+    ) {
+      // Shuffle starts the evidence, but the table must still be monitored when
+      // the new shoe actually opens. Re-promote on the first post-shuffle window
+      // if a mid-shuffle demote/disconnect dropped it back to pending.
       const evidence = this.browserBridge?.shoeEvidence(event.tableId);
       if (isVerifiedPhysicalShoeEvidence(evidence)) {
         this.promotePendingTable(event.tableId);
-        this.clearStaleRoadCount(event.tableId);
+        if (event.type === 'newShoeSignal' && normalizeBgTableId(event.tableId) === undefined) {
+          this.clearStaleRoadCount(event.tableId);
+        }
       }
     }
     this.cachedLightSnapshot = undefined;
-    await this.orchestrator.enqueue(event.tableId, event);
+    const liveEvent = this.isLiveTableFeedEvent(event)
+      ? await this.restoreDisconnectedFeed(event)
+      : event;
+    await this.orchestrator.enqueue(liveEvent.tableId, liveEvent);
     if (
       event.type === 'handSettled'
       || event.type === 'bettingWindowOpened'
@@ -1490,6 +1578,17 @@ export class DesktopConsoleService {
 
   private scheduleDisconnectedMonitorRemoval(tableId: string, reason?: string): void {
     if (this.closing || !this.monitorTableIds.includes(tableId)) return;
+    const startupGap = reason === 'table-not-discovered'
+      || reason === 'process-restarted'
+      || reason === 'extension-session-restarted'
+      || reason === 'browser-extension-disconnected'
+      || reason === 'table-feed-stale'
+      || reason === undefined
+      || reason === '';
+    if (startupGap && !this.connectedThisProcess.has(tableId)) return;
+    if (this.liveMonitorStartedAt > 0 && Date.now() - this.liveMonitorStartedAt < 60_000) return;
+    const shuffleHoldUntil = this.shuffleHoldUntilByTable.get(tableId) ?? 0;
+    if (Date.now() < shuffleHoldUntil) return;
     if (reason === 'table-not-discovered') {
       this.noteTableDisconnect(tableId);
       if (!this.browserBridge?.getExtensionStatus().authenticated) return;
@@ -1499,7 +1598,12 @@ export class DesktopConsoleService {
     // the table is what leaves the console stuck on 数据流已断开 / 已过期.
     // Chronic flappers (4+ disconnects in 5 minutes) escalate to OPEN: schedule
     // removal so a permanently dead table does not occupy the monitor list forever.
-    if (!this.flapEscalated(tableId) && (reason === 'table-feed-stale' || reason === 'browser-extension-disconnected')) return;
+    if (!this.flapEscalated(tableId) && (
+      reason === 'table-feed-stale'
+      || reason === 'browser-extension-disconnected'
+      || reason === 'process-restarted'
+      || reason === 'extension-session-restarted'
+    )) return;
     if (this.disconnectedMonitorRemovalTimers.has(tableId)) return;
     const delayMs = DISCONNECTED_MONITOR_REMOVAL_MS;
     const timer = setTimeout(() => {
@@ -1514,6 +1618,8 @@ export class DesktopConsoleService {
 
   private async removeDisconnectedMonitorTable(tableId: string): Promise<void> {
     if (!this.monitorTableIds.includes(tableId)) return;
+    const shuffleHoldUntil = this.shuffleHoldUntilByTable.get(tableId) ?? 0;
+    if (Date.now() < shuffleHoldUntil) return;
     const feed = this.liveFeeds.get(tableId);
     const health = feed?.health();
     const shouldRemove = feed === undefined
@@ -1536,13 +1642,18 @@ export class DesktopConsoleService {
     this.runtimeIncidents.resolve('bridge-disconnected', tableId);
   }
 
+
+  private seedBgShoeSequencesFromLedger(): void {
+    this.browserBridge?.seedBgShoeSequences(this.ledger.listBgShoeGenerations());
+  }
+
   async startBrowserBridge(port = 17890): Promise<{ port: number }> {
     if (!this.browserBridge) {
       const bridge = new BrowserBridgeServer({
         port,
         selectedTableIds: this.monitorTableIds,
         requireExtensionSequence: true,
-        allowedExtensionId: BUNDLED_BROWSER_EXTENSION_ID,
+        allowedExtensionIds: [...BUNDLED_BROWSER_EXTENSION_IDS],
         extensionToken: BUNDLED_BROWSER_EXTENSION_TOKEN,
         onRuntimeEvent: event => this.handleBridgeRuntimeEvent(event),
       });
@@ -1552,6 +1663,7 @@ export class DesktopConsoleService {
       }
       this.browserBridgePort = await bridge.start();
       this.browserBridge = bridge;
+      this.seedBgShoeSequencesFromLedger();
     }
     return { port: this.browserBridgePort };
   }
@@ -1598,6 +1710,7 @@ export class DesktopConsoleService {
     await this.startupFailCloseTask;
     const startsNewMonitorSession = !this.liveMonitorActivated;
     this.liveMonitorActivated = true;
+    if (startsNewMonitorSession) this.liveMonitorStartedAt = Date.now();
     this.liveExecutionMode = 'live';
     this.ensureMonitorActors(this.monitorTableIds);
     this.setOrchestratorExecutor(null);
@@ -1606,6 +1719,7 @@ export class DesktopConsoleService {
     if (startsNewMonitorSession) {
       this.runtimeObservedTableIds.clear();
       this.browserBridge?.beginMonitorSession();
+      this.seedBgShoeSequencesFromLedger();
     }
     this.ensureLiveMonitorTimer();
     try {
@@ -1719,7 +1833,10 @@ export class DesktopConsoleService {
     for (const tableId of this.monitorTableIds) {
       if (discoveredTableIds.has(tableId) || this.liveFeeds.has(tableId)) {
         this.cancelDisconnectedMonitorRemoval(tableId);
-      } else if (discoveryReliable) {
+      } else if (
+        discoveryReliable
+        && !isVerifiedPhysicalShoeEvidence(this.browserBridge?.shoeEvidence(tableId))
+      ) {
         this.scheduleDisconnectedMonitorRemoval(tableId, 'table-not-discovered');
       } else {
         this.cancelDisconnectedMonitorRemoval(tableId);
@@ -1760,11 +1877,14 @@ export class DesktopConsoleService {
             },
             onDisconnect: (tableId, reason) => {
               if (!this.isCurrentLiveFeed(tableId, feed)) return;
+              this.lastFeedDisconnectReason.set(tableId, reason ?? '');
               this.runtimeObservedTableIds.delete(tableId);
               // BridgeTableExport performs its own reconnect. Keep the identity
               // registered while it is disconnected: deleting it would make the
               // periodic attach call start() on the same already-started export.
               void this.enqueueExecutionStateOperation(async () => {
+                const health = this.liveFeeds.get(tableId)?.health();
+                if (health?.state === 'CONNECTED') return;
                 if (reason === 'table-feed-stale') {
                   this.ensureRuntimeIncident({
                     code: 'table-feed-stale',
@@ -1854,7 +1974,9 @@ export class DesktopConsoleService {
         });
       }
     }
-    return [...candidates.values()];
+    return [...candidates.values()].sort((left, right) =>
+      left.tableId.localeCompare(right.tableId, undefined, { numeric: true }),
+    );
   }
 
   private tableMetadataSnapshot(monitorCandidates: readonly MonitorTableCandidate[]): MonitorTableCandidate[] {
@@ -2132,6 +2254,7 @@ export class DesktopConsoleService {
               }
             },
             onDisconnect: (tableId, reason) => {
+              this.lastFeedDisconnectReason.set(tableId, reason ?? '');
               const sourceSeq = this.nextMonitorSourceSeq(tableId);
               void this.orchestrator.enqueue(tableId, {
                 type: 'connectionLost',

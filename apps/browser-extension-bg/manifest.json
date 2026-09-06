@@ -1,0 +1,76 @@
+{
+  "manifest_version": 3,
+  "name": "Baccarat BG Room Bridge",
+  "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAssivioZoRb/ZMTyWyHWj4bIKcXWae9iLz25IGpsnkfgOGHQi5sjQ/Yo8ZYkX6/vew41yZJ9qorov61bhUJhnQ35UM6MUAqF/f9t8TP8VjFdLqARSzHOEf8Czz3oDXU4J57jAPTx1LC6WRd+XCNNa6jW1RijajVUv5dUAAPDiRaf0FEz52nU4m7EKM8fPLaGskB5hF7c9lmbHdtvJnFAr7LycP6R6B2cDL41oYPFSIyMQwGo+jQldfF45RHiOujC/GoSMv4Ey3OhL0oxvjPM5OK3OfdTM5deKjymEv3QqyoQlNEKHkkLQNbblnBuWuzU7ziSWK6sfmb6pKrZyS32SaQIDAQAB",
+  "description": "把 Dafabet BG 真人百家乐房间/牌桌数据桥接到本机 EV 中控台，并提供单次受控下注通道。",
+  "permissions": [
+    "storage",
+    "tabs",
+    "alarms",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://*.dafabet.net/*",
+    "https://*.vbgames88.com/*",
+    "https://*.jbz029.com/*",
+    "https://*/*h5V01*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.dafabet.net/*",
+        "https://*.vbgames88.com/*",
+        "https://*.jbz029.com/*",
+        "https://*/*h5V01*"
+      ],
+      "js": [
+        "bg-protocol.js",
+        "bg-network-hook.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://*.dafabet.net/*",
+        "https://*.vbgames88.com/*",
+        "https://*.jbz029.com/*",
+        "https://*/*h5V01*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://*.dafabet.net/*",
+        "https://*.vbgames88.com/*",
+        "https://*.jbz029.com/*",
+        "https://*/*h5V01*"
+      ],
+      "js": [
+        "bg-dom-hook.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_title": "点击重载 BG 桥接扩展"
+  },
+  "commands": {
+    "reload-extension": {
+      "suggested_key": {
+        "default": "Alt+Shift+R"
+      },
+      "description": "重新加载 BG 桥接扩展并刷新 BG 弹窗"
+    }
+  }
+}

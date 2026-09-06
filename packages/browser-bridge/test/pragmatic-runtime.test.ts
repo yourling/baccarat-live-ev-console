@@ -395,6 +395,8 @@ describe('PragmaticRuntimeParser', () => {
     expect(isInternalExternalGameCountAnomaly(80, 5)).toBe(false);
     expect(isInternalExternalGameCountAnomaly(12, 13)).toBe(false);
     expect(isInternalExternalGameCountAnomaly(5, 83, 'protocol-shuffle')).toBe(false);
+    expect(isInternalExternalGameCountAnomaly(12, 1, 'protocol-shuffle')).toBe(false);
+    expect(isInternalExternalGameCountAnomaly(20, 1, 'protocol-shuffle')).toBe(false);
     expect(isInternalExternalGameCountAnomaly(7, 40)).toBe(false);
   });
 
