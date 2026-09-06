@@ -648,6 +648,20 @@ export class SqliteLedger {
     return this.db.transaction(fn)();
   }
 
+  /**
+   * Process start: drop previous-process table feed so live EV/inventory
+   * never continues a stale shoe. Money ledger and table settings stay.
+   */
+  abandonPreviousProcessTableFeed(): void {
+    this.ephemeralEventsByTable.clear();
+    this.ephemeralEventIds.clear();
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM events').run();
+      this.db.prepare('DELETE FROM decisions').run();
+    });
+    this.checkpoint();
+  }
+
   clearMonitorData(): void {
     this.ephemeralEventsByTable.clear();
     this.ephemeralEventIds.clear();

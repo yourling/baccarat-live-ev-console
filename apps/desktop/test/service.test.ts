@@ -3175,4 +3175,40 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+
+  it('starts a fresh table feed after process restart and keeps table settings', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'baccarat-fresh-session-'));
+    const dbPath = join(directory, 'console.sqlite');
+    const first = new DesktopConsoleService(dbPath);
+    try {
+      await first.updateMonitorTableIds(['D055']);
+      await first.injectEvent({
+        type: 'newShoeSignal',
+        eventId: 'shoe-1',
+        tableId: 'D055',
+        timestamp: '2026-09-07T01:00:00.000Z',
+        sourceSeq: 1,
+        source: 'test',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        shoeId: 'shoe-D055',
+        baseline: 'physical-shoe',
+        profile: defaultProfile('D055'),
+      });
+      expect(first.snapshot().snapshot.tables.D055?.projection.shoeBaseline).toBe('physical-shoe');
+      await first.close();
+      const restarted = new DesktopConsoleService(dbPath);
+      try {
+        expect(restarted.snapshot().events).toEqual([]);
+        const projection = restarted.snapshot().snapshot.tables.D055?.projection;
+        expect(projection?.shoeBaseline).toBe('unknown-monitor-session');
+        expect(projection?.seenCards).toEqual([]);
+        expect(restarted.snapshot().monitorTableIds).toContain('D055');
+      } finally {
+        await restarted.close();
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
 });

@@ -400,6 +400,8 @@ export class DesktopConsoleService {
       );
     }
     this.recoverCommittedUnknownSettlements();
+    this.ledger.abandonPreviousProcessTableFeed();
+    this.orchestrator.resetLiveShoeTracking();
     const persistedLiveTableIds = Object.values(this.orchestrator.listTableConfigs())
       .filter(config => config.executionMode === 'live')
       .map(config => config.profile.tableId);
@@ -749,8 +751,8 @@ export class DesktopConsoleService {
         .filter(reservation => {
           if (reservation.status !== 'RESERVED') return false;
           const projection = this.orchestrator.getActor(reservation.tableId)?.peekProjection();
-          if (!projection) return false;
-          return (projection.shoeId !== '' && projection.shoeId !== reservation.shoeId)
+          if (!projection || projection.shoeId === '') return true;
+          return projection.shoeId !== reservation.shoeId
             || (projection.currentHandId !== null && projection.currentHandId !== reservation.handId);
         })
         .map(reservation => reservation.tableId),

@@ -227,6 +227,12 @@ export class TableActor {
     return this.executionMode;
   }
 
+  resetLiveShoeTracking(): void {
+    this.projection = emptyProjection(this.tableId);
+    this.evaluatedWindows.clear();
+    this.pausedDecisionKeys.clear();
+  }
+
   setExecutor(executor: Pick<BrowserAdapter, 'requestBet'> | null): void {
     this.executor = executor;
   }
@@ -1006,6 +1012,10 @@ export class Orchestrator {
 
   updateTableSettings(tableId: string, settings: TableSettingsUpdate): void {
     this.updateTableSettingsForTables([tableId], settings);
+  }
+
+  resetLiveShoeTracking(): void {
+    for (const actor of this.actors.values()) actor.resetLiveShoeTracking();
   }
 
   setOperationalExecutor(executor: OperationalWagerExecutor | null): void {
