@@ -903,19 +903,10 @@ export class DesktopConsoleService {
           gameCount,
           this.browserBridge?.shoeEvidence(tableId),
         );
-        const connectionStatus = this.connectedThisProcess.has(tableId)
-          ? projection.connectionStatus
-          : 'DISCONNECTED';
-        if (baseline === projection.shoeBaseline && connectionStatus === projection.connectionStatus) {
-          return projection;
-        }
-        return {
-          ...projection,
-          shoeBaseline: baseline,
-          connectionStatus,
-        };
+        if (baseline === projection.shoeBaseline) return projection;
+        return { ...projection, shoeBaseline: baseline };
       })(),
-      hasUnknownExecution: this.orchestrator.getReservations().some(reservation => reservation.status === 'UNKNOWN'),
+      hasUnknownExecution: this.orchestrator.getReservations(tableId).some(reservation => reservation.status === 'UNKNOWN'),
       hasSettlementGap: this.hasSettlementGap(tableId),
     });
   }
@@ -983,7 +974,8 @@ export class DesktopConsoleService {
   }
 
   private keepaliveTableReasons(tableId: string): LiveExecutionBlockReason[] {
-    return this.liveTableReasons(tableId);
+    return this.liveTableReasons(tableId).filter(reason =>
+      reason !== 'physical-shoe-baseline-unknown');
   }
 
   private manualLiveTableReasons(tableId: string, approved = true): LiveExecutionBlockReason[] {

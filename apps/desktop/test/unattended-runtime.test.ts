@@ -461,8 +461,9 @@ describe('DesktopConsoleService unattended runtime', () => {
         });
         await restarted['reconcileUnattendedExecution']();
 
-        expect(restarted.snapshot().runtime.tables.D055?.reasons)
-          .toContain('table-connection-not-restored');
+        expect(restarted.snapshot().snapshot.tables.D055?.projection.shoeBaseline)
+          .toBe('unknown-monitor-session');
+        expect(restarted.snapshot().snapshot.tables.D055?.projection.seenCards).toEqual([]);
         expect(restarted.snapshot().snapshot.tables.D055?.executionMode).toBe('live');
 
         await restarted.injectEvent({
