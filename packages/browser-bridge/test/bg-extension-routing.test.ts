@@ -359,6 +359,19 @@ function liveWager(market = 'banker') {
 }
 
 describe('BG official fail-closed channel', () => {
+  it('only marks the URL/session table ready, not every BG frame', () => {
+    const harness = createBgRuntimeContext();
+    const probe = Reflect.get(harness.context, 'probeBgBetTable') as (tableId: string) => {
+      status: string;
+      diagnostics?: { reason?: string };
+    };
+    expect(probe('B06').status).toBe('ready');
+    expect(probe('C03')).toEqual(expect.objectContaining({
+      status: 'not-ready',
+      diagnostics: expect.objectContaining({ reason: 'table-not-in-frame' }),
+    }));
+  });
+
   it('does not send when the table has no countdown', async () => {
     const harness = createBgRuntimeContext();
     const result = await harness.execute(liveWager());

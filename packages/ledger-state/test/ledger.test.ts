@@ -1838,4 +1838,23 @@ describe('monitor history retention', () => {
     ]);
     ledger.close();
   });
+
+  it('drops previous-process table feed but keeps money rows', () => {
+    const ledger = new SqliteLedger();
+    ledger.appendEvent(ev({
+      type: 'handSettled',
+      shoeId: 'shoe-1',
+      handId: 'h1',
+      playerCards: [{ rank: 'A', suit: 'S' }, { rank: '2', suit: 'H' }],
+      bankerCards: [{ rank: '3', suit: 'C' }, { rank: '4', suit: 'D' }],
+      outcomes: { playerPair: false, bankerPair: false },
+    }, 1));
+    ledger.saveDecision(decision('d1', 'h1', 'bankerPair', false, '2026-09-07T01:00:00.000Z'));
+    expect(ledger.countEvents()).toBeGreaterThan(0);
+    expect(ledger.listDecisions('t1')).toHaveLength(1);
+    ledger.abandonPreviousProcessTableFeed();
+    expect(ledger.countEvents()).toBe(0);
+    expect(ledger.listDecisions('t1')).toHaveLength(0);
+    ledger.close();
+  });
 });

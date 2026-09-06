@@ -56,6 +56,35 @@
     return null;
   }
 
+  function urlTableId() {
+    try {
+      const href = String(location.href || '');
+      const matched = /[?&#]table=([A-Za-z]\d{2})/i.exec(href);
+      return matched ? normalizeTableId(matched[1]) : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function sessionTableIds() {
+    const ids = [];
+    const add = value => {
+      const id = normalizeTableId(value);
+      if (id && ids.indexOf(id) < 0) ids.push(id);
+    };
+    const session = protocolSession();
+    if (session) {
+      (session.hallTableIds || []).forEach(add);
+      (session.baccaratTableIds || []).forEach(add);
+      Object.keys(session.countdownByTable || {}).forEach(add);
+      Object.keys(session.seqNoByTable || {}).forEach(add);
+    }
+    const custom = customAdapter();
+    if (custom && typeof custom.tableId === 'string') add(custom.tableId);
+    add(urlTableId());
+    return ids;
+  }
+
   function remainingWindowSec(tableId) {
     const custom = customAdapter();
     if (custom && typeof custom.remainingWindowSec === 'number') return custom.remainingWindowSec;
@@ -93,16 +122,20 @@
     const adapterTable = custom && typeof custom.tableId === 'string'
       ? normalizeTableId(custom.tableId)
       : '';
-    const tableIds = [];
-    if (normalized) tableIds.push(normalized);
-    if (adapterTable && !tableIds.includes(adapterTable)) tableIds.push(adapterTable);
     const session = protocolSession();
+    const betSocket = session && session.betSocket && session.betSocket.readyState === 1;
+    const tableIds = sessionTableIds();
+    const tableMatched = !normalized
+      || tableIds.indexOf(normalized) >= 0
+      || adapterTable === normalized;
     return {
       hasUser: Boolean(session && session.uid),
-      hasSocket: Boolean(readySubmit),
+      hasSocket: Boolean(custom || betSocket),
+      hasBetSocket: Boolean(custom || betSocket),
+      tableMatched,
       tableIds,
       host: location.hostname,
-      tableId: adapterTable || normalized,
+      tableId: adapterTable || urlTableId() || normalized,
       runtimeRevision: RUNTIME_REVISION,
     };
   }
@@ -116,13 +149,19 @@
     const normalized = normalizeTableId(tableId);
     const status = channelStatus(normalized);
     globalThis.__baccaratBgBetChannel = status;
-    const ready = status.hasSocket && (!normalized || status.tableIds.includes(normalized) || status.tableId === '' || status.tableId === normalized);
+    const ready = status.hasSocket && status.tableMatched;
     return {
       status: ready ? 'ready' : 'not-ready',
       runtimeRevision: RUNTIME_REVISION,
       host: location.hostname,
       tableId: normalized || status.tableId,
-      diagnostics: { hasSocket: status.hasSocket, tableIds: status.tableIds },
+      diagnostics: {
+        hasSocket: status.hasSocket,
+        hasBetSocket: status.hasBetSocket,
+        tableMatched: status.tableMatched,
+        tableIds: status.tableIds,
+        reason: ready ? '' : (!status.hasSocket ? 'bg-socket-missing' : 'table-not-in-frame'),
+      },
     };
   };
 
