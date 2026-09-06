@@ -298,6 +298,22 @@ function rejectedReceipt(request, requestId, reason) {
   };
 }
 
+function pickReadyBgFrame(ready) {
+  if (!Array.isArray(ready) || ready.length === 0) return null;
+  if (ready.length === 1) return ready[0];
+  const scored = ready.map(entry => {
+    const diagnostics = entry.result && entry.result.diagnostics ? entry.result.diagnostics : {};
+    let score = 0;
+    if (diagnostics.hasBetSocket) score += 8;
+    if (diagnostics.tableMatched) score += 8;
+    if (entry.frameId > 0) score += 2;
+    return { entry, score };
+  });
+  scored.sort((left, right) => right.score - left.score || left.entry.frameId - right.entry.frameId);
+  if (scored[0].score > scored[1].score) return scored[0].entry;
+  return null;
+}
+
 async function uniqueBgPopupTab() {
   const tabs = await chrome.tabs.query({ url: [DAFABET_POPUP_QUERY] });
   const targets = tabs.filter(tab => tab.id && exactDafabetBgPopup(tab.url));
@@ -337,11 +353,12 @@ async function executeUniqueBgBet(message, generation) {
     && entry.result.runtimeRevision === BG_BET_RUNTIME_REVISION
     && Number.isInteger(entry.frameId),
   );
-  if (ready.length !== 1) {
+  const chosen = pickReadyBgFrame(ready);
+  if (!chosen) {
     return rejectedReceipt(request, requestId, `expected one ready BG frame, found ${ready.length}`);
   }
   const [executed] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id, frameIds: [ready[0].frameId] },
+    target: { tabId: tab.id, frameIds: [chosen.frameId] },
     world: 'MAIN',
     func: payload => globalThis.executeBgBetOneShot(payload),
     args: [request],
