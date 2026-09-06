@@ -112,6 +112,22 @@ function semanticStoredEventPayload(payload: string): string | undefined {
   }
 }
 
+function isStaleHandSettlementReplay(existingPayload: string, incoming: NormalizedEvent): boolean {
+  if (incoming.type !== 'handSettled') return false;
+  try {
+    const parsed: unknown = JSON.parse(existingPayload);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return false;
+    const existingType = Reflect.get(parsed, 'type');
+    const existingTableId = Reflect.get(parsed, 'tableId');
+    const existingHandId = Reflect.get(parsed, 'handId');
+    return existingType === 'handSettled'
+      && existingTableId === incoming.tableId
+      && existingHandId === incoming.handId;
+  } catch {
+    return false;
+  }
+}
+
 function storedEventForReplay(event: NormalizedEvent): NormalizedEvent {
   if (
     event.type !== 'connectionRestored'
@@ -1154,6 +1170,7 @@ export class SqliteLedger {
     if (existing) {
       const existingSemanticPayload = semanticStoredEventPayload(existing.payload);
       if (existing.payload_hash !== hash && existingSemanticPayload !== semanticPayload) {
+        if (isStaleHandSettlementReplay(existing.payload, event)) return 'duplicate';
         throw new LedgerConflictError(`event_id ${event.eventId} already exists with a different payload; append rejected`);
       }
       return 'duplicate';

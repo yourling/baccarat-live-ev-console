@@ -403,6 +403,7 @@ export class PragmaticRuntimeParser {
 
     const handId = typeof table.roundId === 'string' ? table.roundId.trim() : '';
     if (!handId || handId === '—') return;
+    if (this.settledHands.has(`${tableId}:${handId}`)) return;
 
     this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
 
@@ -571,10 +572,10 @@ export class PragmaticRuntimeParser {
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
     this.evidenceByTable.delete(tableId);
-    this.clearHandState(tableId);
+    this.clearHandState(tableId, { keepSettledHands: true });
   }
 
-  private clearHandState(tableId: string): void {
+  private clearHandState(tableId: string, options: { readonly keepSettledHands?: boolean } = {}): void {
     const prefix = `${tableId}:`;
     for (const key of this.cardsByHand.keys()) if (key.startsWith(prefix)) this.cardsByHand.delete(key);
     for (const key of this.seenCardsByHand.keys()) if (key.startsWith(prefix)) this.seenCardsByHand.delete(key);
@@ -584,8 +585,9 @@ export class PragmaticRuntimeParser {
     for (const key of this.windowOpenCount.keys()) if (key.startsWith(prefix)) this.windowOpenCount.delete(key);
     for (const key of this.windowClosesAtMs.keys()) if (key.startsWith(prefix)) this.windowClosesAtMs.delete(key);
     for (const key of this.lastWindowEmitAtMs.keys()) if (key.startsWith(prefix)) this.lastWindowEmitAtMs.delete(key);
-    for (const key of this.settledHands) if (key.startsWith(prefix)) this.settledHands.delete(key);
     for (const key of this.finishedHands) if (key.startsWith(prefix)) this.finishedHands.delete(key);
+    if (options.keepSettledHands === true) return;
+    for (const key of this.settledHands) if (key.startsWith(prefix)) this.settledHands.delete(key);
   }
 
   private emitShoe(

@@ -528,6 +528,49 @@ describe('BgRuntimeParser', () => {
     expect(settled.some(event => event.type === 'handSettled')).toBe(true);
   });
 
+  it('does not re-settle a leftover round after the shoe shuffles', () => {
+    const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'C01',
+      roundId: '2098609',
+      bettingOpen: true,
+      playerCards: [],
+      bankerCards: [],
+      shoeReset: 'seq:1',
+      source: 'protocol',
+    }]));
+    const settled = parser.parse(snapshot([{
+      tableId: 'C01',
+      roundId: '2098609',
+      bettingOpen: false,
+      gameSettled: true,
+      playerCards: ['JS', '8C'],
+      bankerCards: ['9S', '4D'],
+      shoeReset: 'seq:1',
+      source: 'protocol',
+    }]));
+    expect(settled.filter(event => event.type === 'handSettled')).toEqual([
+      expect.objectContaining({ type: 'handSettled', handId: '2098609', shoeId: 'bg-C01-1' }),
+    ]);
+
+    const shuffled = parser.parse(snapshot([{
+      tableId: 'C01',
+      roundId: '2098609',
+      bettingOpen: false,
+      gameSettled: true,
+      playerCards: ['JS', '8C'],
+      bankerCards: ['9S', '4D'],
+      shuffleEvent: true,
+      shoeReset: 'seq:2',
+      source: 'protocol',
+    }]));
+    expect(shuffled.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({ baseline: 'physical-shoe', shoeId: 'bg-C01-2' }),
+    ]);
+    expect(shuffled.filter(event => event.type === 'handSettled')).toEqual([]);
+    expect(shuffled.filter(event => event.type === 'cardObserved')).toEqual([]);
+  });
+
   it('ignores impossible shoe game counts above 80', () => {
     const parser = new BgRuntimeParser();
     parser.parse(snapshot([{

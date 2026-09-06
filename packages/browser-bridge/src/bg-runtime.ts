@@ -619,6 +619,9 @@ export class BgRuntimeParser {
 
     const handId = typeof table.roundId === 'string' ? table.roundId.trim() : '';
     if (!handId || handId === '—') return;
+    // BG round ids are process-global. A leftover snapshot after shuffle must
+    // not re-emit the same handSettled id onto the new shoe.
+    if (this.settledHands.has(`${tableId}:${handId}`)) return;
 
     this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
 
@@ -871,10 +874,10 @@ export class BgRuntimeParser {
     this.bankerLeadOtherByTable.delete(tableId);
     this.bankerLeadHandByTable.delete(tableId);
     this.stickyBankerLeadByTable.delete(tableId);
-    this.clearHandState(tableId);
+    this.clearHandState(tableId, { keepSettledHands: true });
   }
 
-  private clearHandState(tableId: string): void {
+  private clearHandState(tableId: string, options: { readonly keepSettledHands?: boolean } = {}): void {
     const prefix = `${tableId}:`;
     for (const key of this.cardsByHand.keys()) if (key.startsWith(prefix)) this.cardsByHand.delete(key);
     for (const key of this.seenCardsByHand.keys()) if (key.startsWith(prefix)) this.seenCardsByHand.delete(key);
@@ -884,8 +887,9 @@ export class BgRuntimeParser {
     for (const key of this.windowOpenCount.keys()) if (key.startsWith(prefix)) this.windowOpenCount.delete(key);
     for (const key of this.windowClosesAtMs.keys()) if (key.startsWith(prefix)) this.windowClosesAtMs.delete(key);
     for (const key of this.lastWindowEmitAtMs.keys()) if (key.startsWith(prefix)) this.lastWindowEmitAtMs.delete(key);
-    for (const key of this.settledHands) if (key.startsWith(prefix)) this.settledHands.delete(key);
     for (const key of this.finishedHands) if (key.startsWith(prefix)) this.finishedHands.delete(key);
+    if (options.keepSettledHands === true) return;
+    for (const key of this.settledHands) if (key.startsWith(prefix)) this.settledHands.delete(key);
   }
 
   private emitShoe(
@@ -927,6 +931,7 @@ export class BgRuntimeParser {
       this.handsThisShoeByTable.set(tableId, index + 1);
       this.lastRoundByTable.set(tableId, handId);
       const handKey = `${tableId}:${handId}`;
+      if (this.settledHands.has(handKey)) continue;
       this.cardsByHand.set(handKey, { playerCards, bankerCards, source: 'protocol' });
       this.recordCards(tableId, handId, 'player', playerCards, observedAt, events);
       this.recordCards(tableId, handId, 'banker', bankerCards, observedAt, events);

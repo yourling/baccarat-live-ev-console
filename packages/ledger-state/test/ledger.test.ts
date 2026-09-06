@@ -759,6 +759,30 @@ describe('ledger persistence and append safety', () => {
     led.close();
   });
 
+  it('keeps the first handSettled when the same id later arrives on a new shoe', () => {
+    const led = new SqliteLedger();
+    const first = ev({
+      type: 'handSettled',
+      shoeId: 'bg-C01-1',
+      handId: '2098609',
+      playerCards: [{ rank: 'J' }, { rank: '8' }],
+      bankerCards: [{ rank: '9' }, { rank: '4' }],
+    }, 2);
+    const replay = {
+      ...first,
+      shoeId: 'bg-C01-2',
+      sourceSeq: 85,
+      timestamp: '2025-01-01T00:05:00.000Z',
+    };
+    expect(led.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'bg-C01-1', profile: { ...defaultProfile('t1'), autoConfirmNewShoe: true } }, 1))).toBe('appended');
+    expect(led.appendEvent(first)).toBe('appended');
+    expect(led.appendEvent(replay)).toBe('duplicate');
+    expect(led.listEvents('t1').filter(event => event.type === 'handSettled')).toEqual([
+      expect.objectContaining({ shoeId: 'bg-C01-1', handId: '2098609' }),
+    ]);
+    led.close();
+  });
+
   it('rejects sourceSeq collisions and keeps original event intact', () => {
     const led = new SqliteLedger();
     led.appendEvent(ev({ type: 'newShoeSignal', shoeId: 's1', profile: { ...defaultProfile('t1'), autoConfirmNewShoe: true } }, 1));
