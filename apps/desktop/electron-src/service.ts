@@ -1052,9 +1052,6 @@ export class DesktopConsoleService {
   private async reconcileUnattendedExecution(): Promise<void> {
     await this.startupFailCloseTask;
     this.refreshAccountingIncidents();
-    if (this.orchestrator.getReservations().some(reservation => reservation.status === 'UNKNOWN')) {
-      this.operationalWagers.disableKeepaliveImmediately();
-    }
     const selectedTableIds = this.currentMonitorTableIds();
     const approvedTableIds = this.monitorTableIds
       .filter(tableId => selectedTableIds.includes(tableId));
@@ -1401,7 +1398,7 @@ export class DesktopConsoleService {
     const canArm = projection.autoBetStatus === 'DISARMED'
       && effectiveShoeBaseline(projection, gameCount, this.browserBridge?.shoeEvidence(tableId)) === 'physical-shoe'
       && projection.connectionStatus === 'CONNECTED'
-      && !this.orchestrator.getReservations().some(reservation => reservation.status === 'UNKNOWN')
+      && !this.orchestrator.getReservations(tableId).some(reservation => reservation.status === 'UNKNOWN')
       && !projection.sealed
       && (projection.status === 'TRACKING'
         || projection.status === 'BETTING_WINDOW'
@@ -2602,6 +2599,55 @@ export class DesktopConsoleService {
       this.refreshAccountingIncidents(true);
       this.cachedSummary = undefined;
       this.cachedRecordCounts = undefined;
+      return this.snapshot();
+    });
+  }
+
+  async writeOffUnknownOperationalWager(
+    command: DesktopUnknownWagerReconciliationCommand,
+  ): Promise<DesktopConsoleSnapshot> {
+    return await this.enqueueExecutionStateOperation(async () => {
+      await this.startupFailCloseTask;
+      const reservation = this.orchestrator.getReservations()
+        .find(candidate => candidate.reservationId === command.reservationId);
+      if (!reservation) throw new Error(`reservation ${command.reservationId} not found`);
+      if (reservation.status !== 'UNKNOWN') {
+        throw new Error(`reservation ${command.reservationId} is not an UNKNOWN exposure`);
+      }
+
+      const record = this.ledger.getOperationalWager(command.wagerId);
+      if (!record) throw new Error(`operational wager ${command.wagerId} not found`);
+      const matchesReservation = record.reservationId === reservation.reservationId
+        && record.wager.wagerId === reservation.intentId
+        && record.wager.tableId === reservation.tableId
+        && record.wager.shoeId === reservation.shoeId
+        && record.wager.handId === reservation.handId
+        && record.wager.market === reservation.market
+        && record.wager.amount === reservation.amount
+        && record.wager.source === reservation.executionSource;
+      if (!matchesReservation) {
+        throw new Error('operational wager does not match the reservation');
+      }
+      if (record.status !== 'UNKNOWN') {
+        throw new Error(`operational wager ${command.wagerId} is not an UNKNOWN exposure`);
+      }
+      if (record.reconciliation !== undefined) {
+        throw new Error('operational wager already has a reconciliation audit');
+      }
+
+      const writeOff = record.writeOff ?? {
+        reason: 'operator-unconfirmed-write-off' as const,
+        writtenOffAt: new Date().toISOString(),
+      };
+      this.ledger.writeOffOperationalWager(command.wagerId, writeOff);
+      this.orchestrator.writeOffUnknownReservation(
+        command.reservationId,
+        writeOff.reason,
+      );
+      this.refreshAccountingIncidents(true);
+      this.cachedSummary = undefined;
+      this.cachedRecordCounts = undefined;
+      await this.reconcileUnattendedExecution();
       return this.snapshot();
     });
   }

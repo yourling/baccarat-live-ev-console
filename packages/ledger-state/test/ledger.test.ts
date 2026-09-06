@@ -174,6 +174,40 @@ describe('ledger replay', () => {
     ledger.close();
   });
 
+  it('records an operator write-off for an unconfirmable UNKNOWN wager', () => {
+    const ledger = new SqliteLedger();
+    const wager: OperationalWagerRecord = {
+      wager: {
+        wagerId: 'opw-write-off',
+        tableId: 'A30',
+        shoeId: 'bg-A30-27',
+        handId: '1095107',
+        market: 'player',
+        amount: 20,
+        source: 'keepalive',
+        createdAt: '2026-09-06T18:14:30.493Z',
+      },
+      reservationId: 'rsv-write-off',
+      status: 'UNKNOWN',
+      reason: 'committed-rejection-uncertain',
+    };
+    expect(ledger.saveOperationalWager(wager)).toBe(true);
+    const written = ledger.writeOffOperationalWager('opw-write-off', {
+      reason: 'operator-unconfirmed-write-off',
+      writtenOffAt: '2026-09-07T03:20:00.000Z',
+    });
+    expect(written.writeOff).toEqual({
+      reason: 'operator-unconfirmed-write-off',
+      writtenOffAt: '2026-09-07T03:20:00.000Z',
+    });
+    expect(ledger.writeOffOperationalWager('opw-write-off', written.writeOff!)).toEqual(written);
+    expect(() => ledger.writeOffOperationalWager('opw-write-off', {
+      reason: 'operator-unconfirmed-write-off',
+      writtenOffAt: '2026-09-07T03:21:00.000Z',
+    })).toThrow(LedgerConflictError);
+    ledger.close();
+  });
+
   it('does not restore an expired reservation when ACCEPTED receipt evidence mismatches', () => {
     const ledger = new SqliteLedger();
     const reservation: RiskReservation = {

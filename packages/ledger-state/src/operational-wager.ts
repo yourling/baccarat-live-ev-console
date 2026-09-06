@@ -46,6 +46,7 @@ export interface OperationalWagerRecord {
   readonly receipt?: OperationalWagerAuditReceipt;
   readonly reconciliation?: OperationalWagerReconciliation;
   readonly settlement?: OperationalWagerSettlement;
+  readonly writeOff?: OperationalWagerWriteOff;
 }
 
 export interface OperationalWagerReconciliation {
@@ -63,4 +64,9 @@ export interface OperationalWagerSettlement {
   readonly realizedPnl: number;
   readonly reason: 'operator-confirmed-platform-settlement';
   readonly settledAt: string;
+}
+
+export interface OperationalWagerWriteOff {
+  readonly reason: 'operator-unconfirmed-write-off';
+  readonly writtenOffAt: string;
 }

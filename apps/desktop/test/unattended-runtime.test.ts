@@ -252,6 +252,57 @@ describe('DesktopConsoleService unattended runtime', () => {
     }
   });
 
+  it('keeps keepalive enabled when UNKNOWN exposure is isolated to one table', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'baccarat-unattended-unknown-isolate-'));
+    const dbPath = join(directory, 'console.sqlite');
+    const first = new DesktopConsoleService(dbPath);
+    let firstClosed = false;
+    try {
+      await first.updateMonitorTableIds(['D055', 'D066']);
+      const unknownReservation: RiskReservation = {
+        reservationId: 'unknown-isolate',
+        intentId: 'unknown-isolate-intent',
+        tableId: 'D055',
+        shoeId: 'shoe-D055',
+        handId: 'hand-D055',
+        market: 'player',
+        executionSource: 'keepalive',
+        amount: 20,
+        maxLoss: 20,
+        maxProfit: 20,
+        status: 'UNKNOWN',
+        createdAt: '2026-08-27T01:00:01.000Z',
+        releaseReason: 'committed-rejection-uncertain',
+      };
+      expect(first['ledger'].saveReservation(unknownReservation)).toBe(true);
+
+      await first.close();
+      firstClosed = true;
+
+      const restarted = new DesktopConsoleService(dbPath);
+      try {
+        const bridge = new BrowserBridgeServer();
+        authenticateBridge(bridge);
+        vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+        restarted['browserBridge'] = bridge;
+        restarted['liveFeeds'].set('D055', freshFeed('D055'));
+        restarted['liveFeeds'].set('D066', freshFeed('D066'));
+        await restarted.injectEvent(physicalShoe('D055'));
+        await restarted.injectEvent(physicalShoe('D066'));
+
+        const enabled = await restarted.setKeepaliveEnabled(true);
+        expect(enabled.keepalive.enabled).toBe(true);
+        expect(enabled.runtime.tables.D055?.reasons).toContain('unknown-execution-pending');
+        expect(enabled.runtime.tables.D066?.reasons ?? []).not.toContain('unknown-execution-pending');
+      } finally {
+        await restarted.close();
+      }
+    } finally {
+      if (!firstClosed) await first.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('repairs a persisted UNKNOWN that is proven to have failed before frame execution', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'baccarat-unattended-precommit-repair-'));
     const dbPath = join(directory, 'console.sqlite');

@@ -567,7 +567,7 @@ export class TableActor {
     if (Number.isFinite(windowNowMs) && closesAtMs - windowNowMs < 3_000) {
       return;
     }
-    if (this.riskManager.hasUnknownReservations()) {
+    if (this.riskManager.hasUnknownReservations(this.tableId)) {
       return;
     }
     const evalKey = `${event.shoeId}:${event.handId}:${event.market}`;
@@ -1141,6 +1141,13 @@ export class Orchestrator {
     reason: string,
   ): ReturnType<RiskManager['settleUnknown']> {
     return this.riskManager.settleUnknown(reservationId, settlement, reason);
+  }
+
+  writeOffUnknownReservation(
+    reservationId: string,
+    reason: string,
+  ): ReturnType<RiskManager['writeOffUnknown']> {
+    return this.riskManager.writeOffUnknown(reservationId, reason);
   }
 
   settleReservedReservationManually(

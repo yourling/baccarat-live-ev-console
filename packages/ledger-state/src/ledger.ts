@@ -968,6 +968,34 @@ export class SqliteLedger {
     return updated;
   }
 
+  writeOffOperationalWager(
+    wagerId: string,
+    writeOff: NonNullable<OperationalWagerRecord['writeOff']>,
+  ): OperationalWagerRecord {
+    const existing = this.getOperationalWager(wagerId);
+    if (!existing) throw new LedgerConflictError(`operational wager ${wagerId} not found`);
+    if (existing.writeOff) {
+      if (stableStringify(existing.writeOff) !== stableStringify(writeOff)) {
+        throw new LedgerConflictError(`operational wager ${wagerId} already has a different write-off`);
+      }
+      return existing;
+    }
+    if (existing.status !== 'UNKNOWN') {
+      throw new LedgerConflictError(`operational wager ${wagerId} is not an UNKNOWN exposure`);
+    }
+    if (existing.reconciliation !== undefined) {
+      throw new LedgerConflictError(`operational wager ${wagerId} already has a reconciliation audit`);
+    }
+    const updated: OperationalWagerRecord = { ...existing, writeOff };
+    const result = this.db.prepare(`
+      UPDATE operational_wagers SET payload = ? WHERE wager_id = ?
+    `).run(stableStringify(updated), wagerId);
+    if (result.changes !== 1) {
+      throw new LedgerConflictError(`operational wager ${wagerId} write-off was not updated`);
+    }
+    return updated;
+  }
+
   getHandSettlement(
     tableId: string,
     shoeId: string,

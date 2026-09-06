@@ -38,6 +38,7 @@ declare global {
       executeOneShotLiveBet: (command: OneShotLiveBetCommand) => Promise<OneShotLiveBetResult>;
       executeOperationalWager: (command: DesktopOperationalWagerCommand) => Promise<DesktopOperationalWagerResult>;
       reconcileUnknownOperationalWager: (command: DesktopUnknownWagerReconciliationCommand) => Promise<DesktopConsoleSnapshot>;
+      writeOffUnknownOperationalWager: (command: DesktopUnknownWagerReconciliationCommand) => Promise<DesktopConsoleSnapshot>;
       settlePendingOperationalWager: (command: DesktopPendingSettlementCommand) => Promise<DesktopConsoleSnapshot>;
       updateKeepaliveSettings: (settings: DesktopKeepaliveStrategySettings) => Promise<DesktopConsoleSnapshot>;
       setKeepaliveEnabled: (enabled: boolean) => Promise<DesktopConsoleSnapshot>;

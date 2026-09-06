@@ -134,6 +134,8 @@ export interface DesktopUnknownWagerReconciliationCommand {
   readonly wagerId: string;
 }
 
+export type DesktopUnknownWagerWriteOffCommand = DesktopUnknownWagerReconciliationCommand;
+
 export interface DesktopPendingSettlementCommand {
   readonly reservationId: string;
   readonly wagerId: string;
@@ -244,6 +246,12 @@ export function parseDesktopOperationalWagerCommand(value: unknown): DesktopOper
     throw new TypeError('handId must be a non-empty trimmed string when provided');
   }
   return { tableId, market, amount, ...(handId === undefined ? {} : { handId }) };
+}
+
+export function parseDesktopUnknownWagerWriteOffCommand(
+  value: unknown,
+): DesktopUnknownWagerWriteOffCommand {
+  return parseDesktopUnknownWagerReconciliationCommand(value);
 }
 
 export function parseDesktopUnknownWagerReconciliationCommand(

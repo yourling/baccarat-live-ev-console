@@ -14,6 +14,7 @@ import {
   parseDesktopOperationalWagerCommand,
   parseDesktopPendingSettlementCommand,
   parseDesktopUnknownWagerReconciliationCommand,
+  parseDesktopUnknownWagerWriteOffCommand,
   parseOneShotLiveBetCommand,
 } from '../src/api-types.js';
 
@@ -123,6 +124,10 @@ function registerIpc(): void {
   ipcMain.handle('console:reconcile-unknown-operational-wager', (_event, command: unknown) =>
     getService().reconcileUnknownOperationalWager(
       parseDesktopUnknownWagerReconciliationCommand(command),
+    ));
+  ipcMain.handle('console:write-off-unknown-operational-wager', (_event, command: unknown) =>
+    getService().writeOffUnknownOperationalWager(
+      parseDesktopUnknownWagerWriteOffCommand(command),
     ));
   ipcMain.handle('console:settle-pending-operational-wager', (_event, command: unknown) =>
     getService().settlePendingOperationalWager(

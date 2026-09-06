@@ -638,6 +638,35 @@ export function App() {
     setRecordQueryRevision(previous => previous + 1);
   }
 
+  const writeOffUnknownOperationalWager = useCallback(async (row: BetLedgerRow) => {
+    if (!window.desktop || !row.operationalWager || !canWriteOffUnknownOperationalWager(row)) return;
+    const accepted = await confirm({
+      title: '勾销未知敞口',
+      description: '无法确认平台结果时使用。此操作不宣称输赢，只释放本地资金敞口，不会再次下注。勾销后该桌不再因这笔未知结果阻断保活。',
+      details: [
+        { label: '牌桌 / 牌局', value: `${row.reservation.tableId} / ${row.reservation.handId}` },
+        { label: '下注', value: `${MARKET_LABELS[row.reservation.market]} ${formatAmount(row.reservation.amount)}` },
+      ],
+      confirmLabel: '勾销未知敞口',
+      tone: 'danger',
+    });
+    if (!accepted) return;
+    setReconcilingReservationId(row.reservation.reservationId);
+    setError(null);
+    try {
+      const nextSnapshot = await window.desktop.writeOffUnknownOperationalWager({
+        reservationId: row.reservation.reservationId,
+        wagerId: row.operationalWager.wager.wagerId,
+      });
+      setSnapshot(nextSnapshot);
+      setRecordQueryRevision(previous => previous + 1);
+    } catch (writeOffError) {
+      setError(writeOffError instanceof Error ? writeOffError.message : String(writeOffError));
+    } finally {
+      setReconcilingReservationId(null);
+    }
+  }, [confirm]);
+
   const reconcileUnknownOperationalWager = useCallback(async (row: BetLedgerRow) => {
     if (!window.desktop || !row.operationalWager || !canReconcileOperationalWager(row)) return;
     const accepted = await confirm({
@@ -1137,7 +1166,7 @@ export function App() {
 
       {view === 'events' && recordPage?.kind === 'events' && <><EventTable events={recordEvents} totalCount={recordTotal} tableLabel={tableLabel} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
 
-      {view === 'ledger' && recordPage?.kind === 'ledger' && <><BetLedgerView rows={recordLedgerRows} totalCount={recordTotal} reconcilingReservationId={reconcilingReservationId} tableLabel={tableLabel} onReconcile={reconcileUnknownOperationalWager} onSettle={settlePendingOperationalWager} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
+      {view === 'ledger' && recordPage?.kind === 'ledger' && <><BetLedgerView rows={recordLedgerRows} totalCount={recordTotal} reconcilingReservationId={reconcilingReservationId} tableLabel={tableLabel} onReconcile={reconcileUnknownOperationalWager} onWriteOff={writeOffUnknownOperationalWager} onSettle={settlePendingOperationalWager} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
 
       {view === 'settings' && (
         <SystemSettingsView
@@ -1725,10 +1754,20 @@ function canReconcileOperationalWager(row: BetLedgerRow): boolean {
       && operationalWager?.status === 'REJECTED'
       && operationalWager.receipt?.status === 'REJECTED';
   return statusPairMatches
+    && operationalWager?.writeOff === undefined
     && operationalWager?.reservationId === row.reservation.reservationId
     && typeof raw === 'object'
     && raw !== null
     && Reflect.get(raw, 'commitStarted') === true;
+}
+
+function canWriteOffUnknownOperationalWager(row: BetLedgerRow): boolean {
+  const operationalWager = row.operationalWager;
+  return row.reservation.status === 'UNKNOWN'
+    && operationalWager?.status === 'UNKNOWN'
+    && operationalWager.writeOff === undefined
+    && operationalWager.reconciliation === undefined
+    && operationalWager.reservationId === row.reservation.reservationId;
 }
 
 function canSettlePendingOperationalWager(row: BetLedgerRow): boolean {
@@ -1751,6 +1790,7 @@ function BetLedgerView(props: {
   reconcilingReservationId: string | null;
   tableLabel: (tableId: string) => string;
   onReconcile: (row: BetLedgerRow) => Promise<void>;
+  onWriteOff: (row: BetLedgerRow) => Promise<void>;
   onSettle: (row: BetLedgerRow, outcome: 'WIN' | 'LOSS' | 'PUSH') => Promise<void>;
 }) {
   return (
@@ -1782,6 +1822,16 @@ function BetLedgerView(props: {
                         onClick={() => void props.onReconcile(row)}
                       >
                         {props.reconcilingReservationId === row.reservation.reservationId ? '核对中...' : '确认平台已成交'}
+                      </button>
+                    )}
+                    {canWriteOffUnknownOperationalWager(row) && (
+                      <button
+                        type="button"
+                        className="button button--small button--ghost ledger-reconcile"
+                        disabled={props.reconcilingReservationId !== null}
+                        onClick={() => void props.onWriteOff(row)}
+                      >
+                        {props.reconcilingReservationId === row.reservation.reservationId ? '勾销中...' : '无法确认，勾销敞口'}
                       </button>
                     )}
                   </td>
@@ -2184,6 +2234,9 @@ function ledgerReceiptLabel(row: BetLedgerRow): string {
   if (row.operationalWager?.reconciliation?.status === 'ACCEPTED' || row.reservation.status === 'SETTLED') {
     return receiptStatusLabel('ACCEPTED');
   }
+  if (row.operationalWager?.writeOff) {
+    return '平台未确认（已勾销）';
+  }
   if (row.operationalWager?.status === 'UNKNOWN' || row.reservation.status === 'UNKNOWN') {
     return receiptStatusLabel('UNKNOWN');
   }
@@ -2203,6 +2256,9 @@ function ledgerResult(
 ): { label: string; tone: BetLedgerRow['resultTone'] } {
   if (typeof reservation.realizedPnl === 'number') {
     return reservation.realizedPnl > 0 ? { label: '命中', tone: 'good' } : reservation.realizedPnl < 0 ? { label: '未中', tone: 'danger' } : { label: '持平', tone: 'neutral' };
+  }
+  if (operationalWager?.writeOff) {
+    return { label: '无法确认已勾销', tone: 'neutral' };
   }
   if (operationalWager?.reconciliation?.status !== 'ACCEPTED'
     && (operationalWager?.status === 'UNKNOWN' || reservation.status === 'UNKNOWN')) {

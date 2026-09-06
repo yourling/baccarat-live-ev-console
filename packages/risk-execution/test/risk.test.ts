@@ -113,6 +113,28 @@ describe('risk manager', () => {
     expect(nextHand.reason).toMatch(/max-concurrent-executions|global-exposure-cap/);
   });
 
+  it('writes off UNKNOWN without inventing pnl and frees exposure', () => {
+    const m = new RiskManager();
+    const reserved = m.tryReserve(intent('s1', 'h1', 'bankerPair', 10), profile, limits);
+    expect(reserved.ok).toBe(true);
+    expect(m.markUnknown(reserved.reservation!.reservationId, 'committed-rejection-uncertain')).toBe(true);
+    expect(m.getState()).toMatchObject({ reservedExposure: 10, pendingExecutions: 1 });
+
+    const writtenOff = m.writeOffUnknown(reserved.reservation!.reservationId, 'operator-unconfirmed-write-off');
+    expect(writtenOff).toEqual(expect.objectContaining({
+      status: 'RELEASED',
+      releaseReason: 'operator-unconfirmed-write-off',
+    }));
+    expect(writtenOff.realizedPnl).toBeUndefined();
+    expect(m.getState()).toMatchObject({
+      reservedExposure: 0,
+      pendingExecutions: 0,
+      executedToday: 0,
+      dayLoss: 0,
+    });
+    expect(m.hasUnknownReservations()).toBe(false);
+  });
+
   it('shrinks when policy is shrink, but skips below table min', () => {
     const m = new RiskManager();
     const capLimits = { ...limits, defaultExposureCap: 15, insufficientBehavior: 'shrink' as const };

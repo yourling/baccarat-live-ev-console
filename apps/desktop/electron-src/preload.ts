@@ -33,6 +33,8 @@ const api = {
     ipcRenderer.invoke('console:execute-operational-wager', command),
   reconcileUnknownOperationalWager: (command: DesktopUnknownWagerReconciliationCommand) =>
     ipcRenderer.invoke('console:reconcile-unknown-operational-wager', command),
+  writeOffUnknownOperationalWager: (command: DesktopUnknownWagerReconciliationCommand) =>
+    ipcRenderer.invoke('console:write-off-unknown-operational-wager', command),
   settlePendingOperationalWager: (command: DesktopPendingSettlementCommand) =>
     ipcRenderer.invoke('console:settle-pending-operational-wager', command),
   updateKeepaliveSettings: (settings: DesktopKeepaliveStrategySettings) =>

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Orchestrator, TableActor } from '../src/index.js';
 import { SqliteLedger } from '@baccarat/ledger-state';
-import { SimulatedAdapter, type BetExecutionRequest } from '@baccarat/adapter-contract';
+import { SimulatedAdapter, type BetExecutionRequest, type OperationalWagerExecutionRequest } from '@baccarat/adapter-contract';
 import { FixtureBuilder as SimulatorFixtureBuilder } from '@baccarat/simulator-fixtures';
 import { RiskManager } from '@baccarat/risk-execution';
 import type {
@@ -1350,6 +1350,54 @@ describe('unknown monitor-session baseline execution', () => {
     }));
     expect(requestCount).toBe(0);
     expect(actor.getProjection().shoeBaseline).toBe('unknown-monitor-session');
+    ledger.close();
+  });
+
+  it('does not block another table when one table has UNKNOWN exposure', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const operationalExecutor = {
+      requestOperationalWager: async (request: OperationalWagerExecutionRequest) => ({
+        receiptId: `receipt-${request.wager.wagerId}`,
+        wagerId: request.wager.wagerId,
+        tableId: request.wager.tableId,
+        shoeId: request.wager.shoeId,
+        handId: request.wager.handId,
+        market: request.wager.market,
+        amount: request.wager.amount,
+        source: request.wager.source,
+        status: request.wager.tableId === 't1' ? 'UNKNOWN' as const : 'ACCEPTED' as const,
+        createdAt: '2025-01-01T00:00:02.000Z',
+        raw: { commitStarted: true, reason: 'bet-state:5:700' },
+      }),
+    };
+    const orchestrator = new Orchestrator({
+      ledger,
+      riskLimits,
+      operationalExecutor,
+      operationalWagerTerms: {
+        banker: { netWin: 0.95, loss: 1 },
+        player: { netWin: 1, loss: 1 },
+        tiePolicy: 'push',
+      },
+    });
+    const t1 = orchestrator.registerTable({ ...simProfile('t1'), autoBetArmedByDefault: false }, 'live', 20);
+    const t2 = orchestrator.registerTable({ ...simProfile('t2'), autoBetArmedByDefault: false }, 'live', 20);
+    for (const [tableId, actor] of [['t1', t1], ['t2', t2]] as const) {
+      const events = new FixtureBuilder(tableId)
+        .newShoe(`s-${tableId}`, actor.getProfile())
+        .openWindow(`s-${tableId}`, `h-${tableId}`, 'bankerPair')
+        .build();
+      await Promise.all(events.map(event => orchestrator.enqueue(tableId, event)));
+      await actor.flush();
+    }
+
+    const unknown = await t1.placeOperationalWager({ market: 'bankerPair', amount: 20, source: 'keepalive' });
+    expect(unknown.status).toBe('UNKNOWN');
+    expect(orchestrator.getReservations('t1').some(reservation => reservation.status === 'UNKNOWN')).toBe(true);
+
+    const accepted = await t2.placeOperationalWager({ market: 'bankerPair', amount: 20, source: 'keepalive' });
+    expect(accepted).toEqual(expect.objectContaining({ status: 'ACCEPTED' }));
+    expect(orchestrator.getReservations('t2')[0]?.status).toBe('RESERVED');
     ledger.close();
   });
 

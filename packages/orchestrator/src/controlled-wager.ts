@@ -98,7 +98,7 @@ export async function executeControlledOperationalWager(
   ) {
     return rejected('physical-shoe-required');
   }
-  if (context.riskManager.hasUnknownReservations()) {
+  if (context.riskManager.hasUnknownReservations(context.tableId)) {
     return rejected('unknown-execution-pending');
   }
   if (projection.sealed) return rejected('shoe-sealed');
