@@ -26,6 +26,8 @@ import {
   effectiveShoeBaseline,
   emptyProjection,
   isPhysicalShoeBettable,
+  isPrematurePhysicalShoeReset,
+  isWrapShapedRoadCount,
   modelRevisionFor,
   operationalReceiptCommitStarted,
   profileVersionFor,
@@ -316,6 +318,13 @@ export class TableActor {
     });
   }
 
+  private shouldHoldCurrentPhysicalShoe(current: ShoeStateProjection): boolean {
+    if (!isPrematurePhysicalShoeReset(current)) return false;
+    const road = this.observedGameCount?.(this.tableId);
+    if (typeof road === 'number' && isWrapShapedRoadCount(current.handNumber, road)) return false;
+    return true;
+  }
+
   private bindIncomingShoe(event: NormalizedEvent): NormalizedEvent | null {
     const current = this.projection;
     if (event.type === 'newShoeSignal') {
@@ -330,6 +339,12 @@ export class TableActor {
         // Restart attach tokens must not wipe a ledger-rebuilt physical shoe.
         return null;
       }
+      if (
+        incomingBaseline === 'physical-shoe'
+        && this.shouldHoldCurrentPhysicalShoe(current)
+      ) {
+        return null;
+      }
       return event;
     }
     if (!('shoeId' in event) || typeof event.shoeId !== 'string' || !current.shoeId) return event;
@@ -337,6 +352,9 @@ export class TableActor {
     const incomingGen = bgShoeGeneration(event.shoeId);
     const currentGen = bgShoeGeneration(current.shoeId);
     if (incomingGen !== undefined && currentGen !== undefined && incomingGen > currentGen) {
+      if (this.shouldHoldCurrentPhysicalShoe(current)) {
+        return { ...event, shoeId: current.shoeId };
+      }
       return event;
     }
     if (current.shoeBaseline === 'physical-shoe' && current.seenCards.length > 0) {

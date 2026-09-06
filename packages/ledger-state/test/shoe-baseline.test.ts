@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { defaultProfile } from '@baccarat/contracts';
 import { emptyProjection } from '../src/projection.js';
-import { effectiveShoeBaseline, explainShoeBaseline, initialShoeTotal, isMissedShuffleRoadCount, isVerifiedPhysicalShoeEvidence, isVerifiedPhysicalShoeReason, isWrapShapedRoadCount, shoeBaselineReasonLabel } from '../src/shoe-baseline.js';
+import { effectiveShoeBaseline, explainShoeBaseline, initialShoeTotal, isMissedShuffleRoadCount, isPrematurePhysicalShoeReset, isVerifiedPhysicalShoeEvidence, isVerifiedPhysicalShoeReason, isWrapShapedRoadCount, shoeBaselineReasonLabel } from '../src/shoe-baseline.js';
 
 describe('effectiveShoeBaseline', () => {
   it('keeps unknown attach unknown', () => {
@@ -145,3 +145,31 @@ describe('effectiveShoeBaseline', () => {
     ).evidence.reason).toBe('inventory-contradiction');
   });
 });
+
+describe('isPrematurePhysicalShoeReset', () => {
+  it('holds a mid-shoe physical inventory against a shuffle pulse', () => {
+    const projection = emptyProjection('C02');
+    projection.shoeBaseline = 'physical-shoe';
+    projection.remainingTotal = 307;
+    projection.handNumber = 22;
+    projection.seenCards = Array.from({ length: 20 }, () => ({ rank: 'A' as const }));
+    expect(isPrematurePhysicalShoeReset(projection)).toBe(true);
+  });
+
+  it('allows a new shoe near the typical cut or after a deep shoe', () => {
+    const nearCut = emptyProjection('C01');
+    nearCut.shoeBaseline = 'physical-shoe';
+    nearCut.remainingTotal = 149;
+    nearCut.handNumber = 54;
+    nearCut.seenCards = Array.from({ length: 20 }, () => ({ rank: 'A' as const }));
+    expect(isPrematurePhysicalShoeReset(nearCut)).toBe(false);
+
+    const deep = emptyProjection('C01');
+    deep.shoeBaseline = 'physical-shoe';
+    deep.remainingTotal = 200;
+    deep.handNumber = 50;
+    deep.seenCards = Array.from({ length: 20 }, () => ({ rank: 'A' as const }));
+    expect(isPrematurePhysicalShoeReset(deep)).toBe(false);
+  });
+});
+

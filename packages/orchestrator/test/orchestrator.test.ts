@@ -1582,10 +1582,10 @@ describe('restart attach must not wipe a rebuilt physical shoe', () => {
       profile,
     } as NormalizedEvent);
     await actor.flush();
-    expect(actor.getProjection().shoeId).toBe('bg-B01-3');
+    expect(actor.getProjection().shoeId).toBe('bg-B01-2');
     expect(actor.getProjection().shoeBaseline).toBe('physical-shoe');
-    expect(actor.getProjection().seenCards.length).toBe(0);
-    expect(actor.getProjection().remainingTotal).toBe(416);
+    expect(actor.getProjection().seenCards.length).toBe(4);
+    expect(actor.getProjection().remainingTotal).toBe(412);
     ledger.close();
   });
 });

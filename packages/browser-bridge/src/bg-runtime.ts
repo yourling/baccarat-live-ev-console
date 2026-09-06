@@ -107,6 +107,18 @@ function isMidShoeInflatedHistoryMismatch(handNumber: number, road: number): boo
     && high - low >= ROAD_WRAP_MIN_DROP;
 }
 
+export function isCredibleBgEndOfShoeShuffle(
+  previousRoad: number | undefined,
+  incomingRoad: number | undefined,
+  handsThisShoe: number | undefined,
+): boolean {
+  if (incomingRoad !== undefined) {
+    if (isRoadWrapToNewShoe(previousRoad, incomingRoad)) return true;
+    if (isExhaustedShoeRoadDrop(previousRoad, incomingRoad, handsThisShoe)) return true;
+  }
+  return (handsThisShoe ?? 0) >= DEEP_SHOE_ROAD_MIN;
+}
+
 function isExhaustedShoeRoadDrop(
   previous: number | undefined,
   gameCount: number,
@@ -770,20 +782,38 @@ export class BgRuntimeParser {
       // startshuffling/endshuffling may set shuffleEvent on that first token;
       // only a later token change is protocol-shuffle.
       if (previousToken !== undefined) {
-        this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
+        const alreadyPhysical = this.hasVerifiedPhysicalEvidence(tableId);
+        const handsThisShoe = this.handsThisShoeByTable.get(tableId);
+        if (
+          !alreadyPhysical
+          || isCredibleBgEndOfShoeShuffle(previousRoad, incomingRoad, handsThisShoe)
+        ) {
+          this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
+        }
       }
       return;
     }
     if (!shuffleEvent) return;
     if (isInflatedRoadCorrection(this.lastGameCountByTable.get(tableId), table.gameCount ?? 0)) return;
     // Same token is reused when startshuffling is missed or endshuffling
-    // copies lastFinishedShuffle. If this shoe already dealt, that pulse is
-    // the next shuffle, not a duplicate of the current one.
+    // copies lastFinishedShuffle. Only a deep/wrapped shoe is the next shuffle;
+    // a 2-20 hand pulse is the current shoe's leftover shuffle flag.
     if (this.shoeAlreadyDealt(tableId)) {
-      this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
+      const previousRoad = this.lastGameCountByTable.get(tableId);
+      const incomingRoad = Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1
+        ? table.gameCount
+        : undefined;
+      if (isCredibleBgEndOfShoeShuffle(previousRoad, incomingRoad, this.handsThisShoeByTable.get(tableId))) {
+        this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
+      }
       return;
     }
     this.promoteProtocolShuffle(tableId, observedAt, events);
+  }
+
+  private hasVerifiedPhysicalEvidence(tableId: string): boolean {
+    const reason = this.evidenceByTable.get(tableId)?.reason;
+    return reason === 'protocol-shuffle' || reason === 'road-wrap' || reason === 'manual-confirm';
   }
 
   private shoeAlreadyDealt(tableId: string): boolean {
