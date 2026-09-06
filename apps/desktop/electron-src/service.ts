@@ -974,8 +974,9 @@ export class DesktopConsoleService {
   }
 
   private keepaliveTableReasons(tableId: string): LiveExecutionBlockReason[] {
-    return this.liveTableReasons(tableId).filter(reason =>
-      reason !== 'physical-shoe-baseline-unknown');
+    // Fail-closed (#16 / AGENTS.md): keepalive is a platform-reaching path and
+    // still requires physical-shoe. Do not strip physical-shoe-baseline-unknown.
+    return this.liveTableReasons(tableId);
   }
 
   private manualLiveTableReasons(tableId: string, approved = true): LiveExecutionBlockReason[] {

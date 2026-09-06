@@ -703,7 +703,7 @@ describe('DesktopConsoleService operational wagers', () => {
     }
   });
 
-  it('allows fixed keepalive on an observed window before the physical-shoe baseline is known', async () => {
+  it('blocks fixed keepalive until physical-shoe baseline is known (fail-closed)', async () => {
     // Given: global automation is enabled while a live table is attached mid-shoe.
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();
