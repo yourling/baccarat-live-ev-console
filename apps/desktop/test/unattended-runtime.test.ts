@@ -235,7 +235,7 @@ describe('DesktopConsoleService unattended runtime', () => {
         const snapshot = restarted.snapshot();
         expect(snapshot.snapshot.tables.D055?.executionMode).toBe('live');
         expect(snapshot.runtime.executionReady).toBe(false);
-        expect(snapshot.runtime.tables.D055?.reasons).not.toContain('unknown-execution-pending');
+        expect(snapshot.runtime.tables.D055?.reasons).toContain('unknown-execution-pending');
         expect(snapshot.runtime.incidents).toContainEqual(expect.objectContaining({
           code: 'unknown-execution',
           severity: 'degraded',
@@ -525,7 +525,7 @@ describe('DesktopConsoleService unattended runtime', () => {
 
       const snapshot = service.snapshot();
       expect(snapshot.snapshot.tables.D055?.executionMode).toBe('live');
-      expect(snapshot.runtime.tables.D055?.reasons).not.toContain('settlement-gap');
+      expect(snapshot.runtime.tables.D055?.reasons).toContain('settlement-gap');
       expect(snapshot.runtime.incidents).toContainEqual(expect.objectContaining({
         code: 'settlement-gap',
         severity: 'degraded',
@@ -549,12 +549,11 @@ describe('DesktopConsoleService unattended runtime', () => {
         reservedExposure: 20,
         pendingExecutions: 1,
       });
-      expect(afterRollover.runtime.tables.D055?.reasons).not.toContain('settlement-gap');
+      expect(afterRollover.runtime.tables.D055?.reasons).toContain('settlement-gap');
 
       const enabled = await service.setKeepaliveEnabled(true);
-      expect(enabled.keepalive.enabled).toBe(true);
-      expect(enabled.runtime.executionReady).toBe(true);
-      expect(enabled.runtime.status).toBe('degraded');
+      expect(enabled.runtime.executionReady).toBe(false);
+      expect(enabled.runtime.tables.D055?.reasons).toContain('settlement-gap');
     } finally {
       await service.close();
     }

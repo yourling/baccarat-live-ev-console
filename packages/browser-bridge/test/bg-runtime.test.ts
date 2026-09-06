@@ -89,7 +89,7 @@ describe('BgRuntimeParser', () => {
     expect(parser.shoeEvidence('B06')).toEqual({ reason: 'attach' });
   });
 
-  it('promotes a physical shoe on the first NEXT_SHOES shuffle pulse', () => {
+  it('records the first NEXT_SHOES shuffle pulse without promoting a physical shoe', () => {
     const parser = new BgRuntimeParser();
     const events = parser.parse(snapshot([{
       tableId: 'A31',
@@ -99,6 +99,17 @@ describe('BgRuntimeParser', () => {
     }]));
     expect(events.filter(event => event.type === 'newShoeSignal')).toEqual([
       expect.objectContaining({ baseline: 'unknown-monitor-session', tableId: 'A31' }),
+    ]);
+    expect(parser.shoeEvidence('A31')).toEqual({ reason: 'attach' });
+    expect(parser.currentShoeId('A31')).toBe('bg-A31-1');
+
+    const promoted = parser.parse(snapshot([{
+      tableId: 'A31',
+      shuffleEvent: true,
+      shoeReset: 'seq:100',
+      source: 'protocol',
+    }]));
+    expect(promoted.filter(event => event.type === 'newShoeSignal')).toEqual([
       expect.objectContaining({ baseline: 'physical-shoe', tableId: 'A31' }),
     ]);
     expect(parser.shoeEvidence('A31')).toEqual({ reason: 'protocol-shuffle' });
@@ -192,10 +203,15 @@ describe('BgRuntimeParser', () => {
       playerCards: [index % 2 === 0 ? 'AS' : '2D', index % 3 === 0 ? 'KH' : 'QC'],
       bankerCards: ['8S', index % 2 === 0 ? '5C' : '7H', index % 3 === 0 ? '9D' : '2S'],
     }));
+    parser.parse(snapshot([{
+      tableId: 'B28',
+      shoeReset: 'bg-shoe-1',
+      source: 'protocol',
+    }]));
     const events = parser.parse(snapshot([{
       tableId: 'B28',
       shuffleEvent: true,
-      shoeReset: 'seq:189993',
+      shoeReset: 'bg-shoe-2',
       roundId: '190004',
       gameCount: 12,
       source: 'protocol',
@@ -208,10 +224,15 @@ describe('BgRuntimeParser', () => {
 
   it('replays history road cards onto a newly opened physical shoe', () => {
     const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'A31',
+      shoeReset: 'bg-shoe-1',
+      source: 'protocol',
+    }]));
     const events = parser.parse(snapshot([{
       tableId: 'A31',
       shuffleEvent: true,
-      shoeReset: 'seq:10',
+      shoeReset: 'bg-shoe-2',
       roundId: '12',
       gameCount: 2,
       source: 'protocol',
@@ -221,7 +242,6 @@ describe('BgRuntimeParser', () => {
       ],
     }]));
     expect(events.filter(event => event.type === 'newShoeSignal')).toEqual([
-      expect.objectContaining({ baseline: 'unknown-monitor-session' }),
       expect.objectContaining({ baseline: 'physical-shoe' }),
     ]);
     const cards = events.filter(event => event.type === 'cardObserved');
@@ -261,8 +281,7 @@ describe('BgRuntimeParser', () => {
     const parser = new BgRuntimeParser();
     parser.parse(snapshot([{
       tableId: 'B01',
-      shuffleEvent: true,
-      shoeReset: 'seq:200',
+      shoeReset: 'bg-shoe-1',
       source: 'protocol',
     }]));
     const hands = Array.from({ length: 24 }, () => ({
@@ -273,7 +292,7 @@ describe('BgRuntimeParser', () => {
       tableId: 'B01',
       roundId: '224',
       gameCount: 24,
-      shoeReset: 'seq:201',
+      shoeReset: 'bg-shoe-2',
       source: 'protocol',
       historyHands: hands,
     }]));
@@ -285,8 +304,13 @@ describe('BgRuntimeParser', () => {
     const parser = new BgRuntimeParser();
     parser.parse(snapshot([{
       tableId: 'A30',
-      shuffleEvent: true,
       shoeReset: 'seq:200',
+      source: 'protocol',
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'A30',
+      shuffleEvent: true,
+      shoeReset: 'seq:300',
       source: 'protocol',
     }]));
     const hands = Array.from({ length: 36 }, () => ({
@@ -306,6 +330,11 @@ describe('BgRuntimeParser', () => {
 
   it('replays HISTORY onto a shoe that was opened by a previous NEXT_SHOES pulse', () => {
     const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'C07',
+      shoeReset: 'seq:2030681',
+      source: 'protocol',
+    }]));
     parser.parse(snapshot([{
       tableId: 'C07',
       shuffleEvent: true,
@@ -393,7 +422,7 @@ describe('BgRuntimeParser', () => {
     expect(parser.acceptedGameCount('B01')).toBe(18);
   });
 
-  it('opens a physical shoe when a dealt road 72 collapses to a new-shoe 18', () => {
+  it('does not treat a dealt road 72 collapsing to 18 as a protocol-shuffle', () => {
     const parser = new BgRuntimeParser();
     parser.parse(snapshot([{
       tableId: 'A05',
@@ -408,11 +437,9 @@ describe('BgRuntimeParser', () => {
       shoeReset: 'seq:4963355',
       source: 'protocol',
     }]));
-    expect(shuffled.filter(event => event.type === 'newShoeSignal')).toEqual([
-      expect.objectContaining({ baseline: 'physical-shoe', tableId: 'A05' }),
-    ]);
-    expect(parser.shoeEvidence('A05')).toEqual({ reason: 'protocol-shuffle' });
-    expect(parser.acceptedGameCount('A05')).toBe(18);
+    expect(shuffled.filter(event => event.type === 'newShoeSignal' && event.baseline === 'physical-shoe')).toHaveLength(0);
+    expect(parser.shoeEvidence('A05')?.reason).not.toBe('protocol-shuffle');
+    expect(parser.acceptedGameCount('A05')).toBe(72);
   });
 
   it('does not promote HISTORY shuffleEvent on a 29→18 correction', () => {

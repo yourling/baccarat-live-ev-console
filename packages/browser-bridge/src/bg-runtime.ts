@@ -570,14 +570,6 @@ export class BgRuntimeParser {
           gameCount,
         });
         this.lastGameCountByTable.set(tableId, gameCount);
-      } else if (isExhaustedShoeRoadDrop(previous, gameCount, previousHands)) {
-        // Missed NEXT_SHOES: a dealt shoe's road collapsed to an early new-shoe
-        // plate. 29→18 mid-shoe is isInflatedRoadCorrection, not this.
-        this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
-        this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', {
-          reason: 'protocol-shuffle',
-        });
-        this.lastGameCountByTable.set(tableId, gameCount);
       } else if (isPlausibleGameCountAdvance(previousRoad, gameCount)) {
         this.lastGameCountByTable.set(tableId, gameCount);
       }
@@ -738,7 +730,9 @@ export class BgRuntimeParser {
       : undefined;
     const shuffleEvent = table.shuffleEvent === true;
     if (token === undefined) {
-      if (shuffleEvent) this.promoteProtocolShuffle(tableId, observedAt, events);
+      if (shuffleEvent && this.lastShoeResetByTable.has(tableId)) {
+        this.promoteProtocolShuffle(tableId, observedAt, events);
+      }
       return;
     }
     const previousToken = this.lastShoeResetByTable.get(tableId);
@@ -773,8 +767,9 @@ export class BgRuntimeParser {
       // shuffleEvent. That is a correction, not a new shoe.
       if (shuffleEvent && inflatedCorrection) return;
       // A leftover currentShoe token on first attach is not a shuffle.
-      // startshuffling/endshuffling sets shuffleEvent even on the first token.
-      if (previousToken !== undefined || shuffleEvent) {
+      // startshuffling/endshuffling may set shuffleEvent on that first token;
+      // only a later token change is protocol-shuffle.
+      if (previousToken !== undefined) {
         this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
       }
       return;
@@ -802,6 +797,7 @@ export class BgRuntimeParser {
     observedAt: string,
     events: NormalizedEvent[],
   ): void {
+    if (!this.lastShoeResetByTable.has(tableId)) return;
     if (this.evidenceByTable.get(tableId)?.reason === 'protocol-shuffle') return;
     this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
     this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });

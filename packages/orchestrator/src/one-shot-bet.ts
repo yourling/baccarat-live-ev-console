@@ -8,7 +8,12 @@ import {
   type ShoeStateProjection,
   type TableProfile,
 } from '@baccarat/contracts';
-import { SqliteLedger } from '@baccarat/ledger-state';
+import {
+  SqliteLedger,
+  effectiveShoeBaseline,
+  isPhysicalShoeBettable,
+  operationalReceiptCommitStarted,
+} from '@baccarat/ledger-state';
 import { RiskManager } from '@baccarat/risk-execution';
 
 export interface OneShotBetCommand {
@@ -22,12 +27,15 @@ export type OneShotBetRejectionReason =
   | 'invalid-command'
   | 'executor-required'
   | 'duplicate'
+  | 'connected-required'
+  | 'betting-window-required'
+  | 'physical-shoe-required'
   | 'risk-rejected'
   | 'exact-amount-not-reserved'
   | 'receipt-mismatch'
   | 'platform-rejected';
 
-type OneShotUnknownReason = 'executor-no-receipt' | 'executor-error' | 'platform-unknown';
+type OneShotUnknownReason = 'executor-no-receipt' | 'executor-error' | 'platform-unknown' | 'receipt-mismatch';
 
 export type OneShotBetResult =
   | { readonly status: 'ACCEPTED'; readonly receipt: BetReceipt; readonly reservationId: string }
@@ -65,6 +73,14 @@ export async function executeOneShotBet(
   if (invalid) return rejected(invalid);
   if (context.executor === null) return rejected('executor-required');
   if (hasDuplicate(context.ledger, context.tableId, command)) return rejected('duplicate');
+  if (context.projection.connectionStatus !== 'CONNECTED') return rejected('connected-required');
+  if (context.projection.status !== 'BETTING_WINDOW') return rejected('betting-window-required');
+  if (
+    effectiveShoeBaseline(context.projection) !== 'physical-shoe'
+    || !isPhysicalShoeBettable(context.projection)
+  ) {
+    return rejected('physical-shoe-required');
+  }
 
   const normalizedAmount = String(command.amount);
   const intent: BetIntent = {
@@ -103,11 +119,11 @@ export async function executeOneShotBet(
     return unknown(context, reservationId, 'executor-error');
   }
   if (receipt === null) return unknown(context, reservationId, 'executor-no-receipt');
-  if (!receiptMatchesIntent(receipt, intent, reservationId)) {
-    context.riskManager.release(reservationId, false, 'receipt-mismatch', receipt.receiptId);
-    return rejected('receipt-mismatch', { reservationId });
-  }
-  if (receipt.status === 'SIMULATED') {
+  if (!receiptMatchesIntent(receipt, intent, reservationId) || receipt.status === 'SIMULATED') {
+    if (operationalReceiptCommitStarted(receipt.raw)) {
+      context.riskManager.markUnknown(reservationId, 'one-shot-receipt-mismatch', receipt.receiptId);
+      return { status: 'UNKNOWN', reason: 'receipt-mismatch', receipt, reservationId };
+    }
     context.riskManager.release(reservationId, false, 'receipt-mismatch', receipt.receiptId);
     return rejected('receipt-mismatch', { reservationId });
   }

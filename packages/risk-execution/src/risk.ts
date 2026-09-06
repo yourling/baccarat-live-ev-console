@@ -305,7 +305,7 @@ export class RiskManager {
   private openReservedExposure(): number {
     let exposure = 0;
     for (const reservation of this.reservations.values()) {
-      if (reservation.status === 'RESERVED') exposure += reservation.maxLoss;
+      if (holdsRiskExposure(reservation.status)) exposure += reservation.maxLoss;
     }
     return exposure;
   }
@@ -313,7 +313,7 @@ export class RiskManager {
   private openReservedExecutions(): number {
     let count = 0;
     for (const reservation of this.reservations.values()) {
-      if (reservation.status === 'RESERVED') count += 1;
+      if (holdsRiskExposure(reservation.status)) count += 1;
     }
     return count;
   }

@@ -14,6 +14,8 @@ import {
 } from '@baccarat/contracts';
 import {
   SqliteLedger,
+  effectiveShoeBaseline,
+  isPhysicalShoeBettable,
   type OperationalWagerRecord,
 } from '@baccarat/ledger-state';
 import { RiskManager } from '@baccarat/risk-execution';
@@ -90,6 +92,15 @@ export async function executeControlledOperationalWager(
     : undefined;
   if (projection.connectionStatus !== 'CONNECTED') return rejected('connected-required');
   if (projection.status !== 'BETTING_WINDOW') return rejected('betting-window-required');
+  if (
+    effectiveShoeBaseline(projection) !== 'physical-shoe'
+    || !isPhysicalShoeBettable(projection)
+  ) {
+    return rejected('physical-shoe-required');
+  }
+  if (context.riskManager.hasUnknownReservations()) {
+    return rejected('unknown-execution-pending');
+  }
   if (projection.sealed) return rejected('shoe-sealed');
   if (command.source !== 'manual' && !projection.currentHandId) return rejected('current-hand-required');
   if (command.source === 'manual' && !manualHandId && !projection.currentHandId) {

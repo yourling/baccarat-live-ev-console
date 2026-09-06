@@ -318,6 +318,7 @@ export function evaluateLiveExecutionReadiness(
     reasons.push('table-connection-not-restored');
   }
   if (input.projection.sealed) reasons.push('shoe-sealed');
+  if (input.hasUnknownExecution) reasons.push('unknown-execution-pending');
   if (input.hasSettlementGap) reasons.push('settlement-gap');
   return reasons;
 }

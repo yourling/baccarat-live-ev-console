@@ -532,6 +532,20 @@ export class TableActor {
     if (!isPhysicalShoeBettable(projection)) {
       return;
     }
+    const closesAt = event.closesAt ?? projection.bettingWindowClosesAt;
+    const closesAtMs = typeof closesAt === 'string' && closesAt.length > 0 ? Date.parse(closesAt) : Number.NaN;
+    if (typeof closesAt !== 'string' || closesAt.length === 0 || !Number.isFinite(closesAtMs)) {
+      return;
+    }
+    const eventMs = Date.parse(event.timestamp);
+    const liveSkewMs = Number.isFinite(eventMs) ? Math.abs(Date.now() - eventMs) : Number.POSITIVE_INFINITY;
+    const windowNowMs = liveSkewMs < 60_000 ? Date.now() : eventMs;
+    if (Number.isFinite(windowNowMs) && closesAtMs - windowNowMs < 3_000) {
+      return;
+    }
+    if (this.riskManager.hasUnknownReservations()) {
+      return;
+    }
     const evalKey = `${event.shoeId}:${event.handId}:${event.market}`;
     const previousEval = this.evaluatedWindows.get(evalKey);
     const hasClosesAt = typeof event.closesAt === 'string' && event.closesAt.length > 0;
@@ -589,14 +603,6 @@ export class TableActor {
         return;
       }
     }
-    const closesAt = event.closesAt ?? projection.bettingWindowClosesAt;
-    const eventMs = Date.parse(event.timestamp);
-    const closesAtMs = typeof closesAt === 'string' ? Date.parse(closesAt) : Number.NaN;
-    const liveSkewMs = Number.isFinite(eventMs) ? Math.abs(Date.now() - eventMs) : Number.POSITIVE_INFINITY;
-    const windowNowMs = liveSkewMs < 60_000 ? Date.now() : eventMs;
-    if (Number.isFinite(windowNowMs) && Number.isFinite(closesAtMs) && closesAtMs - windowNowMs < 3_000) {
-      return;
-    }
     const handPlaced = placedHandKey(this.tableId, event.shoeId, event.handId);
     if (this.placedHandKeys.has(handPlaced)) return;
     const reminder = reminderKey(event.shoeId, event.handId, projection.modelRevision, event.market);
@@ -645,16 +651,25 @@ export class TableActor {
     receipt ??= unknownExecutionReceipt(intent, reservation, 'executor-no-receipt');
     if (receipt) {
       if (!receiptMatchesIntent(receipt, intent, reservation)) {
-        this.riskManager.release(reservation.reservationId, false, 'receipt-mismatch', receipt.receiptId);
+        const uncommittedRejected = receipt.status === 'REJECTED'
+          && operationalReceiptCommitStarted(receipt.raw) !== true;
+        if (uncommittedRejected) {
+          this.riskManager.release(reservation.reservationId, false, 'receipt-mismatch', receipt.receiptId);
+        } else {
+          this.riskManager.markUnknown(reservation.reservationId, 'receipt-mismatch', receipt.receiptId);
+        }
         return;
       }
       if (isRetryableWindowRejection(receipt)) {
-        this.placedKeys.delete(placed);
-        this.placedHandKeys.delete(handPlaced);
-        this.reminderKeys.delete(reminder);
-        this.evaluatedWindows.delete(evalKey);
-        this.riskManager.release(reservation.reservationId, false, 'window-not-ready', receipt.receiptId);
-        return;
+        if (operationalReceiptCommitStarted(receipt.raw) !== true) {
+          this.placedKeys.delete(placed);
+          this.placedHandKeys.delete(handPlaced);
+          this.reminderKeys.delete(reminder);
+          this.evaluatedWindows.delete(evalKey);
+          this.riskManager.release(reservation.reservationId, false, 'window-not-ready', receipt.receiptId);
+          return;
+        }
+        this.riskManager.markUnknown(reservation.reservationId, 'window-not-ready-committed', receipt.receiptId);
       }
       const receiptEvent: NormalizedEvent = {
         type: 'betReceipt',
@@ -736,6 +751,14 @@ export class TableActor {
       return;
     }
     if (receipt.status === 'REJECTED') {
+      if (operationalReceiptCommitStarted(receipt.raw)) {
+        this.riskManager.markUnknown(
+          receipt.reservationId,
+          'committed-rejection-uncertain',
+          receipt.receiptId,
+        );
+        return;
+      }
       this.riskManager.release(receipt.reservationId, false, 'receipt-rejected', receipt.receiptId);
       return;
     }

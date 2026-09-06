@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Orchestrator, TableActor } from '../src/index.js';
 import { SqliteLedger } from '@baccarat/ledger-state';
 import { SimulatedAdapter, type BetExecutionRequest } from '@baccarat/adapter-contract';
-import { FixtureBuilder } from '@baccarat/simulator-fixtures';
+import { FixtureBuilder as SimulatorFixtureBuilder } from '@baccarat/simulator-fixtures';
 import { RiskManager } from '@baccarat/risk-execution';
 import type {
   BetIntent,
@@ -59,6 +59,25 @@ function acceptingLiveExecutor() {
       return liveReceipt(request, 'ACCEPTED', `live-accepted-${count}`);
     },
   };
+}
+
+function futureClosesAt(offsetMs = 10_000): string {
+  return new Date(Date.now() + offsetMs).toISOString();
+}
+
+function withClosesAt(events: NormalizedEvent[], closesAt = futureClosesAt()): NormalizedEvent[] {
+  return events.map(event => (
+    event.type === 'bettingWindowOpened'
+    && (typeof event.closesAt !== 'string' || event.closesAt.length === 0)
+      ? { ...event, closesAt }
+      : event
+  ));
+}
+
+class FixtureBuilder extends SimulatorFixtureBuilder {
+  build(): NormalizedEvent[] {
+    return withClosesAt(super.build());
+  }
 }
 
 describe('orchestrator table actor', () => {
@@ -127,7 +146,7 @@ describe('orchestrator table actor', () => {
     ledger.close();
   });
 
-  it('allows one-shot manual betting before a physical shoe baseline is known', async () => {
+  it('rejects one-shot manual betting before a physical shoe baseline is known', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile = { ...simProfile(), autoBetArmedByDefault: false };
     let requestCount = 0;
@@ -166,24 +185,15 @@ describe('orchestrator table actor', () => {
     });
 
     expect(result).toEqual(expect.objectContaining({
-      status: 'ACCEPTED',
-      receipt: expect.objectContaining({
-        receiptId: 'live-unknown-baseline',
-        status: 'ACCEPTED',
-      }),
+      status: 'REJECTED',
+      reason: 'physical-shoe-required',
     }));
-    expect(requestCount).toBe(1);
-    expect(ledger.listReservations('t1')).toContainEqual(expect.objectContaining({
-      tableId: 't1',
-      shoeId: 's1',
-      handId: 'h1',
-      market: 'bankerPair',
-      status: 'RESERVED',
-    }));
+    expect(requestCount).toBe(0);
+    expect(ledger.listReservations('t1')).toEqual([]);
     ledger.close();
   });
 
-  it('allows one-shot manual betting through stale local connection and hand state', async () => {
+  it('rejects one-shot manual betting while disconnected or after the shoe baseline is unknown', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile: TableProfile = {
       ...simProfile(),
@@ -239,7 +249,10 @@ describe('orchestrator table actor', () => {
       market: 'bankerPair',
       amount: 20,
     });
-    expect(disconnected).toEqual(expect.objectContaining({ status: 'ACCEPTED' }));
+    expect(disconnected).toEqual(expect.objectContaining({
+      status: 'REJECTED',
+      reason: 'connected-required',
+    }));
 
     await orchestrator.enqueue('t1', connectionRestored);
     await orchestrator.enqueue('t1', secondHandWindow);
@@ -251,8 +264,11 @@ describe('orchestrator table actor', () => {
       market: 'bankerPair',
       amount: 20,
     });
-    expect(wrongHand).toEqual(expect.objectContaining({ status: 'ACCEPTED' }));
-    expect(requestCount).toBe(2);
+    expect(wrongHand).toEqual(expect.objectContaining({
+      status: 'REJECTED',
+      reason: 'physical-shoe-required',
+    }));
+    expect(requestCount).toBe(0);
     ledger.close();
   });
 
@@ -654,7 +670,7 @@ describe('orchestrator table actor', () => {
     await actor.flush();
 
     expect(ledger.listReceipts('t1')).toHaveLength(0);
-    expect(orchestrator.getReservations('t1')[0]?.status).toBe('RELEASED');
+    expect(orchestrator.getReservations('t1')[0]?.status).toBe('UNKNOWN');
     expect(orchestrator.getReservations('t1')[0]?.releaseReason).toBe('receipt-mismatch');
     ledger.close();
   });
@@ -749,11 +765,133 @@ describe('orchestrator table actor', () => {
       shoeId: 's1',
       handId: 'h1',
       market: 'bankerPair',
+      closesAt: futureClosesAt(),
     };
     await orchestrator.enqueue('t1', retryWindow);
     await actor.flush();
     expect(attempts).toBe(2);
     expect(ledger.listReceipts('t1')[0]?.receipt.status).toBe('ACCEPTED');
+    ledger.close();
+  });
+
+  it('does not retry a committed round-not-current pair rejection', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile = simProfile();
+    let attempts = 0;
+    const executor = {
+      requestBet: async (request: { readonly intent: BetIntent; readonly reservationId?: string }) => {
+        attempts += 1;
+        return {
+          receiptId: 'window-not-ready-committed',
+          intentId: request.intent.intentId,
+          reservationId: request.reservationId ?? '',
+          status: 'REJECTED' as const,
+          amount: request.intent.amount,
+          market: request.intent.market,
+          mode: request.intent.mode,
+          createdAt: new Date().toISOString(),
+          raw: { reason: 'round-not-current', commitStarted: true },
+        };
+      },
+    };
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor });
+    const actor = orchestrator.registerTable(profile, 'simulated', 10);
+    const first = new FixtureBuilder('t1')
+      .newShoe('s1', profile)
+      .openWindow('s1', 'h1', 'bankerPair')
+      .build();
+    await Promise.all(first.map(event => orchestrator.enqueue('t1', event)));
+    await actor.flush();
+    expect(attempts).toBe(1);
+    expect(actor['placedKeys'].has('t1:s1:h1:bankerPair')).toBe(true);
+    expect(actor['placedHandKeys'].has('t1:s1:h1')).toBe(true);
+    expect(orchestrator.getReservations('t1')[0]).toEqual(expect.objectContaining({
+      status: 'UNKNOWN',
+      releaseReason: 'window-not-ready-committed',
+    }));
+
+    const retryWindow: NormalizedEvent = {
+      type: 'bettingWindowOpened',
+      eventId: newId('evt'),
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: ledger.nextSourceSeq('t1'),
+      shoeId: 's1',
+      handId: 'h1',
+      market: 'bankerPair',
+      closesAt: futureClosesAt(),
+    };
+    await orchestrator.enqueue('t1', retryWindow);
+    await actor.flush();
+    expect(attempts).toBe(1);
+    expect(actor['placedKeys'].has('t1:s1:h1:bankerPair')).toBe(true);
+    expect(ledger.listReceipts('t1')[0]?.receipt.status).toBe('REJECTED');
+    ledger.close();
+  });
+
+  it('does not auto-bet pairs when closesAt is missing', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile = simProfile();
+    const requests: BetExecutionRequest[] = [];
+    const executor = {
+      requestBet: async (request: BetExecutionRequest) => {
+        requests.push(request);
+        return liveReceipt(request, 'ACCEPTED', 'should-not-execute');
+      },
+    };
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor });
+    const actor = orchestrator.registerTable(profile, 'live', 10);
+    const setup = new SimulatorFixtureBuilder('t1').newShoe('s1', profile).build();
+    await Promise.all(setup.map(event => orchestrator.enqueue('t1', event)));
+    await actor.flush();
+    const openWindow: NormalizedEvent = {
+      type: 'bettingWindowOpened',
+      eventId: newId('evt'),
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: ledger.nextSourceSeq('t1'),
+      shoeId: 's1',
+      handId: 'h1',
+      market: 'bankerPair',
+    };
+    await orchestrator.enqueue('t1', openWindow);
+    await actor.flush();
+    expect(requests).toEqual([]);
+    expect(ledger.listReceipts('t1')).toEqual([]);
+    ledger.close();
+  });
+
+  it('does not auto-bet pairs when the betting window has less than 3s remaining', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile = simProfile();
+    const requests: BetExecutionRequest[] = [];
+    const executor = {
+      requestBet: async (request: BetExecutionRequest) => {
+        requests.push(request);
+        return liveReceipt(request, 'ACCEPTED', 'should-not-execute');
+      },
+    };
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor });
+    const actor = orchestrator.registerTable(profile, 'live', 10);
+    const setup = new SimulatorFixtureBuilder('t1').newShoe('s1', profile).build();
+    await Promise.all(setup.map(event => orchestrator.enqueue('t1', event)));
+    await actor.flush();
+    const now = Date.now();
+    const shortWindow: NormalizedEvent = {
+      type: 'bettingWindowOpened',
+      eventId: newId('evt'),
+      tableId: 't1',
+      timestamp: new Date(now).toISOString(),
+      sourceSeq: ledger.nextSourceSeq('t1'),
+      shoeId: 's1',
+      handId: 'h1',
+      market: 'bankerPair',
+      closesAt: new Date(now + 2_000).toISOString(),
+    };
+    await orchestrator.enqueue('t1', shortWindow);
+    await actor.flush();
+    expect(requests).toEqual([]);
+    expect(ledger.listReceipts('t1')).toEqual([]);
     ledger.close();
   });
 
@@ -964,6 +1102,7 @@ describe('orchestrator table actor', () => {
       shoeId: 's1',
       handId: 'h1',
       market: 'bankerPair',
+      closesAt: futureClosesAt(),
     };
     await orchestrator.enqueue('t1', window);
     expect(ledger.listReceipts('t1').length).toBe(1);
@@ -1172,6 +1311,48 @@ describe('orchestrator table actor', () => {
 
 
 describe('unknown monitor-session baseline execution', () => {
+  it('rejects an operational wager before a physical shoe baseline is known', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile = { ...simProfile(), autoBetArmedByDefault: false };
+    let requestCount = 0;
+    const orchestrator = new Orchestrator({
+      ledger,
+      riskLimits,
+      operationalExecutor: {
+        requestOperationalWager: async () => {
+          requestCount += 1;
+          throw new Error('should-not-execute');
+        },
+      },
+    });
+    const actor = orchestrator.registerTable(profile, 'live', 10);
+    const fixture = new FixtureBuilder('t1')
+      .newShoe('monitor-session-t1', profile)
+      .openWindow('monitor-session-t1', 'h1', 'bankerPair')
+      .build();
+    const monitorStart = {
+      ...fixture[0],
+      baseline: 'unknown-monitor-session',
+    } as unknown as NormalizedEvent;
+
+    await orchestrator.enqueue('t1', monitorStart);
+    await orchestrator.enqueue('t1', fixture[1]!);
+    await actor.flush();
+
+    const result = await actor.placeOperationalWager({
+      market: 'bankerPair',
+      amount: 20,
+      source: 'manual',
+    });
+    expect(result).toEqual(expect.objectContaining({
+      status: 'REJECTED',
+      reason: 'physical-shoe-required',
+    }));
+    expect(requestCount).toBe(0);
+    expect(actor.getProjection().shoeBaseline).toBe('unknown-monitor-session');
+    ledger.close();
+  });
+
   it('does not automatically execute pair bets before a physical shoe baseline is known', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile = simProfile();

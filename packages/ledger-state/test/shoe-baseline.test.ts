@@ -92,7 +92,10 @@ describe('effectiveShoeBaseline', () => {
     expect(isVerifiedPhysicalShoeReason('attach')).toBe(false);
     expect(isVerifiedPhysicalShoeReason(undefined)).toBe(false);
     expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 1 })).toBe(true);
-    expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 12 })).toBe(true);
+    expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 8 })).toBe(true);
+    expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 9 })).toBe(false);
+    expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 12 })).toBe(false);
+    expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 20 })).toBe(false);
     expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 0 })).toBe(false);
     expect(isVerifiedPhysicalShoeEvidence({ reason: 'road-wrap', gameCount: 21 })).toBe(false);
   });

@@ -262,51 +262,8 @@
     }
   }
 
-  // ---- 闲置警告弹窗自动处理（预过期提醒，如“长时间未操作，是否继续”） ----
-
-  function isIdleWarningText(text) {
-    return /长时间未操作|您已离开|即将退出|即将过期|会话即将|超时提示|inactiv|still\s+there|about\s+to\s+expire|session\s+is\s+about/i.test(text);
-  }
-
-  function isInsideDialog(el) {
-    try {
-      return !!el.closest(
-        '[role="dialog"],[role="alertdialog"],[class*="dialog"],[class*="modal"],[class*="popup"],[class*="layer"],[class*="mask"],[class*="overlay"],[class*="toast"],[class*="notice"],[class*="alert"],[class*="tip"]'
-      );
-    } catch (_) {
-      return false;
-    }
-  }
-
   function isSessionConflictText(text) {
     return /在其他地方启动了(?:对话|会话)|其他地方.*(?:对话|会话)|(?:对话|会话)已在其他|joined from another (?:device|location|place|window|tab)|(?:conversation|session) (?:has been |was )?started (?:elsewhere|in another)|(?:game|session) already open in another/i.test(text);
-  }
-
-  function dismissIdleDialog() {
-    if (betInFlight > 0) return;
-    if (isSessionConflictText(String(document.body?.innerText || document.body?.textContent || ''))) return;
-    const strong = [];
-    const fallback = [];
-    for (const el of document.querySelectorAll('button, a, [role="button"]')) {
-      const text = String(el.innerText || el.textContent || '').trim();
-      if (!text || text.length > 40) continue;
-      if (/退出|注销|登出|切换账号|下注|投注|确认下注|log\s*out|sign\s*out|exit|place\s*\w*\s*bet/i.test(text)) continue;
-      if (/继续游戏|仍要继续|保持登录|保持在线|我还在|stay|continue|resume|keep\s*me\s*logged|i'?m\s*still/i.test(text)) {
-        strong.push(el);
-      } else if (isInsideDialog(el) && /继续|确定|好的|知道了|ok|confirm/i.test(text)) {
-        fallback.push(el);
-      }
-    }
-    for (const el of strong.concat(fallback)) {
-      if (!isVisibleElement(el)) continue;
-      try {
-        el.click();
-      } catch (_) {
-        continue;
-      }
-      sendSessionAction('idle-dialog-dismissed', String(el.innerText || el.textContent || '').trim().slice(0, 40));
-      return;
-    }
   }
 
   // ---- 会话过期检测 ----
@@ -367,7 +324,6 @@
   function scan() {
     const bodyText = document.body ? document.body.innerText : '';
     checkSessionExpired(bodyText);
-    if (isIdleWarningText(bodyText)) dismissIdleDialog();
 
     if (!diagnosticSent) {
       diagnosticSent = true;

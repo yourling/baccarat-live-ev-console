@@ -187,7 +187,7 @@ describe('PragmaticRuntimeParser', () => {
     expect(parser.shoeEvidence('bc281koreanch281')).toEqual({ reason: 'attach' });
   });
 
-  it('promotes a watched table when the first shoeReset is a live shuffle event', () => {
+  it('keeps a watched table attach when the first shoeReset is a live shuffle event', () => {
     const parser = new PragmaticRuntimeParser();
     parser.parse(snapshot([{
       tableId: 'tobcspbaccarat92',
@@ -204,7 +204,16 @@ describe('PragmaticRuntimeParser', () => {
       shoeReset: 'protocol:tobcspbaccarat92:10',
       shuffleEvent: true,
     }]));
-    expect(shuffled.filter(event => event.type === 'newShoeSignal')).toEqual([
+    expect(shuffled.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
+    expect(parser.shoeEvidence('tobcspbaccarat92')).toEqual({ reason: 'attach' });
+
+    const promoted = parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat92',
+      roundId: '16431832310',
+      source: 'protocol',
+      shoeReset: 'protocol:tobcspbaccarat92:20',
+    }]));
+    expect(promoted.filter(event => event.type === 'newShoeSignal')).toEqual([
       expect.objectContaining({
         type: 'newShoeSignal',
         baseline: 'physical-shoe',
@@ -246,7 +255,7 @@ describe('PragmaticRuntimeParser', () => {
       shoeReset: 'protocol:spto41bctorobc41:10',
       shuffleEvent: true,
     }]));
-    expect(first.filter(event => event.type === 'newShoeSignal' && event.baseline === 'physical-shoe')).toHaveLength(1);
+    expect(first.filter(event => event.type === 'newShoeSignal' && event.baseline === 'physical-shoe')).toHaveLength(0);
     const firstShoe = parser.currentShoeId('spto41bctorobc41');
 
     parser.parse(snapshot([{
@@ -275,6 +284,11 @@ describe('PragmaticRuntimeParser', () => {
 
   it('does not open another shoe for endshuffling on the same unused shuffle token', () => {
     const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'spto41bctorobc41',
+      source: 'protocol',
+      shoeReset: 'protocol:spto41bctorobc41:10',
+    }]));
     parser.parse(snapshot([{
       tableId: 'spto41bctorobc41',
       source: 'protocol',
@@ -350,6 +364,13 @@ describe('PragmaticRuntimeParser', () => {
       gameCount: 78,
       source: 'protocol',
       shoeReset: 'protocol:tobcspbaccarat61:10',
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'tobcspbaccarat61',
+      roundId: 'hand-78',
+      gameCount: 78,
+      source: 'protocol',
+      shoeReset: 'protocol:tobcspbaccarat61:20',
       shuffleEvent: true,
     }]));
     const shoe = parser.currentShoeId('tobcspbaccarat61');
@@ -364,7 +385,7 @@ describe('PragmaticRuntimeParser', () => {
       roundId: 'hand-5',
       gameCount: 5,
       source: 'protocol',
-      shoeReset: 'protocol:tobcspbaccarat61:10',
+      shoeReset: 'protocol:tobcspbaccarat61:20',
     }]));
     expect(next.filter(event => event.type === 'newShoeSignal')).toHaveLength(0);
     expect(parser.currentShoeId('tobcspbaccarat61')).toBe(shoe);
@@ -569,6 +590,7 @@ describe('PragmaticRuntimeParser', () => {
   it('treats a lagged road wrap as joinable even past #2', () => {
     expect(isJoinableNewShoeRoadCount(48, 5)).toBe(true);
     expect(isJoinableNewShoeRoadCount(48, 1)).toBe(true);
+    expect(isJoinableNewShoeRoadCount(29, 18)).toBe(false);
     expect(isJoinableNewShoeRoadCount(34, 33)).toBe(false);
     expect(isJoinableNewShoeRoadCount(undefined, 1)).toBe(false);
   });

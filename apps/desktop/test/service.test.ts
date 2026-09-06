@@ -176,6 +176,7 @@ function openedPlatformRound(tableId: string, eventId: string, handId: string): 
     shoeId: `monitor-session-${tableId}`,
     handId,
     market: 'bankerPair',
+    closesAt: new Date(Date.now() + 12_000).toISOString(),
   };
 }
 
@@ -1614,7 +1615,7 @@ describe('desktop console demo sessions', () => {
     }
   });
 
-  it('allows a one-shot live bet before a physical shoe baseline is known', async () => {
+  it('rejects a one-shot live bet before a physical shoe baseline is known', async () => {
     const service = new DesktopConsoleService(':memory:');
     const tableId = 'D055';
     const handId = 'GD055-midshoe-1';
@@ -1648,20 +1649,9 @@ describe('desktop console demo sessions', () => {
       await service.injectEvent(monitorShoeEvent(tableId, 'monitor-session-start'));
       await service.injectEvent(openedPlatformRound(tableId, 'open-midshoe', handId));
 
-      const result = await service.executeOneShotLiveBet(command);
-
-      expect(result.status).toBe('ACCEPTED');
-      expect(requestBet).toHaveBeenCalledTimes(1);
-      expect(requestBet).toHaveBeenCalledWith(expect.objectContaining({
-        mode: 'live',
-        intent: expect.objectContaining({
-          tableId,
-          shoeId: `monitor-session-${tableId}`,
-          handId,
-        }),
-      }));
-      expect(liveGateCalls).toContain(true);
-      expect(result.snapshot.snapshot.tables[tableId]?.projection.shoeBaseline)
+      await expect(service.executeOneShotLiveBet(command)).rejects.toThrow(/physical-shoe-required/);
+      expect(requestBet).not.toHaveBeenCalled();
+      expect(service.snapshot().snapshot.tables[tableId]?.projection.shoeBaseline)
         .toBe('unknown-monitor-session');
     } finally {
       await service.close();

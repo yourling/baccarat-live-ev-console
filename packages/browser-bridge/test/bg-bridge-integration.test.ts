@@ -128,7 +128,7 @@ describe('BG bridge integration', () => {
       encoding: 'text',
       data,
     });
-    expect(server.shoeEvidence('A31')).toEqual({ reason: 'protocol-shuffle' });
+    expect(server.shoeEvidence('A31')).toEqual({ reason: 'attach' });
     expect(server.getDiscoveredRooms()[0]?.tables.map(table => table.tableId)).toEqual(['A31']);
   });
 
@@ -137,7 +137,7 @@ describe('BG bridge integration', () => {
     server.ingestClientMessage(bgState([
       { tableId: 'C05', roundId: '1910001', shuffleEvent: true, shoeReset: 'seq:1910001', source: 'protocol' },
     ]));
-    expect(server.shoeEvidence('C05')).toEqual({ reason: 'protocol-shuffle' });
+    expect(server.shoeEvidence('C05')).toEqual({ reason: 'attach' });
     expect(server.getDiscoveredRooms()[0]?.tables.map(table => table.tableId)).toEqual(['C05']);
   });
 

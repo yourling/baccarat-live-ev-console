@@ -35,7 +35,7 @@ export interface PragmaticRuntimeSnapshot {
  * Countdown is not parsed as gameCount. A deep-road drop to an early count
  * is a new shoe; open it on the first observation.
  */
-const ROAD_WRAP_MAX = 20;
+const ROAD_WRAP_MAX = 8;
 const ROAD_WRAP_MIN_PREVIOUS = 10;
 const ROAD_WRAP_MIN_DROP = 8;
 
@@ -495,7 +495,9 @@ export class PragmaticRuntimeParser {
       : undefined;
     const shuffleEvent = table.shuffleEvent === true;
     if (token === undefined) {
-      if (shuffleEvent) this.promoteProtocolShuffle(tableId, observedAt, events);
+      if (shuffleEvent && this.lastShoeResetByTable.has(tableId)) {
+        this.promoteProtocolShuffle(tableId, observedAt, events);
+      }
       return;
     }
     const previousToken = this.lastShoeResetByTable.get(tableId);
@@ -503,8 +505,9 @@ export class PragmaticRuntimeParser {
       this.lastShoeResetByTable.set(tableId, token);
       this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
       // A leftover currentShoe token on first attach is not a shuffle.
-      // startshuffling/endshuffling sets shuffleEvent even on the first token.
-      if (previousToken !== undefined || shuffleEvent) {
+      // startshuffling/endshuffling may set shuffleEvent on that first token;
+      // only a later token change is protocol-shuffle.
+      if (previousToken !== undefined) {
         this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
       }
       return;
@@ -531,6 +534,7 @@ export class PragmaticRuntimeParser {
     observedAt: string,
     events: NormalizedEvent[],
   ): void {
+    if (!this.lastShoeResetByTable.has(tableId)) return;
     if (this.evidenceByTable.get(tableId)?.reason === 'protocol-shuffle') return;
     this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
     this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });

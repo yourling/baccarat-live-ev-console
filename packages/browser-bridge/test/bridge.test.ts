@@ -919,30 +919,29 @@ describe('browser bridge server', () => {
     await expect(server.requestBet(betRequest('live'))).rejects.toThrow(/exactly one browser extension connection/i);
   });
 
-  it('fails closed for live bets with multiple extension sockets without sending a bet request', async () => {
-    const server = new BrowserBridgeServer({ port: 0, betTimeoutMs: 5 });
+  it('rejects a second extension socket so live bets stay on the first connection', async () => {
+    const server = new BrowserBridgeServer({ port: 0, betTimeoutMs: 50 });
     const port = await server.start();
-    const clients = [
-      extensionClient(port),
-      extensionClient(port),
-    ];
-    const betRequestCount = { value: 0 };
+    const first = extensionClient(port);
     try {
-      await Promise.all(clients.map(client => new Promise<void>((resolve, reject) => {
-        client.once('open', resolve);
-        client.once('error', reject);
-      })));
-      for (const client of clients) {
-        client.on('message', data => {
-          const message = JSON.parse(data.toString()) as { readonly kind?: string };
-          if (message.kind === 'betRequest') betRequestCount.value += 1;
+      await new Promise<void>((resolve, reject) => {
+        first.once('open', resolve);
+        first.once('error', reject);
+      });
+      const closed = await new Promise<{ code: number }>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('second socket close timeout')), 2000);
+        const second = extensionClient(port);
+        second.once('close', code => {
+          clearTimeout(timer);
+          resolve({ code });
         });
-      }
-
-      await expect(server.requestBet(betRequest('live'))).rejects.toThrow(/exactly one browser extension connection/i);
-      expect(betRequestCount.value).toBe(0);
+        second.once('error', () => undefined);
+      });
+      expect(closed.code).toBe(1008);
+      expect(bridgeSockets(server).size).toBe(1);
+      await expect(server.requestBet(betRequest('live'))).rejects.toThrow(/timed out|no receipt|exactly one/i);
     } finally {
-      for (const client of clients) client.close();
+      first.close();
       await server.close();
     }
   });
@@ -1165,21 +1164,18 @@ describe('browser bridge server', () => {
       await dispatched;
       if (requestId === undefined) throw new Error('live bet request id missing');
 
-      const replacementClient = extensionClient(port);
-      newClient = replacementClient;
-      await new Promise<void>((resolve, reject) => {
-        replacementClient.once('open', resolve);
-        replacementClient.once('error', reject);
+      const replacementClosed = new Promise<number>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('replacement socket close timeout')), 2000);
+        const replacementClient = extensionClient(port);
+        newClient = replacementClient;
+        replacementClient.once('close', code => {
+          clearTimeout(timer);
+          resolve(code);
+        });
+        replacementClient.once('error', () => undefined);
       });
-      const serverSockets = [...bridgeSockets(server)];
-      const replacementServerSocket = serverSockets[1];
-      if (replacementServerSocket === undefined) throw new Error('replacement extension socket missing');
-      ingestFromSocket(server, {
-        kind: 'betResult',
-        requestId,
-        receipt: acceptedLiveReceipt,
-      }, replacementServerSocket);
-
+      await expect(replacementClosed).resolves.toBe(1008);
+      expect(bridgeSockets(server).size).toBe(1);
       expect(bridgePendingBets(server).has(requestId)).toBe(true);
       originalClient.send(JSON.stringify({
         kind: 'betResult',
@@ -1220,48 +1216,35 @@ describe('browser bridge server', () => {
     await server.close();
   });
 
-  it('fails closed for live arming with multiple sockets while still broadcasting liveOff', async () => {
+  it('rejects a second extension socket and still arms liveOn on the first', async () => {
     const server = new BrowserBridgeServer({ port: 0 });
     const port = await server.start();
-    const clients = [
-      extensionClient(port),
-      extensionClient(port),
-    ];
-    const liveOnCount = { value: 0 };
-    const liveOffCount = { value: 0 };
-    let resolveLiveOff: (() => void) | undefined;
-    const liveOffReceived = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('timed out waiting for liveOff broadcast')), 100);
-      resolveLiveOff = () => {
-        clearTimeout(timer);
-        resolve();
-      };
-    });
+    const first = extensionClient(port);
     try {
-      await Promise.all(clients.map(client => new Promise<void>((resolve, reject) => {
-        client.once('open', resolve);
-        client.once('error', reject);
-      })));
-      for (const client of clients) {
-        client.on('message', data => {
-          const message = JSON.parse(data.toString()) as { readonly kind?: string; readonly name?: string };
-          if (message.kind !== 'command') return;
-          if (message.name === 'liveOn') liveOnCount.value += 1;
-          if (message.name === 'liveOff') {
-            liveOffCount.value += 1;
-            if (liveOffCount.value === clients.length) resolveLiveOff?.();
-          }
+      await new Promise<void>((resolve, reject) => {
+        first.once('open', resolve);
+        first.once('error', reject);
+      });
+      const closed = await new Promise<number>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('second socket close timeout')), 2000);
+        const second = extensionClient(port);
+        second.once('close', code => {
+          clearTimeout(timer);
+          resolve(code);
         });
-      }
-
-      expect(() => server.setLiveBetEnabled(true)).toThrow(/exactly one browser extension connection/i);
-      server.setLiveBetEnabled(false);
-      await liveOffReceived;
-
-      expect(liveOnCount.value).toBe(0);
-      expect(liveOffCount.value).toBe(2);
+        second.once('error', () => undefined);
+      });
+      expect(closed).toBe(1008);
+      const command = new Promise<{ readonly kind: string; readonly name?: string }>(resolve => {
+        first.on('message', data => {
+          const message = JSON.parse(data.toString()) as { readonly kind: string; readonly name?: string };
+          if (message.kind === 'command') resolve(message);
+        });
+      });
+      server.setLiveBetEnabled(true);
+      await expect(command).resolves.toEqual({ kind: 'command', name: 'liveOn' });
     } finally {
-      for (const client of clients) client.close();
+      first.close();
       await server.close();
     }
   });
@@ -1720,6 +1703,92 @@ describe('browser bridge runtime supervision', () => {
       expect(events).toContainEqual(expect.objectContaining({ kind: 'extension-authenticated' }));
     } finally {
       rejected.close();
+      client.close();
+      await server.close();
+    }
+  });
+
+  it('rejects a second extension socket with 1008 and does not add it', async () => {
+    const server = new BrowserBridgeServer({
+      port: 0,
+      allowedExtensionId: BUNDLED_BROWSER_EXTENSION_ID,
+      extensionToken: BUNDLED_BROWSER_EXTENSION_TOKEN,
+    });
+    const port = await server.start();
+    const first = authenticatedExtensionClient(port);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        first.once('open', resolve);
+        first.once('error', reject);
+      });
+      expect(server.getExtensionStatus().connectionCount).toBe(1);
+
+      const second = authenticatedExtensionClient(port);
+      const closed = await new Promise<{ code: number; reason: string }>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('second socket close timeout')), 2000);
+        second.once('close', (code, reason) => {
+          clearTimeout(timer);
+          resolve({ code, reason: reason.toString() });
+        });
+        second.once('error', () => {
+          // wait for close
+        });
+      });
+      expect(closed.code).toBe(1008);
+      expect(server.getExtensionStatus().connectionCount).toBe(1);
+      expect(first.readyState).toBe(WebSocket.OPEN);
+    } finally {
+      first.close();
+      await server.close();
+    }
+  });
+
+  it('requires connectionCount === 1 to be authenticated under requireExtensionSequence', async () => {
+    const events: BrowserBridgeRuntimeEvent[] = [];
+    const server = new BrowserBridgeServer({
+      port: 0,
+      requireExtensionSequence: true,
+      allowedExtensionId: BUNDLED_BROWSER_EXTENSION_ID,
+      extensionToken: BUNDLED_BROWSER_EXTENSION_TOKEN,
+      onRuntimeEvent: event => events.push(event),
+    });
+    const port = await server.start();
+    const client = authenticatedExtensionClient(port);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        client.once('open', resolve);
+        client.once('error', reject);
+      });
+      client.send(JSON.stringify({
+        kind: 'hello',
+        extensionVersion: '0.1.0',
+        browser: 'Chrome',
+        timestamp: '2026-08-27T01:00:00.000Z',
+        executorProfileId: 'chrome-profile-desktop-01',
+        bridgeSessionId: 'bridge-session-desktop-01',
+        bridgeSeq: 1,
+      }));
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if (events.some(event => event.kind === 'extension-authenticated')) break;
+        await new Promise(resolve => setTimeout(resolve, 1));
+      }
+      expect(server.getExtensionStatus()).toMatchObject({
+        connectionCount: 1,
+        authenticated: true,
+      });
+
+      const dummy = { send() {}, close() {} };
+      bridgeSockets(server).add(dummy);
+      expect(server.getExtensionStatus()).toMatchObject({
+        connectionCount: 2,
+        authenticated: false,
+      });
+      bridgeSockets(server).delete(dummy);
+      expect(server.getExtensionStatus()).toMatchObject({
+        connectionCount: 1,
+        authenticated: true,
+      });
+    } finally {
       client.close();
       await server.close();
     }

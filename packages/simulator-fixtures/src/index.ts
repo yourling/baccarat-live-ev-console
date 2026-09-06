@@ -1,8 +1,10 @@
-import type {
-  Card,
-  HandSettledEvent,
-  NormalizedEvent,
-  TableProfile,
+import {
+  EVENT_SCHEMA_VERSION,
+  type Card,
+  type HandSettledEvent,
+  type NormalizedEvent,
+  type ShoeBaseline,
+  type TableProfile,
 } from '@baccarat/contracts';
 
 export interface FixtureBuilder {
@@ -30,20 +32,27 @@ export class FixtureBuilder {
   }
 
   private add(type: string, payload: Record<string, unknown>): this {
-    this.events.push({
+    const timestamp = this.nextTimestamp();
+    const event: Record<string, unknown> = {
       eventId: `ev_${this.eventIdNamespace ?? this.tableId}_${this.seq}`,
       tableId: this.tableId,
-      timestamp: this.nextTimestamp(),
+      timestamp,
       sourceSeq: this.seq,
+      source: 'simulator-fixtures',
+      schemaVersion: EVENT_SCHEMA_VERSION,
       type,
       ...payload,
-    } as unknown as NormalizedEvent);
+    };
+    if (type === 'bettingWindowOpened' && typeof event.closesAt !== 'string') {
+      event.closesAt = new Date(Date.parse(timestamp) + 10_000).toISOString();
+    }
+    this.events.push(event as unknown as NormalizedEvent);
     this.seq += 1;
     return this;
   }
 
-  newShoe(shoeId: string, profile: TableProfile): this {
-    return this.add('newShoeSignal', { shoeId, profile });
+  newShoe(shoeId: string, profile: TableProfile, baseline: ShoeBaseline = 'physical-shoe'): this {
+    return this.add('newShoeSignal', { shoeId, profile, baseline });
   }
 
   confirmShoe(shoeId: string, approved = true): this {

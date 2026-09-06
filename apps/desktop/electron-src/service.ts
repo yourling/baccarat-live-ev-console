@@ -913,7 +913,7 @@ export class DesktopConsoleService {
           connectionStatus,
         };
       })(),
-      hasUnknownExecution: false,
+      hasUnknownExecution: this.orchestrator.getReservations().some(reservation => reservation.status === 'UNKNOWN'),
       hasSettlementGap: this.hasSettlementGap(tableId),
     });
   }
@@ -970,24 +970,22 @@ export class DesktopConsoleService {
     tableId: string,
     source?: OperationalWagerSource,
   ): string | undefined {
-    if (source === 'manual') return undefined;
     const actor = this.orchestrator.getActor(tableId);
     if (actor?.snapshot().executionMode !== 'live') return undefined;
-    const reasons = this.keepaliveTableReasons(tableId);
+    const reasons = source === 'manual'
+      ? this.manualLiveTableReasons(tableId)
+      : this.keepaliveTableReasons(tableId);
     return reasons.length === 0
       ? undefined
       : `unattended-runtime-blocked:${reasons.join(',')}`;
   }
 
   private keepaliveTableReasons(tableId: string): LiveExecutionBlockReason[] {
-    return this.liveTableReasons(tableId).filter(reason =>
-      reason !== 'physical-shoe-baseline-unknown'
-      && reason !== 'settlement-gap');
+    return this.liveTableReasons(tableId);
   }
 
   private manualLiveTableReasons(tableId: string, approved = true): LiveExecutionBlockReason[] {
-    return this.liveTableReasons(tableId, approved).filter(reason =>
-      reason !== 'physical-shoe-baseline-unknown');
+    return this.liveTableReasons(tableId, approved);
   }
 
   private runtimeSnapshot(): DesktopRuntimeState {
@@ -1059,6 +1057,9 @@ export class DesktopConsoleService {
   private async reconcileUnattendedExecution(): Promise<void> {
     await this.startupFailCloseTask;
     this.refreshAccountingIncidents();
+    if (this.orchestrator.getReservations().some(reservation => reservation.status === 'UNKNOWN')) {
+      this.operationalWagers.disableKeepaliveImmediately();
+    }
     const selectedTableIds = this.currentMonitorTableIds();
     const approvedTableIds = this.monitorTableIds
       .filter(tableId => selectedTableIds.includes(tableId));
@@ -1405,6 +1406,7 @@ export class DesktopConsoleService {
     const canArm = projection.autoBetStatus === 'DISARMED'
       && effectiveShoeBaseline(projection, gameCount, this.browserBridge?.shoeEvidence(tableId)) === 'physical-shoe'
       && projection.connectionStatus === 'CONNECTED'
+      && !this.orchestrator.getReservations().some(reservation => reservation.status === 'UNKNOWN')
       && !projection.sealed
       && (projection.status === 'TRACKING'
         || projection.status === 'BETTING_WINDOW'
@@ -2926,6 +2928,14 @@ function remapDemoEvent(
 ): NormalizedEvent {
   const timestamp = new Date(startedAt.getTime() + Math.max(0, event.sourceSeq - 1) * 1000).toISOString();
   const next = { ...event, timestamp } as NormalizedEvent;
+  if ('closesAt' in event && typeof event.closesAt === 'string') {
+    const originalTs = Date.parse(event.timestamp);
+    const remappedTs = Date.parse(timestamp);
+    const originalClose = Date.parse(event.closesAt);
+    if (Number.isFinite(originalTs) && Number.isFinite(remappedTs) && Number.isFinite(originalClose)) {
+      (next as { closesAt: string }).closesAt = new Date(remappedTs + (originalClose - originalTs)).toISOString();
+    }
+  }
   const oldShoeId = 'shoeId' in event && typeof event.shoeId === 'string' ? event.shoeId : undefined;
   const newShoeId = oldShoeId ? shoeIds.get(tableId + '|' + oldShoeId) : undefined;
   if (newShoeId && 'shoeId' in next && typeof next.shoeId === 'string') {

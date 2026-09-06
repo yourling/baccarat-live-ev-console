@@ -158,6 +158,7 @@ describe('unattended runtime supervisor', () => {
       'table-feed-stale',
       'physical-shoe-baseline-unknown',
       'table-connection-not-restored',
+      'unknown-execution-pending',
       'settlement-gap',
     ]);
   });

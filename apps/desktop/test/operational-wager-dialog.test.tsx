@@ -25,6 +25,7 @@ function actorSnapshot(
       ...emptyProjection('D055'),
       status,
       connectionStatus: 'CONNECTED',
+      shoeBaseline: 'physical-shoe',
       currentHandId: handId,
       bettingWindowClosesAt: closesAt ?? null,
     },

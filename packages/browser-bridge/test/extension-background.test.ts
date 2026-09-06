@@ -65,6 +65,21 @@ function isPragmaticFinalInjection(value: unknown): boolean {
 }
 
 describe('extension background multitable command', () => {
+  it('does not click session-timeout continue buttons', () => {
+    const hook = readFileSync(
+      new URL('../../../apps/browser-extension/pragmatic-dom-hook.js', import.meta.url),
+      'utf8',
+    );
+    const content = readFileSync(
+      new URL('../../../apps/browser-extension/content.js', import.meta.url),
+      'utf8',
+    );
+    expect(hook).not.toMatch(/button\.click\s*\(/);
+    expect(hook).not.toContain('native-idle-continue-click');
+    expect(content).not.toContain('dismissIdleDialog');
+    expect(content).not.toContain('idle-dialog-dismissed');
+  });
+
   it('loads with a runtime connect listener for the keepalive port', async () => {
     const harness = await createHarness();
     expect(harness.chrome.runtime.onConnect.addListener).toHaveBeenCalled();
