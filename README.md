@@ -9,7 +9,7 @@
 - 对子 EV 策略与庄对/闲对单次 `BetIntent` 经过 `TableActor`、`RiskManager`、reservation、桥接回执、结算，以及按桌/靴/局/市场的重复保护。自动对子只在有效 `physical-shoe`（protocol-shuffle / road-wrap / 人工确认）上评估；第一次见到 shoeReset、待牌靴或 `unknown-monitor-session` 时不下对子，避免假 EV 和 `UNKNOWN` 回执。路子 #55 配剩余 407 张这种入桌数字不得当成 8 副新靴。
 - 四市场 `OperationalWager` 支持 `banker`、`player`、`bankerPair` 和 `playerPair`，用于手动操作与庄/闲保活。它也统一进入同一 actor/风控/reservation/结算链路，并按桌/靴/局/市场/来源防重。当前受控路径要求 `executionMode === 'live'`。
 - 页头「开启保活」与「开启自动投注」互相独立：保活只打庄/闲，对子策略只打庄对/闲对。保活不再扫完整监控列表，只在刚开盘的那一桌尝试。
-- 所有可到达平台的请求都要求 `physical-shoe`、已连接投影、当前下注窗口、未封靴和可用桥接。对子自动下注还要求窗口剩余至少 3 秒；窗口未就绪的预提交拒绝可在同一局重试。`UNKNOWN` 会保留风险敞口、关闭保活并阻断所有后续执行；新一局出现上一局未结算 reservation 时同样失败关闭。
+- 所有可到达平台的请求都要求 `physical-shoe`、已连接投影、当前下注窗口、未封靴和可用桥接。对子自动下注还要求窗口剩余至少 3 秒（`closesAt` 缺失则不评估）；窗口未就绪且未提交（`commitStarted===false`）的预提交拒绝可在同一局重试，已提交则标 UNKNOWN。`UNKNOWN` 会保留风险敞口、关闭保活并阻断所有后续执行；新一局出现上一局未结算 reservation 时同样失败关闭。
 - 桌面运行监督器持久化每桌 live 批准和事故记录；默认裁剪到 200 条，但仍在生效的阻断事故绝不因历史上限被淘汰。进程重启后先降为 `shadow` 并写入 `process-restarted` 断线事件，只有当前进程重新观察到新鲜数据、实体牌靴和恢复后的连续投影，且没有 `UNKNOWN` 或结算缺口时，才恢复无人值守授权。
 - 本机桥固定校验打包扩展 ID 和共享 loopback token，要求恰好一个扩展连接，并校验扩展会话内单调消息序号。连续性证明必须是 `cursor-v1:<64 lowercase hex>`，且由上一游标与下一条连续事件或实体新靴重置生成。
 - 页面诊断只发送长度、数量等元数据；桥接日志移除正文/HTML/网络载荷预览，并去除 URL 查询参数和 fragment。事故消息还会脱敏 URL、token、authorization、cookie 和 session 值。
@@ -21,7 +21,7 @@
 - 精确组合概率、烧牌后验、保守 EV，以及从剩余库存直接评估（`packages/probability`）
 - 契约与输入校验（`packages/contracts`，`EVENT_SCHEMA_VERSION=1`）
 - SQLite（better-sqlite3 + WAL）事件账本、投影、重放（`packages/ledger-state`，账本 schema `5`）
-- 牌面热路径留内存：`cardObserved` 不落 SQLite，每桌最多保留 36 张热牌；SQLite 只持久化新靴/结算/回执/决策和少量窗口事件，并做 WAL 自动回收
+- 牌面热路径留内存：`cardObserved` 不落 SQLite，当前靴牌面全留内存；SQLite 只持久化新靴/结算/回执/决策和少量窗口事件，并做 WAL 自动回收
 - 事件冲突检测：event_id 相同但 payload 不同 / sourceSeq 冲突均拒绝，绝不静默改写历史
 - 每桌串行 Actor、决策与回执幂等、重启恢复（`packages/orchestrator`）；Actor 重放默认 `latestShoeOnly`
 - 持久化全局风控：预留/释放/结算、日/桌/靴亏损、重启恢复（`packages/risk-execution`）
@@ -34,9 +34,9 @@
 
 自动对子 EV 策略和 `BetIntent`/单次下注仅接受 `bankerPair`（庄对）和 `playerPair`（闲对）。`OperationalWager` 接受 `banker`（庄）、`player`（闲）、`bankerPair` 和 `playerPair`，其中全局定时保活只选择庄或闲。两者都由桌台 actor 串行执行并接入统一风控、预留、回执审计和牌局结算。
 
-浏览器端还会检查唯一 Dafabet 弹窗：Pragmatic 为 `/live-dealer/popup-launch/jeju-speed-baccarat`，BG 为 `/live-dealer/popup-launch/live-baccarat-bg`。仓库已删除 mstrom / Evolution / 旧 live-baccarat-pa 适配器。BG 厂商 WS 协议以捕获夹具为准，解析器只吃版本化快照，不臆造报文。当前标准结算条款按庄赢净利 `0.95`、闲赢净利 `1`、和局退回本金处理；对子使用桌台配置赔率（默认净利 `11`）。最终收益由对应 reservation 的 `realizedPnl` 汇总，而不是仅按平台接受回执推算。
+浏览器端还会检查唯一 Dafabet 弹窗：Pragmatic 为 `/live-dealer/popup-launch/jeju-speed-baccarat`，BG 为 `/live-dealer/popup-launch/live-baccarat-bg`。仓库已删除 mstrom / Evolution / 旧 live-baccarat-pa 适配器。BG 真金提交走页面 MAIN world 的 `BaccaratBgProtocol.submit`；缺会话、socket 或开盘倒计时则预提交拒绝。`__baccaratBgBetAdapter` 仅测试覆盖。当前标准结算条款按庄赢净利 `0.95`、闲赢净利 `1`、和局退回本金处理；对子使用桌台配置赔率（默认净利 `11`）。最终收益由对应 reservation 的 `realizedPnl` 汇总，而不是仅按平台接受回执推算。
 
-实盘最多监控 64 张桌。新会话默认不监控任何桌；只有环境变量 BACCARAT_LIVE_TABLES 才会预填桌号。大厅里尚未入监控的 Dafabet Pragmatic / BG 桌显示为「待加入」，仅本进程见过的协议 shoeReset token 变化、路子明显回绕或人工确认后才标实体新靴并晋升；第一次见到 shoeReset 或路子 #55 配满靴库存仍为待牌靴。刚洗完的实体靴即使 DOM 路子仍停在高位，也不得被降级。断开超过 15 秒的监控桌会被移除。
+实盘最多监控 64 张桌。新会话默认不监控任何桌；只有环境变量 BACCARAT_LIVE_TABLES 才会预填桌号。大厅里尚未入监控的 Dafabet Pragmatic / BG 桌显示为「待加入」，仅本进程见过的协议 shoeReset token 变化、路子明显回绕或人工确认后才标实体新靴并晋升；第一次见到 shoeReset 或路子 #55 配满靴库存仍为待牌靴。刚洗完的实体靴即使 DOM 路子仍停在高位，也不得被降级。断开超过 15 秒的监控桌会被移除；启动 60 秒内、洗牌 hold、以及未 flap 升级的 stale/闪断/重启不断开删除。
 
 ## 目录
 

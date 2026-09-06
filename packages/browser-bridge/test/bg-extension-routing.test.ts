@@ -21,6 +21,10 @@ const networkHookSource = readFileSync(
   new URL('../../../apps/browser-extension-bg/bg-network-hook.js', import.meta.url),
   'utf8',
 );
+const protocolSource = readFileSync(
+  new URL('../../../apps/browser-extension-bg/bg-protocol.js', import.meta.url),
+  'utf8',
+);
 const manifest = JSON.parse(readFileSync(
   new URL('../../../apps/browser-extension-bg/manifest.json', import.meta.url),
   'utf8',
@@ -171,6 +175,7 @@ describe('BG extension routing', () => {
     expect(backgroundSource).toContain('chrome.action.onClicked');
     expect(backgroundSource).toContain('chrome.commands.onCommand');
     expect(backgroundSource).toContain('pendingBgPopupReloadIds');
+    expect(backgroundSource).not.toMatch(/chrome\.tabs\.reload\s*\(/);
     expect(networkHookSource).not.toContain('autoBet');
     expect(JSON.stringify(manifest)).toContain('reload-extension');
     expect(betRuntimeSource).toContain('bg-adapter-missing');
@@ -258,6 +263,150 @@ describe('BG extension routing', () => {
         market: 'banker',
         raw: expect.objectContaining({ runtimeRevision: 'bg-bet-runtime/2026-09-05.1' }),
       }),
+    }));
+  });
+});
+
+function encodeBetConfirm(proto: { encodeHeader(command: number, action: number, size: number, ext: number): number; BET_CMD: number }, userFlag: number, state = 1) {
+  const body = new Uint8Array(16);
+  const view = new DataView(body.buffer);
+  view.setUint32(0, state, true);
+  view.setUint16(4, userFlag, true);
+  view.setUint16(6, 0, true);
+  view.setFloat64(8, 1000, true);
+  const packet = new Uint8Array(20);
+  const headerView = new DataView(packet.buffer);
+  headerView.setUint32(0, proto.encodeHeader(proto.BET_CMD, 4, 20, 0), true);
+  packet.set(body, 4);
+  return packet.buffer;
+}
+
+function createBgRuntimeContext() {
+  const sent: unknown[] = [];
+  const socket = {
+    readyState: 1,
+    send(data: unknown) { sent.push(data); },
+  };
+  const context = vm.createContext({
+    location: {
+      hostname: 'www.dafabet.net',
+      pathname: '/sc/live-dealer/popup-launch/live-baccarat-bg',
+      href: 'https://www.dafabet.net/sc/live-dealer/popup-launch/live-baccarat-bg?table=B06',
+      search: '?table=B06',
+      protocol: 'https:',
+    },
+    Date,
+    JSON,
+    Math,
+    console,
+    setTimeout,
+    clearTimeout,
+    TextEncoder,
+    TextDecoder,
+    Uint8Array,
+    DataView,
+    ArrayBuffer,
+    Number,
+    String,
+    Object,
+    Array,
+    Boolean,
+    Error,
+    Promise,
+    globalThis: null,
+  });
+  Reflect.set(context, 'globalThis', context);
+  vm.runInContext(protocolSource, context);
+  vm.runInContext(betRuntimeSource, context);
+  const proto = Reflect.get(context, 'BaccaratBgProtocol') as {
+    session: Record<string, any>;
+    submit: (request: Record<string, unknown>) => Promise<Record<string, unknown>>;
+    ingestBuffer: (buffer: ArrayBuffer, direction: string, socket: unknown) => unknown;
+    encodeHeader: (command: number, action: number, size: number, ext: number) => number;
+    BET_CMD: number;
+  };
+  proto.session.uid = 123456;
+  proto.session.token = 't'.repeat(32);
+  proto.session.betSocket = socket;
+  proto.session.confirmWaitMs = 80;
+  proto.session.userFlag = 1;
+  const executeOneShot = Reflect.get(context, 'executeBgBetOneShot') as (
+    request: Record<string, unknown>,
+  ) => Promise<Record<string, any>>;
+  return {
+    context,
+    proto,
+    socket,
+    sent,
+    execute: (request: Record<string, unknown>) => executeOneShot(request),
+  };
+}
+
+function liveWager(market = 'banker') {
+  return {
+    mode: 'live',
+    wager: {
+      wagerId: 'bg-wager-1',
+      tableId: 'B06',
+      shoeId: 'bg-B06-1',
+      handId: '200',
+      market,
+      amount: 10,
+      source: 'manual',
+      createdAt: '2026-09-05T01:00:00.000Z',
+    },
+  };
+}
+
+describe('BG official fail-closed channel', () => {
+  it('does not send when the table has no countdown', async () => {
+    const harness = createBgRuntimeContext();
+    const result = await harness.execute(liveWager());
+    expect(harness.sent).toHaveLength(0);
+    expect(result).toEqual(expect.objectContaining({
+      status: 'REJECTED',
+      raw: expect.objectContaining({ commitStarted: false, reason: 'no-countdown' }),
+    }));
+  });
+
+  it('does not send when remaining window is <= 0', async () => {
+    const harness = createBgRuntimeContext();
+    harness.proto.session.countdownByTable.B06 = 5;
+    harness.proto.session.countdownAtByTable.B06 = Date.now() - 8_000;
+    const result = await harness.execute(liveWager());
+    expect(harness.sent).toHaveLength(0);
+    expect(result).toEqual(expect.objectContaining({
+      status: 'REJECTED',
+      raw: expect.objectContaining({ commitStarted: false, reason: 'betting-closed' }),
+    }));
+  });
+
+  it('ignores a BET_CONFIRM whose userFlag does not match and times out as UNKNOWN', async () => {
+    const harness = createBgRuntimeContext();
+    harness.proto.session.countdownByTable.B06 = 15;
+    harness.proto.session.countdownAtByTable.B06 = Date.now();
+    const pending = harness.execute(liveWager());
+    await new Promise(resolve => setTimeout(resolve, 15));
+    expect(harness.sent.length).toBeGreaterThan(0);
+    harness.proto.ingestBuffer(encodeBetConfirm(harness.proto, 99), 'recv', harness.socket);
+    const result = await pending;
+    expect(result.status).toBe('UNKNOWN');
+    expect(result.raw).toEqual(expect.objectContaining({
+      reason: 'bet-confirm-timeout',
+      commitStarted: true,
+    }));
+  });
+
+  it('returns UNKNOWN on bet-confirm timeout', async () => {
+    const harness = createBgRuntimeContext();
+    harness.proto.session.countdownByTable.B06 = 15;
+    harness.proto.session.countdownAtByTable.B06 = Date.now();
+    const result = await harness.execute(liveWager());
+    expect(harness.sent.length).toBeGreaterThan(0);
+    expect(result.status).toBe('UNKNOWN');
+    expect(result.raw).toEqual(expect.objectContaining({
+      reason: 'bet-confirm-timeout',
+      commitStarted: true,
     }));
   });
 });

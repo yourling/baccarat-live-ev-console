@@ -3,7 +3,7 @@
  *
  * The client exposes stable semantic attributes for round timers and table
  * IDs. This hook only reads those attributes and never interacts with a bet
- * control. The sole click is the exact session-timeout reconnect button.
+ * control. It never clicks session-timeout, continue-game, or reconnect buttons.
  */
 (function () {
   if (!/(^|\.)client\.pragmaticplaylive\.net$/i.test(location.hostname)) return;
@@ -13,15 +13,12 @@
 
   const SCAN_INTERVAL_MS = 500;
   const HEARTBEAT_INTERVAL_MS = 5000;
-  const CONTINUE_RETRY_INTERVAL_MS = 5000;
   const TABLE_PREFIX = 'TileHeight-';
   const SUITS = Object.freeze({ '♠': 'S', '♥': 'H', '♦': 'D', '♣': 'C' });
   let lastSnapshotHash = '';
   let lastDiscoveryHash = '';
   let lastSentAt = 0;
   let timeoutReported = false;
-  let continueClickedAt = 0;
-  let continuePending = false;
   let conflictReported = false;
   const lastGameCountByTable = new Map();
   const pendingGameCountByTable = new Map();
@@ -82,7 +79,7 @@
     return /在其他地方启动了(?:对话|会话)|其他地方.*(?:对话|会话)|(?:对话|会话)已在其他|joined from another (?:device|location|place|window|tab)|(?:conversation|session) (?:has been |was )?started (?:elsewhere|in another)|(?:game|session) already open in another/i.test(text);
   }
 
-  function continueNativeIdleSession(now) {
+  function continueNativeIdleSession() {
     const bodyText = clean(document.body?.innerText || document.body?.textContent);
     const button = continueGameButton();
     const dialogText = clean(button?.closest?.('[role="dialog"],[role="alertdialog"]')?.textContent || '');
@@ -105,28 +102,7 @@
         frame: 'iframe', detail: 'pragmatic-session-conflict-cleared', timestamp: observedAt(),
       });
     }
-    if (!button) {
-      if (continuePending) {
-        continuePending = false;
-        send({
-          kind: 'sessionAction', action: 'native-idle-continue-cleared', url: location.href,
-          frame: 'iframe', detail: 'pragmatic-continue-game', timestamp: observedAt(),
-        });
-      }
-      return;
-    }
-    if (now - continueClickedAt < CONTINUE_RETRY_INTERVAL_MS) return;
-    continueClickedAt = now;
-    try {
-      button.click();
-    } catch (_) {
-      return;
-    }
-    continuePending = true;
-    send({
-      kind: 'sessionAction', action: 'native-idle-continue-click', url: location.href,
-      frame: 'iframe', detail: clean(button.textContent).slice(0, 40), timestamp: observedAt(),
-    });
+    // Never click 继续游戏 / continue game / 重新连接. Observe only.
   }
 
   function readTableIdParam(raw) {
@@ -421,7 +397,7 @@
 
   function scan(force) {
     const now = Date.now();
-    continueNativeIdleSession(now);
+    continueNativeIdleSession();
     recoverExpiredSession();
     if (!isStateFrame) return;
     const tables = isSingle ? singleSnapshot() : multiSnapshot();

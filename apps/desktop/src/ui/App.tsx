@@ -2380,7 +2380,7 @@ function safeEvaluate(
 
 function isVerifiedPhysicalShoeReason(reason: string | undefined, gameCount?: number): boolean {
   if (reason === 'protocol-shuffle' || reason === 'manual-confirm') return true;
-  return reason === 'road-wrap' && typeof gameCount === 'number' && gameCount >= 1 && gameCount <= 20;
+  return reason === 'road-wrap' && typeof gameCount === 'number' && gameCount >= 1 && gameCount <= 8;
 }
 
 function isDisplayedPhysicalShoe(
@@ -2447,10 +2447,7 @@ function manualOperationalRuntimeBlockReason(
   runtime: DesktopConsoleSnapshot['runtime']['tables'][string] | undefined,
 ): string | undefined {
   if (runtime === undefined) return '运行状态未就绪';
-  const reasons = runtime.reasons.filter(reason =>
-    reason !== 'physical-shoe-baseline-unknown'
-    && reason !== 'unknown-execution-pending'
-    && reason !== 'settlement-gap');
+  const reasons = runtime.reasons;
   return reasons.length > 0
     ? `手动下注未就绪：${reasons.map(runtimeReasonLabel).join('、')}`
     : undefined;

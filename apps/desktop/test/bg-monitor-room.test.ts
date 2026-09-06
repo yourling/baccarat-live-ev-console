@@ -77,6 +77,26 @@ describe('desktop BG monitor room', () => {
         }),
       });
       service['promotePendingTablesFromRooms'](bridge.getDiscoveredRooms());
+      expect(service['monitorTableIds']).not.toContain('C07');
+      bridge.ingestClientMessage({
+        kind: 'networkCapture',
+        source: 'baccarat-bridge-bg-state',
+        url: 'https://cdnx-hwa.jbz029.com/h5V01/pc/index.html?table=B06',
+        direction: 'recv',
+        encoding: 'text',
+        data: JSON.stringify({
+          version: 1,
+          view: 'single',
+          observedAt: '2026-09-05T01:00:01.000Z',
+          tables: [{
+            tableId: 'C07',
+            shuffleEvent: true,
+            shoeReset: 'seq:2030683',
+            source: 'protocol',
+          }],
+        }),
+      });
+      service['promotePendingTablesFromRooms'](bridge.getDiscoveredRooms());
       expect(service['monitorTableIds']).toContain('C07');
     } finally {
       await service.close();
@@ -103,6 +123,25 @@ describe('desktop BG monitor room', () => {
             tableId: 'A30',
             shuffleEvent: true,
             shoeReset: 'seq:10',
+            gameCount: 1,
+            source: 'protocol',
+          }],
+        }),
+      });
+      bridge.ingestClientMessage({
+        kind: 'networkCapture',
+        source: 'baccarat-bridge-bg-state',
+        url: 'https://cdnx-hwa.jbz029.com/h5V01/pc/index.html?table=B06',
+        direction: 'recv',
+        encoding: 'text',
+        data: JSON.stringify({
+          version: 1,
+          view: 'single',
+          observedAt: '2026-09-05T01:00:01.000Z',
+          tables: [{
+            tableId: 'A30',
+            shuffleEvent: true,
+            shoeReset: 'seq:11',
             gameCount: 1,
             source: 'protocol',
           }],
@@ -143,6 +182,25 @@ describe('desktop BG monitor room', () => {
             tableId: 'A30',
             shuffleEvent: true,
             shoeReset: 'seq:10',
+            source: 'protocol',
+          }],
+        }),
+      });
+      expect(bridge.shoeEvidence('A30')?.reason).toBe('attach');
+      bridge.ingestClientMessage({
+        kind: 'networkCapture',
+        source: 'baccarat-bridge-bg-state',
+        url: 'https://cdnx-hwa.jbz029.com/h5V01/pc/index.html?table=B06',
+        direction: 'recv',
+        encoding: 'text',
+        data: JSON.stringify({
+          version: 1,
+          view: 'single',
+          observedAt: '2026-09-05T01:00:01.000Z',
+          tables: [{
+            tableId: 'A30',
+            shuffleEvent: true,
+            shoeReset: 'seq:11',
             source: 'protocol',
           }],
         }),

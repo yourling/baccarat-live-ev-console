@@ -132,7 +132,7 @@ describe('Pragmatic DOM hook', () => {
     expect(sendMessage.mock.calls.some(call => call[0]?.kind === 'sessionExpired')).toBe(false);
   });
 
-  it('uses the native continue-game dialog for idle keepalive', () => {
+  it('does not click the native continue-game dialog for idle keepalive', () => {
     const dom = new JSDOM('<body><div role="dialog"><button>继续游戏</button></div></body>', {
       url: 'https://client.pragmaticplaylive.net/desktop/launcher/?table_id=bc281koreanch281',
     });
@@ -168,18 +168,12 @@ describe('Pragmatic DOM hook', () => {
       action: 'native-idle-keepalive-armed',
       detail: '/desktop/launcher/',
     }));
-    expect(click).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
-      kind: 'sessionAction',
-      action: 'native-idle-continue-click',
-      detail: '继续游戏',
-    }));
+    expect(click).not.toHaveBeenCalled();
+    expect(sendMessage.mock.calls.some(call => call[0]?.action === 'native-idle-continue-click')).toBe(false);
 
     context.__baccaratPragmaticReplay();
-    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
-      kind: 'sessionAction',
-      action: 'native-idle-continue-cleared',
-    }));
+    expect(click).not.toHaveBeenCalled();
+    expect(sendMessage.mock.calls.some(call => call[0]?.action === 'native-idle-continue-cleared')).toBe(false);
   });
 
   it('reads the labeled road count instead of a timer 8 after an empty #', () => {

@@ -589,30 +589,12 @@ async function flushPendingBgPopupReload() {
   if (!stored.pendingBgPopupReloadReason && !(Array.isArray(stored.pendingBgPopupReloadIds) && stored.pendingBgPopupReloadIds.length)) {
     return;
   }
-  const ids = new Set();
-  for (const id of Array.isArray(stored.pendingBgPopupReloadIds) ? stored.pendingBgPopupReloadIds : []) {
-    if (Number.isInteger(id)) ids.add(id);
-  }
-  for (const id of await collectBgReloadTabIds()) ids.add(id);
-  let reloaded = 0;
-  for (const id of ids) {
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId: id, allFrames: true },
-        func: () => { try { window.onbeforeunload = null; } catch (_) {} },
-      });
-    } catch (_) {}
-    try {
-      await chrome.tabs.reload(id);
-      reloaded += 1;
-    } catch (_) {}
-  }
   send({
     kind: 'sessionAction',
     action: 'command-executed',
     url: '',
     frame: '',
-    detail: `reloadExtension-flushed:tabs=${reloaded}`,
+    detail: 'reloadExtension-flushed:manual-popup-refresh-required',
     timestamp: new Date().toISOString(),
   });
 }

@@ -400,12 +400,15 @@ describe('BG live wire', () => {
     proto.session.uid = 5;
     proto.session.token = 'token-token-token-token-token-12';
     proto.session.sockets = [gameSocket];
-    await expect(proto.submit({ tableId: 'B06', market: 'banker', amount: 10, handId: '5063063' })).rejects.toThrow(/bg-socket-missing/);
+    await expect(proto.submit({ tableId: 'B06', market: 'banker', amount: 10, handId: '5063063' })).resolves.toEqual(
+      expect.objectContaining({ status: 'REJECTED', reason: 'bg-socket-missing', sent: false }),
+    );
     expect(gameSocket.sent).toEqual([]);
   });
 
-  it('accepts a confirm even when userFlag does not match the outbound flag', async () => {
+  it('ignores a confirm whose userFlag does not match the outbound flag', async () => {
     const proto = loadProtocol();
+    proto.session.confirmWaitMs = 60;
     const socket = {
       readyState: 1,
       send(data: ArrayBuffer) {
@@ -423,7 +426,7 @@ describe('BG live wire', () => {
     proto.session.sockets = [socket];
     proto.session.betSocket = socket;
     await expect(proto.submit({ tableId: 'B06', market: 'banker', amount: 10, handId: '5063063' })).resolves.toEqual(
-      expect.objectContaining({ status: 'ACCEPTED', userFlag: 99 }),
+      expect.objectContaining({ status: 'UNKNOWN', reason: 'bet-confirm-timeout' }),
     );
   });
 

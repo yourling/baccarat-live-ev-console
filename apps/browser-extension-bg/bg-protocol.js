@@ -548,6 +548,7 @@
     lastConfirm: null,
     recentPackets: [],
     confirmWaitMs: 4000,
+    betInFlight: false,
   };
 
   function packetHex(packet, max) {
@@ -683,37 +684,55 @@
   }
 
   async function submit({ tableId, market, amount, handId }) {
+    if (session.betInFlight) {
+      return { status: 'REJECTED', reason: 'bet-in-flight', sent: false };
+    }
     const seqNo = Number(handId);
-    if (!session.uid || !session.token) throw new Error('bg-session-missing');
-    if (!Number.isFinite(seqNo) || seqNo <= 0) throw new Error('invalid-hand');
+    if (!session.uid || !session.token) {
+      return { status: 'REJECTED', reason: 'bg-session-missing', sent: false };
+    }
+    if (!Number.isFinite(seqNo) || seqNo <= 0) {
+      return { status: 'REJECTED', reason: 'invalid-hand', sent: false };
+    }
     const socket = pickBetSocket();
-    if (!socket) throw new Error('bg-socket-missing');
+    if (!socket) {
+      return { status: 'REJECTED', reason: 'bg-socket-missing', sent: false };
+    }
     session.userFlag = (session.userFlag + 1) & 0xffff || 1;
     const expectedFlag = session.userFlag;
     session.lastConfirm = null;
     const startedAt = Date.now();
-    socket.send(encodeBet({
-      uid: session.uid,
-      token: session.token,
-      seqNo,
-      tableId: String(tableId).toUpperCase(),
-      userFlag: expectedFlag,
-      amount,
-      market,
-    }));
-    const waitMs = Number(session.confirmWaitMs) > 0 ? Number(session.confirmWaitMs) : 4000;
-    const deadline = Date.now() + waitMs;
-    while (Date.now() < deadline) {
-      const matched = confirmResult(session.lastConfirm);
-      if (matched) return matched;
-      await new Promise(resolve => setTimeout(resolve, 20));
+    session.betInFlight = true;
+    try {
+      socket.send(encodeBet({
+        uid: session.uid,
+        token: session.token,
+        seqNo,
+        tableId: String(tableId).toUpperCase(),
+        userFlag: expectedFlag,
+        amount,
+        market,
+      }));
+      const waitMs = Number(session.confirmWaitMs) > 0 ? Number(session.confirmWaitMs) : 4000;
+      const deadline = Date.now() + waitMs;
+      while (Date.now() < deadline) {
+        const confirm = session.lastConfirm;
+        if (confirm && confirm.userFlag === expectedFlag) {
+          const matched = confirmResult(confirm);
+          return { ...matched, sent: true, expectedFlag };
+        }
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      return {
+        status: 'UNKNOWN',
+        reason: 'bet-confirm-timeout',
+        expectedFlag,
+        seen: packetsSince(startedAt),
+        sent: true,
+      };
+    } finally {
+      session.betInFlight = false;
     }
-    return {
-      status: 'UNKNOWN',
-      reason: 'bet-confirm-timeout',
-      expectedFlag,
-      seen: packetsSince(startedAt),
-    };
   }
 
   globalThis.BaccaratBgProtocol = {

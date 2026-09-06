@@ -113,9 +113,7 @@ describe('browser bridge executor lease', () => {
     });
     const port = await server.start();
     const first = await openClient(port);
-    const second = await openClient(port);
     const firstMessages = collectMessages(first);
-    const secondMessages = collectMessages(second);
     let firstBetSeq = 2;
     first.on('message', data => {
       const message = JSON.parse(data.toString()) as {
@@ -146,29 +144,31 @@ describe('browser bridge executor lease', () => {
       });
       expect(events.filter(event => event.kind === 'executor-lease-acquired')).toHaveLength(1);
 
-      sendHello(second, {
-        sessionId: 'bridge-session-other-02',
-        seq: 1,
-        profileId: 'chrome-profile-owner-01',
+      const secondClosed = new Promise<{ code: number; reason: string }>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('second socket close timeout')), 2000);
+        const second = authenticatedExtensionClient(port);
+        second.once('close', (code: number, reason: Buffer) => {
+          clearTimeout(timer);
+          resolve({ code, reason: reason.toString() });
+        });
+        second.once('error', () => undefined);
       });
-      await waitForEvent(events, 'executor-lease-rejected');
+      const closed = await secondClosed;
+      expect(closed.code).toBe(1008);
+      expect(closed.reason).toContain('extension already connected');
       expect(events.filter(event => event.kind === 'executor-lease-acquired')).toHaveLength(1);
       expect(server.getExecutorStatus().active_executor_count).toBe(1);
-      await waitUntil(() => secondMessages.some(message => message.kind === 'executorLeaseRejected'));
-      expect(secondMessages.some(message => message.kind === 'executorLeaseGranted')).toBe(false);
 
       await expect(server.requestBet(liveBetRequest())).resolves.toMatchObject({
         receiptId: 'r-lease-1',
       });
       expect(firstMessages.some(message => message.kind === 'betRequest')).toBe(true);
-      expect(secondMessages.some(message => message.kind === 'betRequest')).toBe(false);
       expect(firstMessages.find(message => message.kind === 'betRequest')).toMatchObject({
         leaseId: expect.any(String),
         signature: expect.stringMatching(/^[0-9a-f]{64}$/i),
       });
     } finally {
       first.close();
-      second.close();
       await server.close();
     }
   });

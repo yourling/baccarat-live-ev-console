@@ -97,7 +97,7 @@ describe('risk manager', () => {
     expect(r.reason).toContain('global-exposure-cap');
   });
 
-  it('does not let UNKNOWN reservations consume new exposure or concurrency capacity', () => {
+  it('UNKNOWN does consume exposure/concurrency', () => {
     const m = new RiskManager();
     const tightLimits = { ...limits, defaultExposureCap: 10, maxConcurrentExecutions: 1 };
     const first = m.tryReserve(intent('s1', 'h1', 'bankerPair', 10), profile, tightLimits);
@@ -109,7 +109,8 @@ describe('risk manager', () => {
     expect(duplicate.reason).toContain('duplicate');
 
     const nextHand = m.tryReserve(intent('s1', 'h2', 'bankerPair', 10), profile, tightLimits);
-    expect(nextHand.ok).toBe(true);
+    expect(nextHand.ok).toBe(false);
+    expect(nextHand.reason).toMatch(/max-concurrent-executions|global-exposure-cap/);
   });
 
   it('shrinks when policy is shrink, but skips below table min', () => {

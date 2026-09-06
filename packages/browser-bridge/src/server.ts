@@ -1076,6 +1076,10 @@ export class BrowserBridgeServer implements RoomMonitor {
       } else if (role === 'command') {
         this.commandClients.add(socket);
       } else {
+        if (this.sockets.size > 0) {
+          socket.close(1008, 'extension already connected');
+          return;
+        }
         this.clearExtensionDisconnectGrace();
         this.sockets.add(socket);
         this.socketLastSeenAt.set(socket, Date.now());
@@ -1175,14 +1179,16 @@ export class BrowserBridgeServer implements RoomMonitor {
       .sort((left, right) => right - left)[0];
     const lease = this.executorLeases.getActiveLease();
     const leasedSocket = this.ownerSocketForActiveLease();
-    const authenticated = this.requireExtensionSequence
-      ? (
-        lease !== null
-        && !!lease.claimantId
-        && leasedSocket !== undefined
-        && this.socketBridgeSession.has(leasedSocket)
-      )
-      : sockets.length === 1;
+    const authenticated = sockets.length === 1 && (
+      this.requireExtensionSequence
+        ? (
+          lease !== null
+          && !!lease.claimantId
+          && leasedSocket !== undefined
+          && this.socketBridgeSession.has(leasedSocket)
+        )
+        : true
+    );
     return {
       connectionCount: sockets.length,
       authenticated,

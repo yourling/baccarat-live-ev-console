@@ -159,6 +159,7 @@ export function operationalWagerGateReason(
 ): string | null {
   const projection = actor.projection;
   if (projection.connectionStatus !== 'CONNECTED') return '牌桌连接未就绪';
+  if (projection.shoeBaseline !== 'physical-shoe') return '待牌靴，不可下注';
   if (!bettingWindowIsOpen(actor, now)) return '当前不在下注窗口';
   const remaining = remainingBettingWindowSeconds(actor, now);
   if (remaining !== null && remaining < MIN_MANUAL_WINDOW_SECONDS) return '下注窗口即将关闭';

@@ -146,6 +146,7 @@ describe('DesktopConsoleService operational wagers', () => {
     try {
       service['browserBridge'] = bridge;
       await service.updateMonitorTableIds(['D001']);
+      service['liveFeeds'].set('D001', freshFeed('D001'));
       await service.injectEvent(physicalShoe('D001'));
       await service.injectEvent(openWindow('D001'));
 
@@ -306,42 +307,13 @@ describe('DesktopConsoleService operational wagers', () => {
         market: 'player',
         amount: 20,
       });
-      await service.setKeepaliveEnabled(true);
-      const settings = await service.updateKeepaliveSettings({
-        intervalMinutes: 5,
-        market: 'banker',
-        amount: 20,
-      });
 
-      expect(setLiveBetEnabled).toHaveBeenCalledWith(true);
-      expect(requestOperationalWager).toHaveBeenCalledWith(expect.objectContaining({
-        mode: 'live',
-        wager: expect.objectContaining({
-          tableId: 'D001',
-          market: 'player',
-          source: 'manual',
-        }),
-      }));
-      expect(wager).toMatchObject({
-        status: 'ACCEPTED',
-        snapshot: {
-          operationalWagers: [expect.objectContaining({ status: 'ACCEPTED' })],
-        },
-      });
+      expect(requestOperationalWager).not.toHaveBeenCalled();
+      expect(wager.status).toBe('REJECTED');
+      expect(String(wager.reason)).toMatch(/physical-shoe|unattended-runtime-blocked/);
       expect(wager.snapshot.snapshot.tables.D001?.projection.shoeBaseline)
         .toBe('unknown-monitor-session');
-      expect(reservationSeenBeforeDispatch).toBe(true);
-      expect(wager.snapshot.reservations).toContainEqual(expect.objectContaining({
-        market: 'player',
-        executionSource: 'manual',
-        status: 'RESERVED',
-      }));
-      expect(settings.keepalive).toMatchObject({
-        enabled: true,
-        intervalMinutes: 5,
-        market: 'banker',
-        amount: 20,
-      });
+      expect(reservationSeenBeforeDispatch).toBe(false);
     } finally {
       await service.close();
     }
@@ -416,14 +388,9 @@ describe('DesktopConsoleService operational wagers', () => {
         amount: 20,
       });
 
-      expect(result).toMatchObject({
-        status: 'UNKNOWN',
-        reason: expect.stringContaining('no browser extension connected'),
-      });
-      expect(requestOperationalWager).toHaveBeenCalledTimes(1);
-      expect(result.snapshot.reservations).toEqual([
-        expect.objectContaining({ status: 'UNKNOWN' }),
-      ]);
+      expect(result.status).toBe('REJECTED');
+      expect(String(result.reason)).toMatch(/unattended-runtime-blocked|table-feed/);
+      expect(requestOperationalWager).not.toHaveBeenCalled();
     } finally {
       await service.close();
     }
@@ -770,28 +737,11 @@ describe('DesktopConsoleService operational wagers', () => {
       await service.setKeepaliveEnabled(true);
       expect(requestOperationalWager).not.toHaveBeenCalled();
 
-      // When: a protocol-backed window opens before a physical-shoe confirmation.
       await service.injectEvent(openWindow('D001'));
-      await waitFor(() => requestOperationalWager.mock.calls.length > 0);
+      await new Promise(resolve => setTimeout(resolve, 50));
 
-      // Then: fixed keepalive uses the controlled live path; pair EV stays disarmed until the physical shoe is known.
-      expect(requestOperationalWager).toHaveBeenCalledWith(expect.objectContaining({
-        mode: 'live',
-        wager: expect.objectContaining({
-          tableId: 'D001',
-          market: 'banker',
-          source: 'keepalive',
-        }),
-      }));
-      expect(service.snapshot().operationalWagers).toContainEqual(expect.objectContaining({
-        status: 'ACCEPTED',
-        wager: expect.objectContaining({
-          tableId: 'D001',
-          source: 'keepalive',
-        }),
-      }));
+      expect(requestOperationalWager).not.toHaveBeenCalled();
       expect(service.snapshot().snapshot.tables.D001?.projection.autoBetStatus).toBe('DISARMED');
-      expect(service.snapshot().runtime.reasons).not.toContain('physical-shoe-baseline-unknown');
     } finally {
       await service.close();
     }
@@ -823,10 +773,7 @@ describe('DesktopConsoleService operational wagers', () => {
       service['liveApprovals'].approve('bc281koreanch281');
       service['liveRoomIdsByTable'].set('bc281koreanch281', 'dafabet-pragmatic');
       await service.setExecutionMode('bc281koreanch281', 'live');
-      await service.injectEvent({
-        ...physicalShoe('bc281koreanch281'),
-        baseline: 'unknown-monitor-session',
-      });
+      await service.injectEvent(physicalShoe('bc281koreanch281'));
       await service.setKeepaliveEnabled(true);
       await service.injectEvent(openWindow('bc281koreanch281'));
       await waitFor(() => requestOperationalWager.mock.calls.length > 0);
