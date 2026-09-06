@@ -670,9 +670,7 @@ export class SqliteLedger {
   }
 
   listRecentDisplayEvents(tableId: string, limit = 24): NormalizedEvent[] {
-    return this.listEvents(tableId)
-      .filter(event => event.type === 'cardObserved' || event.type === 'handSettled')
-      .slice(-Math.max(1, limit));
+    return this.listRecentDisplayEventsForTables([tableId], limit);
   }
 
   listDecisionsTail(limit = 200): DecisionSnapshot[] {
@@ -1591,11 +1589,34 @@ export class SqliteLedger {
   }
 
   listRecentDisplayEventsForTables(tableIds: readonly string[], limitPerTable = 24): NormalizedEvent[] {
-    if (tableIds.length === 0) return [];
+    const uniqueTableIds = [...new Set(tableIds.filter(tableId => tableId.length > 0))];
+    if (uniqueTableIds.length === 0) return [];
     const limit = Math.max(1, limitPerTable);
+    const placeholders = uniqueTableIds.map(() => '?').join(', ');
+    const rows = this.db.prepare(`
+      SELECT table_id AS tableId, payload FROM (
+        SELECT table_id, payload, ROW_NUMBER() OVER (
+          PARTITION BY table_id ORDER BY id DESC
+        ) AS rn
+        FROM events
+        WHERE table_id IN (${placeholders})
+          AND type IN ('cardObserved', 'handSettled')
+      ) ranked
+      WHERE rn <= ?
+      ORDER BY table_id ASC, rn DESC
+    `).all(...uniqueTableIds, limit) as Array<{ tableId: string; payload: string }>;
+    const persistedByTable = new Map<string, NormalizedEvent[]>();
+    for (const row of rows) {
+      const list = persistedByTable.get(row.tableId) ?? [];
+      list.push(JSON.parse(row.payload) as NormalizedEvent);
+      persistedByTable.set(row.tableId, list);
+    }
     const events: NormalizedEvent[] = [];
-    for (const tableId of tableIds) {
-      events.push(...this.listRecentDisplayEvents(tableId, limit));
+    for (const tableId of uniqueTableIds) {
+      const persisted = persistedByTable.get(tableId) ?? [];
+      const ephemeral = (this.ephemeralEventsByTable.get(tableId) ?? [])
+        .filter(event => event.type === 'cardObserved' || event.type === 'handSettled');
+      events.push(...mergeLedgerEvents(persisted, ephemeral).slice(-limit));
     }
     return events;
   }
