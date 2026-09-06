@@ -8,6 +8,7 @@ describe('DesktopConsoleService snapshot performance', () => {
       const ledger = service['ledger'];
       const listDecisionHandsPage = vi.spyOn(ledger, 'listDecisionHandsPage');
       const listEventsPage = vi.spyOn(ledger, 'listEventsPage');
+      const listEvents = vi.spyOn(ledger, 'listEvents');
       const getMonitorSummary = vi.spyOn(ledger, 'getMonitorSummary');
 
       const snapshot = service.snapshot({
@@ -18,6 +19,7 @@ describe('DesktopConsoleService snapshot performance', () => {
 
       expect(listDecisionHandsPage).not.toHaveBeenCalled();
       expect(listEventsPage).not.toHaveBeenCalled();
+      expect(listEvents).not.toHaveBeenCalled();
       expect(getMonitorSummary).not.toHaveBeenCalled();
       expect(snapshot.recordCounts).toEqual({ events: 0, decisions: 0, ledger: 0 });
       expect(snapshot.summary).toEqual({ rows: [], incomePoints: [] });

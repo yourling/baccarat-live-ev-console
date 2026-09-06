@@ -19,6 +19,7 @@ export interface TableActorSnapshot {
   executionMode: 'shadow' | 'simulated' | 'live';
   defaultBetAmount: number;
   pendingEvents: number;
+  missingUnobservedCards?: number;
 }
 
 export interface OrchestratorSnapshot {

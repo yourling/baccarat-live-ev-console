@@ -14,6 +14,7 @@ apps/desktop/release/
 
 # Local capture / research dumps (not product)
 .tmp-pragmatic/
+.tmp-bg/
 scripts/temp-*.cjs
 eng.traineddata
 .jspace/
@@ -30,3 +31,8 @@ apps/desktop/.claude/
 apps/desktop/.trae/
 apps/desktop/skills/
 apps/lord-god-space/
+
+# Local scratch dumps
+/tmp-*
+/.tmp-*
+

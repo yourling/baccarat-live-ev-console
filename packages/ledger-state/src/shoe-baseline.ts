@@ -26,6 +26,41 @@ export const VERIFIED_PHYSICAL_SHOE_REASONS = [
 
 export type VerifiedPhysicalShoeReason = (typeof VERIFIED_PHYSICAL_SHOE_REASONS)[number];
 
+const ROAD_WRAP_MAX = 8;
+const ROAD_WRAP_MIN_PREVIOUS = 10;
+const ROAD_WRAP_MIN_DROP = 8;
+const EARLY_SHOE_ROAD_MAX = 20;
+const DEEP_SHOE_HAND_MIN = 50;
+
+/**
+ * HISTORY/DOM sometimes stays at 局 1-8 while protocol has already tracked
+ * a full mid/late shoe. That shape matches a road wrap, but if this shoeId
+ * was not actually reset, the tracked remaining cards are the truth.
+ */
+export function isWrapShapedRoadCount(handNumber: number, gameCount: number): boolean {
+  return Number.isInteger(handNumber)
+    && Number.isInteger(gameCount)
+    && handNumber >= ROAD_WRAP_MIN_PREVIOUS
+    && gameCount >= 1
+    && gameCount <= ROAD_WRAP_MAX
+    && handNumber - gameCount >= ROAD_WRAP_MIN_DROP;
+}
+
+/**
+ * Missed shuffle: live bead plate is still in early 局 9-20 while this shoeId
+ * already played 50+ hands. 局18 + old inventory is how A05 advertised +31%.
+ * Wrap-shaped 1-8 is not this; that is either a real wrap (parser opens a new
+ * shoe) or a stuck early HISTORY road (keep tracked remaining/EV).
+ */
+export function isMissedShuffleRoadCount(handNumber: number, gameCount: number): boolean {
+  return Number.isInteger(handNumber)
+    && Number.isInteger(gameCount)
+    && handNumber >= DEEP_SHOE_HAND_MIN
+    && gameCount > ROAD_WRAP_MAX
+    && gameCount <= EARLY_SHOE_ROAD_MAX
+    && handNumber - gameCount >= ROAD_WRAP_MIN_DROP;
+}
+
 export function isVerifiedPhysicalShoeReason(
   reason: string | undefined,
 ): reason is VerifiedPhysicalShoeReason {
@@ -85,26 +120,28 @@ export function explainShoeBaseline(
   gameCount?: number,
   parserEvidence?: ShoeBaselineEvidence,
 ): { readonly baseline: ShoeBaseline; readonly evidence: ShoeBaselineEvidence } {
+  const verified = isVerifiedPhysicalShoeEvidence(parserEvidence);
+  const initial = initialShoeTotal(projection.profileSnapshot.numberOfDecks);
+  const deepUnseenRoad = projection.seenCards.length < 8
+    && projection.handNumber < 8
+    && projection.remainingTotal >= initial - 16
+    && typeof gameCount === 'number'
+    && gameCount >= 8;
+  if (deepUnseenRoad && (projection.shoeBaseline === 'physical-shoe' || verified)) {
+    return {
+      baseline: 'unknown-monitor-session',
+      evidence: { reason: 'restart-empty-inventory', gameCount },
+    };
+  }
   if (projection.shoeBaseline !== 'physical-shoe') {
+    if (verified && parserEvidence !== undefined) {
+      return { baseline: 'physical-shoe', evidence: parserEvidence };
+    }
     return {
       baseline: 'unknown-monitor-session',
       evidence: parserEvidence?.reason === 'attach' || parserEvidence === undefined
         ? { reason: 'attach', ...(gameCount === undefined ? {} : { gameCount }) }
         : parserEvidence,
-    };
-  }
-  const initial = initialShoeTotal(projection.profileSnapshot.numberOfDecks);
-  const verified = isVerifiedPhysicalShoeEvidence(parserEvidence);
-  // Lagged DOM road counts must not demote a shoe this process already saw shuffle.
-  if (
-    !verified
-    && projection.seenCards.length < 8
-    && typeof gameCount === 'number'
-    && gameCount >= 8
-  ) {
-    return {
-      baseline: 'unknown-monitor-session',
-      evidence: { reason: 'restart-empty-inventory', gameCount },
     };
   }
   if (
@@ -120,7 +157,16 @@ export function explainShoeBaseline(
     };
   }
   if (typeof gameCount === 'number' && gameCount >= 1) {
-    const minRemaining = initial - gameCount * 6 - 20;
+    if (isMissedShuffleRoadCount(projection.handNumber, gameCount)) {
+      return {
+        baseline: 'unknown-monitor-session',
+        evidence: { reason: 'inventory-contradiction', gameCount },
+      };
+    }
+    // A stuck early HISTORY road (局3) must not shrink the burn budget of a
+    // 50-hand tracked shoe. Use the larger of road vs actually tracked hands.
+    const handsForBudget = Math.max(gameCount, projection.handNumber);
+    const minRemaining = initial - handsForBudget * 6 - 20;
     if (projection.remainingTotal < minRemaining) {
       return {
         baseline: 'unknown-monitor-session',
@@ -130,6 +176,10 @@ export function explainShoeBaseline(
   }
   return {
     baseline: 'physical-shoe',
-    evidence: parserEvidence ?? { reason: 'protocol-shuffle' },
+    // A rebuilt ledger shoe is already physical. The new process's first
+    // shoeReset token is only attach and must not hide remaining/EV.
+    evidence: verified && parserEvidence !== undefined
+      ? parserEvidence
+      : { reason: 'protocol-shuffle' },
   };
 }

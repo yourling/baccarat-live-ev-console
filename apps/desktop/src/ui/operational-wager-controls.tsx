@@ -12,7 +12,7 @@ const MARKET_LABELS: Record<OperationalWagerMarket, string> = {
 };
 
 const MARKETS: readonly OperationalWagerMarket[] = ['banker', 'player', 'bankerPair', 'playerPair'];
-const DEFAULT_PAGE_CHIP_AMOUNT = 10;
+const DEFAULT_PAGE_CHIP_AMOUNT = 20;
 
 type OperationalWagerStatus = 'ACCEPTED' | 'REJECTED' | 'UNKNOWN';
 

@@ -283,7 +283,7 @@ describe('operational wager confirmation', () => {
       });
       expect(container.querySelector('input')).toBeNull();
       expect(container.textContent).toContain('默认筹码');
-      expect(container.textContent).toContain('10.00');
+      expect(container.textContent).toContain('20.00');
 
       const bankerButton = Array.from(container.querySelectorAll('button'))
         .find(button => button.textContent === '庄');
@@ -298,7 +298,7 @@ describe('operational wager confirmation', () => {
         confirmButton.click();
       });
 
-      expect(executed).toEqual([expect.objectContaining({ amount: 10 })]);
+      expect(executed).toEqual([expect.objectContaining({ amount: 20 })]);
     } finally {
       await act(async () => {
         root.unmount();

@@ -248,6 +248,77 @@ describe('ledger replay', () => {
     led.close();
   });
 
+  it('rebuilds physical-shoe inventory from persisted handSettled when cardObserved was memory-only', () => {
+    const profile = defaultProfile('t1');
+    const events: NormalizedEvent[] = [
+      ev({ type: 'newShoeSignal', shoeId: 'bg-t1-2', baseline: 'physical-shoe', profile: { ...profile, autoConfirmNewShoe: true } }, 1),
+      ev({
+        type: 'handSettled',
+        shoeId: 'bg-t1-2',
+        handId: '3823000',
+        playerCards: [{ rank: 'A', suit: 'S', raw: 'AS' }, { rank: '8', suit: 'H', raw: '8H' }],
+        bankerCards: [{ rank: 'K', suit: 'D', raw: 'KD' }, { rank: '7', suit: 'C', raw: '7C' }],
+      }, 2),
+      ev({
+        type: 'handSettled',
+        shoeId: 'bg-t1-2',
+        handId: '3823001',
+        playerCards: [{ rank: '2', suit: 'S', raw: '2S' }, { rank: '3', suit: 'H', raw: '3H' }, { rank: '4', suit: 'D', raw: '4D' }],
+        bankerCards: [{ rank: '5', suit: 'C', raw: '5C' }, { rank: '6', suit: 'S', raw: '6S' }],
+      }, 3),
+    ];
+    const led = new SqliteLedger();
+    for (const event of events) led.appendEvent(event);
+    const projection = led.replay('t1', { latestShoeOnly: true }).state.get('t1')!;
+    expect(projection.shoeBaseline).toBe('physical-shoe');
+    expect(projection.handNumber).toBe(2);
+    expect(projection.seenCards).toHaveLength(9);
+    expect(projection.remainingTotal).toBe(416 - 9);
+    led.close();
+  });
+
+  it('replays from the last physical shoe even if a later attach token was recorded', () => {
+    const profile = defaultProfile('t1');
+    const led = new SqliteLedger();
+    led.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'bg-t1-2', baseline: 'physical-shoe', profile: { ...profile, autoConfirmNewShoe: true } }, 1));
+    led.appendEvent(ev({
+      type: 'handSettled',
+      shoeId: 'bg-t1-2',
+      handId: '3823000',
+      playerCards: [{ rank: 'A', suit: 'S', raw: 'AS' }, { rank: '8', suit: 'H', raw: '8H' }],
+      bankerCards: [{ rank: 'K', suit: 'D', raw: 'KD' }, { rank: '7', suit: 'C', raw: '7C' }],
+    }, 2));
+    led.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'bg-t1-1', baseline: 'unknown-monitor-session', profile: { ...profile, autoConfirmNewShoe: true } }, 3));
+    const projection = led.replay('t1', { latestShoeOnly: true }).state.get('t1')!;
+    expect(projection.shoeId).toBe('bg-t1-2');
+    expect(projection.shoeBaseline).toBe('physical-shoe');
+    expect(projection.seenCards).toHaveLength(4);
+    expect(projection.remainingTotal).toBe(412);
+    led.close();
+  });
+
+  it('ignores a same-id physical newShoe that arrives seconds after recorded hands', () => {
+    const profile = defaultProfile('t1');
+    const led = new SqliteLedger();
+    led.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'bg-t1-2', baseline: 'physical-shoe', profile: { ...profile, autoConfirmNewShoe: true } }, 1));
+    led.appendEvent(ev({
+      type: 'handSettled',
+      shoeId: 'bg-t1-2',
+      handId: '100',
+      playerCards: [{ rank: 'A', suit: 'S', raw: 'AS' }, { rank: '8', suit: 'H', raw: '8H' }],
+      bankerCards: [{ rank: 'K', suit: 'D', raw: 'KD' }, { rank: '7', suit: 'C', raw: '7C' }],
+    }, 2));
+    led.appendEvent({
+      ...ev({ type: 'newShoeSignal', shoeId: 'bg-t1-2', baseline: 'physical-shoe', profile: { ...profile, autoConfirmNewShoe: true } }, 3),
+      timestamp: '2025-01-01T00:00:43.000Z',
+    });
+    const projection = led.replay('t1', { latestShoeOnly: true }).state.get('t1')!;
+    expect(projection.shoeId).toBe('bg-t1-2');
+    expect(projection.seenCards).toHaveLength(4);
+    expect(projection.remainingTotal).toBe(412);
+    led.close();
+  });
+
   it('does not consume inventory twice for a replayed card on the same hand', () => {
     const profile = defaultProfile('t1');
     const events: NormalizedEvent[] = [
@@ -291,13 +362,14 @@ describe('ledger replay', () => {
     expect(state?.status).toBe('TRACKING');
   });
 
-  it('demotes a physical shoe after connectionLost until a new shuffle arrives', () => {
+  it('keeps a physical shoe after a table-feed-stale gap', () => {
     const profile = { ...defaultProfile('t1'), autoConfirmNewShoe: true };
     const state = replayEvents([
       ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile }, 1),
       ev({ type: 'connectionLost', reason: 'table-feed-stale' }, 2),
     ]).get('t1');
-    expect(state?.shoeBaseline).toBe('unknown-monitor-session');
+    expect(state?.shoeBaseline).toBe('physical-shoe');
+    expect(state?.connectionStatus).toBe('DISCONNECTED');
     expect(state?.autoBetStatus).toBe('DISARMED');
     const restored = replayEvents([
       ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile }, 1),
@@ -307,7 +379,17 @@ describe('ledger replay', () => {
         continuityProof: `cursor-v1:${'a'.repeat(64)}`,
       }, 3),
     ]).get('t1');
-    expect(restored?.shoeBaseline).toBe('unknown-monitor-session');
+    expect(restored?.shoeBaseline).toBe('physical-shoe');
+    expect(restored?.connectionStatus).toBe('CONNECTED');
+  });
+
+  it('demotes a physical shoe after a non-transient connectionLost', () => {
+    const profile = { ...defaultProfile('t1'), autoConfirmNewShoe: true };
+    const state = replayEvents([
+      ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile }, 1),
+      ev({ type: 'connectionLost', reason: 'process-restart' }, 2),
+    ]).get('t1');
+    expect(state?.shoeBaseline).toBe('unknown-monitor-session');
   });
 
   it('keeps a physical shoe after an extension-bridge flash disconnect', () => {
@@ -777,17 +859,32 @@ describe('projection state machine hardening', () => {
     expect(withProof.autoBetStatus).toBe('DISARMED');
   });
 
-  it('rejects drawing a rank more times than the shoe inventory allows', () => {
+  it('leaves RESYNCING when the current shoe keeps dealing after a feed gap', () => {
+    const profile = defaultProfile('t1');
+    const state = replayEvents([
+      ev({ type: 'newShoeSignal', shoeId: 's1', baseline: 'physical-shoe', profile: { ...profile, autoConfirmNewShoe: true } }, 1),
+      ev({ type: 'connectionLost', reason: 'table-feed-stale' }, 2),
+      ev({ type: 'bettingWindowOpened', shoeId: 's1', handId: 'h2', market: 'bankerPair' }, 3),
+    ]).get('t1')!;
+    expect(state.status).toBe('BETTING_WINDOW');
+    expect(state.connectionStatus).toBe('CONNECTED');
+    expect(state.shoeBaseline).toBe('physical-shoe');
+  });
+
+  it('ignores an extra exhausted-rank card without killing a still-dealable physical shoe', () => {
     const profile = defaultProfile('t1');
     const events: NormalizedEvent[] = [
-      ev({ type: 'newShoeSignal', shoeId: 's1', profile: { ...profile, autoConfirmNewShoe: true, numberOfDecks: 1 } }, 1),
+      ev({ type: 'newShoeSignal', shoeId: 's1', baseline: 'physical-shoe', profile: { ...profile, autoConfirmNewShoe: true, numberOfDecks: 1 } }, 1),
       ev({ type: 'cardObserved', shoeId: 's1', handId: 'h1', card: { rank: 'A' } }, 2),
       ev({ type: 'cardObserved', shoeId: 's1', handId: 'h2', card: { rank: 'A' } }, 3),
       ev({ type: 'cardObserved', shoeId: 's1', handId: 'h3', card: { rank: 'A' } }, 4),
       ev({ type: 'cardObserved', shoeId: 's1', handId: 'h4', card: { rank: 'A' } }, 5),
       ev({ type: 'cardObserved', shoeId: 's1', handId: 'h5', card: { rank: 'A' } }, 6),
     ];
-    expect(() => replayEvents(events)).toThrowError(ProjectionError);
+    const state = replayEvents(events).get('t1');
+    expect(state?.shoeBaseline).toBe('physical-shoe');
+    expect(state?.seenCards).toHaveLength(4);
+    expect(state?.remainingTotal).toBe(48);
   });
 
   it('rejects malformed event envelopes before mutating projection', () => {
@@ -1726,7 +1823,7 @@ describe('monitor history retention', () => {
       }, seq++));
     }
     const events = ledger.listEvents('t1');
-    expect(events.filter(event => event.type === 'cardObserved')).toHaveLength(36);
+    expect(events.filter(event => event.type === 'cardObserved')).toHaveLength(40);
     expect(events.filter(event => event.type === 'bettingWindowOpened')).toHaveLength(8);
     expect(events.filter(event => event.type === 'bettingWindowClosed')).toHaveLength(8);
     ledger.close();

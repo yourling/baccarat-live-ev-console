@@ -7,6 +7,7 @@ import type {
 import { OperationalWagerCoordinator } from '../electron-src/operational-wager-coordinator.js';
 
 const BASE_TIME = new Date('2026-08-27T00:00:00.000Z');
+const OPEN_CLOSES_AT = new Date(BASE_TIME.valueOf() + 12_000).toISOString();
 
 function accepted(
   tableId: string,
@@ -126,7 +127,7 @@ describe('OperationalWagerCoordinator', () => {
       await coordinator.tick(BASE_TIME);
       expect(calls).toEqual([]);
 
-      await coordinator.tick(BASE_TIME, 'D002');
+      await coordinator.tick(BASE_TIME, 'D002', OPEN_CLOSES_AT);
       expect(calls).toEqual(['D002']);
       expect(coordinator.getKeepaliveState()).toMatchObject({
         enabled: true,
@@ -176,7 +177,7 @@ describe('OperationalWagerCoordinator', () => {
         market: 'player',
         amount: 20,
       }, BASE_TIME);
-      await coordinator.tick(BASE_TIME, 'D003');
+      await coordinator.tick(BASE_TIME, 'D003', OPEN_CLOSES_AT);
       expect(calls).toEqual([]);
     } finally {
       coordinator.close();
@@ -228,7 +229,7 @@ describe('OperationalWagerCoordinator', () => {
         market: 'player',
         amount: 20,
       }, BASE_TIME);
-      await coordinator.tick(BASE_TIME, 'D001');
+      await coordinator.tick(BASE_TIME, 'D001', OPEN_CLOSES_AT);
 
       expect(calls).toEqual(['D001']);
       expect(coordinator.getKeepaliveState()).toMatchObject({
@@ -279,7 +280,7 @@ describe('OperationalWagerCoordinator', () => {
       }, BASE_TIME);
       expect(placeOperationalWager).not.toHaveBeenCalled();
       ready = true;
-      const queuedTick = coordinator.tick(BASE_TIME, 'D001');
+      const queuedTick = coordinator.tick(BASE_TIME, 'D001', OPEN_CLOSES_AT);
       await serializationStarted;
       coordinator.disableKeepaliveImmediately();
       releaseSerialization();
@@ -287,6 +288,66 @@ describe('OperationalWagerCoordinator', () => {
 
       expect(placeOperationalWager).not.toHaveBeenCalled();
       expect(coordinator.getKeepaliveState().enabled).toBe(false);
+    } finally {
+      coordinator.close();
+      ledger.close();
+    }
+  });
+
+  it('skips a just-opened window with under 5 seconds remaining without burning the interval', async () => {
+    const ledger = new SqliteLedger(':memory:');
+    const placeOperationalWager = vi.fn(async (command: ControlledOperationalWagerCommand) =>
+      accepted('D001', command));
+    const coordinator = new OperationalWagerCoordinator({
+      ledger,
+      actor: () => ({ placeOperationalWager }),
+      monitorTableIds: () => ['D001'],
+      serialize: async operation => await operation(),
+    });
+    try {
+      await coordinator.updateKeepalive({
+        enabled: true,
+        intervalMinutes: 10,
+        market: 'player',
+        amount: 20,
+      }, BASE_TIME);
+      await coordinator.tick(BASE_TIME, 'D001', new Date(BASE_TIME.valueOf() + 3_000).toISOString());
+      expect(placeOperationalWager).not.toHaveBeenCalled();
+      expect(coordinator.getKeepaliveState().lastAttemptAt).toBeUndefined();
+      expect(coordinator.getKeepaliveState().lastReason).toBe('window-too-short');
+
+      await coordinator.tick(new Date(BASE_TIME.valueOf() + 4_000), 'D001', OPEN_CLOSES_AT);
+      expect(placeOperationalWager).not.toHaveBeenCalled();
+
+      await coordinator.tick(new Date(BASE_TIME.valueOf() + 10_000), 'D001', new Date(BASE_TIME.valueOf() + 22_000).toISOString());
+      expect(placeOperationalWager).toHaveBeenCalledTimes(1);
+    } finally {
+      coordinator.close();
+      ledger.close();
+    }
+  });
+
+  it('skips keepalive when the opened window has no closesAt', async () => {
+    const ledger = new SqliteLedger(':memory:');
+    const placeOperationalWager = vi.fn(async (command: ControlledOperationalWagerCommand) =>
+      accepted('D001', command));
+    const coordinator = new OperationalWagerCoordinator({
+      ledger,
+      actor: () => ({ placeOperationalWager }),
+      monitorTableIds: () => ['D001'],
+      serialize: async operation => await operation(),
+    });
+    try {
+      await coordinator.updateKeepalive({
+        enabled: true,
+        intervalMinutes: 10,
+        market: 'player',
+        amount: 20,
+      }, BASE_TIME);
+      await coordinator.tick(BASE_TIME, 'D001');
+      expect(placeOperationalWager).not.toHaveBeenCalled();
+      expect(coordinator.getKeepaliveState().lastReason).toBe('window-remaining-unknown');
+      expect(coordinator.getKeepaliveState().lastAttemptAt).toBeUndefined();
     } finally {
       coordinator.close();
       ledger.close();

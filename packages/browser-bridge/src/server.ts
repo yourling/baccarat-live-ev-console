@@ -35,6 +35,12 @@ import type {
   BridgeServerMessage,
 } from './protocol.js';
 import { PragmaticRuntimeParser, pragmaticGameCountSnapshot, selectStableGameCount, type ParserShoeEvidence } from './pragmatic-runtime.js';
+import { BgRuntimeParser, bgGameCountSnapshot, normalizeBgTableId, selectBgRoadCount } from './bg-runtime.js';
+import {
+  DAFABET_BG_ROOM_ID,
+  DAFABET_PRAGMATIC_ROOM_ID,
+  isLiveBridgeRoomId,
+} from './identity.js';
 import {
   PragmaticProtocolState,
   inspectPragmaticGameresult,
@@ -47,6 +53,9 @@ import { ExecutorLeaseRegistry, type HostExecutionChannelClaimResult } from './e
 
 export const PRAGMATIC_BET_RUNTIME_REVISION = 'pragmatic-bet-runtime/2026-08-30.14';
 const PRAGMATIC_BET_RUNTIME_FAMILY = 'pragmatic-bet-runtime/';
+export const BG_BET_RUNTIME_REVISION = 'bg-bet-runtime/2026-09-05.1';
+const BG_BET_RUNTIME_FAMILY = 'bg-bet-runtime/';
+
 
 export class OperationalWagerRuntimeRevisionError extends Error {
   constructor(readonly receipt: OperationalWagerReceipt) {
@@ -65,6 +74,7 @@ export interface BrowserBridgeServerOptions {
   extensionDisconnectGraceMs?: number;
   requireExtensionSequence?: boolean;
   allowedExtensionId?: string;
+  allowedExtensionIds?: readonly string[];
   extensionToken?: string;
   onRuntimeEvent?: (event: BrowserBridgeRuntimeEvent) => void;
 }
@@ -111,7 +121,9 @@ function mergeBridgeTableDescriptor(
 ): BridgeRoomDescriptor['tables'][number] {
   const gameCount = next.gameCount === undefined
     ? previous?.gameCount
-    : selectStableGameCount(previous?.gameCount, next.gameCount);
+    : normalizeBgTableId(next.tableId) !== undefined
+      ? selectBgRoadCount(previous?.gameCount, next.gameCount)
+      : selectStableGameCount(previous?.gameCount, next.gameCount);
   return {
     ...(previous ?? { tableId: next.tableId }),
     tableId: next.tableId,
@@ -122,6 +134,17 @@ function mergeBridgeTableDescriptor(
       ? {}
       : { profile: { ...(previous?.profile ?? {}), ...(next.profile ?? {}) } }),
     ...(next.monitorUrl === undefined ? {} : { monitorUrl: next.monitorUrl }),
+  };
+}
+
+function sanitizeBgBridgeRoom(room: BridgeRoomDescriptor): BridgeRoomDescriptor {
+  return {
+    ...room,
+    tables: room.tables.flatMap(table => {
+      const tableId = normalizeBgTableId(table.tableId);
+      if (tableId === undefined) return [];
+      return [{ ...table, tableId }];
+    }),
   };
 }
 
@@ -193,20 +216,22 @@ const PRAGMATIC_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
 const PRAGMATIC_EXECUTION_LANE = 'pragmatic:shared-multitable-ui';
 
 /** 观察广播只透传游戏协议通道，不含视频/资源/页面 IPC。 */
-const OBSERVABLE_NETWORK_PATTERN = /pragmaticplaylive\.net\/game/i;
+const OBSERVABLE_NETWORK_PATTERN = /pragmaticplaylive\.net\/game|h5V01|jbz029|baccarat-bridge-bg/i;
 
 const LIVE_PROTOCOL_CAPTURE_SOURCES = new Set([
   'baccarat-bridge-pragmatic-ws',
   'baccarat-bridge-pragmatic-state',
   'baccarat-bridge-runtime-selection',
   'baccarat-bridge-runtime-state',
+  'baccarat-bridge-bg-ws',
+  'baccarat-bridge-bg-state',
 ]);
 
 function isLiveProtocolCapture(
   message: Extract<BridgeClientMessage, { kind: 'networkCapture' }>,
 ): boolean {
   if (message.encoding === 'base64') return false;
-  if (typeof message.data === 'string' && message.data.length > 16_384) return false;
+  if (typeof message.data === 'string' && message.data.length > 65_536) return false;
   if (LIVE_PROTOCOL_CAPTURE_SOURCES.has(message.source)) return true;
   return OBSERVABLE_NETWORK_PATTERN.test(message.url);
 }
@@ -238,18 +263,31 @@ const COMMAND_PATH = '/command';
 const BRIDGE_DEBUG_ENABLED = process.env.BACCARAT_BRIDGE_DEBUG === '1';
 
 const TABLE_STALE_AFTER_MS = 45_000;
+const BG_TABLE_STALE_AFTER_MS = 300_000;
+const SHUFFLE_HOLD_MS = 10 * 60 * 1000;
 const EXTENSION_HEARTBEAT_TIMEOUT_MS = 15_000;
 const EXTENSION_DISCONNECT_GRACE_MS = 8_000;
 
 type BridgeSocketRole = 'extension' | 'observer' | 'command';
 
+function allowedExtensionIdSet(
+  identity: Pick<BrowserBridgeServerOptions, 'allowedExtensionId' | 'allowedExtensionIds'> = {},
+): ReadonlySet<string> | undefined {
+  const ids = [
+    ...(identity.allowedExtensionIds ?? []),
+    ...(identity.allowedExtensionId === undefined ? [] : [identity.allowedExtensionId]),
+  ].filter(id => /^[a-p]{32}$/.test(id));
+  if (ids.length === 0) return undefined;
+  return new Set(ids);
+}
+
 function bridgeSocketRole(
   origin: string,
   requestUrl: string | undefined,
-  identity: Pick<BrowserBridgeServerOptions, 'allowedExtensionId' | 'extensionToken'> = {},
+  identity: Pick<BrowserBridgeServerOptions, 'allowedExtensionId' | 'allowedExtensionIds' | 'extensionToken'> = {},
 ): BridgeSocketRole | null {
   const path = bridgeRequestPath(requestUrl);
-  if (isExtensionOrigin(origin, identity.allowedExtensionId)) {
+  if (isExtensionOrigin(origin, allowedExtensionIdSet(identity))) {
     return path === '/' && hasExtensionToken(requestUrl, identity.extensionToken)
       ? 'extension'
       : null;
@@ -268,12 +306,12 @@ function bridgeRequestPath(requestUrl: string | undefined): string {
   }
 }
 
-function isExtensionOrigin(origin: string, allowedExtensionId?: string): boolean {
+function isExtensionOrigin(origin: string, allowedIds?: ReadonlySet<string>): boolean {
   try {
     const url = new URL(origin);
     return url.protocol === 'chrome-extension:'
       && /^[a-p]{32}$/.test(url.hostname)
-      && (allowedExtensionId === undefined || url.hostname === allowedExtensionId);
+      && (allowedIds === undefined || allowedIds.has(url.hostname));
   } catch {
     return false;
   }
@@ -675,6 +713,7 @@ class BridgeTableExport implements TableExport {
   private flushWaiters: Array<() => void> = [];
   private restoreInFlight?: Promise<void>;
   private lastObservationAt: number;
+  private shuffleHoldUntil = 0;
   private transportContinuous = true;
   private disconnectReason?: string;
 
@@ -756,6 +795,7 @@ class BridgeTableExport implements TableExport {
   ingestEvent(event: NormalizedEvent): void {
     if (this.stopped) return;
     this.noteObservation();
+    if (event.type === 'newShoeSignal') this.shuffleHoldUntil = Date.now() + SHUFFLE_HOLD_MS;
     this.pending.push(event);
     if (this.started) {
       void this.drain();
@@ -790,6 +830,7 @@ class BridgeTableExport implements TableExport {
 
   checkFreshness(now = Date.now()): void {
     if (!this.started || this.stopped || this.state !== 'CONNECTED') return;
+    if (now < this.shuffleHoldUntil) return;
     if (now - this.lastObservationAt <= this.staleAfterMs) return;
     this.handleDisconnect('table-feed-stale');
   }
@@ -947,6 +988,8 @@ export class BrowserBridgeServer implements RoomMonitor {
   private pendingBets = new Map<string, PendingBet>();
   private readonly tableExecutionTails = new Map<string, Promise<void>>();
   private pragmaticParser = new PragmaticRuntimeParser();
+  private bgParser = new BgRuntimeParser();
+  private readonly bgShoeSequenceSeed = new Map<string, number>();
   private readonly pragmaticProtocol = new PragmaticProtocolState();
   private readonly parsedSourceSeqByTable = new Map<string, number>();
   private readonly parsedEventIds = new Set<string>();
@@ -1169,24 +1212,45 @@ export class BrowserBridgeServer implements RoomMonitor {
   }
 
   shoeEvidence(tableId: string) {
-    return this.pragmaticParser.shoeEvidence(tableId);
+    return this.bgParser.shoeEvidence(tableId) ?? this.pragmaticParser.shoeEvidence(tableId);
   }
 
   acceptedGameCount(tableId: string): number | undefined {
-    return this.pragmaticParser.acceptedGameCount(tableId);
+    return this.bgParser.acceptedGameCount(tableId) ?? this.pragmaticParser.acceptedGameCount(tableId);
+  }
+
+  seedBgShoeSequences(sequences: ReadonlyArray<{ tableId: string; sequence: number }>): void {
+    for (const { tableId, sequence } of sequences) {
+      this.bgParser.seedShoeSequence(tableId, sequence);
+      const current = this.bgShoeSequenceSeed.get(tableId) ?? 0;
+      if (sequence > current) this.bgShoeSequenceSeed.set(tableId, sequence);
+    }
   }
 
   recordShoeEvidence(tableId: string, evidence: ParserShoeEvidence): void {
+    if (this.roomIdForTable(tableId) === DAFABET_BG_ROOM_ID) {
+      this.bgParser.recordShoeEvidence(tableId, evidence);
+      return;
+    }
     this.pragmaticParser.recordShoeEvidence(tableId, evidence);
   }
 
   openPhysicalShoe(tableId: string): void {
     if (!this.isTableSelected(tableId)) return;
-    this.ingestParsedEvents(this.pragmaticParser.openPhysicalShoe(tableId, new Date().toISOString()));
+    const timestamp = new Date().toISOString();
+    if (this.roomIdForTable(tableId) === DAFABET_BG_ROOM_ID) {
+      this.ingestParsedEvents(this.bgParser.openPhysicalShoe(tableId, timestamp), DAFABET_BG_ROOM_ID);
+      return;
+    }
+    this.ingestParsedEvents(this.pragmaticParser.openPhysicalShoe(tableId, timestamp), DAFABET_PRAGMATIC_ROOM_ID);
   }
 
   beginMonitorSession(): void {
     this.pragmaticParser = new PragmaticRuntimeParser();
+    this.bgParser = new BgRuntimeParser();
+    for (const [tableId, sequence] of this.bgShoeSequenceSeed) {
+      this.bgParser.seedShoeSequence(tableId, sequence);
+    }
     this.pragmaticProtocol.reset();
     this.parsedSourceSeqByTable.clear();
     this.parsedEventIds.clear();
@@ -1195,12 +1259,14 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.runtimeStateLastObservedAt.clear();
     this.runtimeStateStaleTableIds.clear();
     for (const [key, exportInstance] of this.exports) {
-      if (!key.startsWith('dafabet-pragmatic::')) continue;
+      if (!key.startsWith(`${DAFABET_PRAGMATIC_ROOM_ID}::`) && !key.startsWith(`${DAFABET_BG_ROOM_ID}::`)) continue;
       void exportInstance.stop();
       this.exports.delete(key);
     }
-    this.rooms.delete('dafabet-pragmatic');
-    this.discoveredRooms.delete('dafabet-pragmatic');
+    this.rooms.delete(DAFABET_PRAGMATIC_ROOM_ID);
+    this.rooms.delete(DAFABET_BG_ROOM_ID);
+    this.discoveredRooms.delete(DAFABET_PRAGMATIC_ROOM_ID);
+    this.discoveredRooms.delete(DAFABET_BG_ROOM_ID);
   }
 
   async discoverRooms(): Promise<RoomDescriptor[]> {
@@ -1216,11 +1282,17 @@ export class BrowserBridgeServer implements RoomMonitor {
 
   confirmPhysicalShoe(tableId: string): void {
     if (!this.isTableSelected(tableId)) throw new Error(`table ${tableId} is not selected`);
-    this.pragmaticParser.recordShoeEvidence(tableId, { reason: 'manual-confirm' });
-    const shoeId = `pragmatic-${tableId}-operator`;
+    const roomId = this.roomIdForTable(tableId);
+    const prefix = roomId === DAFABET_BG_ROOM_ID ? 'bg' : 'pragmatic';
+    if (roomId === DAFABET_BG_ROOM_ID) {
+      this.bgParser.recordShoeEvidence(tableId, { reason: 'manual-confirm' });
+    } else {
+      this.pragmaticParser.recordShoeEvidence(tableId, { reason: 'manual-confirm' });
+    }
+    const shoeId = `${prefix}-${tableId}-operator`;
     this.ingestParsedEvents([{
       type: 'newShoeSignal',
-      eventId: `pragmatic-session:${shoeId}:new-shoe`,
+      eventId: `${prefix}-session:${shoeId}:new-shoe`,
       tableId,
       timestamp: new Date().toISOString(),
       sourceSeq: 0,
@@ -1229,7 +1301,7 @@ export class BrowserBridgeServer implements RoomMonitor {
       shoeId,
       baseline: 'physical-shoe',
       profile: { ...defaultProfile(tableId), autoConfirmNewShoe: true },
-    }]);
+    }], roomId);
   }
   async requestBet(request: BetExecutionRequest): Promise<BetReceipt | null> {
     const receipt = await this.requestExecution(request);
@@ -1244,8 +1316,10 @@ export class BrowserBridgeServer implements RoomMonitor {
       const revision = typeof receipt.raw === 'object' && receipt.raw !== null
         ? Reflect.get(receipt.raw, 'runtimeRevision')
         : undefined;
-      const expectedFamily = PRAGMATIC_BET_RUNTIME_FAMILY;
-      if (!isCompatibleOperationalRuntimeRevision(revision, expectedFamily)) {
+      if (
+        !isCompatibleOperationalRuntimeRevision(revision, PRAGMATIC_BET_RUNTIME_FAMILY)
+        && !isCompatibleOperationalRuntimeRevision(revision, BG_BET_RUNTIME_FAMILY)
+      ) {
         throw new OperationalWagerRuntimeRevisionError(receipt);
       }
       return receipt;
@@ -1376,7 +1450,7 @@ export class BrowserBridgeServer implements RoomMonitor {
       this.ingestParsedEvents(this.pragmaticParser.parse(
         JSON.stringify(snapshot),
         selectedTableId => this.isTableSelected(selectedTableId),
-      ));
+      ), DAFABET_PRAGMATIC_ROOM_ID);
     }
 
     if (newlySelectedTableIds.length > 0) {
@@ -1454,16 +1528,24 @@ export class BrowserBridgeServer implements RoomMonitor {
     const message = raw as BridgeClientMessage;
     switch (message.kind) {
       case 'roomDiscovered':
-      case 'roomUpdated':
+      case 'roomUpdated': {
+        const room = message.room.roomId === DAFABET_BG_ROOM_ID
+          ? sanitizeBgBridgeRoom(message.room)
+          : message.room;
+        const merged = room.roomId === DAFABET_BG_ROOM_ID
+          ? upsertBridgeRoom(this.discoveredRooms, room)
+          : replaceBridgeRoom(this.discoveredRooms, room);
         this.rooms.set(
-          message.room.roomId,
-          selectedBridgeRoom(
-            replaceBridgeRoom(this.discoveredRooms, message.room),
-            tableId => this.isTableSelected(tableId),
-          ),
+          room.roomId,
+          selectedBridgeRoom(merged, tableId => this.isTableSelected(tableId)),
         );
-        this.ingestPragmaticGameCountsFromRoom(message.room);
+        if (room.roomId === DAFABET_PRAGMATIC_ROOM_ID) {
+          this.ingestPragmaticGameCountsFromRoom(room);
+        } else if (room.roomId === DAFABET_BG_ROOM_ID) {
+          this.ingestBgGameCountsFromRoom(room);
+        }
         break;
+      }
       case 'tableEvent': {
         if (!this.isTableSelected(message.tableId)) break;
         const exportInstance = this.getOrCreateExport(message.roomId, message.tableId);
@@ -1511,7 +1593,7 @@ export class BrowserBridgeServer implements RoomMonitor {
             this.ingestParsedEvents(this.pragmaticParser.parse(
               gameCountSnapshot,
               tableId => this.isTableSelected(tableId),
-            ));
+            ), DAFABET_PRAGMATIC_ROOM_ID);
           }
         } else if (
           message.source === 'baccarat-bridge-pragmatic-ws'
@@ -1522,17 +1604,31 @@ export class BrowserBridgeServer implements RoomMonitor {
           const snapshot = this.pragmaticProtocol.ingest(message.data);
           if (snapshot !== undefined) {
             for (const table of snapshot.tables) {
-              this.ensureRoomForTable(table.tableId, 'dafabet-pragmatic');
+              this.ensureRoomForTable(table.tableId, DAFABET_PRAGMATIC_ROOM_ID);
               if (this.isTableSelected(table.tableId)) this.noteTableObservation(table.tableId);
             }
             this.ingestParsedEvents(this.pragmaticParser.parse(
               JSON.stringify(snapshot),
               tableId => this.isTableSelected(tableId),
-            ));
+            ), DAFABET_PRAGMATIC_ROOM_ID);
           } else {
             const tableId = pragmaticProtocolTableId(message.data);
             if (tableId !== undefined && this.isTableSelected(tableId)) this.noteTableObservation(tableId);
           }
+        } else if (message.source === 'baccarat-bridge-bg-state') {
+          const visibleTableIds = visibleTableIdsFromPragmaticState(message.data);
+          if (visibleTableIds !== undefined) {
+            for (const tableId of visibleTableIds) this.visibleTableIds.add(tableId);
+          }
+          this.recordBgSnapshotTables(message.data);
+          for (const tableId of this.bgParser.observedTableIds(message.data)) {
+            this.ensureRoomForTable(tableId, DAFABET_BG_ROOM_ID);
+            if (this.isTableSelected(tableId)) this.noteTableObservation(tableId);
+          }
+          this.ingestParsedEvents(this.bgParser.parse(
+            message.data,
+            () => true,
+          ), DAFABET_BG_ROOM_ID);
         } else if (message.source === 'baccarat-bridge-runtime-selection') {
           this.applyRuntimeSelection(message.data);
         }
@@ -1589,7 +1685,10 @@ export class BrowserBridgeServer implements RoomMonitor {
     } else if (
       message.kind === 'networkCapture'
       && isLiveProtocolCapture(message)
-      && OBSERVABLE_NETWORK_PATTERN.test(message.url)
+      && (
+        OBSERVABLE_NETWORK_PATTERN.test(message.url)
+        || String(message.source || '').startsWith('baccarat-bridge-bg-')
+      )
     ) {
       this.broadcastToObservers({ kind: 'observe', message: observableNetworkCapture(message) });
     }
@@ -1637,7 +1736,7 @@ export class BrowserBridgeServer implements RoomMonitor {
 
   private refreshSelectedRoomsFromDiscovery(): void {
     for (const [roomId, discovered] of this.discoveredRooms) {
-      if (roomId !== 'dafabet-pragmatic') continue;
+      if (!isLiveBridgeRoomId(roomId)) continue;
       this.rooms.set(roomId, {
         ...discovered,
         tables: discovered.tables.filter(table => this.isTableSelected(table.tableId)),
@@ -1656,10 +1755,24 @@ export class BrowserBridgeServer implements RoomMonitor {
         tables: tables.map(table => ({ tableId: table.tableId, gameCount: table.gameCount })),
       }),
       tableId => this.isTableSelected(tableId),
-    ));
+    ), DAFABET_PRAGMATIC_ROOM_ID);
   }
 
-  private ingestParsedEvents(events: readonly NormalizedEvent[]): void {
+  private ingestBgGameCountsFromRoom(room: BridgeRoomDescriptor): void {
+    const tables = room.tables.filter(table => Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1);
+    if (tables.length === 0) return;
+    this.ingestParsedEvents(this.bgParser.parse(
+      JSON.stringify({
+        version: 1,
+        view: 'multi',
+        observedAt: new Date().toISOString(),
+        tables: tables.map(table => ({ tableId: table.tableId, gameCount: table.gameCount })),
+      }),
+      () => true,
+    ), DAFABET_BG_ROOM_ID);
+  }
+
+  private ingestParsedEvents(events: readonly NormalizedEvent[], roomId: string): void {
     for (const event of events) {
       if (!this.isTableSelected(event.tableId)) continue;
       if (this.parsedEventIds.has(event.eventId)) continue;
@@ -1679,7 +1792,6 @@ export class BrowserBridgeServer implements RoomMonitor {
       if (BRIDGE_DEBUG_ENABLED) {
         console.log('[bridge-event]', JSON.stringify(normalizedEvent));
       }
-      const roomId = 'dafabet-pragmatic';
       this.ensureRoomForTable(normalizedEvent.tableId, roomId);
       const exportInstance = this.getOrCreateExport(roomId, normalizedEvent.tableId);
       exportInstance.ingestEvent(normalizedEvent);
@@ -1711,8 +1823,60 @@ export class BrowserBridgeServer implements RoomMonitor {
     }
   }
 
-  private ensureRoomForTable(tableId: string, roomId = 'dafabet-pragmatic'): void {
-    const displayName = 'Dafabet Pragmatic Play';
+  private roomIdForTable(tableId: string): string {
+    const bg = this.discoveredRooms.get(DAFABET_BG_ROOM_ID);
+    if (bg?.tables.some(table => table.tableId === tableId)) return DAFABET_BG_ROOM_ID;
+    return DAFABET_PRAGMATIC_ROOM_ID;
+  }
+
+  private recordBgSnapshotTables(raw: string): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (typeof parsed !== 'object' || parsed === null) return;
+    const tables = (parsed as { tables?: unknown }).tables;
+    if (!Array.isArray(tables)) return;
+    const hall: BridgeRoomDescriptor['tables'] = [];
+    const rest: BridgeRoomDescriptor['tables'] = [];
+    for (const table of tables) {
+      if (!table || typeof table !== 'object') continue;
+      const rawTableId = typeof (table as { tableId?: unknown }).tableId === 'string'
+        ? (table as { tableId: string }).tableId
+        : '';
+      const tableId = normalizeBgTableId(rawTableId);
+      if (tableId === undefined) continue;
+      const roundId = typeof (table as { roundId?: unknown }).roundId === 'string'
+        ? (table as { roundId: string }).roundId
+        : undefined;
+      const gameCount = typeof (table as { gameCount?: unknown }).gameCount === 'number'
+        ? (table as { gameCount: number }).gameCount
+        : undefined;
+      const source = (table as { source?: unknown }).source;
+      const descriptor = {
+        tableId,
+        ...(roundId ? { roundId } : {}),
+        ...(gameCount !== undefined ? { gameCount } : {}),
+      };
+      if (source === 'hall') hall.push(descriptor);
+      else rest.push(descriptor);
+    }
+    const known = [...hall, ...rest];
+    for (const table of known) {
+      upsertBridgeRoom(this.discoveredRooms, {
+        roomId: DAFABET_BG_ROOM_ID,
+        displayName: 'Dafabet BG Live',
+        tables: [table],
+      });
+      if (this.isTableSelected(table.tableId)) this.noteTableObservation(table.tableId);
+    }
+  }
+
+  private ensureRoomForTable(tableId: string, roomId = DAFABET_PRAGMATIC_ROOM_ID): void {
+    if (roomId === DAFABET_BG_ROOM_ID && normalizeBgTableId(tableId) === undefined) return;
+    const displayName = roomId === DAFABET_BG_ROOM_ID ? 'Dafabet BG Live' : 'Dafabet Pragmatic Play';
     upsertBridgeRoom(this.discoveredRooms, {
       roomId,
       displayName,
@@ -2001,10 +2165,13 @@ export class BrowserBridgeServer implements RoomMonitor {
     const key = exportKey(roomId, tableId);
     const existing = this.exports.get(key);
     if (existing) return existing;
+    const staleAfterMs = roomId === DAFABET_BG_ROOM_ID
+      ? Math.max(this.tableStaleAfterMs, BG_TABLE_STALE_AFTER_MS)
+      : this.tableStaleAfterMs;
     const created = new BridgeTableExport(
       roomId,
       tableId,
-      this.tableStaleAfterMs,
+      staleAfterMs,
       (disconnectedTableId, reason) => {
         this.emitRuntimeEvent({
           kind: 'table-disconnected',

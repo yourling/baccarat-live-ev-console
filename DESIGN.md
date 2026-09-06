@@ -2,7 +2,7 @@
 
 ## 当前实现与发布状态
 
-本文记录当前桌面端 UI 的实际行为与视觉约束，不代表真实资金功能已获产品或安全批准。真人厅平台仅对接 Pragmatic Play；Dafabet 只作为 Jeju Speed Baccarat 弹窗启动器。四市场手动 `OperationalWager`、庄/闲保活和对子 EV 自动策略现在共用 actor、reservation、全局风控、回执审计与结算链路；运行监督器会在桥接、数据新鲜度、连续性或资金状态异常时失败关闭。保活与对子自动投注是互相独立的页头开关。真实资金发布仍待独立非资金长稳验收和外部授权。
+本文记录当前桌面端 UI 的实际行为与视觉约束，不代表真实资金功能已获产品或安全批准。真人厅平台对接 Pragmatic Play 与 Dafabet BG；Dafabet 启动器为 Jeju Speed Baccarat 与 `live-baccarat-bg`，两个扩展互斥。四市场手动 `OperationalWager`、庄/闲保活和对子 EV 自动策略现在共用 actor、reservation、全局风控、回执审计与结算链路；运行监督器会在桥接、数据新鲜度、连续性或资金状态异常时失败关闭。保活与对子自动投注是互相独立的页头开关。真实资金发布仍待独立非资金长稳验收和外部授权。
 
 ## 1. Atmosphere & Identity
 

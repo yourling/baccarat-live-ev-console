@@ -39,7 +39,9 @@ import {
 } from './operational-wager-controls';
 import { KeepaliveSettings } from './keepalive-settings';
 import { resolveVisibleHandCards } from './hand-cards';
-import { selectPragmaticMonitorTableIds } from './monitor-table-selection';
+import { monitorDisplayedConnection } from './monitor-connection';
+import { isMissedShuffleRoadCount, monitorDisplayedRoundLabel } from './monitor-round';
+import { isLiveMonitorRoomId, selectLiveMonitorTableIds } from './monitor-table-selection';
 import { evaluateProjectionPairMarket } from './pair-evaluation';
 import { decisionHandExplanation, planRecordViewChange, recordKindForView, recordTabCount, type ConsoleView } from './record-view';
 import './styles.css';
@@ -132,7 +134,7 @@ const MARKET_LABELS: Record<ExecutionMarket, string> = {
 };
 
 const STATUS_LABELS: Record<TableStatus, string> = {
-  WAITING_NEW_SHOE: '等待新牌靴',
+  WAITING_NEW_SHOE: '洗牌 / 新靴',
   WAITING_CONFIRMATION: '等待确认',
   TRACKING: '跟踪中',
   BETTING_WINDOW: '下注窗口',
@@ -441,7 +443,10 @@ export function App() {
     [monitorMetadata],
   );
   const monitoredTableIds = new Set(snapshot?.monitorTableIds ?? []);
-  const monitorCandidates = (snapshot?.monitorCandidates ?? []).filter(candidate => !monitoredTableIds.has(candidate.tableId));
+  const monitorCandidates = (snapshot?.monitorCandidates ?? [])
+    .filter(candidate => !monitoredTableIds.has(candidate.tableId))
+    .slice()
+    .sort((left, right) => left.tableId.localeCompare(right.tableId, undefined, { numeric: true }));
   const selectedMonitorTable = selectedMonitorTableId === null ? undefined : tableMap.get(selectedMonitorTableId);
   const automationEnabled = snapshot?.automation.enabled ?? false;
   const keepaliveEnabled = snapshot?.keepalive.enabled ?? false;
@@ -454,17 +459,17 @@ export function App() {
         .some(value => value.toLowerCase().includes(query.toLowerCase()));
       return (tableFilter === 'all' || table.tableId === tableFilter)
         && (statusFilter === 'all' || projection.status === statusFilter)
-        && (connectionFilter === 'all' || projection.connectionStatus === connectionFilter)
+        && (connectionFilter === 'all' || monitorDisplayedConnection(projection, snapshot?.runtime?.tables?.[table.tableId]) === connectionFilter)
         && (autoBetFilter === 'all' || projection.autoBetStatus === autoBetFilter)
         && queryMatch;
     });
-  }, [tables, view, tableFilter, query, statusFilter, connectionFilter, autoBetFilter, tableLabel]);
+  }, [tables, view, tableFilter, query, statusFilter, connectionFilter, autoBetFilter, tableLabel, snapshot]);
 
   const displayedMonitorTables = useMemo(() => {
     if (view !== 'monitor' || monitorSort === null) return visibleTables;
     const direction = monitorSort.dir === 'asc' ? 1 : -1;
     return [...visibleTables].sort((left, right) => (
-      compareMonitorTables(left, right, monitorSort.key, tableLabel, monitorMetadata.get(left.tableId), monitorMetadata.get(right.tableId), snapshot?.shoeEvidence) * direction
+      compareMonitorTables(left, right, monitorSort.key, tableLabel, monitorMetadata.get(left.tableId), monitorMetadata.get(right.tableId), snapshot?.shoeEvidence, snapshot?.runtime.tables) * direction
     ));
   }, [view, visibleTables, monitorSort, tableLabel, monitorMetadata, snapshot?.shoeEvidence]);
 
@@ -601,11 +606,17 @@ export function App() {
   const risk = snapshot?.snapshot.riskState;
   const alertCount = snapshot?.runtime.incidents.filter(incident =>
     incident.active && incident.acknowledgedAt === undefined).length ?? 0;
-  const eligibleCount = new Set(
-    (snapshot?.decisions ?? [])
-      .filter(isCurrentlyEligible)
-      .map(decision => `${decision.tableId}|${decision.shoeId}|${decision.handId}`),
-  ).size;
+  const eligibleCount = tables.filter(table => {
+    const ev = monitorPairEv(
+      table,
+      snapshot?.shoeEvidence?.[table.tableId],
+      monitorMetadata.get(table.tableId)?.gameCount,
+      snapshot?.events ?? [],
+    );
+    if (!(ev >= table.projection.profileSnapshot.minEV)) return false;
+    if (table.projection.remainingTotal < 26) return false;
+    return bettingPhaseLabel(table, monitorNow).open;
+  }).length;
 
   function clearFilters() {
     setTableFilter('all');
@@ -1173,6 +1184,7 @@ function compareMonitorTables(
   leftMeta: MonitorTableCandidate | undefined,
   rightMeta: MonitorTableCandidate | undefined,
   evidence: DesktopConsoleSnapshot['shoeEvidence'] | undefined,
+  runtimeTables: DesktopConsoleSnapshot['runtime']['tables'] | undefined,
 ): number {
   const leftProjection = left.projection;
   const rightProjection = right.projection;
@@ -1186,24 +1198,50 @@ function compareMonitorTables(
     case 'betting':
       return Number(leftProjection.status === 'BETTING_WINDOW') - Number(rightProjection.status === 'BETTING_WINDOW');
     case 'connection':
-      return leftProjection.connectionStatus.localeCompare(rightProjection.connectionStatus);
+      return monitorDisplayedConnection(leftProjection, runtimeTables?.[left.tableId])
+        .localeCompare(monitorDisplayedConnection(rightProjection, runtimeTables?.[right.tableId]));
     case 'auto':
       return leftProjection.autoBetStatus.localeCompare(rightProjection.autoBetStatus);
     case 'remaining': {
-      const leftKnown = isDisplayedPhysicalShoe(leftProjection, evidence?.[left.tableId]);
-      const rightKnown = isDisplayedPhysicalShoe(rightProjection, evidence?.[right.tableId]);
+      const leftKnown = isDisplayedPhysicalShoe(leftProjection, evidence?.[left.tableId], leftMeta?.gameCount);
+      const rightKnown = isDisplayedPhysicalShoe(rightProjection, evidence?.[right.tableId], rightMeta?.gameCount);
       return (leftKnown ? leftProjection.remainingTotal : -1) - (rightKnown ? rightProjection.remainingTotal : -1);
     }
     case 'ev': {
-      const leftEv = monitorPairEv(left, evidence?.[left.tableId]);
-      const rightEv = monitorPairEv(right, evidence?.[right.tableId]);
+      const leftEv = monitorPairEv(left, evidence?.[left.tableId], leftMeta?.gameCount);
+      const rightEv = monitorPairEv(right, evidence?.[right.tableId], rightMeta?.gameCount);
       return leftEv - rightEv;
     }
   }
 }
 
-function monitorPairEv(actor: TableActorSnapshot, evidence?: DesktopShoeEvidence): number {
-  if (!isDisplayedPhysicalShoe(actor.projection, evidence)) return Number.NEGATIVE_INFINITY;
+function stickyBankerLeadUntrusted(events: readonly NormalizedEvent[], tableId: string): boolean {
+  const settled = events.filter((event): event is Extract<NormalizedEvent, { type: 'handSettled' }> =>
+    event.type === 'handSettled' && event.tableId === tableId);
+  if (settled.length < 3) return false;
+  const recent = settled.slice(-8);
+  const leadOf = (event: Extract<NormalizedEvent, { type: 'handSettled' }>) => {
+    const card = event.bankerCards[0];
+    if (!card) return '';
+    return (typeof card.raw === 'string' && card.raw ? card.raw : `${card.rank}${card.suit ?? ''}`).toUpperCase();
+  };
+  const last = leadOf(recent[recent.length - 1]!);
+  if (!last) return false;
+  const same = recent.filter(event => leadOf(event) === last);
+  if (same.length < 3) return false;
+  const others = new Set(same.map(event =>
+    `${event.playerCards.map(card => card.raw ?? card.rank).join(',')}|${event.bankerCards.slice(1).map(card => card.raw ?? card.rank).join(',')}`));
+  return others.size >= 2;
+}
+
+function monitorPairEv(
+  actor: TableActorSnapshot,
+  evidence?: DesktopShoeEvidence,
+  gameCount?: number,
+  events: readonly NormalizedEvent[] = [],
+): number {
+  if (stickyBankerLeadUntrusted(events, actor.tableId)) return Number.NEGATIVE_INFINITY;
+  if (!isDisplayedPhysicalShoe(actor.projection, evidence, gameCount)) return Number.NEGATIVE_INFINITY;
   return safeEvaluate(
     actor.projection.profileSnapshot,
     'bankerPair',
@@ -1232,19 +1270,15 @@ function TableMonitorRow(props: {
 }) {
   const { actor } = props;
   const projection = actor.projection;
-  const physicalShoeKnown = isDisplayedPhysicalShoe(projection, props.evidence);
+  const stickyCards = stickyBankerLeadUntrusted(props.events, actor.tableId);
+  const physicalShoeKnown = !stickyCards && isDisplayedPhysicalShoe(projection, props.evidence, props.metadata?.gameCount);
   const bankerPair = physicalShoeKnown
     ? safeEvaluate(projection.profileSnapshot, 'bankerPair', projection.seenCards, projection.remainingCounts)
     : null;
-  const alerts = tableAlerts(actor);
+  const alerts = tableAlerts(actor, props.runtime);
   const displayName = props.metadata?.displayName ?? tableName(actor.tableId);
   const displayedRoundId = projection.currentHandId ?? props.metadata?.roundId;
-  const displayedGameCount = monitorDisplayedGameCount(
-    props.metadata?.gameCount,
-    projection.handNumber,
-    physicalShoeKnown,
-    props.evidence?.reason,
-  );
+  const round = monitorDisplayedRoundLabel(actor.tableId, projection, props.metadata, props.evidence?.reason);
   const bettingPhase = bettingPhaseLabel(actor, props.now);
   const windowOpen = bettingPhase.open;
   const handCards = resolveVisibleHandCards(
@@ -1289,21 +1323,23 @@ function TableMonitorRow(props: {
       </td>
       <td data-label="状态"><Badge label={STATUS_LABELS[projection.status]} tone={statusTone(projection.status)} /></td>
       <td data-label="局号">
-        <div className="monitor-table__round" title={displayedRoundId ?? '等待局号'}>
-          <strong>{displayedRoundId ?? '等待局号'}</strong>
-          <span className="muted">#{displayedGameCount ?? '?'}</span>
+        <div className="monitor-table__round" title={round.title}>
+          <strong>{round.label}</strong>
+          {round.pageRound !== undefined && round.label !== String(round.pageRound) && (
+            <span className="muted">#{round.pageRound}</span>
+          )}
         </div>
       </td>
       <td data-label="开盘">
         <strong className={windowOpen ? 'text--good' : undefined}>{bettingLabel}</strong>
       </td>
       <td data-label="连接">
-        <strong className={projection.connectionStatus === 'CONNECTED' ? undefined : 'text--danger'}>
-          {CONNECTION_LABELS[projection.connectionStatus]}
+        <strong className={monitorDisplayedConnection(projection, props.runtime) === 'CONNECTED' ? undefined : 'text--danger'}>
+          {CONNECTION_LABELS[monitorDisplayedConnection(projection, props.runtime)]}
         </strong>
       </td>
       <td data-label="自动"><strong>{shortAutoBetLabel(projection.autoBetStatus)}</strong></td>
-      <td data-label="剩余"><strong>{physicalShoeKnown ? `${projection.remainingTotal} 张` : '未知'}</strong><br /><span className="muted">{physicalShoeKnown ? '实体新靴' : '待牌靴'}{props.evidence ? ` · ${props.evidence.label}` : ''}</span></td>
+      <td data-label="剩余"><strong>{physicalShoeKnown ? `${projection.remainingTotal} 张` : '未知'}</strong><br /><span className="muted">{physicalShoeKnown ? '实体新靴' : '待牌靴'}{props.evidence ? ` · ${props.evidence.label}` : ''}{(actor.missingUnobservedCards ?? 0) > 0 ? ` · 缺 ${actor.missingUnobservedCards} 张` : ''}</span></td>
       <td data-label="对子 EV">
         {bankerPair
           ? <strong className={evTone(bankerPair.evMean)}>{formatSignedPercent(bankerPair.evMean)}</strong>
@@ -1818,7 +1854,7 @@ function MonitorTableSettings(props: {
   const [draft, setDraft] = useState(props.tableIds.join(', '));
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
-  const pragmaticTableIds = selectPragmaticMonitorTableIds(props.candidates);
+  const liveTableIds = selectLiveMonitorTableIds(props.candidates);
 
   useEffect(() => {
     if (!dirty) setDraft(props.tableIds.join(', '));
@@ -1837,7 +1873,7 @@ function MonitorTableSettings(props: {
       tableId => !/^[A-Z]{1,4}\d{2,6}$/.test(tableId) && !/^[a-z0-9]{8,32}$/.test(tableId),
     );
     if (invalidTableId !== undefined) {
-      props.onError(`牌桌号格式无效：${invalidTableId}。例如 D055 或 bc281koreanch281。`);
+      props.onError(`牌桌号格式无效：${invalidTableId}。例如 D055、B06 或 bc281koreanch281。`);
       return;
     }
     setSaving(true);
@@ -1855,11 +1891,11 @@ function MonitorTableSettings(props: {
   }
 
   async function loadPragmaticTables() {
-    if (pragmaticTableIds.length === 0) return;
+    if (liveTableIds.length === 0) return;
     setSaving(true);
     props.onError(null);
     try {
-      const updated = await props.onSave([...new Set([...props.tableIds, ...pragmaticTableIds])]);
+      const updated = await props.onSave([...new Set([...props.tableIds, ...liveTableIds])]);
       if (updated === null) return;
       setDraft(updated.monitorTableIds.join(', '));
       setDirty(false);
@@ -1874,15 +1910,15 @@ function MonitorTableSettings(props: {
     <section className="monitor-table-config" aria-labelledby="monitor-table-config-title">
       <div className="record-heading">
         <h2 id="monitor-table-config-title">监控牌桌</h2>
-        <span className="record-count">已发现 {props.candidates.filter(candidate => candidate.roomId === 'dafabet-pragmatic').length} · 已监控 {props.tableIds.length}</span>
+        <span className="record-count">已发现 {props.candidates.filter(candidate => isLiveMonitorRoomId(candidate.roomId)).length} · 已监控 {props.tableIds.length}</span>
       </div>
       <div className="monitor-table-config__batch-actions">
         <button
           className="button button--small button--ghost"
           onClick={() => void loadPragmaticTables()}
-          disabled={saving || pragmaticTableIds.length === 0}
+          disabled={saving || liveTableIds.length === 0}
         >
-          加入全部已发现桌（{pragmaticTableIds.length}）
+          加入全部已发现桌（{liveTableIds.length}）
         </button>
       </div>
       <div className="monitor-table-config__fields">
@@ -2342,22 +2378,6 @@ function safeEvaluate(
   }
 }
 
-function monitorDisplayedGameCount(
-  roadCount: number | undefined,
-  handNumber: number,
-  _physicalShoeKnown: boolean,
-  _evidenceReason?: string,
-): number | undefined {
-  // A lagged multi-table road can stay on the previous shoe (#83) after a
-  // real shuffle. If it is well ahead of hands seen on this shoeId, the
-  // tracked hand count is the one that matches remaining cards.
-  if (typeof roadCount === 'number' && roadCount >= 1) {
-    if (handNumber >= 1 && roadCount - handNumber >= 8) return handNumber;
-    return roadCount;
-  }
-  return handNumber >= 1 ? handNumber : undefined;
-}
-
 function isVerifiedPhysicalShoeReason(reason: string | undefined, gameCount?: number): boolean {
   if (reason === 'protocol-shuffle' || reason === 'manual-confirm') return true;
   return reason === 'road-wrap' && typeof gameCount === 'number' && gameCount >= 1 && gameCount <= 20;
@@ -2366,20 +2386,48 @@ function isVerifiedPhysicalShoeReason(reason: string | undefined, gameCount?: nu
 function isDisplayedPhysicalShoe(
   projection: ShoeStateProjection,
   evidence?: DesktopShoeEvidence,
+  gameCount?: number,
 ): boolean {
+  const road = gameCount ?? evidence?.gameCount;
+  const initial = projection.profileSnapshot.numberOfDecks * 52;
+  // Only hide a protocol-shuffled shoe when inventory is still full and we
+  // have not actually tracked this shoe. A live shoe that already consumed
+  // cards must keep remaining/EV even if DOM road is ahead of seenCards.
+  if (
+    typeof road === 'number'
+    && road >= 8
+    && projection.handNumber < 8
+    && projection.seenCards.length < 8
+    && projection.remainingTotal >= initial - 16
+  ) {
+    return false;
+  }
+  // Missed shuffle: live bead 局 9-20 with a 50+ hand tracked shoe.
+  // Do not hide remaining when HISTORY is stuck at 局 1-8 on a live deep shoe.
+  if (typeof road === 'number' && isMissedShuffleRoadCount(projection.handNumber, road)) {
+    return false;
+  }
+  if (projection.remainingTotal < 26) return false;
   return projection.shoeId.length > 0
     && projection.shoeBaseline === 'physical-shoe'
-    && (evidence === undefined || isVerifiedPhysicalShoeReason(evidence.reason, evidence.gameCount));
+    && (evidence === undefined
+      || evidence.reason === 'attach'
+      || isVerifiedPhysicalShoeReason(evidence.reason, evidence.gameCount));
 }
 
-function tableAlerts(actor: TableActorSnapshot): string[] {
+function tableAlerts(
+  actor: TableActorSnapshot,
+  runtime?: DesktopConsoleSnapshot['runtime']['tables'][string],
+): string[] {
   const alerts: string[] = [];
   const projection = actor.projection;
   if (projection.redCardSeen) alerts.push('红牌');
   if (projection.shoeBaseline === 'unknown-monitor-session') alerts.push('物理牌靴未知');
-  if (projection.connectionStatus !== 'CONNECTED') alerts.push(CONNECTION_LABELS[projection.connectionStatus]);
+  const connection = monitorDisplayedConnection(projection, runtime);
+  if (connection !== 'CONNECTED') alerts.push(CONNECTION_LABELS[connection]);
   if (projection.autoBetStatus === 'NEEDS_MANUAL_RECOVERY') alerts.push('需要人工恢复');
   if (projection.status === 'INVALIDATED') alerts.push('牌靴作废');
+  if ((actor.missingUnobservedCards ?? 0) > 0) alerts.push(`缺 ${actor.missingUnobservedCards} 张牌面`);
   return alerts;
 }
 

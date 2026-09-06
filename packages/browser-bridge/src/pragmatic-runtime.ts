@@ -117,7 +117,11 @@ export function isInternalExternalGameCountAnomaly(
   if (!Number.isInteger(roadCount) || (roadCount ?? 0) < 1) return false;
   const road = roadCount!;
   if (isRoadWrapToNewShoe(handNumber, road)) return false;
-  if (evidenceReason === 'protocol-shuffle' && handNumber <= ROAD_WRAP_MAX && road > ROAD_WRAP_MAX) {
+  // A just-shuffled shoe has no stable road yet. NEXT_SHOES may stamp 1
+  // while HISTORY/replay still carries the previous shoe, or the new shoe
+  // is still short. Kicking the table out here drops it before the first
+  // post-shuffle START_BET, so it never re-joins on the new shoe.
+  if (evidenceReason === 'protocol-shuffle' && (handNumber <= ROAD_WRAP_MAX || road <= ROAD_WRAP_MAX)) {
     return false;
   }
   return Math.abs(road - handNumber) >= GAME_COUNT_ANOMALY_MIN_GAP;

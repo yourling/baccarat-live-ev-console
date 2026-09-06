@@ -3,6 +3,8 @@ import path from 'node:path';
 import { DesktopConsoleService } from './service.js';
 import { MainWindowRetainer } from './main-window-retainer.js';
 import { acquireSingleInstance } from './single-instance.js';
+import { detachWindowsIme } from './windows-ime.js';
+import { startMainThreadWatchdog, warnIfPreviousMainThreadStall } from './main-thread-watchdog.js';
 import {
   restoreOrCreateMainWindow,
   shouldHideMainWindowOnClose,
@@ -17,10 +19,12 @@ import {
 
 app.commandLine.appendSwitch('disk-cache-size', '1');
 app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion,WinRetrieveSuggestionsOnlyOnDemand');
 
 const devUrl = process.env.VITE_DEV_SERVER_URL;
 let service: DesktopConsoleService | null = null;
 const mainWindowRetainer = new MainWindowRetainer<BrowserWindow>();
+let stopMainThreadWatchdog: (() => void) | undefined;
 type DesktopExecutionMode = 'shadow' | 'live';
 let appQuitting = false;
 
@@ -47,8 +51,10 @@ async function createWindow(): Promise<void> {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      spellcheck: false,
     },
   });
+  detachWindowsIme(win);
   win.webContents.on('did-fail-load', (_event, code, description, url) => {
     console.error('desktop window failed to load', { code, description, url });
     void win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(
@@ -91,7 +97,10 @@ async function createWindow(): Promise<void> {
 }
 
 function registerIpc(): void {
-  ipcMain.handle('console:snapshot', (_event, options) => getService().snapshot(options));
+  ipcMain.handle('console:snapshot', async (_event, options) => {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    return getService().snapshot(options);
+  });
   ipcMain.handle('console:query-records', (_event, query) => getService().queryRecords(query));
   ipcMain.handle('console:run-demo', (_event, seed?: number) => getService().runDemo(seed));
   ipcMain.handle('console:start-demo', (_event, seed?: number) => getService().startDemo(seed));
@@ -166,6 +175,12 @@ if (acquireSingleInstance(app)) {
   });
 
   app.whenReady().then(async () => {
+    const stallLogPath = path.join(app.getPath('userData'), 'main-thread-stall.log');
+    warnIfPreviousMainThreadStall(stallLogPath);
+    stopMainThreadWatchdog = startMainThreadWatchdog({
+      logPath: stallLogPath,
+      exitOnStall: process.env.BACCARAT_STALL_EXIT !== '0',
+    }).stop;
     getService();
     await createWindow();
     app.on('activate', () => {
@@ -182,6 +197,7 @@ if (acquireSingleInstance(app)) {
     if (closing || !service) return;
     event.preventDefault();
     closing = true;
+    stopMainThreadWatchdog?.();
     void service.close().finally(() => {
       service = null;
       app.quit();
