@@ -1,7 +1,24 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { BrowserBridgeServer } from '@baccarat/browser-bridge';
-import { EVENT_SCHEMA_VERSION } from '@baccarat/contracts';
+import { EVENT_SCHEMA_VERSION, defaultProfile } from '@baccarat/contracts';
 import { DesktopConsoleService } from '../electron-src/service';
+
+function bgSettledHand(tableId: string, shoeId: string, handId: string, sourceSeq: number) {
+  return {
+    type: 'handSettled' as const,
+    eventId: `settled-${tableId}-${handId}`,
+    tableId,
+    timestamp: '2026-09-08T02:00:00.000Z',
+    sourceSeq,
+    source: 'bg-runtime' as const,
+    schemaVersion: EVENT_SCHEMA_VERSION,
+    shoeId,
+    handId,
+    playerCards: [{ rank: '5' as const }, { rank: 'A' as const }],
+    bankerCards: [{ rank: '9' as const }, { rank: '8' as const }],
+    outcomes: { bankerPair: false, playerPair: false },
+  };
+}
 
 describe('desktop BG monitor room', () => {
   it('treats dafabet-bg B06 as a live pending-join candidate', async () => {
@@ -220,6 +237,94 @@ describe('desktop BG monitor room', () => {
         market: 'bankerPair',
       });
       expect(service['monitorTableIds']).toContain('A30');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('does not auto-rejoin a missing-card demotion until the next shoe', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const tableId = 'B05';
+    const shoeId = 'bg-B05-2';
+    try {
+      service['browserBridge'] = bridge;
+      service['liveMonitorActivated'] = true;
+      service['ensureMonitorActors']([tableId]);
+      service['monitorTableIds'] = [tableId];
+      service['tableMetadata'].set(tableId, {
+        tableId,
+        roomId: 'dafabet-bg',
+        updatedAt: '2026-09-08T02:00:00.000Z',
+        gameCount: 5,
+      });
+      vi.spyOn(bridge, 'shoeEvidence').mockReturnValue({ reason: 'protocol-shuffle' });
+
+      await service.injectEvent({
+        type: 'newShoeSignal',
+        eventId: 'b05-shoe-2',
+        tableId,
+        timestamp: '2026-09-08T02:00:00.000Z',
+        sourceSeq: 1,
+        source: 'bg-runtime',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        shoeId,
+        baseline: 'physical-shoe',
+        profile: { ...defaultProfile(tableId), autoConfirmNewShoe: true },
+      });
+      const actor = service['orchestrator'].getActor(tableId);
+      if (!actor) throw new Error('B05 actor missing');
+      await actor.setAutoBet(true, shoeId);
+      await service.injectEvent(bgSettledHand(tableId, shoeId, '100', 2));
+      await service.injectEvent(bgSettledHand(tableId, shoeId, '103', 3));
+
+      expect(service['monitorTableIds']).not.toContain(tableId);
+      expect(service['demotedPendingTableIds'].has(tableId)).toBe(true);
+      expect(service['demotedPendingShoeIds'].get(tableId)).toBe(shoeId);
+      expect(service.snapshot().runtime.incidents).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          code: 'shoe-count-mismatch',
+          tableId,
+          active: true,
+          message: expect.stringContaining('缺牌 12 张'),
+        }),
+      ]));
+      expect(service['ledger'].listEvents(tableId)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'autoDisarmChanged', reason: 'execution-reset' }),
+      ]));
+
+      await service.injectEvent({
+        type: 'bettingWindowOpened',
+        eventId: 'b05-same-shoe-window',
+        tableId,
+        timestamp: '2026-09-08T02:01:00.000Z',
+        sourceSeq: 4,
+        source: 'bg-runtime',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        shoeId,
+        handId: '104',
+        market: 'bankerPair',
+      });
+      service['promotePendingTablesFromRooms']([{
+        roomId: 'dafabet-bg',
+        tables: [{ tableId, gameCount: 5 }],
+      }]);
+      expect(service['monitorTableIds']).not.toContain(tableId);
+
+      await service.injectEvent({
+        type: 'newShoeSignal',
+        eventId: 'b05-shoe-3',
+        tableId,
+        timestamp: '2026-09-08T02:10:00.000Z',
+        sourceSeq: 5,
+        source: 'bg-runtime',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        shoeId: 'bg-B05-3',
+        baseline: 'physical-shoe',
+        profile: { ...defaultProfile(tableId), autoConfirmNewShoe: true },
+      });
+      expect(service['monitorTableIds']).toContain(tableId);
+      expect(service['demotedPendingTableIds'].has(tableId)).toBe(false);
     } finally {
       await service.close();
     }

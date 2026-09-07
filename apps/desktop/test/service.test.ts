@@ -466,8 +466,8 @@ describe('desktop console demo sessions', () => {
       const projection = snapshot.snapshot.tables.bc281koreanch281?.projection;
       expect(projection?.shoeBaseline).toBe('unknown-monitor-session');
       expect(snapshot.shoeEvidence.bc281koreanch281).toEqual(expect.objectContaining({
-        reason: 'attach',
-        label: '入桌，未见洗牌',
+        reason: 'restart-empty-inventory',
+        label: '路子已深但未见牌面',
       }));
     } finally {
       await service.close();

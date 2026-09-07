@@ -347,6 +347,7 @@ export class DesktopConsoleService {
   private automationEnabled = false;
   private readonly pendingGameCountByTable = new Map<string, number>();
   private readonly demotedPendingTableIds = new Set<string>();
+  private readonly demotedPendingShoeIds = new Map<string, string>();
   /** The transient allowlist used only while a serialized live transition is being validated. */
   private pendingMonitorTableIds?: readonly string[];
   /** Operator-managed, persisted ordered selection; mutation is the configuration operation. */
@@ -592,14 +593,34 @@ export class DesktopConsoleService {
     this.persistTableMetadata();
   }
 
-  private promotePendingTable(tableId: string): void {
+  private holdDemotedPendingTable(tableId: string, shoeId?: string): void {
+    this.demotedPendingTableIds.add(tableId);
+    this.demotedPendingShoeIds.set(tableId, shoeId ?? '');
+  }
+
+  private clearDemotedPendingTable(tableId: string): void {
+    this.demotedPendingTableIds.delete(tableId);
+    this.demotedPendingShoeIds.delete(tableId);
+  }
+
+  private canAutoPromotePendingTable(tableId: string, incomingShoeId?: string): boolean {
+    if (!this.demotedPendingTableIds.has(tableId)) return true;
+    const heldShoeId = this.demotedPendingShoeIds.get(tableId) ?? '';
+    const nextShoeId = incomingShoeId
+      ?? this.orchestrator.getActor(tableId)?.getProjection().shoeId
+      ?? '';
+    return nextShoeId.length > 0 && nextShoeId !== heldShoeId;
+  }
+
+  private promotePendingTable(tableId: string, incomingShoeId?: string): void {
     if (this.monitorTableIds.includes(tableId)) return;
     if (this.monitorTableIds.length >= MAX_LIVE_MONITOR_TABLES) return;
+    if (!this.canAutoPromotePendingTable(tableId, incomingShoeId)) return;
     const nextTableIds = [...this.monitorTableIds, tableId];
     this.ensureMonitorActors(nextTableIds, this.currentUnifiedTableSettings());
     this.monitorTableIds = nextTableIds;
     this.pendingGameCountByTable.delete(tableId);
-    this.demotedPendingTableIds.delete(tableId);
+    this.clearDemotedPendingTable(tableId);
     this.runtimeIncidents.resolve('shoe-count-mismatch', tableId);
     this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
     this.syncLiveApprovalsToMonitorTables();
@@ -615,7 +636,7 @@ export class DesktopConsoleService {
         const evidence = this.browserBridge?.shoeEvidence(tableId);
         if (isVerifiedPhysicalShoeEvidence(evidence)) {
           this.promotePendingTable(tableId);
-          continue;
+          if (this.monitorTableIds.includes(tableId)) continue;
         }
         const gameCount = table.gameCount;
         if (!Number.isInteger(gameCount) || (gameCount ?? 0) < 1) continue;
@@ -630,11 +651,17 @@ export class DesktopConsoleService {
     }
   }
 
-  private demoteAnomalousMonitorTable(tableId: string, handNumber: number, roadCount: number): boolean {
+  private demoteAnomalousMonitorTable(
+    tableId: string,
+    handNumber: number,
+    roadCount: number,
+    missingCards: number,
+    shoeId?: string,
+  ): boolean {
     if (!this.liveMonitorActivated) return false;
     if (!this.monitorTableIds.includes(tableId)) return false;
     this.pendingGameCountByTable.set(tableId, roadCount);
-    this.demotedPendingTableIds.add(tableId);
+    this.holdDemotedPendingTable(tableId, shoeId);
     const nextTableIds = this.monitorTableIds.filter(candidate => candidate !== tableId);
     this.monitorTableIds = nextTableIds;
     this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
@@ -644,7 +671,7 @@ export class DesktopConsoleService {
       code: 'shoe-count-mismatch',
       severity: 'degraded',
       tableId,
-      message: `内部 #${handNumber} 与牌桌路子 #${roadCount} 相差过大，已移出监控，等待下一靴`,
+      message: `缺牌 ${missingCards} 张（内部 #${handNumber}，路子 #${roadCount}），已移出监控，等待下一靴`,
     });
     return true;
   }
@@ -656,11 +683,17 @@ export class DesktopConsoleService {
     if (!actor) return false;
     const missingCards = actor.missingUnobservedCardCount();
     if (missingCards > 10) {
-      const handNumber = actor.getProjection().handNumber;
+      const projection = actor.getProjection();
       const roadCount = this.tableMetadata.get(tableId)?.gameCount
         ?? this.browserBridge?.acceptedGameCount(tableId)
-        ?? handNumber;
-      return this.demoteAnomalousMonitorTable(tableId, handNumber, roadCount);
+        ?? projection.handNumber;
+      return this.demoteAnomalousMonitorTable(
+        tableId,
+        projection.handNumber,
+        roadCount,
+        missingCards,
+        projection.shoeId || undefined,
+      );
     }
     return false;
   }
@@ -1350,7 +1383,7 @@ export class DesktopConsoleService {
       // if a mid-shuffle demote/disconnect dropped it back to pending.
       const evidence = this.browserBridge?.shoeEvidence(event.tableId);
       if (isVerifiedPhysicalShoeEvidence(evidence)) {
-        this.promotePendingTable(event.tableId);
+        this.promotePendingTable(event.tableId, event.shoeId);
         if (event.type === 'newShoeSignal' && normalizeBgTableId(event.tableId) === undefined) {
           this.clearStaleRoadCount(event.tableId);
         }
@@ -1410,7 +1443,7 @@ export class DesktopConsoleService {
       const projection = actor.getProjection();
       if (!enabled) {
         if (projection.autoBetStatus !== 'DISARMED') {
-          await actor.setAutoBet(false, projection.shoeId || undefined);
+          await actor.setAutoBet(false, projection.shoeId || undefined, 'auto-bet-paused');
         }
         continue;
       }
@@ -1464,7 +1497,7 @@ export class DesktopConsoleService {
     }
     this.liveAuthorizationSources.delete(tableId);
     if (state.projection.autoBetStatus === 'ARMED') {
-      await actor.setAutoBet(false, state.projection.shoeId || undefined);
+      await actor.setAutoBet(false, state.projection.shoeId || undefined, 'execution-reset');
     }
   }
 
@@ -2404,6 +2437,7 @@ export class DesktopConsoleService {
       await this.attachLiveTablesInner();
       this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
       this.monitorTableIds = [...nextTableIds];
+      for (const tableId of nextTableIds) this.clearDemotedPendingTable(tableId);
       this.syncLiveApprovalsToMonitorTables();
       this.pendingMonitorTableIds = undefined;
       return this.snapshot();

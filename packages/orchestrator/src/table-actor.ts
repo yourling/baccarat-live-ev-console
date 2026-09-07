@@ -871,10 +871,10 @@ export class TableActor {
     return next;
   }
 
-  async setAutoBet(armed: boolean, shoeId?: string): Promise<void> {
+  async setAutoBet(armed: boolean, shoeId?: string, reason = 'manual-disarm'): Promise<void> {
     const event: NormalizedEvent = armed
       ? { type: 'autoArmChanged', eventId: newId('evt'), tableId: this.tableId, timestamp: new Date().toISOString(), sourceSeq: this.nextSyntheticSeq(), source: 'console', schemaVersion: EVENT_SCHEMA_VERSION, armed: true, shoeId }
-      : { type: 'autoDisarmChanged', eventId: newId('evt'), tableId: this.tableId, timestamp: new Date().toISOString(), sourceSeq: this.nextSyntheticSeq(), source: 'console', schemaVersion: EVENT_SCHEMA_VERSION, shoeId, reason: 'manual-disarm' };
+      : { type: 'autoDisarmChanged', eventId: newId('evt'), tableId: this.tableId, timestamp: new Date().toISOString(), sourceSeq: this.nextSyntheticSeq(), source: 'console', schemaVersion: EVENT_SCHEMA_VERSION, shoeId, reason };
     await this.enqueue(event);
   }
 

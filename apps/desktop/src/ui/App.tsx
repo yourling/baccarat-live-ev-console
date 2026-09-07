@@ -2558,7 +2558,7 @@ function runtimeIncidentCodeLabel(code: DesktopRuntimeIncident['code']): string 
     'settlement-gap': '结算缺口',
     'scheduler-failure': '调度失败',
     'monitor-failure': '监控失败',
-    'shoe-count-mismatch': '局数与牌桌不符',
+    'shoe-count-mismatch': '缺牌过多，已移出监控',
   };
   return labels[code];
 }
@@ -2597,7 +2597,11 @@ function eventDescription(event: NormalizedEvent): string {
     case 'shoeInvalidated': return event.reason;
     case 'manualCorrection': return event.correction.kind === 'numberOfDecks' ? '副数修正为 ' + event.correction.numberOfDecks : '烧牌模型已修正';
     case 'autoArmChanged': return event.armed ? '自动下注已开启' : '自动下注已暂停';
-    case 'autoDisarmChanged': return event.reason === 'manual-disarm' ? '手动暂停自动下注' : event.reason;
+    case 'autoDisarmChanged':
+      if (event.reason === 'manual-disarm') return '手动暂停自动下注';
+      if (event.reason === 'execution-reset') return '监控降级，已暂停自动下注';
+      if (event.reason === 'auto-bet-paused') return '对子自动已关闭';
+      return event.reason;
   }
 }
 
