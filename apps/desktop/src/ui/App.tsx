@@ -444,9 +444,10 @@ export function App() {
   );
   const monitoredTableIds = new Set(snapshot?.monitorTableIds ?? []);
   const monitorCandidates = (snapshot?.monitorCandidates ?? [])
-    .filter(candidate => !monitoredTableIds.has(candidate.tableId))
+    .filter(candidate => isLiveMonitorRoomId(candidate.roomId) && !monitoredTableIds.has(candidate.tableId))
     .slice()
     .sort((left, right) => left.tableId.localeCompare(right.tableId, undefined, { numeric: true }));
+  const monitorAtCapacity = (snapshot?.monitorTableIds.length ?? 0) >= 64;
   const selectedMonitorTable = selectedMonitorTableId === null ? undefined : tableMap.get(selectedMonitorTableId);
   const automationEnabled = snapshot?.automation.enabled ?? false;
   const keepaliveEnabled = snapshot?.keepalive.enabled ?? false;
@@ -639,7 +640,7 @@ export function App() {
   }
 
   const writeOffUnknownOperationalWager = useCallback(async (row: BetLedgerRow) => {
-    if (!window.desktop || !row.operationalWager || !canWriteOffUnknownOperationalWager(row)) return;
+    if (!window.desktop || !canWriteOffUnknownOperationalWager(row)) return;
     const accepted = await confirm({
       title: '勾销未知敞口',
       description: '无法确认平台结果时使用。此操作不宣称输赢，只释放本地资金敞口，不会再次下注。勾销后该桌不再因这笔未知结果阻断保活。',
@@ -656,7 +657,7 @@ export function App() {
     try {
       const nextSnapshot = await window.desktop.writeOffUnknownOperationalWager({
         reservationId: row.reservation.reservationId,
-        wagerId: row.operationalWager.wager.wagerId,
+        ...(row.operationalWager === undefined ? {} : { wagerId: row.operationalWager.wager.wagerId }),
       });
       setSnapshot(nextSnapshot);
       setRecordQueryRevision(previous => previous + 1);
@@ -856,9 +857,12 @@ export function App() {
   }
 
   async function addMonitorCandidate(tableId: string) {
-    if (!snapshot?.monitorTableIds.includes(tableId)) {
-      await persistMonitorTableIds([...(snapshot?.monitorTableIds ?? []), tableId]);
+    if (snapshot?.monitorTableIds.includes(tableId)) return;
+    if ((snapshot?.monitorTableIds.length ?? 0) >= 64) {
+      setError('已达 64 桌监控上限');
+      return;
     }
+    await persistMonitorTableIds([...(snapshot?.monitorTableIds ?? []), tableId]);
   }
 
   async function removeMonitorTable(tableId: string) {
@@ -1116,18 +1120,31 @@ export function App() {
         <section className="monitor-candidates" aria-labelledby="monitor-candidates-title">
           <div className="section-heading">
             <span id="monitor-candidates-title">待加入牌桌</span>
+            {monitorAtCapacity ? <span className="muted">已达 64 桌上限</span> : null}
           </div>
           <div className="monitor-candidates__list">
-            {monitorCandidates.map(candidate => (
+            {monitorCandidates.map(candidate => {
+              const evidence = snapshot?.shoeEvidence?.[candidate.tableId];
+              const pendingLabel = monitorAtCapacity
+                ? '已达 64 桌上限'
+                : isVerifiedPhysicalShoeReason(evidence?.reason, evidence?.gameCount)
+                  ? '可手动加入'
+                  : '等待洗牌证据';
+              return (
               <div className="monitor-candidate" key={candidate.roomId + ':' + candidate.tableId}>
                 <div>
                   <strong>{candidate.displayName ?? candidate.tableId}</strong>
                   <span>{candidate.displayName ? candidate.tableId : candidate.roomName ?? candidate.roomId}</span>
-                  <span className="muted">#{candidate.gameCount ?? '?'} · 等待洗牌证据</span>
+                  <span className="muted">#{candidate.gameCount ?? '?'} · {pendingLabel}</span>
                 </div>
-                <button className="button button--small button--primary" onClick={() => void addMonitorCandidate(candidate.tableId)}>加入监控</button>
+                <button
+                  className="button button--small button--primary"
+                  disabled={monitorAtCapacity}
+                  onClick={() => void addMonitorCandidate(candidate.tableId)}
+                >加入监控</button>
               </div>
-            ))}
+              );
+            })}
           </div>
         </section>
       )}
@@ -1136,6 +1153,7 @@ export function App() {
         <MonitorTableSettingsDialog
           actor={selectedMonitorTable}
           evidence={snapshot?.shoeEvidence?.[selectedMonitorTable.tableId]}
+          gameCount={snapshot?.tableMetadata?.find(candidate => candidate.tableId === selectedMonitorTable.tableId)?.gameCount}
           liveApproved={snapshot?.runtime.approvedLiveTableIds.includes(selectedMonitorTable.tableId) ?? false}
           riskLimits={snapshot?.snapshot.riskLimits}
           liveModeConfirmationOpen={pendingLiveExecutionTableId === selectedMonitorTable.tableId}
@@ -1400,6 +1418,7 @@ function TableMonitorRow(props: {
 function MonitorTableSettingsDialog(props: {
   actor: TableActorSnapshot;
   evidence?: DesktopShoeEvidence;
+  gameCount?: number;
   liveApproved: boolean;
   riskLimits?: RiskLimits;
   liveModeConfirmationOpen: boolean;
@@ -1417,7 +1436,7 @@ function MonitorTableSettingsDialog(props: {
   tableLabel: (tableId: string) => string;
 }) {
   const { actor } = props;
-  const physicalShoeKnown = isDisplayedPhysicalShoe(actor.projection, props.evidence);
+  const physicalShoeKnown = isDisplayedPhysicalShoe(actor.projection, props.evidence, props.gameCount);
 
   return (
     <div className="monitor-settings-overlay" role="presentation" onClick={props.onClose}>
@@ -1762,9 +1781,10 @@ function canReconcileOperationalWager(row: BetLedgerRow): boolean {
 }
 
 function canWriteOffUnknownOperationalWager(row: BetLedgerRow): boolean {
+  if (row.reservation.status !== 'UNKNOWN') return false;
   const operationalWager = row.operationalWager;
-  return row.reservation.status === 'UNKNOWN'
-    && operationalWager?.status === 'UNKNOWN'
+  if (operationalWager === undefined) return true;
+  return operationalWager.status === 'UNKNOWN'
     && operationalWager.writeOff === undefined
     && operationalWager.reconciliation === undefined
     && operationalWager.reservationId === row.reservation.reservationId;
@@ -2455,6 +2475,7 @@ function isDisplayedPhysicalShoe(
     && projection.handNumber < 8
     && projection.seenCards.length < 8
     && projection.remainingTotal >= initial - 16
+    && !isVerifiedPhysicalShoeReason(evidence?.reason, evidence?.gameCount)
   ) {
     return false;
   }

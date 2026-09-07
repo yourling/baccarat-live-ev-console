@@ -10,7 +10,22 @@ import { ContractValidationError, defaultProfile, newId } from '@baccarat/contra
 const baseTime = '2025-01-01T00:00:00.000Z';
 
 function ev(partial: any, index: number): NormalizedEvent {
-  return { ...partial, eventId: `e${index}`, tableId: 't1', timestamp: new Date(Date.parse(baseTime)+index*1000).toISOString(), sourceSeq: index };
+  const event = {
+    ...partial,
+    eventId: `e${index}`,
+    tableId: 't1',
+    timestamp: new Date(Date.parse(baseTime)+index*1000).toISOString(),
+    sourceSeq: index,
+  };
+  if (
+    event.type === 'newShoeSignal'
+    && event.baseline === undefined
+    && event.source !== 'pragmatic-runtime'
+    && event.source !== 'bg-runtime'
+  ) {
+    event.baseline = 'physical-shoe';
+  }
+  return event;
 }
 
 function decision(
@@ -756,6 +771,28 @@ describe('ledger persistence and append safety', () => {
     const second = { ...first, shoeId: 's2' };
     led.appendEvent(first);
     expect(() => led.appendEvent(second)).toThrowError(LedgerConflictError);
+    led.close();
+  });
+
+  it('rejects a same-id handSettled correction on the same shoe', () => {
+    const led = new SqliteLedger();
+    const first = ev({
+      type: 'handSettled',
+      shoeId: 'shoe-1',
+      handId: 'h1',
+      playerCards: [{ rank: 'J' }, { rank: '8' }],
+      bankerCards: [{ rank: '9' }, { rank: '4' }],
+    }, 2);
+    const correction = {
+      ...first,
+      playerCards: [{ rank: 'A' as const }, { rank: 'A' as const }],
+      bankerCards: [{ rank: 'K' as const }, { rank: 'K' as const }],
+      sourceSeq: 3,
+      timestamp: '2025-01-01T00:05:00.000Z',
+    };
+    led.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'shoe-1', profile: { ...defaultProfile('t1'), autoConfirmNewShoe: true } }, 1));
+    expect(led.appendEvent(first)).toBe('appended');
+    expect(() => led.appendEvent(correction)).toThrowError(LedgerConflictError);
     led.close();
   });
 

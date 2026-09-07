@@ -134,7 +134,10 @@ export interface DesktopUnknownWagerReconciliationCommand {
   readonly wagerId: string;
 }
 
-export type DesktopUnknownWagerWriteOffCommand = DesktopUnknownWagerReconciliationCommand;
+export interface DesktopUnknownWagerWriteOffCommand {
+  readonly reservationId: string;
+  readonly wagerId?: string;
+}
 
 export interface DesktopPendingSettlementCommand {
   readonly reservationId: string;
@@ -251,7 +254,16 @@ export function parseDesktopOperationalWagerCommand(value: unknown): DesktopOper
 export function parseDesktopUnknownWagerWriteOffCommand(
   value: unknown,
 ): DesktopUnknownWagerWriteOffCommand {
-  return parseDesktopUnknownWagerReconciliationCommand(value);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('unknown wager write-off command must be an object');
+  }
+  const wagerId = Reflect.get(value, 'wagerId');
+  return {
+    reservationId: readRequiredTrimmedString(value, 'reservationId'),
+    ...(typeof wagerId === 'string' && wagerId.trim().length > 0
+      ? { wagerId: wagerId.trim() }
+      : {}),
+  };
 }
 
 export function parseDesktopUnknownWagerReconciliationCommand(

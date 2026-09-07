@@ -275,7 +275,7 @@ export function applyEvent(
   switch (event.type) {
     case 'newShoeSignal': {
       const shoeId = nonEmptyString(event.shoeId, 'shoeId', event);
-      const shoeBaseline = event.baseline ?? (event.source === 'pragmatic-runtime' ? 'unknown-monitor-session' : 'physical-shoe');
+      const shoeBaseline = event.baseline ?? 'unknown-monitor-session';
       const profile = withProfile({ ...(event.profile ?? {}) } as TableProfile, event.tableId);
       updated.shoeId = shoeId;
       updated.shoeBaseline = shoeBaseline;

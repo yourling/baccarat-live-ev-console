@@ -68,14 +68,14 @@ describe('operational wager confirmation', () => {
     expect(operationalWagerGateReason(actor)).toBe('当前不在下注窗口');
   });
 
-  it('labels an open betting window even after the local countdown has elapsed', () => {
+  it('labels an elapsed betting window as closed', () => {
     const actor = actorSnapshot(
       'BETTING_WINDOW',
       '16393876410',
       new Date(Date.now() - 500).toISOString(),
     );
-    expect(bettingPhaseLabel(actor).open).toBe(true);
-    expect(bettingPhaseLabel(actor).text).toBe('可下注');
+    expect(bettingPhaseLabel(actor).open).toBe(false);
+    expect(bettingPhaseLabel(actor).text).toBe('停注');
   });
 
   it('labels dealing and waiting tables instead of a blanket closed window', () => {

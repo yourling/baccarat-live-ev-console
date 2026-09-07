@@ -237,6 +237,7 @@ describe('orchestrator table actor', () => {
       shoeId: 's1',
       handId: 'h2',
       market: 'bankerPair',
+      closesAt: '2025-01-01T00:00:15.000Z',
     };
 
     await Promise.all(events.map(event => orchestrator.enqueue('t1', event)));
@@ -363,7 +364,7 @@ describe('orchestrator table actor', () => {
     ledger.close();
   });
 
-  it('keeps a terminal rejected one-shot reservation as a duplicate tombstone', async () => {
+  it('retries an uncommitted rejected one-shot on the same hand', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile: TableProfile = {
       ...simProfile(),
@@ -396,13 +397,10 @@ describe('orchestrator table actor', () => {
     const second = await actor.placeOneShotBet(command);
 
     expect(first.status).toBe('REJECTED');
-    expect(second).toEqual({
-      status: 'REJECTED',
-      reason: 'duplicate',
-    });
-    expect(requests).toHaveLength(1);
-    expect(ledger.listReceipts('t1')[0]?.receipt.status).toBe('REJECTED');
-    expect(ledger.listReservations('t1')[0]?.status).toBe('RELEASED');
+    expect(second.status).toBe('REJECTED');
+    expect(second).toEqual(expect.objectContaining({ reason: 'platform-rejected' }));
+    expect(requests).toHaveLength(2);
+    expect(ledger.listReceipts('t1')).toHaveLength(0);
     ledger.close();
   });
 
@@ -432,6 +430,16 @@ describe('orchestrator table actor', () => {
       amount: 20,
     });
 
+    const blocked = await actor.placeOneShotBet({
+      shoeId: 's1',
+      handId: 'h1',
+      market: 'playerPair',
+      amount: 20,
+    });
+    expect(blocked).toEqual(expect.objectContaining({
+      status: 'REJECTED',
+      reason: 'unknown-execution-pending',
+    }));
     expect(result).toEqual(expect.objectContaining({
       status: 'UNKNOWN',
       reason: 'platform-unknown',
@@ -1578,12 +1586,12 @@ describe('restart attach must not wipe a rebuilt physical shoe', () => {
 
     expect(actor.getProjection().shoeId).toBe('bg-t1-2');
     expect(actor.getProjection().shoeBaseline).toBe('physical-shoe');
-    expect(actor.getProjection().seenCards.length).toBe(5);
-    expect(actor.getProjection().remainingTotal).toBe(remaining - 1);
+    expect(actor.getProjection().seenCards.length).toBe(4);
+    expect(actor.getProjection().remainingTotal).toBe(remaining);
     ledger.close();
   });
 
-  it('does not glue a later physical shoe generation onto the rebuilt shoe', async () => {
+  it('accepts a later physical shoe generation instead of holding the rebuilt shoe', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile = {
       ...simProfile('B01'),
@@ -1630,10 +1638,9 @@ describe('restart attach must not wipe a rebuilt physical shoe', () => {
       profile,
     } as NormalizedEvent);
     await actor.flush();
-    expect(actor.getProjection().shoeId).toBe('bg-B01-2');
+    expect(actor.getProjection().shoeId).toBe('bg-B01-3');
     expect(actor.getProjection().shoeBaseline).toBe('physical-shoe');
-    expect(actor.getProjection().seenCards.length).toBe(4);
-    expect(actor.getProjection().remainingTotal).toBe(412);
+    expect(actor.getProjection().seenCards.length).toBe(0);
     ledger.close();
   });
 });

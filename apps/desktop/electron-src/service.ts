@@ -68,6 +68,7 @@ import {
   type DesktopRuntimeState,
   type DesktopPendingSettlementCommand,
   type DesktopUnknownWagerReconciliationCommand,
+  type DesktopUnknownWagerWriteOffCommand,
   type DesktopShoeEvidence,
   type MonitorTableCandidate,
   type OneShotLiveBetCommand,
@@ -247,7 +248,7 @@ function defaultMonitorTableIds(): string[] {
     .split(',')
     .map(value => value.trim())
     .filter(value => value.length > 0);
-  return normalizeMonitorTableIds(rawTableIds, true);
+  return normalizeMonitorTableIds(rawTableIds, true).slice(0, MAX_LIVE_MONITOR_TABLES);
 }
 
 function isRetiredDefaultMonitorList(tableIds: readonly string[]): boolean {
@@ -322,7 +323,12 @@ export class DesktopConsoleService {
   private persistentLiveGateEnabled = false;
   private transportDownAt?: number;
   private recoverySuppressUntil = 0;
-  private readonly tableFlapStats = new Map<string, { disconnects: number; lastDisconnectAt: number; lastRecoveredAt?: number }>();
+  private readonly tableFlapStats = new Map<string, {
+    disconnects: number;
+    lastDisconnectAt: number;
+    lastRecoveredAt?: number;
+    recentDisconnectAt: number[];
+  }>();
   private liveRoomTimer?: NodeJS.Timeout;
   private liveMonitorRetryAttempt = 0;
   private liveMonitorOperation: Promise<void> = Promise.resolve();
@@ -401,6 +407,21 @@ export class DesktopConsoleService {
       );
     }
     this.recoverCommittedUnknownSettlements();
+    for (const reservation of this.orchestrator.getReservations()) {
+      if (reservation.status !== 'RESERVED' && reservation.status !== 'UNKNOWN') continue;
+      const settlement = this.ledger.getHandSettlement(
+        reservation.tableId,
+        reservation.shoeId,
+        reservation.handId,
+      );
+      if (!settlement) continue;
+      this.orchestrator.recoverAcceptedHandSettlement(
+        reservation.tableId,
+        reservation.shoeId,
+        reservation.handId,
+        settlement,
+      );
+    }
     this.ledger.abandonPreviousProcessTableFeed();
     this.orchestrator.resetLiveShoeTracking();
     const persistedLiveTableIds = Object.values(this.orchestrator.listTableConfigs())
@@ -545,7 +566,7 @@ export class DesktopConsoleService {
   }
 
   private keepaliveEligibleTableIds(): string[] {
-    return [...this.monitorTableIds, ...this.pendingJoinTableIds()];
+    return [...this.monitorTableIds];
   }
 
   private observedTableIds(): string[] {
@@ -1466,10 +1487,16 @@ export class DesktopConsoleService {
     return this.failCloseLiveExecution(tableIds.filter(tableId => this.hasLiveExposure(tableId)));
   }
 
-  private noteTableDisconnect(tableId: string): void {
-    const stats = this.tableFlapStats.get(tableId) ?? { disconnects: 0, lastDisconnectAt: 0 };
-    stats.disconnects += 1;
-    stats.lastDisconnectAt = Date.now();
+  private noteTableDisconnect(tableId: string, now = Date.now()): void {
+    const stats = this.tableFlapStats.get(tableId) ?? {
+      disconnects: 0,
+      lastDisconnectAt: 0,
+      recentDisconnectAt: [],
+    };
+    const recent = [...(stats.recentDisconnectAt ?? []), now].filter(at => now - at < 300_000);
+    stats.recentDisconnectAt = recent;
+    stats.disconnects = recent.length;
+    stats.lastDisconnectAt = now;
     this.tableFlapStats.set(tableId, stats);
   }
 
@@ -1480,8 +1507,9 @@ export class DesktopConsoleService {
 
   private flapEscalated(tableId: string, now = Date.now()): boolean {
     const stats = this.tableFlapStats.get(tableId);
-    if (stats === undefined || stats.disconnects < 4) return false;
-    return now - stats.lastDisconnectAt < 300_000;
+    if (stats === undefined) return false;
+    const recent = (stats.recentDisconnectAt ?? []).filter(at => now - at < 300_000);
+    return recent.length >= 4;
   }
 
   private beginRecoverySuppression(windowMs = 60_000): void {
@@ -2482,13 +2510,30 @@ export class DesktopConsoleService {
     await this.startupFailCloseTask;
     const actor = this.orchestrator.getActor(input.tableId);
     const bridge = this.browserBridge;
+    const gateWasAlreadyEnabled = this.persistentLiveGateEnabled;
     if (actor && bridge) {
       this.orchestrator.updateTableExecutionMode(input.tableId, 'live');
-      await this.setPersistentLiveGate(true);
       this.setOperationalWagerExecutor(true);
-      this.liveAuthorizationSources.set(input.tableId, 'manual');
+      if (!gateWasAlreadyEnabled) {
+        try {
+          bridge.setLiveBetEnabled(true);
+        } catch {
+          // Gate is restored in finally; a missing live session still fails closed in the extension.
+        }
+      }
     }
-    const result = await this.operationalWagers.executeManual(input);
+    let result: OperationalWagerResult;
+    try {
+      result = await this.operationalWagers.executeManual(input);
+    } finally {
+      if (actor && bridge && !gateWasAlreadyEnabled) {
+        try {
+          bridge.setLiveBetEnabled(false);
+        } catch {
+          this.persistentLiveGateEnabled = false;
+        }
+      }
+    }
     if (result.status === 'UNKNOWN') {
       this.refreshAccountingIncidents(true);
     }
@@ -2612,7 +2657,7 @@ export class DesktopConsoleService {
   }
 
   async writeOffUnknownOperationalWager(
-    command: DesktopUnknownWagerReconciliationCommand,
+    command: DesktopUnknownWagerWriteOffCommand,
   ): Promise<DesktopConsoleSnapshot> {
     return await this.enqueueExecutionStateOperation(async () => {
       await this.startupFailCloseTask;
@@ -2623,35 +2668,40 @@ export class DesktopConsoleService {
         throw new Error(`reservation ${command.reservationId} is not an UNKNOWN exposure`);
       }
 
-      const record = this.ledger.getOperationalWager(command.wagerId);
-      if (!record) throw new Error(`operational wager ${command.wagerId} not found`);
-      const matchesReservation = record.reservationId === reservation.reservationId
-        && record.wager.wagerId === reservation.intentId
-        && record.wager.tableId === reservation.tableId
-        && record.wager.shoeId === reservation.shoeId
-        && record.wager.handId === reservation.handId
-        && record.wager.market === reservation.market
-        && record.wager.amount === reservation.amount
-        && record.wager.source === reservation.executionSource;
-      if (!matchesReservation) {
-        throw new Error('operational wager does not match the reservation');
+      const record = command.wagerId ? this.ledger.getOperationalWager(command.wagerId) : undefined;
+      if (record) {
+        const matchesReservation = record.reservationId === reservation.reservationId
+          && record.wager.wagerId === reservation.intentId
+          && record.wager.tableId === reservation.tableId
+          && record.wager.shoeId === reservation.shoeId
+          && record.wager.handId === reservation.handId
+          && record.wager.market === reservation.market
+          && record.wager.amount === reservation.amount
+          && record.wager.source === reservation.executionSource;
+        if (!matchesReservation) {
+          throw new Error('operational wager does not match the reservation');
+        }
+        if (record.status !== 'UNKNOWN') {
+          throw new Error(`operational wager ${command.wagerId} is not an UNKNOWN exposure`);
+        }
+        if (record.reconciliation !== undefined) {
+          throw new Error('operational wager already has a reconciliation audit');
+        }
+        const writeOff = record.writeOff ?? {
+          reason: 'operator-unconfirmed-write-off' as const,
+          writtenOffAt: new Date().toISOString(),
+        };
+        this.ledger.writeOffOperationalWager(record.wager.wagerId, writeOff);
+        this.orchestrator.writeOffUnknownReservation(
+          command.reservationId,
+          writeOff.reason,
+        );
+      } else {
+        this.orchestrator.writeOffUnknownReservation(
+          command.reservationId,
+          'operator-unconfirmed-write-off',
+        );
       }
-      if (record.status !== 'UNKNOWN') {
-        throw new Error(`operational wager ${command.wagerId} is not an UNKNOWN exposure`);
-      }
-      if (record.reconciliation !== undefined) {
-        throw new Error('operational wager already has a reconciliation audit');
-      }
-
-      const writeOff = record.writeOff ?? {
-        reason: 'operator-unconfirmed-write-off' as const,
-        writtenOffAt: new Date().toISOString(),
-      };
-      this.ledger.writeOffOperationalWager(command.wagerId, writeOff);
-      this.orchestrator.writeOffUnknownReservation(
-        command.reservationId,
-        writeOff.reason,
-      );
       this.refreshAccountingIncidents(true);
       this.cachedSummary = undefined;
       this.cachedRecordCounts = undefined;

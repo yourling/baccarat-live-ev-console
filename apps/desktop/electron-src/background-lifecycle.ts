@@ -10,6 +10,10 @@ export function shouldHideMainWindowOnClose(_appQuitting: boolean): boolean {
   return false;
 }
 
+export function canOpenLiveDealerVideoPage(platform = process.platform): boolean {
+  return platform === 'win32';
+}
+
 export async function restoreOrCreateMainWindow(
   window: RestorableMainWindow | null,
   createWindow: () => Promise<void>,

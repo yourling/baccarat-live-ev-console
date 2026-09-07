@@ -120,9 +120,12 @@ function isStaleHandSettlementReplay(existingPayload: string, incoming: Normaliz
     const existingType = Reflect.get(parsed, 'type');
     const existingTableId = Reflect.get(parsed, 'tableId');
     const existingHandId = Reflect.get(parsed, 'handId');
+    const existingShoeId = Reflect.get(parsed, 'shoeId');
     return existingType === 'handSettled'
       && existingTableId === incoming.tableId
-      && existingHandId === incoming.handId;
+      && existingHandId === incoming.handId
+      && typeof existingShoeId === 'string'
+      && existingShoeId !== incoming.shoeId;
   } catch {
     return false;
   }
@@ -1057,6 +1060,10 @@ export class SqliteLedger {
         AND json_extract(payload, '$.wager.handId') = ?
         AND json_extract(payload, '$.wager.market') = ?
         AND json_extract(payload, '$.wager.source') = ?
+        AND (
+          json_extract(payload, '$.status') != 'REJECTED'
+          OR json_extract(payload, '$.receipt.raw.commitStarted') = 1
+        )
       LIMIT 1
     `).get(tableId, shoeId, handId, market, source));
   }
@@ -1301,7 +1308,7 @@ export class SqliteLedger {
         return [event];
       }
       if ('shoeId' in event && typeof event.shoeId === 'string' && event.shoeId !== physicalShoeId) {
-        return [{ ...event, shoeId: physicalShoeId }];
+        return [];
       }
       return [event];
     });

@@ -655,7 +655,7 @@ describe('desktop console demo sessions', () => {
     }
   });
 
-  it('lets keepalive target a pending table without arming pair bets', async () => {
+  it('does not let keepalive target a pending table', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();
     try {
@@ -674,7 +674,7 @@ describe('desktop console demo sessions', () => {
       await service.setAutomationEnabled(true);
 
       expect(service.snapshot().monitorTableIds).not.toContain('speedbca14gesbc1');
-      expect(service['operationalWagers']['options'].keepaliveTableIds?.() ?? []).toContain('speedbca14gesbc1');
+      expect(service['operationalWagers']['options'].keepaliveTableIds?.() ?? []).not.toContain('speedbca14gesbc1');
       expect(service.snapshot().snapshot.tables.speedbca14gesbc1).toBeUndefined();
     } finally {
       await service.close();

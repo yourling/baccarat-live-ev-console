@@ -107,7 +107,7 @@ export function OperationalWagerControls(props: {
   );
 }
 
-const MIN_MANUAL_WINDOW_SECONDS = 2;
+const MIN_MANUAL_WINDOW_SECONDS = 3;
 
 export function currentWagerHandId(
   actor: TableActorSnapshot,
@@ -131,7 +131,7 @@ export function remainingBettingWindowSeconds(actor: TableActorSnapshot, now = D
 export function bettingWindowIsOpen(actor: TableActorSnapshot, now = Date.now()): boolean {
   if (actor.projection.status !== 'BETTING_WINDOW') return false;
   const remaining = remainingBettingWindowSeconds(actor, now);
-  return remaining === null || remaining > 0;
+  return remaining !== null && remaining > 0;
 }
 
 export function bettingPhaseLabel(actor: TableActorSnapshot, now = Date.now()): {
@@ -142,7 +142,7 @@ export function bettingPhaseLabel(actor: TableActorSnapshot, now = Date.now()): 
   if (projection.status === 'BETTING_WINDOW') {
     const remaining = remainingBettingWindowSeconds(actor, now);
     if (remaining !== null && remaining > 0) return { text: `可下注 ${remaining}s`, open: true };
-    return { text: '可下注', open: true };
+    return { text: '停注', open: false };
   }
   if (projection.status === 'PENDING_SETTLEMENT') return { text: '结算中', open: false };
   if (projection.status === 'TRACKING' && projection.currentHandHasCards) return { text: '发牌中', open: false };

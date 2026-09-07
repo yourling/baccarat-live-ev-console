@@ -798,9 +798,6 @@ export class BgRuntimeParser {
       : undefined;
     const shuffleEvent = table.shuffleEvent === true;
     if (token === undefined) {
-      if (shuffleEvent && this.lastShoeResetByTable.has(tableId)) {
-        this.promoteProtocolShuffle(tableId, observedAt, events);
-      }
       return;
     }
     const previousToken = this.lastShoeResetByTable.get(tableId);
@@ -851,9 +848,9 @@ export class BgRuntimeParser {
     }
     if (!shuffleEvent) return;
     if (isInflatedRoadCorrection(this.lastGameCountByTable.get(tableId), table.gameCount ?? 0)) return;
-    // Same token is reused when startshuffling is missed or endshuffling
-    // copies lastFinishedShuffle. Only a deep/wrapped shoe is the next shuffle;
-    // a 2-20 hand pulse is the current shoe's leftover shuffle flag.
+    // Same token + sticky shuffleEvent is leftover currentShoe. A later
+    // shuffle after real play must be a token change, road wrap, or a
+    // credible end-of-shoe pulse on an already dealt shoe.
     if (this.shoeAlreadyDealt(tableId)) {
       const previousRoad = this.lastGameCountByTable.get(tableId);
       const incomingRoad = Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1
@@ -862,9 +859,7 @@ export class BgRuntimeParser {
       if (isCredibleBgEndOfShoeShuffle(previousRoad, incomingRoad, this.handsThisShoeByTable.get(tableId))) {
         this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
       }
-      return;
     }
-    this.promoteProtocolShuffle(tableId, observedAt, events);
   }
 
   private hasVerifiedPhysicalEvidence(tableId: string): boolean {
@@ -876,17 +871,6 @@ export class BgRuntimeParser {
     // First snapshot of a new shoe often still carries a round id, which
     // counts as 1. A later shuffle after real play is at least a second hand.
     return (this.handsThisShoeByTable.get(tableId) ?? 0) >= 2;
-  }
-
-  private promoteProtocolShuffle(
-    tableId: string,
-    observedAt: string,
-    events: NormalizedEvent[],
-  ): void {
-    if (!this.lastShoeResetByTable.has(tableId)) return;
-    if (this.evidenceByTable.get(tableId)?.reason === 'protocol-shuffle') return;
-    this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
-    this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
   }
 
   private ensureShoe(
@@ -1215,7 +1199,7 @@ export class BgRuntimeParser {
     if (playerCards.length < 2 || bankerCards.length < 2) return;
     if (!force && !isCompleteBaccaratHand(playerCards, bankerCards)) return;
     this.settledHands.add(handKey);
-    events.push(this.makeEvent(tableId, 'handSettled', `settled:${handId}`, timestamp, {
+    events.push(this.makeEvent(tableId, 'handSettled', `settled:${this.shoeIdByTable.get(tableId) ?? ''}:${handId}`, timestamp, {
       shoeId: this.shoeIdByTable.get(tableId) ?? '',
       handId,
       playerCards,

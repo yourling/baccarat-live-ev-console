@@ -496,9 +496,6 @@ export class PragmaticRuntimeParser {
       : undefined;
     const shuffleEvent = table.shuffleEvent === true;
     if (token === undefined) {
-      if (shuffleEvent && this.lastShoeResetByTable.has(tableId)) {
-        this.promoteProtocolShuffle(tableId, observedAt, events);
-      }
       return;
     }
     const previousToken = this.lastShoeResetByTable.get(tableId);
@@ -513,32 +510,7 @@ export class PragmaticRuntimeParser {
       }
       return;
     }
-    if (!shuffleEvent) return;
-    // Same token is reused when startshuffling is missed or endshuffling
-    // copies lastFinishedShuffle. If this shoe already dealt, that pulse is
-    // the next shuffle, not a duplicate of the current one.
-    if (this.shoeAlreadyDealt(tableId)) {
-      this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
-      return;
-    }
-    this.promoteProtocolShuffle(tableId, observedAt, events);
-  }
-
-  private shoeAlreadyDealt(tableId: string): boolean {
-    // First snapshot of a new shoe often still carries a round id, which
-    // counts as 1. A later shuffle after real play is at least a second hand.
-    return (this.handsThisShoeByTable.get(tableId) ?? 0) >= 2;
-  }
-
-  private promoteProtocolShuffle(
-    tableId: string,
-    observedAt: string,
-    events: NormalizedEvent[],
-  ): void {
-    if (!this.lastShoeResetByTable.has(tableId)) return;
-    if (this.evidenceByTable.get(tableId)?.reason === 'protocol-shuffle') return;
-    this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
-    this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
+    // Same token + sticky shuffleEvent is leftover currentShoe, not a new shoe.
   }
 
   private ensureShoe(
@@ -720,7 +692,7 @@ export class PragmaticRuntimeParser {
     if (!cards || cards.playerCards.length < 2 || cards.bankerCards.length < 2) return;
     if (!force && !isCompleteBaccaratHand(cards.playerCards, cards.bankerCards)) return;
     this.settledHands.add(handKey);
-    events.push(this.makeEvent(tableId, 'handSettled', `settled:${handId}`, timestamp, {
+    events.push(this.makeEvent(tableId, 'handSettled', `settled:${this.shoeIdByTable.get(tableId) ?? ''}:${handId}`, timestamp, {
       shoeId: this.shoeIdByTable.get(tableId) ?? '',
       handId,
       playerCards: cards.playerCards,

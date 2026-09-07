@@ -47,6 +47,7 @@ import {
   type OneShotBetCommand,
   type OneShotBetResult,
 } from './one-shot-bet.js';
+import { isPairBettingWindowReady } from './betting-window.js';
 import { selectMarkets } from './strategy.js';
 
 export interface TableActorOptions {
@@ -187,6 +188,8 @@ export class TableActor {
       riskLimits: this.riskLimits,
       executor: this.executor,
       requestTimeoutMs: Math.max(this.requestTimeoutMs, 12_000),
+      observedGameCount: this.observedGameCount?.(this.tableId),
+      observedShoeEvidence: this.observedShoeEvidence?.(this.tableId),
       recordReceipt: (receiptCommand, receipt) => this.recordOneShotReceipt(receiptCommand, receipt),
     }));
   }
@@ -206,6 +209,8 @@ export class TableActor {
       terms: this.operationalWagerTerms,
       canExecuteAutomaticBets: () => this.canExecuteAutomaticBets(this.tableId),
       requestTimeoutMs: Math.max(this.requestTimeoutMs, 12_000),
+      observedGameCount: this.observedGameCount?.(this.tableId),
+      observedShoeEvidence: this.observedShoeEvidence?.(this.tableId),
     }));
   }
 
@@ -349,7 +354,11 @@ export class TableActor {
         incomingBaseline === 'physical-shoe'
         && this.shouldHoldCurrentPhysicalShoe(current)
       ) {
-        return null;
+        const incomingGen = bgShoeGeneration(event.shoeId);
+        const currentGen = bgShoeGeneration(current.shoeId);
+        if (incomingGen === undefined || currentGen === undefined || incomingGen <= currentGen) {
+          return null;
+        }
       }
       return event;
     }
@@ -358,14 +367,12 @@ export class TableActor {
     const incomingGen = bgShoeGeneration(event.shoeId);
     const currentGen = bgShoeGeneration(current.shoeId);
     if (incomingGen !== undefined && currentGen !== undefined && incomingGen > currentGen) {
-      if (this.shouldHoldCurrentPhysicalShoe(current)) {
-        return { ...event, shoeId: current.shoeId };
-      }
+      if (this.shouldHoldCurrentPhysicalShoe(current)) return null;
       return event;
     }
     if (current.shoeBaseline === 'physical-shoe' && current.seenCards.length > 0) {
       if (current.sealed || current.remainingTotal < 26) return event;
-      return { ...event, shoeId: current.shoeId };
+      return null;
     }
     return event;
   }
@@ -546,25 +553,21 @@ export class TableActor {
   ): Promise<void> {
     if (event.shoeId !== projection.shoeId || projection.sealed) return;
     if (projection.status !== 'BETTING_WINDOW') return;
-    if (effectiveShoeBaseline(
-      projection,
-      this.observedGameCount?.(this.tableId),
-      this.observedShoeEvidence?.(this.tableId),
-    ) !== 'physical-shoe') {
-      return;
-    }
-    if (!isPhysicalShoeBettable(projection)) {
+    if (
+      effectiveShoeBaseline(
+        projection,
+        this.observedGameCount?.(this.tableId),
+        this.observedShoeEvidence?.(this.tableId),
+      ) !== 'physical-shoe'
+      || !isPhysicalShoeBettable(projection)
+    ) {
       return;
     }
     const closesAt = event.closesAt ?? projection.bettingWindowClosesAt;
-    const closesAtMs = typeof closesAt === 'string' && closesAt.length > 0 ? Date.parse(closesAt) : Number.NaN;
-    if (typeof closesAt !== 'string' || closesAt.length === 0 || !Number.isFinite(closesAtMs)) {
-      return;
-    }
     const eventMs = Date.parse(event.timestamp);
     const liveSkewMs = Number.isFinite(eventMs) ? Math.abs(Date.now() - eventMs) : Number.POSITIVE_INFINITY;
     const windowNowMs = liveSkewMs < 60_000 ? Date.now() : eventMs;
-    if (Number.isFinite(windowNowMs) && closesAtMs - windowNowMs < 3_000) {
+    if (!isPairBettingWindowReady(closesAt, windowNowMs)) {
       return;
     }
     if (this.riskManager.hasUnknownReservations(this.tableId)) {
@@ -574,9 +577,7 @@ export class TableActor {
     const previousEval = this.evaluatedWindows.get(evalKey);
     const hasClosesAt = typeof event.closesAt === 'string' && event.closesAt.length > 0;
     if (previousEval !== undefined && (previousEval.hadClosesAt || !hasClosesAt)) return;
-    const evaluation = projection.shoeBaseline === 'physical-shoe' && projection.remainingTotal > 0
-      ? evaluatePairMarketFromRemaining(this.profile, event.market, projection.remainingCounts)
-      : evaluatePairMarket(this.profile, event.market, projection.seenCards);
+    const evaluation = this.evaluatePair(projection, event.market);
     const eligible = evaluation.evLower >= this.profile.minEV;
     const reason = eligible
       ? `evLower=${evaluation.evLower.toFixed(6)} >= minEV=${this.profile.minEV}`
@@ -620,8 +621,8 @@ export class TableActor {
       return;
     }
     if (this.profile.betStrategy.type === 'both') {
-      const banker = evaluatePairMarket(this.profile, 'bankerPair', projection.seenCards);
-      const player = evaluatePairMarket(this.profile, 'playerPair', projection.seenCards);
+      const banker = this.evaluatePair(projection, 'bankerPair');
+      const player = this.evaluatePair(projection, 'playerPair');
       const preferredMarket = player.evLower > banker.evLower ? 'playerPair' : 'bankerPair';
       if (event.market !== preferredMarket) {
         return;
@@ -726,6 +727,15 @@ export class TableActor {
     );
   }
 
+  private evaluatePair(
+    projection: ShoeStateProjection,
+    market: Extract<NormalizedEvent, { type: 'bettingWindowOpened' }>['market'] | 'bankerPair' | 'playerPair',
+  ) {
+    return projection.shoeBaseline === 'physical-shoe' && projection.remainingTotal > 0
+      ? evaluatePairMarketFromRemaining(this.profile, market, projection.remainingCounts)
+      : evaluatePairMarket(this.profile, market, projection.seenCards);
+  }
+
   private recordDecision(
     event: Extract<NormalizedEvent, { type: 'bettingWindowOpened' | 'bettingWindowClosed' }>,
     projection: ShoeStateProjection,
@@ -734,9 +744,7 @@ export class TableActor {
     auditNote?: string,
     strategyChoice?: DecisionSnapshot['strategyChoice'],
   ): DecisionSnapshot | null {
-    const result = projection.shoeBaseline === 'physical-shoe' && projection.remainingTotal > 0
-      ? evaluatePairMarketFromRemaining(this.profile, event.market, projection.remainingCounts)
-      : evaluatePairMarket(this.profile, event.market, projection.seenCards);
+    const result = this.evaluatePair(projection, event.market);
     const snapshot: DecisionSnapshot = {
       snapshotId: newId('dec'),
       tableId: this.tableId,
