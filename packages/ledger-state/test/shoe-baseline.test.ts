@@ -126,6 +126,18 @@ describe('effectiveShoeBaseline', () => {
     expect(explainShoeBaseline(projection, 18, { reason: 'protocol-shuffle' }).evidence.reason).toBe('inventory-contradiction');
   });
 
+  it('hides mixed leftover inventory when a deep shoe still shows 局 1-8', () => {
+    const projection = emptyProjection('B17');
+    projection.shoeBaseline = 'physical-shoe';
+    projection.profileSnapshot = defaultProfile('B17');
+    projection.remainingTotal = 30;
+    projection.seenCards = Array.from({ length: 386 }, () => ({ rank: 'A' as const }));
+    projection.handNumber = 55;
+    expect(isWrapShapedRoadCount(55, 1)).toBe(true);
+    expect(effectiveShoeBaseline(projection, 1, { reason: 'protocol-shuffle' })).toBe('unknown-monitor-session');
+    expect(explainShoeBaseline(projection, 1, { reason: 'protocol-shuffle' }).evidence.reason).toBe('inventory-contradiction');
+  });
+
   it('rejects remaining 22 on road #51 as an impossible physical shoe', () => {
     const projection = emptyProjection('bc281koreanch281');
     projection.shoeBaseline = 'physical-shoe';

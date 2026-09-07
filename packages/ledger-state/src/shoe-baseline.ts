@@ -185,6 +185,17 @@ export function explainShoeBaseline(
         evidence: { reason: 'inventory-contradiction', gameCount },
       };
     }
+    // Parser should have opened a road-wrap. If it missed, do not advertise
+    // late-shoe pair EV on mixed inventory (B17 EV 0.91).
+    if (
+      isWrapShapedRoadCount(projection.handNumber, gameCount)
+      && projection.remainingTotal < 80
+    ) {
+      return {
+        baseline: 'unknown-monitor-session',
+        evidence: { reason: 'inventory-contradiction', gameCount },
+      };
+    }
     // A stuck early HISTORY road (局3) must not shrink the burn budget of a
     // 50-hand tracked shoe. Use the larger of road vs actually tracked hands.
     const handsForBudget = Math.max(gameCount, projection.handNumber);

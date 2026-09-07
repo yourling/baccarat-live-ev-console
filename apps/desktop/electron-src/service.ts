@@ -22,6 +22,7 @@ import {
   effectiveShoeBaseline,
   explainShoeBaseline,
   isVerifiedPhysicalShoeEvidence,
+  isWrapShapedRoadCount,
   shoeBaselineReasonLabel,
 } from '@baccarat/ledger-state';
 import {
@@ -457,6 +458,13 @@ export class DesktopConsoleService {
       const reason = this.browserBridge?.shoeEvidence(tableId)?.reason;
       if (reason === 'protocol-shuffle' && accepted === undefined && incoming !== undefined && incoming > 20) {
         return undefined;
+      }
+      if (
+        typeof accepted === 'number'
+        && typeof incoming === 'number'
+        && isWrapShapedRoadCount(accepted, incoming)
+      ) {
+        return incoming;
       }
       return selectBgRoadCount(accepted, incoming);
     }

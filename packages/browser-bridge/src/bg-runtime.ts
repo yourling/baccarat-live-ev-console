@@ -544,9 +544,10 @@ export class BgRuntimeParser {
       this.historyFirstSeqByTable.set(tableId, historySeq);
     }
 
-    let gameCount = Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1
+    const feltRoad = Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1
       ? table.gameCount
       : undefined;
+    let gameCount = feltRoad;
     if (laggedPreviousShoeRoad) {
       gameCount = undefined;
     } else {
@@ -558,8 +559,26 @@ export class BgRuntimeParser {
       const firstSeq = historySeq ?? this.historyFirstSeqByTable.get(tableId);
       const seqRoad = roadCountFromSeqWindow(firstSeq, liveSeq);
       const trackedHands = this.handsThisShoeByTable.get(tableId) ?? 0;
-      if (trackedHands >= INFLATED_ROAD_PREVIOUS_MAX) {
-        gameCount = Math.max(gameCount ?? 0, trackedHands);
+      const previousRoad = this.lastGameCountByTable.get(tableId);
+      const wrapIncoming = feltRoad !== undefined
+        && (
+          isRoadWrapToNewShoe(trackedHands > 0 ? trackedHands : undefined, feltRoad)
+          || isRoadWrapToNewShoe(previousRoad, feltRoad)
+          || (
+            isExhaustedShoeRoadDrop(previousRoad, feltRoad, trackedHands)
+            && feltRoad <= ROAD_WRAP_MAX
+          )
+        );
+      if (wrapIncoming) {
+        gameCount = feltRoad;
+      } else if (trackedHands >= INFLATED_ROAD_PREVIOUS_MAX) {
+        // Prefer tracked hands over a lagged HISTORY 21, but keep 29→18 corrections
+        // and never cover a wrap-shaped felt 局 1-8.
+        if (feltRoad !== undefined && isInflatedRoadCorrection(previousRoad ?? trackedHands, feltRoad)) {
+          gameCount = feltRoad;
+        } else {
+          gameCount = Math.max(feltRoad ?? 0, trackedHands);
+        }
       } else if (seqRoad !== undefined && (gameCount === undefined || gameCount > seqRoad)) {
         gameCount = seqRoad;
       }
@@ -670,10 +689,10 @@ export class BgRuntimeParser {
       this.settleRememberedHand(tableId, previousHandId, observedAt, events);
       const nextHands = (this.handsThisShoeByTable.get(tableId) ?? 1) + 1;
       if (nextHands > MAX_BACCARAT_SHOE_HANDS) {
-        this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', {
-          reason: 'road-wrap',
-          previousGameCount: nextHands - 1,
-          gameCount: 1,
+        // 80 hands without shuffle evidence is not a road-wrap. Reset to 待牌靴
+        // so pair EV cannot keep eating the previous inventory.
+        this.beginNewShoe(tableId, observedAt, events, 'unknown-monitor-session', {
+          reason: 'attach',
         });
         this.handsThisShoeByTable.set(tableId, 1);
       } else {
@@ -1054,17 +1073,21 @@ export class BgRuntimeParser {
     const handKey = `${tableId}:${handId}`;
     if (this.settledHands.has(handKey)) return;
     const cards = this.cardsByHand.get(handKey);
-    if (!cards || cards.playerCards.length < 2 || cards.bankerCards.length < 2) return;
-    if (!force && !isCompleteBaccaratHand(cards.playerCards, cards.bankerCards)) return;
+    if (!cards) return;
+    const stickyLead = this.stickyBankerLeadByTable.get(tableId);
+    const bankerCards = stripMatchingBankerLead([...cards.bankerCards], stickyLead);
+    const playerCards = cards.playerCards;
+    if (playerCards.length < 2 || bankerCards.length < 2) return;
+    if (!force && !isCompleteBaccaratHand(playerCards, bankerCards)) return;
     this.settledHands.add(handKey);
     events.push(this.makeEvent(tableId, 'handSettled', `settled:${handId}`, timestamp, {
       shoeId: this.shoeIdByTable.get(tableId) ?? '',
       handId,
-      playerCards: cards.playerCards,
-      bankerCards: cards.bankerCards,
+      playerCards,
+      bankerCards,
       outcomes: {
-        playerPair: cards.playerCards[0]!.rank === cards.playerCards[1]!.rank,
-        bankerPair: cards.bankerCards[0]!.rank === cards.bankerCards[1]!.rank,
+        playerPair: playerCards[0]!.rank === playerCards[1]!.rank,
+        bankerPair: bankerCards[0]!.rank === bankerCards[1]!.rank,
       },
     }));
   }
