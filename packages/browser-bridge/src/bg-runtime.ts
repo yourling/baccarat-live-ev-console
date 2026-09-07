@@ -59,6 +59,8 @@ const GAME_COUNT_ATTACH_MAX = 1;
 const GAME_COUNT_CATCH_UP_MAX = 5;
 /** 8-deck shoe with a cut cannot produce 100+ hands. */
 const MAX_BACCARAT_SHOE_HANDS = 80;
+/** Live bead plate 1-8 stepping +1 while internal is deep: missed the 局1 wrap. */
+const AUTHENTIC_ROAD_STREAK = 5;
 
 function isRoadWrapToNewShoe(
   previous: number | undefined,
@@ -402,6 +404,18 @@ export function bgGameCountSnapshot(raw: string): string | undefined {
   });
 }
 
+function normalizeFeltRoad(value: unknown): number | undefined {
+  if (value === 0) return 1;
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 1) return value;
+  return undefined;
+}
+
+type AuthenticHandCards = {
+  readonly handId: string;
+  readonly playerCards: readonly Card[];
+  readonly bankerCards: readonly Card[];
+};
+
 function seqFromShoeReset(token: string | undefined): number | undefined {
   if (!token) return undefined;
   const match = /^seq:(\d+)$/.exec(token);
@@ -437,6 +451,9 @@ export class BgRuntimeParser {
   private readonly bankerLeadOtherByTable = new Map<string, Set<string>>();
   private readonly bankerLeadHandByTable = new Map<string, string>();
   private readonly stickyBankerLeadByTable = new Map<string, string>();
+  private readonly lastFeltRoadByTable = new Map<string, number>();
+  private readonly authenticRoadStreakByTable = new Map<string, number>();
+  private readonly authenticHandsByTable = new Map<string, AuthenticHandCards[]>();
 
   stickyBankerLead(tableId: string): string | undefined {
     return this.stickyBankerLeadByTable.get(tableId);
@@ -521,6 +538,7 @@ export class BgRuntimeParser {
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
     this.evidenceByTable.delete(tableId);
+    this.clearAuthenticRoadTracking(tableId);
     this.clearHandState(tableId);
   }
 
@@ -544,9 +562,7 @@ export class BgRuntimeParser {
       this.historyFirstSeqByTable.set(tableId, historySeq);
     }
 
-    const feltRoad = Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1
-      ? table.gameCount
-      : undefined;
+    const feltRoad = normalizeFeltRoad(table.gameCount);
     let gameCount = feltRoad;
     if (laggedPreviousShoeRoad) {
       gameCount = undefined;
@@ -560,13 +576,18 @@ export class BgRuntimeParser {
       const seqRoad = roadCountFromSeqWindow(firstSeq, liveSeq);
       const trackedHands = this.handsThisShoeByTable.get(tableId) ?? 0;
       const previousRoad = this.lastGameCountByTable.get(tableId);
+      // 局1 is an immediate wrap. 局2-8 after a deep internal shoe wait for
+      // five +1 bead-plate steps so a missed 局1 can still latch.
       const wrapIncoming = feltRoad !== undefined
         && (
-          isRoadWrapToNewShoe(trackedHands > 0 ? trackedHands : undefined, feltRoad)
-          || isRoadWrapToNewShoe(previousRoad, feltRoad)
+          isRoadWrapToNewShoe(previousRoad, feltRoad)
           || (
-            isExhaustedShoeRoadDrop(previousRoad, feltRoad, trackedHands)
-            && feltRoad <= ROAD_WRAP_MAX
+            feltRoad === 1
+            && isRoadWrapToNewShoe(trackedHands > 0 ? trackedHands : undefined, feltRoad)
+          )
+          || (
+            feltRoad === 1
+            && isExhaustedShoeRoadDrop(previousRoad, feltRoad, trackedHands)
           )
         );
       if (wrapIncoming) {
@@ -688,7 +709,20 @@ export class BgRuntimeParser {
       this.closeWindows(tableId, previousHandId, observedAt, events);
       this.settleRememberedHand(tableId, previousHandId, observedAt, events);
       const nextHands = (this.handsThisShoeByTable.get(tableId) ?? 1) + 1;
-      if (nextHands > MAX_BACCARAT_SHOE_HANDS) {
+      const latched = this.maybeLatchAuthenticRoad(
+        tableId,
+        table.gameCount,
+        nextHands,
+        previousHandId,
+        observedAt,
+        events,
+      );
+      if (latched) {
+        this.handsThisShoeByTable.set(
+          tableId,
+          (this.handsThisShoeByTable.get(tableId) ?? 0) + 1,
+        );
+      } else if (nextHands > MAX_BACCARAT_SHOE_HANDS) {
         // 80 hands without shuffle evidence is not a road-wrap. Reset to 待牌靴
         // so pair EV cannot keep eating the previous inventory.
         this.beginNewShoe(tableId, observedAt, events, 'unknown-monitor-session', {
@@ -868,6 +902,106 @@ export class BgRuntimeParser {
     this.emitShoe(tableId, sequence, baseline, timestamp, events);
   }
 
+  private clearAuthenticRoadTracking(tableId: string): void {
+    this.lastFeltRoadByTable.delete(tableId);
+    this.authenticRoadStreakByTable.delete(tableId);
+    this.authenticHandsByTable.delete(tableId);
+  }
+
+  private pushAuthenticHand(tableId: string, handId: string): void {
+    const cards = this.cardsByHand.get(`${tableId}:${handId}`);
+    if (!cards || cards.playerCards.length + cards.bankerCards.length === 0) return;
+    const list = this.authenticHandsByTable.get(tableId) ?? [];
+    list.push({
+      handId,
+      playerCards: [...cards.playerCards],
+      bankerCards: [...cards.bankerCards],
+    });
+    this.authenticHandsByTable.set(tableId, list.slice(-ROAD_WRAP_MAX));
+  }
+
+  private replayAuthenticHandCards(
+    tableId: string,
+    hands: readonly AuthenticHandCards[],
+    timestamp: string,
+    events: NormalizedEvent[],
+  ): void {
+    const stickyLead = this.stickyBankerLeadByTable.get(tableId);
+    for (const hand of hands) {
+      const bankerCards = stripMatchingBankerLead([...hand.bankerCards], stickyLead);
+      this.recordCards(tableId, hand.handId, 'player', hand.playerCards, timestamp, events);
+      this.recordCards(tableId, hand.handId, 'banker', bankerCards, timestamp, events);
+    }
+  }
+
+  private maybeLatchAuthenticRoad(
+    tableId: string,
+    rawFelt: unknown,
+    internalHands: number,
+    previousHandId: string,
+    timestamp: string,
+    events: NormalizedEvent[],
+  ): boolean {
+    if (events.some(event =>
+      event.tableId === tableId
+      && event.type === 'newShoeSignal'
+      && event.baseline === 'physical-shoe')) {
+      this.clearAuthenticRoadTracking(tableId);
+      return false;
+    }
+    const felt = normalizeFeltRoad(rawFelt);
+    if (felt === undefined) {
+      this.clearAuthenticRoadTracking(tableId);
+      return false;
+    }
+    if (felt > ROAD_WRAP_MAX) {
+      this.clearAuthenticRoadTracking(tableId);
+      this.lastFeltRoadByTable.set(tableId, felt);
+      return false;
+    }
+    const deepMismatch = internalHands >= ROAD_WRAP_MIN_PREVIOUS
+      && internalHands - felt >= ROAD_WRAP_MIN_DROP;
+    if (!deepMismatch) {
+      this.clearAuthenticRoadTracking(tableId);
+      this.lastFeltRoadByTable.set(tableId, felt);
+      return false;
+    }
+    const lastFelt = this.lastFeltRoadByTable.get(tableId);
+    let streak = this.authenticRoadStreakByTable.get(tableId) ?? 0;
+    if (
+      lastFelt !== undefined
+      && lastFelt >= 1
+      && lastFelt <= ROAD_WRAP_MAX
+      && felt === lastFelt + 1
+    ) {
+      streak += 1;
+      this.pushAuthenticHand(tableId, previousHandId);
+    } else if (lastFelt === felt) {
+      this.clearAuthenticRoadTracking(tableId);
+      this.lastFeltRoadByTable.set(tableId, felt);
+      return false;
+    } else {
+      streak = 1;
+      this.authenticHandsByTable.set(tableId, []);
+    }
+    this.authenticRoadStreakByTable.set(tableId, streak);
+    this.lastFeltRoadByTable.set(tableId, felt);
+    if (streak < AUTHENTIC_ROAD_STREAK) return false;
+
+    const replay = (this.authenticHandsByTable.get(tableId) ?? []).slice(-felt);
+    this.beginNewShoe(tableId, timestamp, events, 'physical-shoe', {
+      reason: 'road-wrap',
+      previousGameCount: internalHands,
+      gameCount: felt,
+    });
+    this.replayAuthenticHandCards(tableId, replay, timestamp, events);
+    this.lastFeltRoadByTable.set(tableId, felt);
+    this.authenticRoadStreakByTable.set(tableId, 0);
+    this.authenticHandsByTable.set(tableId, []);
+    this.handsThisShoeByTable.set(tableId, replay.length);
+    return true;
+  }
+
   private beginNewShoe(
     tableId: string,
     timestamp: string,
@@ -888,6 +1022,7 @@ export class BgRuntimeParser {
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
     this.evidenceByTable.delete(tableId);
+    this.clearAuthenticRoadTracking(tableId);
     this.bankerLeadByTable.delete(tableId);
     this.bankerLeadStreakByTable.delete(tableId);
     this.bankerLeadOtherByTable.delete(tableId);
