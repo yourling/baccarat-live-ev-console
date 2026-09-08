@@ -31,4 +31,20 @@ describe('Winfinity extension routing', () => {
     expect(networkHookSource).toContain('youngpoisson.xyz');
     expect(networkHookSource).not.toContain('autoBet');
   });
+
+  it('is included in extension syntax check dirs', () => {
+    const checker = readFileSync(
+      new URL('../../../scripts/check-extension-syntax.mjs', import.meta.url),
+      'utf8',
+    );
+    expect(checker).toContain('browser-extension-winfinity');
+  });
+
+  it('is packaged as an extraResource', () => {
+    const desktopPackage = JSON.parse(readFileSync(
+      new URL('../../../apps/desktop/package.json', import.meta.url),
+      'utf8',
+    )) as { build?: { extraResources?: Array<{ from?: string }> } };
+    expect(desktopPackage.build?.extraResources?.some(entry => entry.from === '../browser-extension-winfinity')).toBe(true);
+  });
 });

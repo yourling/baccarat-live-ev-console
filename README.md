@@ -27,16 +27,16 @@
 - 持久化全局风控：预留/释放/结算、日/桌/靴亏损、重启恢复（`packages/risk-execution`）
 - 影子/模拟执行桥仍用于演示与测试；桌面实盘监控默认强制 `live`。Pragmatic Play 的庄对/闲对 `BetIntent` 与四市场受控 `OperationalWager` 执行实现（`packages/adapter-contract`、`packages/browser-bridge`、`apps/browser-extension`）
 - 房间级牌桌数据导出监控层：房间发现、逐桌导出、游标/批量/健康、断点续传（`packages/room-monitor`）
-- 浏览器扩展 + 本地 WebSocket 桥：Pragmatic 与 BG 各有独立扩展。只抓游戏协议 WebSocket，提供真实下注执行通道。不发送 `autoBet`、不点视频入座。两个扩展互斥，本机桥只接受一条连接
+- 浏览器扩展 + 本地 WebSocket 桥：Pragmatic、BG 与桃园 Winfinity 各有独立扩展。只抓游戏协议 WebSocket。不发送 `autoBet`、不点视频入座。三个扩展互斥，本机桥只接受一条连接。Winfinity 第一期只采集、拒绝下注
 - Electron + React 桌面控制台：IPC、arm/disarm、副数修正、事件/决策/回执审计、运行事故与生命周期（`apps/desktop`）
 
 ## Pragmatic Play 集成边界
 
 自动对子 EV 策略和 `BetIntent`/单次下注仅接受 `bankerPair`（庄对）和 `playerPair`（闲对）。`OperationalWager` 接受 `banker`（庄）、`player`（闲）、`bankerPair` 和 `playerPair`，其中全局定时保活只选择庄或闲。两者都由桌台 actor 串行执行并接入统一风控、预留、回执审计和牌局结算。
 
-浏览器端还会检查唯一 Dafabet 弹窗：Pragmatic 为 `/live-dealer/popup-launch/jeju-speed-baccarat`，BG 为 `/live-dealer/popup-launch/live-baccarat-bg`。仓库已删除 mstrom / Evolution / 旧 live-baccarat-pa 适配器。BG 真金提交走页面 MAIN world 的 `BaccaratBgProtocol.submit`；缺会话、socket 或开盘倒计时则预提交拒绝。`__baccaratBgBetAdapter` 仅测试覆盖。当前标准结算条款按庄赢净利 `0.95`、闲赢净利 `1`、和局退回本金处理；对子使用桌台配置赔率（默认净利 `11`）。最终收益由对应 reservation 的 `realizedPnl` 汇总，而不是仅按平台接受回执推算。
+浏览器端还会检查唯一 Dafabet 弹窗：Pragmatic 为 `/live-dealer/popup-launch/jeju-speed-baccarat`，BG 为 `/live-dealer/popup-launch/live-baccarat-bg`，桃园 Winfinity 为 `/live-dealer/popup-launch/tao-yuan-baccarat`。仓库已删除 mstrom / Evolution / 旧 live-baccarat-pa 适配器。BG 真金提交走页面 MAIN world 的 `BaccaratBgProtocol.submit`；缺会话、socket 或开盘倒计时则预提交拒绝。`__baccaratBgBetAdapter` 仅测试覆盖。当前标准结算条款按庄赢净利 `0.95`、闲赢净利 `1`、和局退回本金处理；对子使用桌台配置赔率（默认净利 `11`）。最终收益由对应 reservation 的 `realizedPnl` 汇总，而不是仅按平台接受回执推算。
 
-实盘最多监控 64 张桌。新会话默认不监控任何桌；只有环境变量 BACCARAT_LIVE_TABLES 才会预填桌号。大厅里尚未入监控的 Dafabet Pragmatic / BG 桌显示为「待加入」，仅本进程见过的协议 shoeReset token 变化、路子明显回绕或人工确认后才标实体新靴并晋升；第一次见到 shoeReset 或路子 #55 配满靴库存仍为待牌靴。刚洗完的实体靴即使 DOM 路子仍停在高位，也不得被降级。监控桌缺未观测牌超过 10 张会移出监控回到待加入，同一靴不会自动加回。断开超过 15 秒的监控桌会被移除；启动 60 秒内、洗牌 hold、以及未 flap 升级的 stale/闪断/重启不断开删除。
+实盘最多监控 64 张桌。新会话默认不监控任何桌；只有环境变量 BACCARAT_LIVE_TABLES 才会预填桌号。大厅里尚未入监控的 Dafabet Pragmatic / BG / Winfinity 桌显示为「待加入」，仅本进程见过的协议 shoeReset token 变化、路子明显回绕或人工确认后才标实体新靴并晋升；第一次见到 shoeReset 或路子 #55 配满靴库存仍为待牌靴。刚洗完的实体靴即使 DOM 路子仍停在高位，也不得被降级。监控桌缺未观测牌超过 10 张会移出监控回到待加入，同一靴不会自动加回。断开超过 15 秒的监控桌会被移除；启动 60 秒内、洗牌 hold、以及未 flap 升级的 stale/闪断/重启不断开删除。
 
 ## 目录
 
@@ -45,8 +45,9 @@
 - `packages/ledger-state`：事件账本、投影、重放、执行审计；牌面事件为内存热路径。
 - `packages/adapter-contract`：适配器接口、模拟适配器、归一化降级、`OperationalWager` 契约。
 - `packages/room-monitor`：游戏房间/牌桌发现、逐桌导出、游标/批量/健康与断点续传。
-- `packages/browser-bridge`：浏览器扩展 ↔ 本机控制台的 WebSocket 桥、BridgeRoomMonitor、真实下注请求通道、Pragmatic / BG 运行时归一化。
+- `packages/browser-bridge`：浏览器扩展 ↔ 本机控制台的 WebSocket 桥、BridgeRoomMonitor、真实下注请求通道、Pragmatic / BG / Winfinity 运行时归一化。
 - `apps/browser-extension-bg`：Dafabet BG 独立扩展（extraResources，非 workspace）。
+- `apps/browser-extension-winfinity`：Dafabet 桃园 Winfinity 独立扩展（extraResources，非 workspace；第一期只采集不下注）。
 - `packages/simulator-fixtures`：确定性事件流构造器。
 - `packages/orchestrator`：桌台串行 Actor、策略选择、幂等、持久化表配置、受控下注。
 - `packages/risk-execution`：全局风控、预留/释放/缩额/结算。

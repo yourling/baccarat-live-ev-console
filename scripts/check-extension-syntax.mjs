@@ -7,6 +7,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const dirs = [
   join(root, 'apps', 'browser-extension'),
   join(root, 'apps', 'browser-extension-bg'),
+  join(root, 'apps', 'browser-extension-winfinity'),
 ];
 
 let failed = false;

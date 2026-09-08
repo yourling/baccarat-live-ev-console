@@ -2,7 +2,7 @@
 
 ## 当前实现与发布状态
 
-本文记录当前桌面端 UI 的实际行为与视觉约束，不代表真实资金功能已获产品或安全批准。真人厅平台对接 Pragmatic Play 与 Dafabet BG；Dafabet 启动器为 Jeju Speed Baccarat 与 `live-baccarat-bg`，两个扩展互斥。四市场手动 `OperationalWager`、庄/闲保活和对子 EV 自动策略现在共用 actor、reservation、全局风控、回执审计与结算链路；运行监督器会在桥接、数据新鲜度、连续性或资金状态异常时失败关闭。保活与对子自动投注是互相独立的页头开关。真实资金发布仍待独立非资金长稳验收和外部授权。
+本文记录当前桌面端 UI 的实际行为与视觉约束，不代表真实资金功能已获产品或安全批准。真人厅平台对接 Pragmatic Play、Dafabet BG 与 Dafabet 桃园 Winfinity；Dafabet 启动器为 Jeju Speed Baccarat、`live-baccarat-bg` 与 `tao-yuan-baccarat`，三个扩展互斥。Winfinity 第一期只采集不下注。四市场手动 `OperationalWager`、庄/闲保活和对子 EV 自动策略现在共用 actor、reservation、全局风控、回执审计与结算链路；运行监督器会在桥接、数据新鲜度、连续性或资金状态异常时失败关闭。保活与对子自动投注是互相独立的页头开关。真实资金发布仍待独立非资金长稳验收和外部授权。
 
 ## 1. Atmosphere & Identity
 
@@ -81,13 +81,13 @@
 - **Motion**: 仅 120ms 的颜色/边框过渡。
 
 ### Pending join tables
-- **Structure**: 监控表下方的「待加入牌桌」列表，展示已发现但尚未晋升为监控桌的 Dafabet Pragmatic / BG 桌。
+- **Structure**: 监控表下方的「待加入牌桌」列表，展示已发现但尚未晋升为监控桌的 Dafabet Pragmatic / BG / Winfinity 桌。
 - **States**: 空、等待换靴回绕、可手动加入、已达 64 桌上限。
 - **Rule**: 不会把整个大厅目录一次灌入监控。自动晋升只发生在本进程见过协议 shoeReset token 变化、路子明显回绕，或人工确认重置牌靴之后；第一次见到 token 不得晋升。因缺牌过多被移出监控的桌回到待加入，同一靴不得自动加回，下一靴或人工加入后才可再晋升。操作者也可手动加入。
 
 ### Monitor table configuration
 - **Structure**: 设置页中的受控文本输入、当前已保存桌号摘要、保存按钮、「加入全部已发现桌」批量和格式提示。
-- **States**: 默认、保存中、格式错误、空数据、已保存。桌号接受遗留大写短号（如 `D055`）或 Pragmatic 小写 id（8–32 位字母数字）。
+- **States**: 默认、保存中、格式错误、空数据、已保存。桌号接受遗留大写短号（如 `D055`）、Pragmatic 小写 id（8–32 位字母数字），以及 Winfinity 短号（如 `tyn-bac8`）或 `wnf-<24hex>`。
 - **Accessibility**: 使用明确标签、帮助文本和错误文字；不以占位符代替标签。
 
 ### Unified betting settings
