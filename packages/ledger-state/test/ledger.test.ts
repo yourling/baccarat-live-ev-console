@@ -574,6 +574,41 @@ describe('ledger replay', () => {
     expect(state).toMatchObject({ handNumber: 2, currentHandId: 'h2', status: 'TRACKING' });
   });
 
+  it('leaves waiting-confirmation once live play arrives on that shoe', () => {
+    const profile = defaultProfile('t1');
+    const opened = replayEvents([
+      ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile }, 1),
+      ev({
+        type: 'bettingWindowOpened',
+        shoeId: 'shoe-1',
+        handId: 'h1',
+        market: 'bankerPair',
+        closesAt: '2026-09-08T14:13:33.000Z',
+      }, 2),
+    ]).get('t1');
+    expect(opened).toMatchObject({
+      status: 'BETTING_WINDOW',
+      currentHandId: 'h1',
+      shoeBaseline: 'physical-shoe',
+    });
+
+    const settled = replayEvents([
+      ev({ type: 'newShoeSignal', shoeId: 'shoe-1', baseline: 'physical-shoe', profile }, 1),
+      ev({
+        type: 'handSettled',
+        shoeId: 'shoe-1',
+        handId: 'h1',
+        playerCards: [{ rank: 'A' }, { rank: '8' }],
+        bankerCards: [{ rank: 'K' }, { rank: '7' }],
+      }, 2),
+    ]).get('t1');
+    expect(settled).toMatchObject({
+      status: 'TRACKING',
+      currentHandId: 'h1',
+      handNumber: 1,
+    });
+  });
+
   it('records betting-window close time from the opened event', () => {
     const profile = defaultProfile('t1');
     const events: NormalizedEvent[] = [

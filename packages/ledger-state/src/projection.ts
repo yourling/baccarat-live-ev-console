@@ -189,6 +189,12 @@ function recoverLiveFeed(projection: ShoeStateProjection): void {
   projection.connectionStatus = 'CONNECTED';
 }
 
+function acceptLivePlay(projection: ShoeStateProjection): void {
+  if (projection.status !== 'WAITING_CONFIRMATION') return;
+  // Verified physical shoes, and any shoe already dealing, are not shuffling.
+  projection.status = 'TRACKING';
+}
+
 function rejectOverdrawnRank(projection: ShoeStateProjection, rank: CardRank): boolean {
   if (projection.shoeBaseline !== 'physical-shoe') return false;
   if (projection.remainingCounts[rank] > 0) return false;
@@ -311,6 +317,7 @@ export function applyEvent(
       assertValidCard(event.card);
       if (!isCurrentShoe(event.shoeId, current)) break;
       recoverLiveFeed(updated);
+      acceptLivePlay(updated);
       const copyId = typeof event.card.raw === 'string' && event.card.raw.trim().length > 0
         ? event.card.raw.trim().toUpperCase()
         : `${event.card.rank}${event.card.suit ?? ''}`;
@@ -345,7 +352,8 @@ export function applyEvent(
       assertMarket(event.market, 'market', event);
       if (!isCurrentShoe(event.shoeId, current)) break;
       recoverLiveFeed(updated);
-      if (updated.redCardSeen || updated.status === 'INVALIDATED' || updated.status === 'WAITING_CONFIRMATION') {
+      acceptLivePlay(updated);
+      if (updated.redCardSeen || updated.status === 'INVALIDATED') {
         break;
       }
       if (updated.shoeBaseline === 'physical-shoe' && !isPhysicalShoeBettable(updated)) {
@@ -396,6 +404,7 @@ export function applyEvent(
       }
       if (!isCurrentShoe(event.shoeId, current)) break;
       recoverLiveFeed(updated);
+      acceptLivePlay(updated);
       if (beginHand(updated, event.handId) === 'stale') break;
       applySettledHandCards(updated, event.handId, event.playerCards, event.bankerCards);
       if (updated.redCardSeen) {

@@ -1662,6 +1662,49 @@ describe('exhausted unknown new-shoe must replace mixed physical inventory', () 
     expect(actor.getProjection().profileSnapshot.minEV).toBe(0.05);
     ledger.close();
   });
+
+  it('auto-confirms a physical shoe even when the table profile waits for confirmation', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile = {
+      ...simProfile('A26'),
+      autoConfirmNewShoe: false,
+      autoBetArmedByDefault: false,
+      minEV: 0.05,
+    };
+    const orchestrator = new Orchestrator({ ledger, riskLimits });
+    const actor = orchestrator.registerTable(profile, 'live', 20);
+    await orchestrator.enqueue('A26', {
+      type: 'newShoeSignal',
+      eventId: 'a26-physical',
+      tableId: 'A26',
+      timestamp: '2026-09-08T13:37:03.447Z',
+      sourceSeq: 1,
+      source: 'bg-runtime',
+      schemaVersion: 1,
+      shoeId: 'bg-A26-11',
+      baseline: 'physical-shoe',
+      profile: defaultProfile('A26'),
+    } as NormalizedEvent);
+    await orchestrator.enqueue('A26', {
+      type: 'bettingWindowOpened',
+      eventId: 'a26-open',
+      tableId: 'A26',
+      timestamp: '2026-09-08T13:37:10.000Z',
+      sourceSeq: 2,
+      source: 'bg-runtime',
+      schemaVersion: 1,
+      shoeId: 'bg-A26-11',
+      handId: '1685100',
+      market: 'bankerPair',
+      closesAt: '2026-09-08T13:37:18.000Z',
+    } as NormalizedEvent);
+    await actor.flush();
+    expect(actor.getProjection().shoeBaseline).toBe('physical-shoe');
+    expect(actor.getProjection().status).toBe('BETTING_WINDOW');
+    expect(actor.getProjection().profileSnapshot.minEV).toBe(0.05);
+    expect(actor.getProjection().profileSnapshot.autoConfirmNewShoe).toBe(true);
+    ledger.close();
+  });
 });
 
 describe('restart attach must not wipe a rebuilt physical shoe', () => {

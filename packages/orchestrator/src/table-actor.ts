@@ -387,7 +387,16 @@ export class TableActor {
     if (bound === null) return;
     event = bound;
     if (event.type === 'newShoeSignal') {
-      event = { ...event, profile: structuredClone(this.profile) };
+      const incomingConfirm = event.profile?.autoConfirmNewShoe === true;
+      event = {
+        ...event,
+        profile: {
+          ...structuredClone(this.profile),
+          autoConfirmNewShoe: incomingConfirm
+            || event.baseline === 'physical-shoe'
+            || this.profile.autoConfirmNewShoe,
+        },
+      };
     }
     const previousProjection = this.projection;
     const watermark = previousProjection.eventWatermark + 1;
