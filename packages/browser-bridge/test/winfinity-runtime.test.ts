@@ -256,4 +256,48 @@ describe('Winfinity settlement and shoes', () => {
       }),
     ]));
   });
+
+  it('binds operator shoe id after manual confirm until the protocol uuid changes', () => {
+    const parser = new WinfinityRuntimeParser();
+    parser.registerAlias(VENDOR, 'tyn-bac8');
+    parser.parseFrame(wsFrame('GAME_STATE_CHANGED', {
+      state: { state: 'BETS_OPEN', bettingTime: '0', bettingTimeDuration: '0', allowedSideBets: [] },
+    }));
+    parser.openPhysicalShoe('tyn-bac8', '2026-09-09T00:00:00.000Z');
+    const cards = parser.parseFrame(wsFrame('CARDS_TAKEN', {
+      cards: {
+        cards: [{
+          id: 'card-1',
+          card: { rank: 'QUEEN', suit: 'DIAMOND' },
+          position: { area: 'PLAYER', order: 'ORDER_LEFT' },
+        }],
+        allCards: [],
+      },
+    }));
+    expect(cards.filter(event => event.type === 'cardObserved')).toEqual([
+      expect.objectContaining({
+        shoeId: 'wnf-tyn-bac8-operator',
+      }),
+    ]);
+    expect(parser.shoeEvidence('tyn-bac8')).toEqual({ reason: 'manual-confirm' });
+    const shuffled = parser.parseFrame(JSON.stringify({
+      id: 'evt-2',
+      timestamp: '1788889999999',
+      type: 'GAME_STATE_CHANGED',
+      meta: {
+        tableId: VENDOR,
+        round: { id: 'hand-2', startedAt: '1788889999999', shoeId: SHOE_B },
+      },
+      state: { state: 'BETS_OPEN', bettingTime: '0', bettingTimeDuration: '0', allowedSideBets: [] },
+    }));
+    expect(parser.shoeEvidence('tyn-bac8')).toEqual({ reason: 'protocol-shuffle' });
+    expect(shuffled).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'newShoeSignal',
+        shoeId: SHOE_B,
+        baseline: 'physical-shoe',
+        tableId: 'tyn-bac8',
+      }),
+    ]));
+  });
 });

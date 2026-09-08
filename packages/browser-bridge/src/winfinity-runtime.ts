@@ -58,6 +58,7 @@ export class WinfinityRuntimeParser {
   private readonly seenCardIds = new Set<string>();
   private readonly cardsByHand = new Map<string, HandCards>();
   private readonly lastShoeToken = new Map<string, string>();
+  private readonly currentShoeId = new Map<string, string>();
   private readonly evidenceByTable = new Map<string, ShoeEvidence>();
   private readonly settledHands = new Set<string>();
 
@@ -88,8 +89,10 @@ export class WinfinityRuntimeParser {
 
   openPhysicalShoe(tableId: string, timestamp: string): NormalizedEvent[] {
     const events: NormalizedEvent[] = [];
+    const shoeId = `wnf-${tableId}-operator`;
     this.evidenceByTable.set(tableId, { reason: 'manual-confirm' });
-    this.emitNewShoe(tableId, `wnf-${tableId}-operator`, 'physical-shoe', timestamp, events);
+    this.currentShoeId.set(tableId, shoeId);
+    this.emitNewShoe(tableId, shoeId, 'physical-shoe', timestamp, events);
     return events;
   }
 
@@ -115,10 +118,11 @@ export class WinfinityRuntimeParser {
     if (tableId === undefined) return [];
     if (typeof round.id !== 'string' || typeof round.shoeId !== 'string') return [];
     const handId = round.id;
-    const shoeId = round.shoeId;
+    const protocolShoeId = round.shoeId;
     const timestamp = isoFromUnixMs(frame.timestamp) ?? new Date(0).toISOString();
     const events: NormalizedEvent[] = [];
-    this.noteShoe(tableId, shoeId, timestamp, events);
+    this.noteShoe(tableId, protocolShoeId, timestamp, events);
+    const shoeId = this.currentShoeId.get(tableId) ?? protocolShoeId;
     if (frame.type === 'GAME_STATE_CHANGED') {
       const state = asRecord(frame.state);
       if (state === undefined) return events;
@@ -298,11 +302,14 @@ export class WinfinityRuntimeParser {
     if (previous === shoeId) return;
     this.lastShoeToken.set(tableId, shoeId);
     if (previous === undefined) {
+      if (this.evidenceByTable.get(tableId)?.reason === 'manual-confirm') return;
       this.evidenceByTable.set(tableId, { reason: 'attach' });
+      this.currentShoeId.set(tableId, shoeId);
       this.emitNewShoe(tableId, shoeId, 'unknown-monitor-session', timestamp, events);
       return;
     }
     this.evidenceByTable.set(tableId, { reason: 'protocol-shuffle' });
+    this.currentShoeId.set(tableId, shoeId);
     this.clearTableHandState(tableId);
     this.emitNewShoe(tableId, shoeId, 'physical-shoe', timestamp, events);
   }
