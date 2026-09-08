@@ -1,7 +1,7 @@
 import type { MonitorTableCandidate } from '../api-types';
 
 export function isLiveMonitorRoomId(roomId: string): boolean {
-  return roomId === 'dafabet-pragmatic' || roomId === 'dafabet-bg';
+  return roomId === 'dafabet-pragmatic' || roomId === 'dafabet-bg' || roomId === 'dafabet-winfinity';
 }
 
 export function selectPragmaticMonitorTableIds(

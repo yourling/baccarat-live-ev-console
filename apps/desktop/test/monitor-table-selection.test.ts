@@ -31,4 +31,13 @@ describe('Pragmatic monitor table selection', () => {
     ]);
     expect(selected).toEqual(['B06', 'pragmatictable01']);
   });
+
+  it('selects Winfinity tables with BG and Pragmatic and ignores other rooms', () => {
+    const selected = selectLiveMonitorTableIds([
+      { roomId: 'dafabet-winfinity', tableId: 'tyn-bac8' },
+      { roomId: 'dafabet-bg', tableId: 'B06' },
+      { roomId: 'other', tableId: 'nope' },
+    ]);
+    expect(selected).toEqual(['tyn-bac8', 'B06']);
+  });
 });

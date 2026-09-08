@@ -90,6 +90,8 @@ const TABLE_METADATA_CONFIG_KEY = 'desktop:table-metadata:v1';
 const UNIFIED_BET_SETTINGS_CONFIG_KEY = 'desktop:unified-bet-settings:v1';
 const LEGACY_MONITOR_TABLE_ID_PATTERN = /^[A-Z]{1,4}\d{2,6}$/i;
 const PRAGMATIC_MONITOR_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
+const WINFINITY_MONITOR_TABLE_ID_PATTERN = /^[a-z0-9]+-bac\d+$/i;
+const WINFINITY_FALLBACK_MONITOR_TABLE_ID_PATTERN = /^wnf-[a-f0-9]{24}$/i;
 const DISCONNECTED_MONITOR_REMOVAL_MS = 15_000;
 const SHUFFLE_MONITOR_HOLD_MS = 10 * 60 * 1000;
 const MAX_LIVE_FEED_STALENESS_MS = 120_000;
@@ -129,6 +131,10 @@ function hasOneShotLiveBetActor(value: unknown): value is OneShotLiveBetActor {
     && typeof Reflect.get(value, 'placeOneShotBet') === 'function';
 }
 
+function isLiveDesktopRoomId(roomId: string): boolean {
+  return roomId === 'dafabet-pragmatic' || roomId === 'dafabet-bg' || roomId === 'dafabet-winfinity';
+}
+
 /**
  * A selection transition must distinguish a feed that stopped, disappeared on
  * its own, and one that may still be delivering events after a failed stop.
@@ -149,6 +155,8 @@ function normalizeMonitorTableIds(tableIds: readonly string[], allowEmpty = fals
     if (
       !LEGACY_MONITOR_TABLE_ID_PATTERN.test(tableId)
       && !PRAGMATIC_MONITOR_TABLE_ID_PATTERN.test(tableId)
+      && !WINFINITY_MONITOR_TABLE_ID_PATTERN.test(tableId)
+      && !WINFINITY_FALLBACK_MONITOR_TABLE_ID_PATTERN.test(tableId)
     ) {
       throw new RangeError(`invalid monitor table id: ${rawTableId}`);
     }
@@ -614,7 +622,7 @@ export class DesktopConsoleService {
     };
     for (const tableId of this.demotedPendingTableIds) add(tableId);
     for (const candidate of this.monitorCandidates()) {
-      if (candidate.roomId !== 'dafabet-pragmatic' && candidate.roomId !== 'dafabet-bg') continue;
+      if (!isLiveDesktopRoomId(candidate.roomId)) continue;
       const tableId = normalizeOptionalMonitorTableId(candidate.tableId);
       if (tableId === undefined) continue;
       add(tableId);
@@ -685,7 +693,7 @@ export class DesktopConsoleService {
 
   private promotePendingTablesFromRooms(rooms: readonly RoomDescriptor[]): void {
     for (const room of rooms) {
-      if (room.roomId !== 'dafabet-pragmatic' && room.roomId !== 'dafabet-bg') continue;
+      if (!isLiveDesktopRoomId(room.roomId)) continue;
       for (const table of room.tables) {
         const tableId = normalizeOptionalMonitorTableId(table.tableId);
         if (tableId === undefined || this.monitorTableIds.includes(tableId)) continue;
