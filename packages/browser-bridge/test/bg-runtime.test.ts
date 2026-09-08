@@ -381,6 +381,149 @@ describe('BgRuntimeParser', () => {
     });
   });
 
+  it('opens a road-wrap after 55 tracked hands when felt road returns to 1', () => {
+    const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'B17',
+      roundId: '1933985',
+      shoeReset: 'seq:1',
+      source: 'protocol',
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'B17',
+      shuffleEvent: true,
+      shoeReset: 'seq:2',
+      source: 'protocol',
+    }]));
+    expect(parser.shoeEvidence('B17')?.reason).toBe('protocol-shuffle');
+    for (let hand = 0; hand < 55; hand += 1) {
+      parser.parse(snapshot([{
+        tableId: 'B17',
+        roundId: String(1933985 + hand),
+        bettingOpen: true,
+        source: 'protocol',
+      }]));
+    }
+    const wrapped = parser.parse(snapshot([{
+      tableId: 'B17',
+      roundId: '1934040',
+      gameCount: 1,
+      bettingOpen: true,
+      source: 'protocol',
+    }]));
+    expect(wrapped.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({ baseline: 'physical-shoe', tableId: 'B17' }),
+    ]);
+    expect(parser.shoeEvidence('B17')).toEqual({
+      reason: 'road-wrap',
+      previousGameCount: 55,
+      gameCount: 1,
+    });
+    const settled = parser.parse(snapshot([{
+      tableId: 'B17',
+      roundId: '1934040',
+      gameCount: 1,
+      bettingOpen: false,
+      gameSettled: true,
+      playerCards: ['AS', '8D'],
+      bankerCards: ['KH', '5C'],
+      source: 'protocol',
+    }]));
+    expect(settled.filter(event => event.type === 'handSettled')).toEqual([
+      expect.objectContaining({
+        type: 'handSettled',
+        handId: '1934040',
+        shoeId: parser.currentShoeId('B17'),
+      }),
+    ]);
+    expect(parser.currentShoeId('B17')).toBe('bg-B17-3');
+  });
+
+  it('latches a 1-8 bead plate after five +1 hands and replays cards onto the new shoe', () => {
+    const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'B17',
+      roundId: '1933985',
+      shoeReset: 'seq:1',
+      source: 'protocol',
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'B17',
+      shuffleEvent: true,
+      shoeReset: 'seq:2',
+      source: 'protocol',
+    }]));
+    for (let hand = 0; hand < 55; hand += 1) {
+      parser.parse(snapshot([{
+        tableId: 'B17',
+        roundId: String(1933985 + hand),
+        bettingOpen: true,
+        playerCards: ['AS', '8D'],
+        bankerCards: ['KH', '5C'],
+        source: 'protocol',
+      }]));
+    }
+    const feltHands = [2, 3, 4, 5, 6];
+    const parsed = feltHands.map((road, index) => parser.parse(snapshot([{
+      tableId: 'B17',
+      roundId: String(1934040 + index),
+      gameCount: road,
+      bettingOpen: index < 4,
+      gameSettled: index === 4,
+      playerCards: ['2H', '3D'],
+      bankerCards: ['4C', '5S'],
+      source: 'protocol',
+    }])));
+    expect(parsed.slice(0, 4).flatMap(events => events.filter(event => event.type === 'newShoeSignal'))).toEqual([]);
+    const wrapped = parsed[4]!;
+    expect(wrapped.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({ baseline: 'physical-shoe', tableId: 'B17' }),
+    ]);
+    expect(parser.shoeEvidence('B17')).toEqual({
+      reason: 'road-wrap',
+      previousGameCount: 60,
+      gameCount: 6,
+    });
+    const replayed = wrapped.filter(event => event.type === 'cardObserved');
+    expect(replayed.length).toBeGreaterThan(0);
+    expect(replayed.every(event => event.shoeId === 'bg-B17-3')).toBe(true);
+    expect(parser.currentShoeId('B17')).toBe('bg-B17-3');
+  });
+
+  it('does not latch a sliding HISTORY window at 21-25', () => {
+    const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'A05',
+      roundId: '4963300',
+      shoeReset: 'seq:1',
+      source: 'protocol',
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'A05',
+      shuffleEvent: true,
+      shoeReset: 'seq:2',
+      source: 'protocol',
+    }]));
+    for (let hand = 0; hand < 50; hand += 1) {
+      parser.parse(snapshot([{
+        tableId: 'A05',
+        roundId: String(4963300 + hand),
+        bettingOpen: true,
+        source: 'protocol',
+      }]));
+    }
+    const sliding = [21, 22, 23, 24, 25].map((road, index) => parser.parse(snapshot([{
+      tableId: 'A05',
+      roundId: String(4963350 + index),
+      gameCount: road,
+      bettingOpen: true,
+      source: 'protocol',
+    }])));
+    expect(sliding.flatMap(events => events.filter(event =>
+      event.type === 'newShoeSignal' && event.baseline === 'physical-shoe',
+    ))).toEqual([]);
+  });
+
   it('caps a 29-row HISTORY packet to 局 18 using the live START_BET seq', () => {
     const parser = new BgRuntimeParser();
     parser.parse(snapshot([{
@@ -402,6 +545,26 @@ describe('BgRuntimeParser', () => {
     }]));
     expect(events.filter(event => event.type === 'newShoeSignal')).toEqual([]);
     expect(parser.acceptedGameCount('B01')).toBe(18);
+  });
+
+  it('does not wrap a 41-hand shoe when felt road corrects 29 to 18', () => {
+    const parser = new BgRuntimeParser();
+    for (let hand = 1; hand <= 41; hand += 1) {
+      parser.parse(snapshot([{
+        tableId: 'B01',
+        roundId: String(3822900 + hand),
+        gameCount: Math.min(hand, 29),
+        bettingOpen: true,
+        source: 'protocol',
+      }]));
+    }
+    const corrected = parser.parse(snapshot([{
+      tableId: 'B01',
+      roundId: '3822941',
+      gameCount: 18,
+      source: 'protocol',
+    }]));
+    expect(corrected.filter(event => event.type === 'newShoeSignal')).toEqual([]);
   });
 
   it('does not open a new shoe when inflated road 29 later matches felt 18', () => {
@@ -528,6 +691,49 @@ describe('BgRuntimeParser', () => {
     expect(settled.some(event => event.type === 'handSettled')).toBe(true);
   });
 
+  it('does not re-settle a leftover round after the shoe shuffles', () => {
+    const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'C01',
+      roundId: '2098609',
+      bettingOpen: true,
+      playerCards: [],
+      bankerCards: [],
+      shoeReset: 'seq:1',
+      source: 'protocol',
+    }]));
+    const settled = parser.parse(snapshot([{
+      tableId: 'C01',
+      roundId: '2098609',
+      bettingOpen: false,
+      gameSettled: true,
+      playerCards: ['JS', '8C'],
+      bankerCards: ['9S', '4D'],
+      shoeReset: 'seq:1',
+      source: 'protocol',
+    }]));
+    expect(settled.filter(event => event.type === 'handSettled')).toEqual([
+      expect.objectContaining({ type: 'handSettled', handId: '2098609', shoeId: 'bg-C01-1' }),
+    ]);
+
+    const shuffled = parser.parse(snapshot([{
+      tableId: 'C01',
+      roundId: '2098609',
+      bettingOpen: false,
+      gameSettled: true,
+      playerCards: ['JS', '8C'],
+      bankerCards: ['9S', '4D'],
+      shuffleEvent: true,
+      shoeReset: 'seq:2',
+      source: 'protocol',
+    }]));
+    expect(shuffled.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({ baseline: 'physical-shoe', shoeId: 'bg-C01-2' }),
+    ]);
+    expect(shuffled.filter(event => event.type === 'handSettled')).toEqual([]);
+    expect(shuffled.filter(event => event.type === 'cardObserved')).toEqual([]);
+  });
+
   it('ignores impossible shoe game counts above 80', () => {
     const parser = new BgRuntimeParser();
     parser.parse(snapshot([{
@@ -552,8 +758,9 @@ describe('BgRuntimeParser', () => {
       }]));
     }
     expect(last.filter(event => event.type === 'newShoeSignal')).toEqual([
-      expect.objectContaining({ baseline: 'physical-shoe', tableId: 'B06' }),
+      expect.objectContaining({ baseline: 'unknown-monitor-session', tableId: 'B06' }),
     ]);
+    expect(parser.shoeEvidence('B06')).toEqual({ reason: 'attach' });
   });
 
   it('does not open a new shoe on consecutive protocol rounds without shoeReset', () => {

@@ -10,7 +10,22 @@ import { ContractValidationError, defaultProfile, newId } from '@baccarat/contra
 const baseTime = '2025-01-01T00:00:00.000Z';
 
 function ev(partial: any, index: number): NormalizedEvent {
-  return { ...partial, eventId: `e${index}`, tableId: 't1', timestamp: new Date(Date.parse(baseTime)+index*1000).toISOString(), sourceSeq: index };
+  const event = {
+    ...partial,
+    eventId: `e${index}`,
+    tableId: 't1',
+    timestamp: new Date(Date.parse(baseTime)+index*1000).toISOString(),
+    sourceSeq: index,
+  };
+  if (
+    event.type === 'newShoeSignal'
+    && event.baseline === undefined
+    && event.source !== 'pragmatic-runtime'
+    && event.source !== 'bg-runtime'
+  ) {
+    event.baseline = 'physical-shoe';
+  }
+  return event;
 }
 
 function decision(
@@ -171,6 +186,40 @@ describe('ledger replay', () => {
     expect(ledger.getConfig<{ repairs: unknown[] }>('ledger:precommit-unknown-repairs:v1')?.repairs)
       .toHaveLength(1);
     expect(ledger.repairPrecommitUnknownOperationalReservations()).toEqual([]);
+    ledger.close();
+  });
+
+  it('records an operator write-off for an unconfirmable UNKNOWN wager', () => {
+    const ledger = new SqliteLedger();
+    const wager: OperationalWagerRecord = {
+      wager: {
+        wagerId: 'opw-write-off',
+        tableId: 'A30',
+        shoeId: 'bg-A30-27',
+        handId: '1095107',
+        market: 'player',
+        amount: 20,
+        source: 'keepalive',
+        createdAt: '2026-09-06T18:14:30.493Z',
+      },
+      reservationId: 'rsv-write-off',
+      status: 'UNKNOWN',
+      reason: 'committed-rejection-uncertain',
+    };
+    expect(ledger.saveOperationalWager(wager)).toBe(true);
+    const written = ledger.writeOffOperationalWager('opw-write-off', {
+      reason: 'operator-unconfirmed-write-off',
+      writtenOffAt: '2026-09-07T03:20:00.000Z',
+    });
+    expect(written.writeOff).toEqual({
+      reason: 'operator-unconfirmed-write-off',
+      writtenOffAt: '2026-09-07T03:20:00.000Z',
+    });
+    expect(ledger.writeOffOperationalWager('opw-write-off', written.writeOff!)).toEqual(written);
+    expect(() => ledger.writeOffOperationalWager('opw-write-off', {
+      reason: 'operator-unconfirmed-write-off',
+      writtenOffAt: '2026-09-07T03:21:00.000Z',
+    })).toThrow(LedgerConflictError);
     ledger.close();
   });
 
@@ -722,6 +771,52 @@ describe('ledger persistence and append safety', () => {
     const second = { ...first, shoeId: 's2' };
     led.appendEvent(first);
     expect(() => led.appendEvent(second)).toThrowError(LedgerConflictError);
+    led.close();
+  });
+
+  it('rejects a same-id handSettled correction on the same shoe', () => {
+    const led = new SqliteLedger();
+    const first = ev({
+      type: 'handSettled',
+      shoeId: 'shoe-1',
+      handId: 'h1',
+      playerCards: [{ rank: 'J' }, { rank: '8' }],
+      bankerCards: [{ rank: '9' }, { rank: '4' }],
+    }, 2);
+    const correction = {
+      ...first,
+      playerCards: [{ rank: 'A' as const }, { rank: 'A' as const }],
+      bankerCards: [{ rank: 'K' as const }, { rank: 'K' as const }],
+      sourceSeq: 3,
+      timestamp: '2025-01-01T00:05:00.000Z',
+    };
+    led.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'shoe-1', profile: { ...defaultProfile('t1'), autoConfirmNewShoe: true } }, 1));
+    expect(led.appendEvent(first)).toBe('appended');
+    expect(() => led.appendEvent(correction)).toThrowError(LedgerConflictError);
+    led.close();
+  });
+
+  it('keeps the first handSettled when the same id later arrives on a new shoe', () => {
+    const led = new SqliteLedger();
+    const first = ev({
+      type: 'handSettled',
+      shoeId: 'bg-C01-1',
+      handId: '2098609',
+      playerCards: [{ rank: 'J' }, { rank: '8' }],
+      bankerCards: [{ rank: '9' }, { rank: '4' }],
+    }, 2);
+    const replay = {
+      ...first,
+      shoeId: 'bg-C01-2',
+      sourceSeq: 85,
+      timestamp: '2025-01-01T00:05:00.000Z',
+    };
+    expect(led.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'bg-C01-1', profile: { ...defaultProfile('t1'), autoConfirmNewShoe: true } }, 1))).toBe('appended');
+    expect(led.appendEvent(first)).toBe('appended');
+    expect(led.appendEvent(replay)).toBe('duplicate');
+    expect(led.listEvents('t1').filter(event => event.type === 'handSettled')).toEqual([
+      expect.objectContaining({ shoeId: 'bg-C01-1', handId: '2098609' }),
+    ]);
     led.close();
   });
 
@@ -1839,22 +1934,66 @@ describe('monitor history retention', () => {
     ledger.close();
   });
 
-  it('drops previous-process table feed but keeps money rows', () => {
+  it('keeps previous-process table feed for audit but excludes it from live replay', () => {
     const ledger = new SqliteLedger();
+    const profile = { ...defaultProfile('t1'), autoConfirmNewShoe: true };
+    ledger.appendEvent(ev({
+      type: 'newShoeSignal',
+      shoeId: 'bg-A01-3',
+      baseline: 'physical-shoe',
+      profile,
+    }, 1));
     ledger.appendEvent(ev({
       type: 'handSettled',
-      shoeId: 'shoe-1',
+      shoeId: 'bg-A01-3',
       handId: 'h1',
       playerCards: [{ rank: 'A', suit: 'S' }, { rank: '2', suit: 'H' }],
       bankerCards: [{ rank: '3', suit: 'C' }, { rank: '4', suit: 'D' }],
       outcomes: { playerPair: false, bankerPair: false },
-    }, 1));
+    }, 2));
     ledger.saveDecision(decision('d1', 'h1', 'bankerPair', false, '2026-09-07T01:00:00.000Z'));
-    expect(ledger.countEvents()).toBeGreaterThan(0);
-    expect(ledger.listDecisions('t1')).toHaveLength(1);
+    expect(ledger.replay('t1', { latestShoeOnly: true }).state.get('t1')?.shoeId).toBe('bg-A01-3');
     ledger.abandonPreviousProcessTableFeed();
-    expect(ledger.countEvents()).toBe(0);
-    expect(ledger.listDecisions('t1')).toHaveLength(0);
+    expect(ledger.countEvents()).toBe(2);
+    expect(ledger.listDecisions('t1')).toHaveLength(1);
+    expect(ledger.listEvents('t1').map(event => event.type)).toEqual(['newShoeSignal', 'handSettled']);
+    expect(ledger.listBgShoeGenerations()).toEqual([{ tableId: 'A01', sequence: 3 }]);
+    expect(ledger.replay('t1', { latestShoeOnly: true }).state.get('t1')).toBeUndefined();
+    ledger.close();
+  });
+
+  it('replays only this-process shoe after abandoning previous-process feed', () => {
+    const ledger = new SqliteLedger();
+    const profile = { ...defaultProfile('t1'), autoConfirmNewShoe: true };
+    ledger.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'shoe-old', profile }, 1));
+    ledger.appendEvent(ev({
+      type: 'handSettled',
+      shoeId: 'shoe-old',
+      handId: 'old-h',
+      playerCards: [{ rank: 'A' }, { rank: '2' }],
+      bankerCards: [{ rank: '3' }, { rank: '4' }],
+    }, 2));
+    ledger.abandonPreviousProcessTableFeed();
+    ledger.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'shoe-new', profile }, 3));
+    ledger.appendEvent(ev({
+      type: 'handSettled',
+      shoeId: 'shoe-new',
+      handId: 'new-h',
+      playerCards: [{ rank: 'K' }, { rank: 'Q' }],
+      bankerCards: [{ rank: 'J' }, { rank: '10' }],
+    }, 4));
+    expect(ledger.listEvents('t1').map(event => (
+      'shoeId' in event ? event.shoeId : undefined
+    ))).toEqual([
+      'shoe-old',
+      'shoe-old',
+      'shoe-new',
+      'shoe-new',
+    ]);
+    const projection = ledger.replay('t1', { latestShoeOnly: true }).state.get('t1');
+    expect(projection?.shoeId).toBe('shoe-new');
+    expect(projection?.seenCards).toHaveLength(4);
+    expect(projection?.seenCards.map(card => card.rank)).toEqual(['K', 'Q', 'J', '10']);
     ledger.close();
   });
 });

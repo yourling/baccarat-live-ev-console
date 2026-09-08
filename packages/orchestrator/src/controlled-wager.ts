@@ -17,8 +17,10 @@ import {
   effectiveShoeBaseline,
   isPhysicalShoeBettable,
   type OperationalWagerRecord,
+  type ShoeBaselineEvidence,
 } from '@baccarat/ledger-state';
 import { RiskManager } from '@baccarat/risk-execution';
+import { isPairBettingWindowReady } from './betting-window.js';
 
 export interface OperationalWagerTerms {
   readonly banker: OddsConfig;
@@ -69,6 +71,8 @@ export interface ControlledOperationalWagerContext {
   readonly terms?: OperationalWagerTerms;
   readonly canExecuteAutomaticBets: () => boolean;
   readonly requestTimeoutMs: number;
+  readonly observedGameCount?: number;
+  readonly observedShoeEvidence?: ShoeBaselineEvidence;
 }
 
 export async function executeControlledOperationalWager(
@@ -93,12 +97,22 @@ export async function executeControlledOperationalWager(
   if (projection.connectionStatus !== 'CONNECTED') return rejected('connected-required');
   if (projection.status !== 'BETTING_WINDOW') return rejected('betting-window-required');
   if (
-    effectiveShoeBaseline(projection) !== 'physical-shoe'
+    (command.market === 'bankerPair' || command.market === 'playerPair')
+    && !isPairBettingWindowReady(projection.bettingWindowClosesAt)
+  ) {
+    return rejected('betting-window-required');
+  }
+  if (
+    effectiveShoeBaseline(
+      projection,
+      context.observedGameCount,
+      context.observedShoeEvidence,
+    ) !== 'physical-shoe'
     || !isPhysicalShoeBettable(projection)
   ) {
     return rejected('physical-shoe-required');
   }
-  if (context.riskManager.hasUnknownReservations()) {
+  if (context.riskManager.hasUnknownReservations(context.tableId)) {
     return rejected('unknown-execution-pending');
   }
   if (projection.sealed) return rejected('shoe-sealed');

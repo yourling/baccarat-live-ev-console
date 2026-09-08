@@ -7,11 +7,11 @@ export function evaluateProjectionPairMarket(
   seenCards: readonly Card[],
   remainingCounts?: Record<CardRank, number>,
 ) {
-  if (seenCards.length > 0) {
-    return evaluatePairMarket(profile, market, [...seenCards]);
-  }
   if (remainingCounts) {
-    return evaluatePairMarketFromRemaining(profile, market, remainingCounts);
+    const remainingTotal = Object.values(remainingCounts).reduce((sum, count) => sum + count, 0);
+    if (remainingTotal > 0) {
+      return evaluatePairMarketFromRemaining(profile, market, remainingCounts);
+    }
   }
-  return evaluatePairMarket(profile, market, []);
+  return evaluatePairMarket(profile, market, [...seenCards]);
 }

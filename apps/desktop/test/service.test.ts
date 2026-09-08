@@ -466,8 +466,8 @@ describe('desktop console demo sessions', () => {
       const projection = snapshot.snapshot.tables.bc281koreanch281?.projection;
       expect(projection?.shoeBaseline).toBe('unknown-monitor-session');
       expect(snapshot.shoeEvidence.bc281koreanch281).toEqual(expect.objectContaining({
-        reason: 'attach',
-        label: '入桌，未见洗牌',
+        reason: 'restart-empty-inventory',
+        label: '路子已深但未见牌面',
       }));
     } finally {
       await service.close();
@@ -655,7 +655,7 @@ describe('desktop console demo sessions', () => {
     }
   });
 
-  it('lets keepalive target a pending table without arming pair bets', async () => {
+  it('does not let keepalive target a pending table', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();
     try {
@@ -674,7 +674,7 @@ describe('desktop console demo sessions', () => {
       await service.setAutomationEnabled(true);
 
       expect(service.snapshot().monitorTableIds).not.toContain('speedbca14gesbc1');
-      expect(service['operationalWagers']['options'].keepaliveTableIds?.() ?? []).toContain('speedbca14gesbc1');
+      expect(service['operationalWagers']['options'].keepaliveTableIds?.() ?? []).not.toContain('speedbca14gesbc1');
       expect(service.snapshot().snapshot.tables.speedbca14gesbc1).toBeUndefined();
     } finally {
       await service.close();
@@ -1538,6 +1538,65 @@ describe('desktop console demo sessions', () => {
       expect(updated.snapshot.tables.D065?.profile.monitorUrl).toBe('窗口-D065');
     } finally {
       await service.close();
+    }
+  });
+
+  it('applies unified EV settings when a factory-default pending table is promoted', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const unified = {
+      minEV: 0.05,
+      defaultBetAmount: 20,
+      betTiers: [
+        { minEV: 0.15, amount: 40 },
+        { minEV: 0.2, amount: 60 },
+      ],
+    };
+    try {
+      await service.updateMonitorTableIds(['A01']);
+      await service.updateAllTableSettings(unified);
+      service['orchestrator'].registerTable(defaultProfile('A23'), 'live', 100);
+      expect(service['orchestrator'].getActor('A23')?.snapshot()).toEqual(expect.objectContaining({
+        defaultBetAmount: 100,
+        profile: expect.objectContaining({ minEV: 0, betTiers: [] }),
+      }));
+      service['liveMonitorActivated'] = true;
+      service['promotePendingTable']('A23');
+      const promoted = service['orchestrator'].getActor('A23')?.snapshot();
+      expect(service.snapshot().monitorTableIds).toContain('A23');
+      expect(promoted?.profile.minEV).toBe(0.05);
+      expect(promoted?.defaultBetAmount).toBe(20);
+      expect(promoted?.profile.betTiers).toEqual(unified.betTiers);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('heals a monitored factory-default table from persisted unified settings on restart', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'baccarat-unified-bet-'));
+    const dbPath = join(dir, 'console.sqlite');
+    const unified = {
+      minEV: 0.05,
+      defaultBetAmount: 20,
+      betTiers: [{ minEV: 0.15, amount: 40 }],
+    };
+    const first = new DesktopConsoleService(dbPath);
+    try {
+      await first.updateMonitorTableIds(['A01', 'A23']);
+      await first.updateAllTableSettings(unified);
+      await first.updateTableSettings('A23', { minEV: 0, defaultBetAmount: 100, betTiers: [] });
+      expect(first['orchestrator'].getActor('A23')?.snapshot().defaultBetAmount).toBe(100);
+    } finally {
+      await first.close();
+    }
+    const restarted = new DesktopConsoleService(dbPath);
+    try {
+      const healed = restarted['orchestrator'].getActor('A23')?.snapshot();
+      expect(healed?.profile.minEV).toBe(0.05);
+      expect(healed?.defaultBetAmount).toBe(20);
+      expect(healed?.profile.betTiers).toEqual(unified.betTiers);
+    } finally {
+      await restarted.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
@@ -3194,15 +3253,70 @@ describe('desktop console demo sessions', () => {
         baseline: 'physical-shoe',
         profile: defaultProfile('D055'),
       });
+      await first.injectEvent({
+        type: 'handSettled',
+        eventId: 'settled-1',
+        tableId: 'D055',
+        timestamp: '2026-09-07T01:00:30.000Z',
+        sourceSeq: 2,
+        source: 'test',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        shoeId: 'shoe-D055',
+        handId: 'h1',
+        playerCards: [{ rank: 'A', suit: 'S' }, { rank: '2', suit: 'H' }],
+        bankerCards: [{ rank: 'K', suit: 'C' }, { rank: '3', suit: 'D' }],
+        outcomes: { bankerPair: false, playerPair: false },
+      });
+      first['ledger'].saveDecision({
+        snapshotId: 'd-h1',
+        tableId: 'D055',
+        shoeId: 'shoe-D055',
+        handId: 'h1',
+        market: 'bankerPair',
+        eventWatermark: 1,
+        profileVersion: 1,
+        modelRevision: 'model-1',
+        pMean: 0.12,
+        pLower: 0.10,
+        evMean: 0.32,
+        evLower: 0.20,
+        eligible: true,
+        reason: 'threshold-met',
+        conservativePolicy: 'worst-case-burn-composition-v1',
+        createdAt: '2026-09-07T01:00:10.000Z',
+      });
       expect(first.snapshot().snapshot.tables.D055?.projection.shoeBaseline).toBe('physical-shoe');
       await first.close();
       const restarted = new DesktopConsoleService(dbPath);
       try {
-        expect(restarted.snapshot().events).toEqual([]);
+        expect(restarted.snapshot().events).toEqual(expect.arrayContaining([
+          expect.objectContaining({ type: 'newShoeSignal', shoeId: 'shoe-D055' }),
+          expect.objectContaining({ type: 'handSettled', handId: 'h1' }),
+        ]));
+        expect(restarted.queryRecords({ kind: 'decisions', page: 1, pageSize: 20 })).toEqual(
+          expect.objectContaining({
+            kind: 'decisions',
+            total: 1,
+            decisions: [expect.objectContaining({
+              tableId: 'D055',
+              shoeId: 'shoe-D055',
+              handId: 'h1',
+              eligible: true,
+              evLower: 0.20,
+            })],
+          }),
+        );
         const projection = restarted.snapshot().snapshot.tables.D055?.projection;
         expect(projection?.shoeBaseline).toBe('unknown-monitor-session');
+        expect(projection?.shoeId).toBe('');
         expect(projection?.seenCards).toEqual([]);
         expect(restarted.snapshot().monitorTableIds).toContain('D055');
+        const config = restarted['orchestrator'].listTableConfigs().D055!;
+        restarted['orchestrator'].registerTable(config.profile, 'live', config.defaultBetAmount);
+        const recreated = restarted['orchestrator'].getActor('D055')?.getProjection();
+        expect(recreated?.shoeId).toBe('');
+        expect(recreated?.shoeBaseline).toBe('unknown-monitor-session');
+        expect(recreated?.seenCards).toEqual([]);
       } finally {
         await restarted.close();
       }

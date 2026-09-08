@@ -84,6 +84,11 @@ type PrecommitUnknownOperationalReservationRepairAudit = {
   readonly repairs: readonly PrecommitUnknownOperationalReservationRepair[];
 };
 
+type LiveFeedEpoch = {
+  readonly afterEventId: number;
+  readonly startedAt: string;
+};
+
 const ACCEPTED_RESERVATION_REPAIR_AUDIT_KEY = 'ledger:accepted-reservation-repairs:v1';
 const PRECOMMIT_UNKNOWN_REPAIR_AUDIT_KEY = 'ledger:precommit-unknown-repairs:v1';
 const INVALID_ACCEPTED_EXPIRY_REASONS = new Set([
@@ -109,6 +114,25 @@ function semanticStoredEventPayload(payload: string): string | undefined {
     return semanticEventPayload(parsed);
   } catch {
     return undefined;
+  }
+}
+
+function isStaleHandSettlementReplay(existingPayload: string, incoming: NormalizedEvent): boolean {
+  if (incoming.type !== 'handSettled') return false;
+  try {
+    const parsed: unknown = JSON.parse(existingPayload);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return false;
+    const existingType = Reflect.get(parsed, 'type');
+    const existingTableId = Reflect.get(parsed, 'tableId');
+    const existingHandId = Reflect.get(parsed, 'handId');
+    const existingShoeId = Reflect.get(parsed, 'shoeId');
+    return existingType === 'handSettled'
+      && existingTableId === incoming.tableId
+      && existingHandId === incoming.handId
+      && typeof existingShoeId === 'string'
+      && existingShoeId !== incoming.shoeId;
+  } catch {
+    return false;
   }
 }
 
@@ -421,6 +445,7 @@ export class LedgerConflictError extends Error {
 export type AppendEventResult = 'appended' | 'duplicate';
 
 const SCHEMA_VERSION = '5';
+const LIVE_FEED_EPOCH_KEY = 'ledger:live-feed-epoch:v1';
 const MONITOR_HISTORY_HANDS_PER_TABLE = 12;
 const MONITOR_WINDOW_EVENT_TYPES = "('bettingWindowOpened','bettingWindowClosed')";
 const MONITOR_TRANSIENT_TYPES = [
@@ -649,15 +674,17 @@ export class SqliteLedger {
   }
 
   /**
-   * Process start: drop previous-process table feed so live EV/inventory
-   * never continues a stale shoe. Money ledger and table settings stay.
+   * Process start: keep persisted events/decisions for audit, but mark them
+   * as previous-process so live EV replay cannot continue a stale shoe.
+   * In-memory cardObserved is dropped. Money ledger and table settings stay.
    */
   abandonPreviousProcessTableFeed(): void {
     this.ephemeralEventsByTable.clear();
     this.ephemeralEventIds.clear();
-    this.transaction(() => {
-      this.db.prepare('DELETE FROM events').run();
-      this.db.prepare('DELETE FROM decisions').run();
+    const row = this.db.prepare('SELECT COALESCE(MAX(id), 0) AS maxId FROM events').get() as { maxId: number };
+    this.setConfig<LiveFeedEpoch>(LIVE_FEED_EPOCH_KEY, {
+      afterEventId: Number(row.maxId) || 0,
+      startedAt: new Date().toISOString(),
     });
     this.checkpoint();
   }
@@ -672,6 +699,10 @@ export class SqliteLedger {
       this.db.prepare('DELETE FROM reservations').run();
       this.db.prepare('DELETE FROM operational_wagers').run();
       this.db.prepare('DELETE FROM risk_state').run();
+    });
+    this.setConfig<LiveFeedEpoch>(LIVE_FEED_EPOCH_KEY, {
+      afterEventId: 0,
+      startedAt: new Date().toISOString(),
     });
     this.db.exec('VACUUM');
   }
@@ -968,6 +999,34 @@ export class SqliteLedger {
     return updated;
   }
 
+  writeOffOperationalWager(
+    wagerId: string,
+    writeOff: NonNullable<OperationalWagerRecord['writeOff']>,
+  ): OperationalWagerRecord {
+    const existing = this.getOperationalWager(wagerId);
+    if (!existing) throw new LedgerConflictError(`operational wager ${wagerId} not found`);
+    if (existing.writeOff) {
+      if (stableStringify(existing.writeOff) !== stableStringify(writeOff)) {
+        throw new LedgerConflictError(`operational wager ${wagerId} already has a different write-off`);
+      }
+      return existing;
+    }
+    if (existing.status !== 'UNKNOWN') {
+      throw new LedgerConflictError(`operational wager ${wagerId} is not an UNKNOWN exposure`);
+    }
+    if (existing.reconciliation !== undefined) {
+      throw new LedgerConflictError(`operational wager ${wagerId} already has a reconciliation audit`);
+    }
+    const updated: OperationalWagerRecord = { ...existing, writeOff };
+    const result = this.db.prepare(`
+      UPDATE operational_wagers SET payload = ? WHERE wager_id = ?
+    `).run(stableStringify(updated), wagerId);
+    if (result.changes !== 1) {
+      throw new LedgerConflictError(`operational wager ${wagerId} write-off was not updated`);
+    }
+    return updated;
+  }
+
   getHandSettlement(
     tableId: string,
     shoeId: string,
@@ -1013,6 +1072,10 @@ export class SqliteLedger {
         AND json_extract(payload, '$.wager.handId') = ?
         AND json_extract(payload, '$.wager.market') = ?
         AND json_extract(payload, '$.wager.source') = ?
+        AND (
+          json_extract(payload, '$.status') != 'REJECTED'
+          OR json_extract(payload, '$.receipt.raw.commitStarted') = 1
+        )
       LIMIT 1
     `).get(tableId, shoeId, handId, market, source));
   }
@@ -1126,6 +1189,7 @@ export class SqliteLedger {
     if (existing) {
       const existingSemanticPayload = semanticStoredEventPayload(existing.payload);
       if (existing.payload_hash !== hash && existingSemanticPayload !== semanticPayload) {
+        if (isStaleHandSettlementReplay(existing.payload, event)) return 'duplicate';
         throw new LedgerConflictError(`event_id ${event.eventId} already exists with a different payload; append rejected`);
       }
       return 'duplicate';
@@ -1196,6 +1260,26 @@ export class SqliteLedger {
     return mergeLedgerEvents(persisted, ephemeral);
   }
 
+  private liveFeedAfterEventId(): number {
+    const epoch = this.getConfig<LiveFeedEpoch>(LIVE_FEED_EPOCH_KEY);
+    return typeof epoch?.afterEventId === 'number'
+      && Number.isInteger(epoch.afterEventId)
+      && epoch.afterEventId > 0
+      ? epoch.afterEventId
+      : 0;
+  }
+
+  private listEventsForLiveReplay(tableId: string): NormalizedEvent[] {
+    const afterEventId = this.liveFeedAfterEventId();
+    const sql = afterEventId > 0
+      ? 'SELECT payload FROM events WHERE table_id = ? AND id > ? ORDER BY seq ASC, id ASC'
+      : 'SELECT payload FROM events WHERE table_id = ? ORDER BY seq ASC, id ASC';
+    const params = afterEventId > 0 ? [tableId, afterEventId] : [tableId];
+    const rows = this.db.prepare(sql).all(...params) as unknown as { payload: string }[];
+    const persisted = rows.map(row => JSON.parse(row.payload) as NormalizedEvent);
+    return mergeLedgerEvents(persisted, this.ephemeralEventsByTable.get(tableId) ?? []);
+  }
+
   listBgShoeGenerations(): ReadonlyArray<{ tableId: string; sequence: number }> {
     const rows = this.db.prepare(
       "SELECT table_id AS tableId, json_extract(payload, '$.shoeId') AS shoeId FROM events WHERE type = 'newShoeSignal'",
@@ -1213,7 +1297,7 @@ export class SqliteLedger {
   }
 
   listEventsFromLatestShoe(tableId: string): NormalizedEvent[] {
-    const events = this.listEvents(tableId);
+    const events = this.listEventsForLiveReplay(tableId);
     let lastAny = 0;
     const physicalIndexes: number[] = [];
     for (let index = 0; index < events.length; index += 1) {
@@ -1256,7 +1340,7 @@ export class SqliteLedger {
         return [event];
       }
       if ('shoeId' in event && typeof event.shoeId === 'string' && event.shoeId !== physicalShoeId) {
-        return [{ ...event, shoeId: physicalShoeId }];
+        return [];
       }
       return [event];
     });

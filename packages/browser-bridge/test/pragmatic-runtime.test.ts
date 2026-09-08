@@ -222,7 +222,7 @@ describe('PragmaticRuntimeParser', () => {
     expect(parser.shoeEvidence('tobcspbaccarat92')).toEqual({ reason: 'protocol-shuffle' });
   });
 
-  it('promotes after an attach token when the same token later arrives as a shuffle event', () => {
+  it('does not promote after an attach token when the same token later arrives as a shuffle event', () => {
     const parser = new PragmaticRuntimeParser();
     parser.parse(snapshot([{
       tableId: 'spto41bctorobc41',
@@ -240,13 +240,11 @@ describe('PragmaticRuntimeParser', () => {
       shoeReset: 'protocol:spto41bctorobc41:10',
       shuffleEvent: true,
     }]));
-    expect(shuffled.find(event => event.type === 'newShoeSignal')).toEqual(expect.objectContaining({
-      baseline: 'physical-shoe',
-    }));
-    expect(parser.shoeEvidence('spto41bctorobc41')).toEqual({ reason: 'protocol-shuffle' });
+    expect(shuffled.filter(event => event.type === 'newShoeSignal')).toEqual([]);
+    expect(parser.shoeEvidence('spto41bctorobc41')).toEqual({ reason: 'attach' });
   });
 
-  it('opens a new physical shoe when shuffle repeats after the current shoe has dealt', () => {
+  it('does not open a new physical shoe when the same shuffle token repeats after the current shoe has dealt', () => {
     const parser = new PragmaticRuntimeParser();
     const first = parser.parse(snapshot([{
       tableId: 'spto41bctorobc41',
@@ -272,14 +270,9 @@ describe('PragmaticRuntimeParser', () => {
       shoeReset: 'protocol:spto41bctorobc41:10',
       shuffleEvent: true,
     }]));
-    expect(reshuffled.filter(event => event.type === 'newShoeSignal')).toEqual([
-      expect.objectContaining({
-        type: 'newShoeSignal',
-        baseline: 'physical-shoe',
-      }),
-    ]);
-    expect(parser.currentShoeId('spto41bctorobc41')).not.toBe(firstShoe);
-    expect(parser.shoeEvidence('spto41bctorobc41')).toEqual({ reason: 'protocol-shuffle' });
+    expect(reshuffled.filter(event => event.type === 'newShoeSignal')).toEqual([]);
+    expect(parser.currentShoeId('spto41bctorobc41')).toBe(firstShoe);
+    expect(parser.shoeEvidence('spto41bctorobc41')).toEqual({ reason: 'attach' });
   });
 
   it('does not open another shoe for endshuffling on the same unused shuffle token', () => {

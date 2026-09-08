@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Orchestrator, TableActor } from '../src/index.js';
 import { SqliteLedger } from '@baccarat/ledger-state';
-import { SimulatedAdapter, type BetExecutionRequest } from '@baccarat/adapter-contract';
+import { SimulatedAdapter, type BetExecutionRequest, type OperationalWagerExecutionRequest } from '@baccarat/adapter-contract';
 import { FixtureBuilder as SimulatorFixtureBuilder } from '@baccarat/simulator-fixtures';
 import { RiskManager } from '@baccarat/risk-execution';
 import type {
@@ -237,6 +237,7 @@ describe('orchestrator table actor', () => {
       shoeId: 's1',
       handId: 'h2',
       market: 'bankerPair',
+      closesAt: '2025-01-01T00:00:15.000Z',
     };
 
     await Promise.all(events.map(event => orchestrator.enqueue('t1', event)));
@@ -363,7 +364,7 @@ describe('orchestrator table actor', () => {
     ledger.close();
   });
 
-  it('keeps a terminal rejected one-shot reservation as a duplicate tombstone', async () => {
+  it('retries an uncommitted rejected one-shot on the same hand', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile: TableProfile = {
       ...simProfile(),
@@ -396,13 +397,10 @@ describe('orchestrator table actor', () => {
     const second = await actor.placeOneShotBet(command);
 
     expect(first.status).toBe('REJECTED');
-    expect(second).toEqual({
-      status: 'REJECTED',
-      reason: 'duplicate',
-    });
-    expect(requests).toHaveLength(1);
-    expect(ledger.listReceipts('t1')[0]?.receipt.status).toBe('REJECTED');
-    expect(ledger.listReservations('t1')[0]?.status).toBe('RELEASED');
+    expect(second.status).toBe('REJECTED');
+    expect(second).toEqual(expect.objectContaining({ reason: 'platform-rejected' }));
+    expect(requests).toHaveLength(2);
+    expect(ledger.listReceipts('t1')).toHaveLength(0);
     ledger.close();
   });
 
@@ -432,6 +430,16 @@ describe('orchestrator table actor', () => {
       amount: 20,
     });
 
+    const blocked = await actor.placeOneShotBet({
+      shoeId: 's1',
+      handId: 'h1',
+      market: 'playerPair',
+      amount: 20,
+    });
+    expect(blocked).toEqual(expect.objectContaining({
+      status: 'REJECTED',
+      reason: 'unknown-execution-pending',
+    }));
     expect(result).toEqual(expect.objectContaining({
       status: 'UNKNOWN',
       reason: 'platform-unknown',
@@ -1353,6 +1361,54 @@ describe('unknown monitor-session baseline execution', () => {
     ledger.close();
   });
 
+  it('does not block another table when one table has UNKNOWN exposure', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const operationalExecutor = {
+      requestOperationalWager: async (request: OperationalWagerExecutionRequest) => ({
+        receiptId: `receipt-${request.wager.wagerId}`,
+        wagerId: request.wager.wagerId,
+        tableId: request.wager.tableId,
+        shoeId: request.wager.shoeId,
+        handId: request.wager.handId,
+        market: request.wager.market,
+        amount: request.wager.amount,
+        source: request.wager.source,
+        status: request.wager.tableId === 't1' ? 'UNKNOWN' as const : 'ACCEPTED' as const,
+        createdAt: '2025-01-01T00:00:02.000Z',
+        raw: { commitStarted: true, reason: 'bet-state:5:700' },
+      }),
+    };
+    const orchestrator = new Orchestrator({
+      ledger,
+      riskLimits,
+      operationalExecutor,
+      operationalWagerTerms: {
+        banker: { netWin: 0.95, loss: 1 },
+        player: { netWin: 1, loss: 1 },
+        tiePolicy: 'push',
+      },
+    });
+    const t1 = orchestrator.registerTable({ ...simProfile('t1'), autoBetArmedByDefault: false }, 'live', 20);
+    const t2 = orchestrator.registerTable({ ...simProfile('t2'), autoBetArmedByDefault: false }, 'live', 20);
+    for (const [tableId, actor] of [['t1', t1], ['t2', t2]] as const) {
+      const events = new FixtureBuilder(tableId)
+        .newShoe(`s-${tableId}`, actor.getProfile())
+        .openWindow(`s-${tableId}`, `h-${tableId}`, 'bankerPair')
+        .build();
+      await Promise.all(events.map(event => orchestrator.enqueue(tableId, event)));
+      await actor.flush();
+    }
+
+    const unknown = await t1.placeOperationalWager({ market: 'bankerPair', amount: 20, source: 'keepalive' });
+    expect(unknown.status).toBe('UNKNOWN');
+    expect(orchestrator.getReservations('t1').some(reservation => reservation.status === 'UNKNOWN')).toBe(true);
+
+    const accepted = await t2.placeOperationalWager({ market: 'bankerPair', amount: 20, source: 'keepalive' });
+    expect(accepted).toEqual(expect.objectContaining({ status: 'ACCEPTED' }));
+    expect(orchestrator.getReservations('t2')[0]?.status).toBe('RESERVED');
+    ledger.close();
+  });
+
   it('does not automatically execute pair bets before a physical shoe baseline is known', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile = simProfile();
@@ -1462,6 +1518,88 @@ describe('table actor dedupe key retention', () => {
 });
 
 
+describe('resetLiveShoeTracking', () => {
+  it('forgets live inventory and missing-card counters without deleting ledger rows', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile = {
+      ...simProfile('t1'),
+      autoConfirmNewShoe: true,
+      autoBetArmedByDefault: false,
+    };
+    const orchestrator = new Orchestrator({ ledger, riskLimits });
+    const actor = orchestrator.registerTable(profile, 'live', 10);
+    await orchestrator.enqueue('t1', {
+      type: 'newShoeSignal',
+      eventId: 'shoe-physical',
+      tableId: 't1',
+      timestamp: '2026-09-08T01:00:00.000Z',
+      sourceSeq: 1,
+      source: 'bg-runtime',
+      schemaVersion: 1,
+      shoeId: 'bg-t1-2',
+      baseline: 'physical-shoe',
+      profile,
+    } as NormalizedEvent);
+    await orchestrator.enqueue('t1', {
+      type: 'handSettled',
+      eventId: 'settled-10',
+      tableId: 't1',
+      timestamp: '2026-09-08T01:01:00.000Z',
+      sourceSeq: 2,
+      source: 'bg-runtime',
+      schemaVersion: 1,
+      shoeId: 'bg-t1-2',
+      handId: '10',
+      playerCards: [{ rank: 'A', suit: 'S', raw: 'AS' }, { rank: '8', suit: 'H', raw: '8H' }],
+      bankerCards: [{ rank: 'K', suit: 'D', raw: 'KD' }, { rank: '7', suit: 'C', raw: '7C' }],
+    } as NormalizedEvent);
+    await orchestrator.enqueue('t1', {
+      type: 'handSettled',
+      eventId: 'settled-12',
+      tableId: 't1',
+      timestamp: '2026-09-08T01:02:00.000Z',
+      sourceSeq: 3,
+      source: 'bg-runtime',
+      schemaVersion: 1,
+      shoeId: 'bg-t1-2',
+      handId: '12',
+      playerCards: [{ rank: '2', suit: 'S', raw: '2S' }, { rank: '3', suit: 'H', raw: '3H' }],
+      bankerCards: [{ rank: '4', suit: 'D', raw: '4D' }, { rank: '5', suit: 'C', raw: '5C' }],
+    } as NormalizedEvent);
+    await actor.flush();
+    expect(actor.getProjection().shoeId).toBe('bg-t1-2');
+    expect(actor.missingUnobservedCardCount()).toBe(6);
+    ledger.saveDecision({
+      snapshotId: 'd-keep',
+      tableId: 't1',
+      shoeId: 'bg-t1-2',
+      handId: '10',
+      market: 'bankerPair',
+      eventWatermark: 1,
+      profileVersion: 1,
+      modelRevision: 'model-1',
+      pMean: 0.1,
+      pLower: 0.08,
+      evMean: 0.2,
+      evLower: 0.1,
+      eligible: true,
+      reason: 'threshold-met',
+      conservativePolicy: 'worst-case-burn-composition-v1',
+      createdAt: '2026-09-08T01:00:30.000Z',
+    });
+
+    orchestrator.resetLiveShoeTracking();
+
+    expect(actor.getProjection().shoeId).toBe('');
+    expect(actor.getProjection().shoeBaseline).toBe('unknown-monitor-session');
+    expect(actor.getProjection().seenCards).toEqual([]);
+    expect(actor.missingUnobservedCardCount()).toBe(0);
+    expect(ledger.listEvents('t1')).toHaveLength(3);
+    expect(ledger.listDecisions('t1')).toHaveLength(1);
+    ledger.close();
+  });
+});
+
 describe('restart attach must not wipe a rebuilt physical shoe', () => {
   it('ignores an unknown attach shoe and keeps ledger inventory', async () => {
     const { ledger, riskLimits } = makeContext();
@@ -1530,12 +1668,12 @@ describe('restart attach must not wipe a rebuilt physical shoe', () => {
 
     expect(actor.getProjection().shoeId).toBe('bg-t1-2');
     expect(actor.getProjection().shoeBaseline).toBe('physical-shoe');
-    expect(actor.getProjection().seenCards.length).toBe(5);
-    expect(actor.getProjection().remainingTotal).toBe(remaining - 1);
+    expect(actor.getProjection().seenCards.length).toBe(4);
+    expect(actor.getProjection().remainingTotal).toBe(remaining);
     ledger.close();
   });
 
-  it('does not glue a later physical shoe generation onto the rebuilt shoe', async () => {
+  it('accepts a later physical shoe generation instead of holding the rebuilt shoe', async () => {
     const { ledger, riskLimits } = makeContext();
     const profile = {
       ...simProfile('B01'),
@@ -1582,10 +1720,9 @@ describe('restart attach must not wipe a rebuilt physical shoe', () => {
       profile,
     } as NormalizedEvent);
     await actor.flush();
-    expect(actor.getProjection().shoeId).toBe('bg-B01-2');
+    expect(actor.getProjection().shoeId).toBe('bg-B01-3');
     expect(actor.getProjection().shoeBaseline).toBe('physical-shoe');
-    expect(actor.getProjection().seenCards.length).toBe(4);
-    expect(actor.getProjection().remainingTotal).toBe(412);
+    expect(actor.getProjection().seenCards.length).toBe(0);
     ledger.close();
   });
 });

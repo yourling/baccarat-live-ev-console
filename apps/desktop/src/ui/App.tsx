@@ -444,9 +444,10 @@ export function App() {
   );
   const monitoredTableIds = new Set(snapshot?.monitorTableIds ?? []);
   const monitorCandidates = (snapshot?.monitorCandidates ?? [])
-    .filter(candidate => !monitoredTableIds.has(candidate.tableId))
+    .filter(candidate => isLiveMonitorRoomId(candidate.roomId) && !monitoredTableIds.has(candidate.tableId))
     .slice()
     .sort((left, right) => left.tableId.localeCompare(right.tableId, undefined, { numeric: true }));
+  const monitorAtCapacity = (snapshot?.monitorTableIds.length ?? 0) >= 64;
   const selectedMonitorTable = selectedMonitorTableId === null ? undefined : tableMap.get(selectedMonitorTableId);
   const automationEnabled = snapshot?.automation.enabled ?? false;
   const keepaliveEnabled = snapshot?.keepalive.enabled ?? false;
@@ -638,6 +639,35 @@ export function App() {
     setRecordQueryRevision(previous => previous + 1);
   }
 
+  const writeOffUnknownOperationalWager = useCallback(async (row: BetLedgerRow) => {
+    if (!window.desktop || !canWriteOffUnknownOperationalWager(row)) return;
+    const accepted = await confirm({
+      title: '勾销未知敞口',
+      description: '无法确认平台结果时使用。此操作不宣称输赢，只释放本地资金敞口，不会再次下注。勾销后该桌不再因这笔未知结果阻断保活。',
+      details: [
+        { label: '牌桌 / 牌局', value: `${row.reservation.tableId} / ${row.reservation.handId}` },
+        { label: '下注', value: `${MARKET_LABELS[row.reservation.market]} ${formatAmount(row.reservation.amount)}` },
+      ],
+      confirmLabel: '勾销未知敞口',
+      tone: 'danger',
+    });
+    if (!accepted) return;
+    setReconcilingReservationId(row.reservation.reservationId);
+    setError(null);
+    try {
+      const nextSnapshot = await window.desktop.writeOffUnknownOperationalWager({
+        reservationId: row.reservation.reservationId,
+        ...(row.operationalWager === undefined ? {} : { wagerId: row.operationalWager.wager.wagerId }),
+      });
+      setSnapshot(nextSnapshot);
+      setRecordQueryRevision(previous => previous + 1);
+    } catch (writeOffError) {
+      setError(writeOffError instanceof Error ? writeOffError.message : String(writeOffError));
+    } finally {
+      setReconcilingReservationId(null);
+    }
+  }, [confirm]);
+
   const reconcileUnknownOperationalWager = useCallback(async (row: BetLedgerRow) => {
     if (!window.desktop || !row.operationalWager || !canReconcileOperationalWager(row)) return;
     const accepted = await confirm({
@@ -827,9 +857,12 @@ export function App() {
   }
 
   async function addMonitorCandidate(tableId: string) {
-    if (!snapshot?.monitorTableIds.includes(tableId)) {
-      await persistMonitorTableIds([...(snapshot?.monitorTableIds ?? []), tableId]);
+    if (snapshot?.monitorTableIds.includes(tableId)) return;
+    if ((snapshot?.monitorTableIds.length ?? 0) >= 64) {
+      setError('已达 64 桌监控上限');
+      return;
     }
+    await persistMonitorTableIds([...(snapshot?.monitorTableIds ?? []), tableId]);
   }
 
   async function removeMonitorTable(tableId: string) {
@@ -1087,18 +1120,31 @@ export function App() {
         <section className="monitor-candidates" aria-labelledby="monitor-candidates-title">
           <div className="section-heading">
             <span id="monitor-candidates-title">待加入牌桌</span>
+            {monitorAtCapacity ? <span className="muted">已达 64 桌上限</span> : null}
           </div>
           <div className="monitor-candidates__list">
-            {monitorCandidates.map(candidate => (
+            {monitorCandidates.map(candidate => {
+              const evidence = snapshot?.shoeEvidence?.[candidate.tableId];
+              const pendingLabel = monitorAtCapacity
+                ? '已达 64 桌上限'
+                : isVerifiedPhysicalShoeReason(evidence?.reason, evidence?.gameCount)
+                  ? '可手动加入'
+                  : '等待洗牌证据';
+              return (
               <div className="monitor-candidate" key={candidate.roomId + ':' + candidate.tableId}>
                 <div>
                   <strong>{candidate.displayName ?? candidate.tableId}</strong>
                   <span>{candidate.displayName ? candidate.tableId : candidate.roomName ?? candidate.roomId}</span>
-                  <span className="muted">#{candidate.gameCount ?? '?'} · 等待洗牌证据</span>
+                  <span className="muted">#{candidate.gameCount ?? '?'} · {pendingLabel}</span>
                 </div>
-                <button className="button button--small button--primary" onClick={() => void addMonitorCandidate(candidate.tableId)}>加入监控</button>
+                <button
+                  className="button button--small button--primary"
+                  disabled={monitorAtCapacity}
+                  onClick={() => void addMonitorCandidate(candidate.tableId)}
+                >加入监控</button>
               </div>
-            ))}
+              );
+            })}
           </div>
         </section>
       )}
@@ -1107,6 +1153,7 @@ export function App() {
         <MonitorTableSettingsDialog
           actor={selectedMonitorTable}
           evidence={snapshot?.shoeEvidence?.[selectedMonitorTable.tableId]}
+          gameCount={snapshot?.tableMetadata?.find(candidate => candidate.tableId === selectedMonitorTable.tableId)?.gameCount}
           liveApproved={snapshot?.runtime.approvedLiveTableIds.includes(selectedMonitorTable.tableId) ?? false}
           riskLimits={snapshot?.snapshot.riskLimits}
           liveModeConfirmationOpen={pendingLiveExecutionTableId === selectedMonitorTable.tableId}
@@ -1137,7 +1184,7 @@ export function App() {
 
       {view === 'events' && recordPage?.kind === 'events' && <><EventTable events={recordEvents} totalCount={recordTotal} tableLabel={tableLabel} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
 
-      {view === 'ledger' && recordPage?.kind === 'ledger' && <><BetLedgerView rows={recordLedgerRows} totalCount={recordTotal} reconcilingReservationId={reconcilingReservationId} tableLabel={tableLabel} onReconcile={reconcileUnknownOperationalWager} onSettle={settlePendingOperationalWager} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
+      {view === 'ledger' && recordPage?.kind === 'ledger' && <><BetLedgerView rows={recordLedgerRows} totalCount={recordTotal} reconcilingReservationId={reconcilingReservationId} tableLabel={tableLabel} onReconcile={reconcileUnknownOperationalWager} onWriteOff={writeOffUnknownOperationalWager} onSettle={settlePendingOperationalWager} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
 
       {view === 'settings' && (
         <SystemSettingsView
@@ -1371,6 +1418,7 @@ function TableMonitorRow(props: {
 function MonitorTableSettingsDialog(props: {
   actor: TableActorSnapshot;
   evidence?: DesktopShoeEvidence;
+  gameCount?: number;
   liveApproved: boolean;
   riskLimits?: RiskLimits;
   liveModeConfirmationOpen: boolean;
@@ -1388,7 +1436,7 @@ function MonitorTableSettingsDialog(props: {
   tableLabel: (tableId: string) => string;
 }) {
   const { actor } = props;
-  const physicalShoeKnown = isDisplayedPhysicalShoe(actor.projection, props.evidence);
+  const physicalShoeKnown = isDisplayedPhysicalShoe(actor.projection, props.evidence, props.gameCount);
 
   return (
     <div className="monitor-settings-overlay" role="presentation" onClick={props.onClose}>
@@ -1725,10 +1773,21 @@ function canReconcileOperationalWager(row: BetLedgerRow): boolean {
       && operationalWager?.status === 'REJECTED'
       && operationalWager.receipt?.status === 'REJECTED';
   return statusPairMatches
+    && operationalWager?.writeOff === undefined
     && operationalWager?.reservationId === row.reservation.reservationId
     && typeof raw === 'object'
     && raw !== null
     && Reflect.get(raw, 'commitStarted') === true;
+}
+
+function canWriteOffUnknownOperationalWager(row: BetLedgerRow): boolean {
+  if (row.reservation.status !== 'UNKNOWN') return false;
+  const operationalWager = row.operationalWager;
+  if (operationalWager === undefined) return true;
+  return operationalWager.status === 'UNKNOWN'
+    && operationalWager.writeOff === undefined
+    && operationalWager.reconciliation === undefined
+    && operationalWager.reservationId === row.reservation.reservationId;
 }
 
 function canSettlePendingOperationalWager(row: BetLedgerRow): boolean {
@@ -1751,6 +1810,7 @@ function BetLedgerView(props: {
   reconcilingReservationId: string | null;
   tableLabel: (tableId: string) => string;
   onReconcile: (row: BetLedgerRow) => Promise<void>;
+  onWriteOff: (row: BetLedgerRow) => Promise<void>;
   onSettle: (row: BetLedgerRow, outcome: 'WIN' | 'LOSS' | 'PUSH') => Promise<void>;
 }) {
   return (
@@ -1782,6 +1842,16 @@ function BetLedgerView(props: {
                         onClick={() => void props.onReconcile(row)}
                       >
                         {props.reconcilingReservationId === row.reservation.reservationId ? '核对中...' : '确认平台已成交'}
+                      </button>
+                    )}
+                    {canWriteOffUnknownOperationalWager(row) && (
+                      <button
+                        type="button"
+                        className="button button--small button--ghost ledger-reconcile"
+                        disabled={props.reconcilingReservationId !== null}
+                        onClick={() => void props.onWriteOff(row)}
+                      >
+                        {props.reconcilingReservationId === row.reservation.reservationId ? '勾销中...' : '无法确认，勾销敞口'}
                       </button>
                     )}
                   </td>
@@ -2184,6 +2254,9 @@ function ledgerReceiptLabel(row: BetLedgerRow): string {
   if (row.operationalWager?.reconciliation?.status === 'ACCEPTED' || row.reservation.status === 'SETTLED') {
     return receiptStatusLabel('ACCEPTED');
   }
+  if (row.operationalWager?.writeOff) {
+    return '平台未确认（已勾销）';
+  }
   if (row.operationalWager?.status === 'UNKNOWN' || row.reservation.status === 'UNKNOWN') {
     return receiptStatusLabel('UNKNOWN');
   }
@@ -2203,6 +2276,9 @@ function ledgerResult(
 ): { label: string; tone: BetLedgerRow['resultTone'] } {
   if (typeof reservation.realizedPnl === 'number') {
     return reservation.realizedPnl > 0 ? { label: '命中', tone: 'good' } : reservation.realizedPnl < 0 ? { label: '未中', tone: 'danger' } : { label: '持平', tone: 'neutral' };
+  }
+  if (operationalWager?.writeOff) {
+    return { label: '无法确认已勾销', tone: 'neutral' };
   }
   if (operationalWager?.reconciliation?.status !== 'ACCEPTED'
     && (operationalWager?.status === 'UNKNOWN' || reservation.status === 'UNKNOWN')) {
@@ -2399,6 +2475,7 @@ function isDisplayedPhysicalShoe(
     && projection.handNumber < 8
     && projection.seenCards.length < 8
     && projection.remainingTotal >= initial - 16
+    && !isVerifiedPhysicalShoeReason(evidence?.reason, evidence?.gameCount)
   ) {
     return false;
   }
@@ -2481,7 +2558,7 @@ function runtimeIncidentCodeLabel(code: DesktopRuntimeIncident['code']): string 
     'settlement-gap': '结算缺口',
     'scheduler-failure': '调度失败',
     'monitor-failure': '监控失败',
-    'shoe-count-mismatch': '局数与牌桌不符',
+    'shoe-count-mismatch': '缺牌过多，已移出监控',
   };
   return labels[code];
 }
@@ -2520,7 +2597,11 @@ function eventDescription(event: NormalizedEvent): string {
     case 'shoeInvalidated': return event.reason;
     case 'manualCorrection': return event.correction.kind === 'numberOfDecks' ? '副数修正为 ' + event.correction.numberOfDecks : '烧牌模型已修正';
     case 'autoArmChanged': return event.armed ? '自动下注已开启' : '自动下注已暂停';
-    case 'autoDisarmChanged': return event.reason === 'manual-disarm' ? '手动暂停自动下注' : event.reason;
+    case 'autoDisarmChanged':
+      if (event.reason === 'manual-disarm') return '手动暂停自动下注';
+      if (event.reason === 'execution-reset') return '监控降级，已暂停自动下注';
+      if (event.reason === 'auto-bet-paused') return '对子自动已关闭';
+      return event.reason;
   }
 }
 

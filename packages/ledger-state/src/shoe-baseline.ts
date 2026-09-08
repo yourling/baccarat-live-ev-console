@@ -69,6 +69,7 @@ export function isPrematurePhysicalShoeReset(
   if (projection.shoeBaseline !== 'physical-shoe') return false;
   if (projection.sealed) return false;
   if (projection.seenCards.length === 0) return false;
+  if (projection.handNumber < ROAD_WRAP_MIN_PREVIOUS) return false;
   if (projection.handNumber >= DEEP_SHOE_HAND_MIN) return false;
   if (projection.remainingTotal < UNDEALABLE_REMAINING) return false;
   return projection.remainingTotal > PREMATURE_RESET_REMAINING_MIN;
@@ -123,6 +124,20 @@ export function shoeBaselineReasonLabel(evidence: ShoeBaselineEvidence): string 
  * cannot be true. DOM road count is used only for restart/old-ledger recovery,
  * never to fight a just-shuffled shoe that still has few tracked hands.
  */
+export function isPhysicalShoeExecutable(
+  projection: Pick<
+    ShoeStateProjection,
+    'shoeBaseline' | 'seenCards' | 'handNumber' | 'remainingTotal' | 'profileSnapshot' | 'sealed'
+  >,
+  gameCount?: number,
+  parserEvidence?: ShoeBaselineEvidence,
+): boolean {
+  return effectiveShoeBaseline(projection, gameCount, parserEvidence) === 'physical-shoe'
+    && projection.shoeBaseline === 'physical-shoe'
+    && !projection.sealed
+    && projection.remainingTotal >= UNDEALABLE_REMAINING;
+}
+
 export function effectiveShoeBaseline(
   projection: Pick<
     ShoeStateProjection,
@@ -149,7 +164,9 @@ export function explainShoeBaseline(
     && projection.remainingTotal >= initial - 16
     && typeof gameCount === 'number'
     && gameCount >= 8;
-  if (deepUnseenRoad && (projection.shoeBaseline === 'physical-shoe' || verified)) {
+  // Lagged DOM road must not hide a just-shuffled physical shoe. Only demote
+  // when this process has no verified shuffle evidence (restart/attach).
+  if (deepUnseenRoad && !verified) {
     return {
       baseline: 'unknown-monitor-session',
       evidence: { reason: 'restart-empty-inventory', gameCount },
@@ -185,6 +202,17 @@ export function explainShoeBaseline(
         evidence: { reason: 'inventory-contradiction', gameCount },
       };
     }
+    // Parser should have opened a road-wrap. If it missed, do not advertise
+    // late-shoe pair EV on mixed inventory (B17 EV 0.91).
+    if (
+      isWrapShapedRoadCount(projection.handNumber, gameCount)
+      && projection.remainingTotal < 80
+    ) {
+      return {
+        baseline: 'unknown-monitor-session',
+        evidence: { reason: 'inventory-contradiction', gameCount },
+      };
+    }
     // A stuck early HISTORY road (局3) must not shrink the burn budget of a
     // 50-hand tracked shoe. Use the larger of road vs actually tracked hands.
     const handsForBudget = Math.max(gameCount, projection.handNumber);
@@ -198,10 +226,8 @@ export function explainShoeBaseline(
   }
   return {
     baseline: 'physical-shoe',
-    // A rebuilt ledger shoe is already physical. The new process's first
-    // shoeReset token is only attach and must not hide remaining/EV.
     evidence: verified && parserEvidence !== undefined
       ? parserEvidence
-      : { reason: 'protocol-shuffle' },
+      : parserEvidence ?? { reason: 'attach' },
   };
 }

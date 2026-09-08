@@ -368,6 +368,23 @@ export class RiskManager {
     return structuredClone(updated);
   }
 
+  writeOffUnknown(reservationId: string, reason: string): RiskReservation {
+    this.rollDayIfNeeded();
+    const reservation = this.reservations.get(reservationId);
+    if (!reservation || reservation.status !== 'UNKNOWN') {
+      throw new Error(`reservation ${reservationId} is not an UNKNOWN exposure`);
+    }
+    const updated = structuredClone(reservation);
+    updated.status = 'RELEASED';
+    updated.releasedAt = new Date().toISOString();
+    updated.releaseReason = reason;
+    const nextState = structuredClone(this.state);
+    nextState.reservedExposure = clampNonNegative(nextState.reservedExposure - updated.maxLoss);
+    nextState.pendingExecutions = clampNonNegative(nextState.pendingExecutions - 1);
+    this.commitReservationUpdate(updated, nextState);
+    return structuredClone(updated);
+  }
+
   settleReservedManually(
     reservationId: string,
     realizedPnl: number,

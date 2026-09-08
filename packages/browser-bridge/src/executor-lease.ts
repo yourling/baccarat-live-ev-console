@@ -93,6 +93,17 @@ export class ExecutorLeaseRegistry {
     }
 
     if (this.active.profileId !== normalizedProfile) {
+      if (!this.active.claimantId) {
+        const lease: ExecutorLease = {
+          leaseId: newId('lease'),
+          profileId: normalizedProfile,
+          secret: randomBytes(32).toString('hex'),
+          claimantId: normalizedClaimant,
+          acquiredAt: new Date().toISOString(),
+        };
+        this.active = lease;
+        return { status: 'acquired', lease, reacquired: false };
+      }
       return {
         status: 'rejected',
         reason: 'executor-lease-held-by-other-profile',

@@ -76,6 +76,18 @@ describe('graded disconnect handling', () => {
       service['noteTableDisconnect']('D055');
       expect(service['flapEscalated']('D055')).toBe(true);
       expect(service['flapEscalated']('D065')).toBe(false);
+      const aged = new DesktopConsoleService(':memory:');
+      try {
+        await aged.updateMonitorTableIds(['D055']);
+        const now = Date.now();
+        aged['noteTableDisconnect']('D055', now - 6 * 60_000);
+        aged['noteTableDisconnect']('D055', now - 5 * 60_000);
+        aged['noteTableDisconnect']('D055', now - 4 * 60_000);
+        aged['noteTableDisconnect']('D055', now);
+        expect(aged['flapEscalated']('D055', now)).toBe(false);
+      } finally {
+        await aged.close();
+      }
     } finally {
       await service.close();
     }

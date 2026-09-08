@@ -78,16 +78,17 @@ describe('ExecutorLeaseRegistry', () => {
     expect(registry.activeExecutorCount()).toBe(1);
   });
 
-  it('does not rebind a parked lease onto a different profile', () => {
+  it('grants a new lease to a different profile after the previous executor is parked', () => {
     const registry = new ExecutorLeaseRegistry();
     const first = registry.tryAcquire('chrome-profile-sw-restart', 'claimant-sw-gen-1');
     if (first.status !== 'acquired') throw new Error('expected first acquire');
     expect(registry.release('claimant-sw-gen-1')).toBe(true);
-    expect(registry.tryAcquire('chrome-profile-intruder-x', 'claimant-intruder-x')).toMatchObject({
-      status: 'rejected',
-      reason: 'executor-lease-held-by-other-profile',
-      activeLeaseId: first.lease.leaseId,
-    });
+    const next = registry.tryAcquire('chrome-profile-intruder-x', 'claimant-intruder-x');
+    expect(next.status).toBe('acquired');
+    if (next.status !== 'acquired') throw new Error('expected hall-switch acquire');
+    expect(next.reacquired).toBe(false);
+    expect(next.lease.leaseId).not.toBe(first.lease.leaseId);
+    expect(next.lease.profileId).toBe('chrome-profile-intruder-x');
   });
 
   it('rejects invalid profile and claimant identifiers', () => {

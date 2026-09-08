@@ -403,6 +403,7 @@ export class PragmaticRuntimeParser {
 
     const handId = typeof table.roundId === 'string' ? table.roundId.trim() : '';
     if (!handId || handId === '—') return;
+    if (this.settledHands.has(`${tableId}:${handId}`)) return;
 
     this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
 
@@ -495,9 +496,6 @@ export class PragmaticRuntimeParser {
       : undefined;
     const shuffleEvent = table.shuffleEvent === true;
     if (token === undefined) {
-      if (shuffleEvent && this.lastShoeResetByTable.has(tableId)) {
-        this.promoteProtocolShuffle(tableId, observedAt, events);
-      }
       return;
     }
     const previousToken = this.lastShoeResetByTable.get(tableId);
@@ -512,32 +510,7 @@ export class PragmaticRuntimeParser {
       }
       return;
     }
-    if (!shuffleEvent) return;
-    // Same token is reused when startshuffling is missed or endshuffling
-    // copies lastFinishedShuffle. If this shoe already dealt, that pulse is
-    // the next shuffle, not a duplicate of the current one.
-    if (this.shoeAlreadyDealt(tableId)) {
-      this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
-      return;
-    }
-    this.promoteProtocolShuffle(tableId, observedAt, events);
-  }
-
-  private shoeAlreadyDealt(tableId: string): boolean {
-    // First snapshot of a new shoe often still carries a round id, which
-    // counts as 1. A later shuffle after real play is at least a second hand.
-    return (this.handsThisShoeByTable.get(tableId) ?? 0) >= 2;
-  }
-
-  private promoteProtocolShuffle(
-    tableId: string,
-    observedAt: string,
-    events: NormalizedEvent[],
-  ): void {
-    if (!this.lastShoeResetByTable.has(tableId)) return;
-    if (this.evidenceByTable.get(tableId)?.reason === 'protocol-shuffle') return;
-    this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
-    this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
+    // Same token + sticky shuffleEvent is leftover currentShoe, not a new shoe.
   }
 
   private ensureShoe(
@@ -571,10 +544,10 @@ export class PragmaticRuntimeParser {
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
     this.evidenceByTable.delete(tableId);
-    this.clearHandState(tableId);
+    this.clearHandState(tableId, { keepSettledHands: true });
   }
 
-  private clearHandState(tableId: string): void {
+  private clearHandState(tableId: string, options: { readonly keepSettledHands?: boolean } = {}): void {
     const prefix = `${tableId}:`;
     for (const key of this.cardsByHand.keys()) if (key.startsWith(prefix)) this.cardsByHand.delete(key);
     for (const key of this.seenCardsByHand.keys()) if (key.startsWith(prefix)) this.seenCardsByHand.delete(key);
@@ -584,8 +557,9 @@ export class PragmaticRuntimeParser {
     for (const key of this.windowOpenCount.keys()) if (key.startsWith(prefix)) this.windowOpenCount.delete(key);
     for (const key of this.windowClosesAtMs.keys()) if (key.startsWith(prefix)) this.windowClosesAtMs.delete(key);
     for (const key of this.lastWindowEmitAtMs.keys()) if (key.startsWith(prefix)) this.lastWindowEmitAtMs.delete(key);
-    for (const key of this.settledHands) if (key.startsWith(prefix)) this.settledHands.delete(key);
     for (const key of this.finishedHands) if (key.startsWith(prefix)) this.finishedHands.delete(key);
+    if (options.keepSettledHands === true) return;
+    for (const key of this.settledHands) if (key.startsWith(prefix)) this.settledHands.delete(key);
   }
 
   private emitShoe(
@@ -718,7 +692,7 @@ export class PragmaticRuntimeParser {
     if (!cards || cards.playerCards.length < 2 || cards.bankerCards.length < 2) return;
     if (!force && !isCompleteBaccaratHand(cards.playerCards, cards.bankerCards)) return;
     this.settledHands.add(handKey);
-    events.push(this.makeEvent(tableId, 'handSettled', `settled:${handId}`, timestamp, {
+    events.push(this.makeEvent(tableId, 'handSettled', `settled:${this.shoeIdByTable.get(tableId) ?? ''}:${handId}`, timestamp, {
       shoeId: this.shoeIdByTable.get(tableId) ?? '',
       handId,
       playerCards: cards.playerCards,

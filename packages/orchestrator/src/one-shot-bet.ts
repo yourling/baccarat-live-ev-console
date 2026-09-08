@@ -13,8 +13,10 @@ import {
   effectiveShoeBaseline,
   isPhysicalShoeBettable,
   operationalReceiptCommitStarted,
+  type ShoeBaselineEvidence,
 } from '@baccarat/ledger-state';
 import { RiskManager } from '@baccarat/risk-execution';
+import { isPairBettingWindowReady } from './betting-window.js';
 
 export interface OneShotBetCommand {
   readonly shoeId: string;
@@ -30,6 +32,8 @@ export type OneShotBetRejectionReason =
   | 'connected-required'
   | 'betting-window-required'
   | 'physical-shoe-required'
+  | 'unknown-execution-pending'
+  | 'current-hand-required'
   | 'risk-rejected'
   | 'exact-amount-not-reserved'
   | 'receipt-mismatch'
@@ -62,6 +66,8 @@ export interface OneShotBetContext {
   readonly riskLimits: RiskLimits;
   readonly executor: Pick<BrowserAdapter, 'requestBet'> | null;
   readonly requestTimeoutMs: number;
+  readonly observedGameCount?: number;
+  readonly observedShoeEvidence?: ShoeBaselineEvidence;
   readonly recordReceipt: (command: OneShotBetCommand, receipt: BetReceipt) => Promise<void>;
 }
 
@@ -75,11 +81,27 @@ export async function executeOneShotBet(
   if (hasDuplicate(context.ledger, context.tableId, command)) return rejected('duplicate');
   if (context.projection.connectionStatus !== 'CONNECTED') return rejected('connected-required');
   if (context.projection.status !== 'BETTING_WINDOW') return rejected('betting-window-required');
+  if (!isPairBettingWindowReady(context.projection.bettingWindowClosesAt)) {
+    return rejected('betting-window-required');
+  }
   if (
-    effectiveShoeBaseline(context.projection) !== 'physical-shoe'
+    effectiveShoeBaseline(
+      context.projection,
+      context.observedGameCount,
+      context.observedShoeEvidence,
+    ) !== 'physical-shoe'
     || !isPhysicalShoeBettable(context.projection)
   ) {
     return rejected('physical-shoe-required');
+  }
+  if (context.riskManager.hasUnknownReservations(context.tableId)) {
+    return rejected('unknown-execution-pending');
+  }
+  if (
+    command.shoeId !== context.projection.shoeId
+    || command.handId !== context.projection.currentHandId
+  ) {
+    return rejected('current-hand-required');
   }
 
   const normalizedAmount = String(command.amount);
@@ -96,11 +118,18 @@ export async function executeOneShotBet(
     decisionSnapshotId: `one-shot:${context.tableId}:${command.shoeId}:${command.handId}:${command.market}:${normalizedAmount}`,
     createdAt: new Date().toISOString(),
   };
-  const reserve = context.riskManager.tryReserve(
-    intent,
-    context.profile,
-    { ...context.riskLimits, insufficientBehavior: 'skip' },
-  );
+  const reserve = context.riskManager.tryReserveExecution({
+    intentId: intent.intentId,
+    tableId: intent.tableId,
+    shoeId: intent.shoeId,
+    handId: intent.handId,
+    market: intent.market,
+    executionSource: 'one-shot',
+    amount: intent.amount,
+  }, context.profile.limits, context.profile.odds[intent.market], {
+    ...context.riskLimits,
+    insufficientBehavior: 'skip',
+  });
   if (!reserve.ok || !reserve.reservation || reserve.amount === undefined) {
     return rejected('risk-rejected', { riskReason: reserve.reason });
   }
@@ -128,6 +157,10 @@ export async function executeOneShotBet(
     return rejected('receipt-mismatch', { reservationId });
   }
 
+  if (receipt.status === 'REJECTED' && !operationalReceiptCommitStarted(receipt.raw)) {
+    context.riskManager.release(reservationId, false, 'receipt-rejected', receipt.receiptId);
+    return rejected('platform-rejected', { receipt, reservationId });
+  }
   await context.recordReceipt(command, receipt);
   switch (receipt.status) {
     case 'ACCEPTED':
@@ -163,12 +196,21 @@ function hasDuplicate(
   tableId: string,
   command: OneShotBetCommand,
 ): boolean {
-  return ledger.hasReceipt(tableId, command.shoeId, command.handId, command.market)
-    || ledger.listReservations(tableId).some(reservation => (
-      reservation.shoeId === command.shoeId
-      && reservation.handId === command.handId
-      && reservation.market === command.market
-    ));
+  if (ledger.hasReceipt(tableId, command.shoeId, command.handId, command.market)) {
+    const stored = ledger.getReceipt(tableId, command.shoeId, command.handId, command.market);
+    if (stored && stored.receipt.status === 'REJECTED' && !operationalReceiptCommitStarted(stored.receipt.raw)) {
+      return false;
+    }
+    return stored !== undefined;
+  }
+  return ledger.listReservations(tableId).some(reservation => (
+    reservation.shoeId === command.shoeId
+    && reservation.handId === command.handId
+    && reservation.market === command.market
+    && (reservation.status === 'RESERVED'
+      || reservation.status === 'UNKNOWN'
+      || reservation.status === 'SETTLED')
+  ));
 }
 
 function receiptMatchesIntent(

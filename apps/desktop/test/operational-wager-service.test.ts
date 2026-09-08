@@ -491,6 +491,80 @@ describe('DesktopConsoleService operational wagers', () => {
     }
   });
 
+  it('writes off an unconfirmable UNKNOWN without claiming pnl and unblocks keepalive', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    vi.spyOn(bridge, 'setLiveBetEnabled').mockImplementation(() => undefined);
+    authenticateBridge(bridge);
+    vi.spyOn(bridge, 'requestOperationalWager')
+      .mockImplementation(async (request: OperationalWagerExecutionRequest) => ({
+        receiptId: `receipt-${request.wager.wagerId}`,
+        wagerId: request.wager.wagerId,
+        tableId: request.wager.tableId,
+        shoeId: request.wager.shoeId,
+        handId: request.wager.handId,
+        market: request.wager.market,
+        amount: request.wager.amount,
+        source: request.wager.source,
+        status: 'REJECTED',
+        createdAt: '2026-09-06T18:14:31.334Z',
+        raw: { commitStarted: true, reason: 'bet-state:5:700', userFlag: 3 },
+      }));
+
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['A30', 'A31']);
+      service['liveFeeds'].set('A30', freshFeed('A30'));
+      service['liveFeeds'].set('A31', freshFeed('A31'));
+      await service.injectEvent(physicalShoe('A30'));
+      await service.injectEvent(physicalShoe('A31'));
+      await service.injectEvent(openWindow('A30'));
+      await service.setExecutionMode('A30', 'live');
+
+      const unknown = await service.executeOperationalWager({
+        tableId: 'A30',
+        market: 'player',
+        amount: 20,
+      });
+      expect(unknown.status).toBe('UNKNOWN');
+      const reservation = unknown.snapshot.reservations.find(candidate =>
+        candidate.intentId === unknown.wager!.wagerId);
+      expect(reservation?.status).toBe('UNKNOWN');
+      expect(unknown.snapshot.runtime.tables.A30?.reasons).toContain('unknown-execution-pending');
+
+      await expect(service.reconcileUnknownOperationalWager({
+        reservationId: reservation!.reservationId,
+        wagerId: unknown.wager!.wagerId,
+      })).rejects.toThrow('authoritative hand settlement is not available');
+
+      const written = await service.writeOffUnknownOperationalWager({
+        reservationId: reservation!.reservationId,
+        wagerId: unknown.wager!.wagerId,
+      });
+      expect(written.reservations.find(candidate =>
+        candidate.reservationId === reservation!.reservationId)).toEqual(expect.objectContaining({
+        status: 'RELEASED',
+        releaseReason: 'operator-unconfirmed-write-off',
+      }));
+      expect(written.operationalWagers).toContainEqual(expect.objectContaining({
+        status: 'UNKNOWN',
+        writeOff: expect.objectContaining({ reason: 'operator-unconfirmed-write-off' }),
+      }));
+      expect(written.snapshot.riskState).toMatchObject({
+        reservedExposure: 0,
+        pendingExecutions: 0,
+        executedToday: 0,
+        dayLoss: 0,
+      });
+      expect(written.runtime.tables.A30?.reasons ?? []).not.toContain('unknown-execution-pending');
+
+      const enabled = await service.setKeepaliveEnabled(true);
+      expect(enabled.keepalive.enabled).toBe(true);
+    } finally {
+      await service.close();
+    }
+  });
+
   it('settles a Pragmatic market-click UNKNOWN once the exact hand has cards', async () => {
     const service = new DesktopConsoleService(':memory:');
     const bridge = new BrowserBridgeServer();

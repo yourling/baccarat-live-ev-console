@@ -65,7 +65,7 @@ npx tsx scripts/bridge-command.ts liveOn
 npx tsx scripts/bridge-command.ts liveOff
 ```
 
-`liveOn` 只会尝试打开扩展连接的执行资格，本身不提交下注，也不代表环境已通过真实资金审批。平台返回拒绝或无资金时，执行器可返回 `REJECTED`；若 `confirmBet` 已开始而无法证明结果，可返回 `UNKNOWN`。`UNKNOWN` 对应的 reservation 保留敞口，桌面端会立即关闭保活、撤销当前运行授权并阻断后续执行，不会在下一调度周期再次尝试。
+`liveOn` 只会尝试打开扩展连接的执行资格，本身不提交下注，也不代表环境已通过真实资金审批。平台返回拒绝或无资金时，执行器可返回 `REJECTED`；若 `confirmBet` 已开始而无法证明结果，可返回 `UNKNOWN`。`UNKNOWN` 对应的 reservation 保留敞口，桌面端会阻断当事桌后续执行；单桌未知敞口不会关闭全局保活开关。无法确认的 UNKNOWN 可由操作员勾销敞口（不宣称输赢）。
 
 ## 信任、恢复与日志边界
 
