@@ -11,7 +11,7 @@ import type {
   RiskLimits,
   TableProfile,
 } from '@baccarat/contracts';
-import { defaultProfile, defaultRiskLimits, newId } from '@baccarat/contracts';
+import { CARD_RANKS, defaultProfile, defaultRiskLimits, newId } from '@baccarat/contracts';
 
 function makeContext() {
   const ledger = new SqliteLedger();
@@ -1596,6 +1596,70 @@ describe('resetLiveShoeTracking', () => {
     expect(actor.missingUnobservedCardCount()).toBe(0);
     expect(ledger.listEvents('t1')).toHaveLength(3);
     expect(ledger.listDecisions('t1')).toHaveLength(1);
+    ledger.close();
+  });
+});
+
+describe('exhausted unknown new-shoe must replace mixed physical inventory', () => {
+  it('accepts an unknown 80-hand-cap shoe and clears the previous physical inventory', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile = {
+      ...simProfile('t1'),
+      autoConfirmNewShoe: true,
+      autoBetArmedByDefault: false,
+      minEV: 0.05,
+    };
+    const orchestrator = new Orchestrator({ ledger, riskLimits });
+    const actor = orchestrator.registerTable(profile, 'live', 10);
+    await orchestrator.enqueue('t1', {
+      type: 'newShoeSignal',
+      eventId: 'shoe-physical',
+      tableId: 't1',
+      timestamp: '2026-09-08T08:00:00.000Z',
+      sourceSeq: 1,
+      source: 'bg-runtime',
+      schemaVersion: 1,
+      shoeId: 'bg-t1-2',
+      baseline: 'physical-shoe',
+      profile: defaultProfile('t1'),
+    } as NormalizedEvent);
+    for (let hand = 1; hand <= 80; hand += 1) {
+      const rank = CARD_RANKS[(hand - 1) % CARD_RANKS.length]!;
+      await orchestrator.enqueue('t1', {
+        type: 'handSettled',
+        eventId: `settled-${hand}`,
+        tableId: 't1',
+        timestamp: new Date(Date.parse('2026-09-08T08:00:00.000Z') + hand * 1000).toISOString(),
+        sourceSeq: hand + 1,
+        source: 'bg-runtime',
+        schemaVersion: 1,
+        shoeId: 'bg-t1-2',
+        handId: String(hand),
+        playerCards: [{ rank }, { rank }],
+        bankerCards: [{ rank }, { rank }],
+      } as NormalizedEvent);
+    }
+    await actor.flush();
+    expect(actor.getProjection().handNumber).toBe(80);
+    expect(actor.getProjection().shoeBaseline).toBe('physical-shoe');
+
+    await orchestrator.enqueue('t1', {
+      type: 'newShoeSignal',
+      eventId: 'cap-unknown',
+      tableId: 't1',
+      timestamp: '2026-09-08T08:30:00.000Z',
+      sourceSeq: 82,
+      source: 'bg-runtime',
+      schemaVersion: 1,
+      shoeId: 'bg-t1-3',
+      baseline: 'unknown-monitor-session',
+      profile: defaultProfile('t1'),
+    } as NormalizedEvent);
+    await actor.flush();
+    expect(actor.getProjection().shoeId).toBe('bg-t1-3');
+    expect(actor.getProjection().shoeBaseline).toBe('unknown-monitor-session');
+    expect(actor.getProjection().seenCards).toEqual([]);
+    expect(actor.getProjection().profileSnapshot.minEV).toBe(0.05);
     ledger.close();
   });
 });

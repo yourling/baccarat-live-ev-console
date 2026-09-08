@@ -712,6 +712,119 @@ describe('BgRuntimeParser', () => {
     expect(parser.currentShoeId('A31')).toBe('bg-A31-2');
   });
 
+  it('does not replay a 29-row previous HISTORY onto a just-opened physical shoe', () => {
+    const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'C07',
+      roundId: '100',
+      shoeReset: 'seq:1',
+      source: 'protocol',
+    }]));
+    const opened = parser.parse(snapshot([{
+      tableId: 'C07',
+      shuffleEvent: true,
+      shoeReset: 'seq:2',
+      gameCount: 8,
+      roundId: '180',
+      bettingOpen: true,
+      source: 'protocol',
+      historyHands: Array.from({ length: 29 }, () => ({
+        playerCards: ['AS', '8S'],
+        bankerCards: ['AH', '7H'],
+      })),
+    }]));
+    expect(opened.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({ baseline: 'physical-shoe', tableId: 'C07' }),
+    ]);
+    expect(opened.filter(event => event.type === 'cardObserved')).toEqual([]);
+    expect(opened.filter(event => event.type === 'handSettled')).toEqual([]);
+  });
+
+  it('fail-closes inventory after 80 hands without shuffle evidence', () => {
+    const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'A05',
+      roundId: '1',
+      shoeReset: 'seq:1',
+      source: 'protocol',
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'A05',
+      shuffleEvent: true,
+      shoeReset: 'seq:2',
+      source: 'protocol',
+    }]));
+    const physicalId = parser.currentShoeId('A05');
+    for (let hand = 1; hand <= 80; hand += 1) {
+      parser.parse(snapshot([{
+        tableId: 'A05',
+        roundId: String(hand),
+        bettingOpen: true,
+        source: 'protocol',
+      }]));
+    }
+    const capped = parser.parse(snapshot([{
+      tableId: 'A05',
+      roundId: '81',
+      bettingOpen: true,
+      source: 'protocol',
+    }]));
+    expect(capped.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({ baseline: 'unknown-monitor-session', tableId: 'A05' }),
+    ]);
+    expect(parser.currentShoeId('A05')).not.toBe(physicalId);
+  });
+
+  it('treats a small shoeReset seq walk as drift and a large jump as shuffle', () => {
+    const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'A05',
+      roundId: '1000',
+      shoeReset: 'seq:1000',
+      source: 'protocol',
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'A05',
+      shuffleEvent: true,
+      shoeReset: 'seq:1001',
+      source: 'protocol',
+    }]));
+    const physicalId = parser.currentShoeId('A05');
+    for (let hand = 0; hand < 46; hand += 1) {
+      parser.parse(snapshot([{
+        tableId: 'A05',
+        roundId: String(1000 + hand),
+        gameCount: hand + 1,
+        bettingOpen: true,
+        shoeReset: `seq:${1000 + hand}`,
+        source: 'protocol',
+      }]));
+    }
+    const drifted = parser.parse(snapshot([{
+      tableId: 'A05',
+      roundId: '1046',
+      gameCount: 47,
+      bettingOpen: true,
+      shoeReset: 'seq:1046',
+      source: 'protocol',
+    }]));
+    expect(drifted.filter(event => event.type === 'newShoeSignal')).toEqual([]);
+    expect(parser.currentShoeId('A05')).toBe(physicalId);
+
+    const jumped = parser.parse(snapshot([{
+      tableId: 'A05',
+      roundId: '2000',
+      gameCount: 47,
+      bettingOpen: true,
+      shoeReset: 'seq:2000',
+      source: 'protocol',
+    }]));
+    expect(jumped.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({ baseline: 'physical-shoe', tableId: 'A05' }),
+    ]);
+    expect(parser.currentShoeId('A05')).not.toBe(physicalId);
+  });
+
   it('does not open a new shoe after a long gap on an early undealt attach', () => {
     const parser = new BgRuntimeParser();
     parser.parse(snapshot([{

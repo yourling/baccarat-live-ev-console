@@ -349,8 +349,11 @@ export class TableActor {
         && current.seenCards.length > 0
         && incomingBaseline !== 'physical-shoe'
       ) {
-        // Restart attach tokens must not wipe a ledger-rebuilt physical shoe.
-        return null;
+        // Restart attach must not wipe a live physical shoe. An exhausted or
+        // 80-hand-capped shoe must still be allowed to fail closed.
+        if (!current.sealed && current.remainingTotal >= 26 && current.handNumber < 80) {
+          return null;
+        }
       }
       if (
         incomingBaseline === 'physical-shoe'
@@ -383,6 +386,9 @@ export class TableActor {
     const bound = this.bindIncomingShoe(event);
     if (bound === null) return;
     event = bound;
+    if (event.type === 'newShoeSignal') {
+      event = { ...event, profile: structuredClone(this.profile) };
+    }
     const previousProjection = this.projection;
     const watermark = previousProjection.eventWatermark + 1;
     const tentativeState = applyEvent(new Map([[this.tableId, previousProjection]]), event, watermark);

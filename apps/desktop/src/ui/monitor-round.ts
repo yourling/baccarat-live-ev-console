@@ -5,7 +5,7 @@ const ROAD_WRAP_MAX = 8;
 const ROAD_WRAP_MIN_PREVIOUS = 10;
 const ROAD_WRAP_MIN_DROP = 8;
 const EARLY_SHOE_ROAD_MAX = 20;
-const DEEP_SHOE_HAND_MIN = 50;
+const DEEP_SHOE_HAND_MIN = 45;
 
 export function isBgMonitorTableId(tableId: string): boolean {
   return BG_TABLE_ID.test(tableId.trim());

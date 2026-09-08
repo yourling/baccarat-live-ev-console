@@ -110,8 +110,20 @@ describe('effectiveShoeBaseline', () => {
     projection.handNumber = 52;
     expect(isWrapShapedRoadCount(52, 3)).toBe(true);
     expect(isMissedShuffleRoadCount(52, 3)).toBe(false);
+    expect(isMissedShuffleRoadCount(49, 12)).toBe(true);
     expect(effectiveShoeBaseline(projection, 3, { reason: 'protocol-shuffle' })).toBe('physical-shoe');
     expect(explainShoeBaseline(projection, 3, { reason: 'protocol-shuffle' }).evidence.reason).toBe('protocol-shuffle');
+  });
+
+  it('hides a 49-hand physical shoe when felt road is still 局 12 after a missed cut', () => {
+    const projection = emptyProjection('A31');
+    projection.shoeBaseline = 'physical-shoe';
+    projection.profileSnapshot = defaultProfile('A31');
+    projection.remainingTotal = 170;
+    projection.seenCards = Array.from({ length: 246 }, () => ({ rank: 'A' as const }));
+    projection.handNumber = 49;
+    expect(isMissedShuffleRoadCount(49, 12)).toBe(true);
+    expect(effectiveShoeBaseline(projection, 12, { reason: 'protocol-shuffle' })).toBe('unknown-monitor-session');
   });
 
   it('hides exhausted inventory when the live bead plate is still early 局 18', () => {

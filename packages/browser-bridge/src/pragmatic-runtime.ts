@@ -6,6 +6,7 @@ import {
   type NormalizedEvent,
   type ShoeBaseline,
 } from '@baccarat/contracts';
+import { isIdleDealtShoeShuffle } from './bg-runtime.js';
 
 export interface PragmaticTableSnapshot {
   readonly tableId: string;
@@ -65,6 +66,7 @@ function isPhysicalShoeFromRoadCount(
 }
 
 const GAME_COUNT_CATCH_UP_MAX = 5;
+const MAX_BACCARAT_SHOE_HANDS = 80;
 
 export function isPlausibleGameCountAdvance(
   previous: number | undefined,
@@ -304,6 +306,7 @@ export class PragmaticRuntimeParser {
   private readonly settledHands = new Set<string>();
   private readonly finishedHands = new Set<string>();
   private readonly evidenceByTable = new Map<string, ParserShoeEvidence>();
+  private readonly lastHandAtByTable = new Map<string, number>();
 
   parse(raw: string, isSelected: (tableId: string) => boolean = () => true): NormalizedEvent[] {
     let snapshot: unknown;
@@ -368,6 +371,7 @@ export class PragmaticRuntimeParser {
     this.lastGameCountByTable.delete(tableId);
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
+    this.lastHandAtByTable.delete(tableId);
     this.evidenceByTable.delete(tableId);
     this.clearHandState(tableId);
   }
@@ -378,7 +382,22 @@ export class PragmaticRuntimeParser {
     events: NormalizedEvent[],
   ): void {
     const tableId = table.tableId;
+    const idleShuffle = isIdleDealtShoeShuffle(
+      this.handsThisShoeByTable.get(tableId),
+      this.lastHandAtByTable.get(tableId),
+      Date.parse(observedAt),
+    );
     this.ingestShoeReset(table, observedAt, events);
+    if (
+      idleShuffle
+      && !events.some(event =>
+        event.tableId === tableId
+        && event.type === 'newShoeSignal'
+        && event.baseline === 'physical-shoe')
+    ) {
+      this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
+      this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
+    }
 
     if (Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1) {
       const previous = this.lastGameCountByTable.get(tableId);
@@ -429,11 +448,19 @@ export class PragmaticRuntimeParser {
       this.finishedHands.add(`${tableId}:${previousHandId}`);
       this.closeWindows(tableId, previousHandId, observedAt, events);
       this.settleRememberedHand(tableId, previousHandId, observedAt, events);
-      this.handsThisShoeByTable.set(tableId, (this.handsThisShoeByTable.get(tableId) ?? 1) + 1);
+      const nextHands = (this.handsThisShoeByTable.get(tableId) ?? 1) + 1;
+      if (nextHands > MAX_BACCARAT_SHOE_HANDS) {
+        this.beginNewShoe(tableId, observedAt, events, 'unknown-monitor-session', {
+          reason: 'attach',
+        });
+        this.handsThisShoeByTable.set(tableId, 1);
+      } else {
+        this.handsThisShoeByTable.set(tableId, nextHands);
+      }
     } else if (previousHandId === undefined) {
       this.handsThisShoeByTable.set(tableId, 1);
     }
-    this.lastRoundByTable.set(tableId, handId);
+    this.setLastRound(tableId, handId, observedAt);
 
     const emptyOpenBoundary = table.bettingOpen === true
       && playerCards.length === 0
@@ -539,10 +566,19 @@ export class PragmaticRuntimeParser {
     this.emitShoe(tableId, sequence, baseline, timestamp, events);
   }
 
+  private setLastRound(tableId: string, handId: string, observedAt: string): void {
+    const previous = this.lastRoundByTable.get(tableId);
+    this.lastRoundByTable.set(tableId, handId);
+    if (previous === handId) return;
+    const at = Date.parse(observedAt);
+    if (Number.isFinite(at)) this.lastHandAtByTable.set(tableId, at);
+  }
+
   private clearShoeTracking(tableId: string): void {
     this.lastGameCountByTable.delete(tableId);
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
+    this.lastHandAtByTable.delete(tableId);
     this.evidenceByTable.delete(tableId);
     this.clearHandState(tableId, { keepSettledHands: true });
   }
