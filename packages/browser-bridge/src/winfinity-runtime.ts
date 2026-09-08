@@ -87,6 +87,10 @@ export class WinfinityRuntimeParser {
     return evidence === undefined ? undefined : { ...evidence };
   }
 
+  recordShoeEvidence(tableId: string, evidence: ShoeEvidence): void {
+    this.evidenceByTable.set(tableId, { reason: evidence.reason });
+  }
+
   openPhysicalShoe(tableId: string, timestamp: string): NormalizedEvent[] {
     const events: NormalizedEvent[] = [];
     const shoeId = `wnf-${tableId}-operator`;
