@@ -49,17 +49,59 @@ describe('Winfinity table ids', () => {
     expect(normalizeWinfinityTableId('638f56dc65729f90d0636fb0')).toBeUndefined();
   });
 
-  it('locks the first public id for a vendor table and ignores later aliases', () => {
+  it('does not lock the wnf fallback on first resolveTableId', () => {
     const parser = new WinfinityRuntimeParser();
-    expect(parser.resolveTableId('638f56dc65729f90d0636fb0')).toBe('wnf-638f56dc65729f90d0636fb0');
-    parser.registerAlias('638f56dc65729f90d0636fb0', 'tyn-bac8');
-    expect(parser.resolveTableId('638f56dc65729f90d0636fb0')).toBe('wnf-638f56dc65729f90d0636fb0');
+    expect(parser.resolveTableId(VENDOR)).toBe(`wnf-${VENDOR}`);
+    expect(parser.hasLockedPublicId(VENDOR)).toBe(false);
+    expect(parser.peekPublicId(VENDOR)).toBeUndefined();
+    parser.registerAlias(VENDOR, 'tyn-bac8');
+    expect(parser.resolveTableId(VENDOR)).toBe('tyn-bac8');
+    expect(parser.peekPublicId(VENDOR)).toBe('tyn-bac8');
   });
 
   it('uses stream id when the alias is registered before first resolve', () => {
     const parser = new WinfinityRuntimeParser();
-    parser.registerAlias('638f56dc65729f90d0636fb0', 'TYN-BAC8');
-    expect(parser.resolveTableId('638f56dc65729f90d0636fb0')).toBe('tyn-bac8');
+    parser.registerAlias(VENDOR, 'TYN-BAC8');
+    expect(parser.resolveTableId(VENDOR)).toBe('tyn-bac8');
+    expect(parser.hasLockedPublicId(VENDOR)).toBe(true);
+  });
+
+  it('lets registerAlias lock a short id after parseFrame without discovery', () => {
+    const parser = new WinfinityRuntimeParser();
+    parser.parseFrame(wsFrame('GAME_STATE_CHANGED', {
+      state: { state: 'BETS_OPEN', bettingTime: '0', bettingTimeDuration: '0', allowedSideBets: [] },
+    }));
+    expect(parser.hasLockedPublicId(VENDOR)).toBe(false);
+    expect(parser.shoeEvidence(`wnf-${VENDOR}`)).toEqual({ reason: 'attach' });
+    parser.registerAlias(VENDOR, 'tyn-bac8');
+    expect(parser.resolveTableId(VENDOR)).toBe('tyn-bac8');
+    expect(parser.shoeEvidence('tyn-bac8')).toEqual({ reason: 'attach' });
+    expect(parser.shoeEvidence(`wnf-${VENDOR}`)).toBeUndefined();
+  });
+
+  it('ignores later aliases after lockPublicId', () => {
+    const parser = new WinfinityRuntimeParser();
+    parser.lockPublicId(VENDOR, `wnf-${VENDOR}`);
+    parser.registerAlias(VENDOR, 'tyn-bac8');
+    expect(parser.resolveTableId(VENDOR)).toBe(`wnf-${VENDOR}`);
+  });
+
+  it('registers TABLES_LIST aliases and ignores unknown shapes', () => {
+    const parser = new WinfinityRuntimeParser();
+    expect(parser.parseFrame(JSON.stringify({
+      type: 'TABLES_LIST',
+      tables: [{ tableId: VENDOR, streamId: 'TYN-BAC8' }],
+    }))).toEqual([]);
+    expect(parser.peekPublicId(VENDOR)).toBe('tyn-bac8');
+    const other = new WinfinityRuntimeParser();
+    expect(other.parseFrame(JSON.stringify({
+      type: 'TABLES_LIST',
+      payload: { tables: [{ objectId: VENDOR, streamId: 'tyn-bac8' }] },
+    }))).toEqual([]);
+    expect(other.peekPublicId(VENDOR)).toBe('tyn-bac8');
+    const ignored = new WinfinityRuntimeParser();
+    expect(ignored.parseFrame(JSON.stringify({ type: 'TABLES_LIST', ok: true }))).toEqual([]);
+    expect(ignored.hasLockedPublicId(VENDOR)).toBe(false);
   });
 });
 

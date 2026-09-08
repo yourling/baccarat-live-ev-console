@@ -66,20 +66,40 @@ export class WinfinityRuntimeParser {
     const vendor = vendorTableId.trim().toLowerCase();
     if (!WINFINITY_VENDOR_TABLE_ID_PATTERN.test(vendor)) return;
     if (this.lockedByVendor.has(vendor)) return;
-    const publicId = publicWinfinityTableId({ streamId, vendorTableId: vendor });
-    if (publicId === undefined) return;
-    this.lockedByVendor.set(vendor, publicId);
+    const stream = streamId.trim().toLowerCase();
+    if (!WINFINITY_STREAM_ID_PATTERN.test(stream)) return;
+    this.applyLock(vendor, stream);
+  }
+
+  lockPublicId(vendorTableId: string, publicId: string): void {
+    const vendor = vendorTableId.trim().toLowerCase();
+    if (!WINFINITY_VENDOR_TABLE_ID_PATTERN.test(vendor)) return;
+    if (this.lockedByVendor.has(vendor)) return;
+    const normalized = normalizeWinfinityTableId(publicId);
+    if (normalized === undefined) return;
+    this.applyLock(vendor, normalized);
+  }
+
+  peekPublicId(vendorTableId: string): string | undefined {
+    const vendor = vendorTableId.trim().toLowerCase();
+    if (!WINFINITY_VENDOR_TABLE_ID_PATTERN.test(vendor)) return undefined;
+    return this.lockedByVendor.get(vendor);
+  }
+
+  hasLockedPublicId(vendorTableId: string): boolean {
+    return this.peekPublicId(vendorTableId) !== undefined;
   }
 
   resolveTableId(vendorTableId: string): string | undefined {
     const vendor = vendorTableId.trim().toLowerCase();
     if (!WINFINITY_VENDOR_TABLE_ID_PATTERN.test(vendor)) return undefined;
-    const locked = this.lockedByVendor.get(vendor);
-    if (locked !== undefined) return locked;
-    const publicId = publicWinfinityTableId({ vendorTableId: vendor });
-    if (publicId === undefined) return undefined;
-    this.lockedByVendor.set(vendor, publicId);
-    return publicId;
+    return this.lockedByVendor.get(vendor) ?? publicWinfinityTableId({ vendorTableId: vendor });
+  }
+
+  registerAliasesFromPayload(payload: unknown): Array<{ vendorTableId: string; publicId: string }> {
+    const found = new Map<string, string>();
+    this.walkAliasPayload(payload, found, 0);
+    return [...found.entries()].map(([vendorTableId, publicId]) => ({ vendorTableId, publicId }));
   }
 
   shoeEvidence(tableId: string): ShoeEvidence | undefined {
@@ -109,6 +129,10 @@ export class WinfinityRuntimeParser {
     }
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
     const frame = parsed as Record<string, unknown>;
+    if (frame.type === 'TABLES_LIST') {
+      this.registerAliasesFromPayload(frame);
+      return [];
+    }
     if (
       frame.type !== 'GAME_STATE_CHANGED'
       && frame.type !== 'CARDS_TAKEN'
@@ -148,6 +172,54 @@ export class WinfinityRuntimeParser {
       this.emitSettled(tableId, shoeId, handId, timestamp, frame, events);
     }
     return events;
+  }
+
+  private applyLock(vendor: string, publicId: string): void {
+    this.lockedByVendor.set(vendor, publicId);
+    const fallback = publicWinfinityTableId({ vendorTableId: vendor });
+    if (fallback !== undefined && fallback !== publicId) this.rekeyTable(fallback, publicId);
+  }
+
+  private rekeyTable(fromId: string, toId: string): void {
+    if (fromId === toId) return;
+    moveMapKey(this.seqByTable, fromId, toId);
+    moveMapKey(this.lastShoeToken, fromId, toId);
+    moveMapKey(this.currentShoeId, fromId, toId);
+    moveMapKey(this.evidenceByTable, fromId, toId);
+    rekeyPrefixedMap(this.cardsByHand, fromId, toId);
+    rekeyPrefixedSet(this.seenCardIds, fromId, toId);
+    rekeyPrefixedSet(this.openedWindows, fromId, toId);
+    rekeyPrefixedSet(this.closedWindows, fromId, toId);
+    rekeyPrefixedSet(this.settledHands, fromId, toId);
+  }
+
+  private walkAliasPayload(
+    value: unknown,
+    found: Map<string, string>,
+    depth: number,
+  ): void {
+    if (depth > 6 || value === null || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const item of value) this.walkAliasPayload(item, found, depth + 1);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    let streamId: string | undefined;
+    let vendor: string | undefined;
+    for (const field of Object.values(record)) {
+      if (typeof field !== 'string') continue;
+      const trimmed = field.trim().toLowerCase();
+      if (streamId === undefined && WINFINITY_STREAM_ID_PATTERN.test(trimmed)) streamId = trimmed;
+      if (vendor === undefined && WINFINITY_VENDOR_TABLE_ID_PATTERN.test(trimmed)) vendor = trimmed;
+    }
+    if (streamId !== undefined && vendor !== undefined) {
+      this.registerAlias(vendor, streamId);
+      const publicId = this.peekPublicId(vendor);
+      if (publicId !== undefined) found.set(vendor, publicId);
+    }
+    for (const field of Object.values(record)) {
+      if (field !== null && typeof field === 'object') this.walkAliasPayload(field, found, depth + 1);
+    }
   }
 
   private emitCards(
@@ -384,6 +456,36 @@ export class WinfinityRuntimeParser {
       ...extra,
     } as NormalizedEvent;
   }
+}
+
+function moveMapKey<T>(map: Map<string, T>, fromId: string, toId: string): void {
+  if (!map.has(fromId)) return;
+  if (!map.has(toId)) map.set(toId, map.get(fromId) as T);
+  map.delete(fromId);
+}
+
+function rekeyPrefixedMap<T>(map: Map<string, T>, fromId: string, toId: string): void {
+  const prefix = `${fromId}:`;
+  const moved: Array<[string, T]> = [];
+  for (const [key, value] of map) {
+    if (!key.startsWith(prefix)) continue;
+    moved.push([`${toId}:${key.slice(prefix.length)}`, value]);
+    map.delete(key);
+  }
+  for (const [key, value] of moved) {
+    if (!map.has(key)) map.set(key, value);
+  }
+}
+
+function rekeyPrefixedSet(set: Set<string>, fromId: string, toId: string): void {
+  const prefix = `${fromId}:`;
+  const moved: string[] = [];
+  for (const key of set) {
+    if (!key.startsWith(prefix)) continue;
+    moved.push(`${toId}:${key.slice(prefix.length)}`);
+    set.delete(key);
+  }
+  for (const key of moved) set.add(key);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

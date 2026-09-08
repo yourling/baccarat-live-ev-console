@@ -246,6 +246,19 @@ const LIVE_PROTOCOL_CAPTURE_SOURCES = new Set([
   'baccarat-bridge-winfinity-state',
 ]);
 
+export const WINFINITY_WS_ALIAS_BUFFER_LIMIT = 32;
+
+function winfinityCaptureType(raw: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null) return undefined;
+    const type = Reflect.get(parsed, 'type');
+    return typeof type === 'string' ? type : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function winfinityVendorTableIdFromCapture(raw: string): string | undefined {
   try {
     const parsed: unknown = JSON.parse(raw);
@@ -257,6 +270,11 @@ function winfinityVendorTableIdFromCapture(raw: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function winfinityFallbackVendorId(publicId: string): string | undefined {
+  const match = /^wnf-([a-f0-9]{24})$/i.exec(publicId.trim());
+  return match?.[1]?.toLowerCase();
 }
 
 function isLiveProtocolCapture(
@@ -1022,6 +1040,7 @@ export class BrowserBridgeServer implements RoomMonitor {
   private pragmaticParser = new PragmaticRuntimeParser();
   private bgParser = new BgRuntimeParser();
   private winfinityParser = new WinfinityRuntimeParser();
+  private readonly winfinityWsBuffer = new Map<string, string[]>();
   private readonly bgShoeSequenceSeed = new Map<string, number>();
   private readonly pragmaticProtocol = new PragmaticProtocolState();
   private readonly parsedSourceSeqByTable = new Map<string, number>();
@@ -1306,6 +1325,7 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.pragmaticParser = new PragmaticRuntimeParser();
     this.bgParser = new BgRuntimeParser();
     this.winfinityParser = new WinfinityRuntimeParser();
+    this.winfinityWsBuffer.clear();
     for (const [tableId, sequence] of this.bgShoeSequenceSeed) {
       this.bgParser.seedShoeSequence(tableId, sequence);
     }
@@ -1353,7 +1373,11 @@ export class BrowserBridgeServer implements RoomMonitor {
         ? 'bg'
         : 'pragmatic';
     if (roomId === DAFABET_WINFINITY_ROOM_ID) {
-      this.winfinityParser.recordShoeEvidence(tableId, { reason: 'manual-confirm' });
+      this.ingestParsedEvents(
+        this.winfinityParser.openPhysicalShoe(tableId, new Date().toISOString()),
+        DAFABET_WINFINITY_ROOM_ID,
+      );
+      return;
     } else if (roomId === DAFABET_BG_ROOM_ID) {
       this.bgParser.recordShoeEvidence(tableId, { reason: 'manual-confirm' });
     } else {
@@ -1742,19 +1766,7 @@ export class BrowserBridgeServer implements RoomMonitor {
           && message.encoding === 'text'
           && message.direction !== 'send'
         ) {
-          const vendorTableId = winfinityVendorTableIdFromCapture(message.data);
-          const publicId = vendorTableId === undefined
-            ? undefined
-            : this.winfinityParser.resolveTableId(vendorTableId);
-          if (publicId !== undefined) {
-            this.ensureRoomForTable(publicId, DAFABET_WINFINITY_ROOM_ID);
-            if (this.isTableSelected(publicId)) this.noteTableObservation(publicId);
-          }
-          const events = this.winfinityParser.parseFrame(message.data);
-          for (const event of events) {
-            this.ensureRoomForTable(event.tableId, DAFABET_WINFINITY_ROOM_ID);
-          }
-          this.ingestParsedEvents(events, DAFABET_WINFINITY_ROOM_ID);
+          this.ingestWinfinityWsFrame(message.data);
         } else if (message.source === 'baccarat-bridge-runtime-selection') {
           this.applyRuntimeSelection(message.data);
         }
@@ -2049,14 +2061,87 @@ export class BrowserBridgeServer implements RoomMonitor {
           ...(gameCount === undefined ? {} : { gameCount }),
         }],
       });
-      this.ensureRoomForTable(publicId, DAFABET_WINFINITY_ROOM_ID);
-      if (this.isTableSelected(publicId)) this.noteTableObservation(publicId);
+      this.discoverWinfinityTable(publicId, vendorTableId);
     }
+  }
+
+  private ingestWinfinityWsFrame(raw: string): void {
+    if (winfinityCaptureType(raw) === 'TABLES_LIST') {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      for (const alias of this.winfinityParser.registerAliasesFromPayload(parsed)) {
+        this.discoverWinfinityTable(alias.publicId, alias.vendorTableId);
+      }
+      return;
+    }
+    const vendorTableId = winfinityVendorTableIdFromCapture(raw);
+    if (vendorTableId === undefined) return;
+    if (this.winfinityParser.hasLockedPublicId(vendorTableId)) {
+      this.flushWinfinityWsBuffer(vendorTableId);
+      this.ingestLockedWinfinityWsFrame(vendorTableId, raw);
+      return;
+    }
+    this.bufferWinfinityWsFrame(vendorTableId, raw);
+  }
+
+  private bufferWinfinityWsFrame(vendorTableId: string, raw: string): void {
+    const vendor = vendorTableId.trim().toLowerCase();
+    const frames = this.winfinityWsBuffer.get(vendor) ?? [];
+    frames.push(raw);
+    this.winfinityWsBuffer.set(vendor, frames);
+    if (frames.length < WINFINITY_WS_ALIAS_BUFFER_LIMIT) return;
+    const fallback = publicWinfinityTableId({ vendorTableId: vendor });
+    if (fallback === undefined) return;
+    this.winfinityParser.lockPublicId(vendor, fallback);
+    this.flushWinfinityWsBuffer(vendor);
+  }
+
+  private flushWinfinityWsBuffer(vendorTableId: string): void {
+    const vendor = vendorTableId.trim().toLowerCase();
+    const frames = this.winfinityWsBuffer.get(vendor);
+    this.winfinityWsBuffer.delete(vendor);
+    if (frames === undefined || frames.length === 0) return;
+    const publicId = this.winfinityParser.peekPublicId(vendor)
+      ?? this.winfinityParser.resolveTableId(vendor);
+    if (publicId === undefined) return;
+    this.winfinityParser.lockPublicId(vendor, publicId);
+    this.ensureRoomForTable(publicId, DAFABET_WINFINITY_ROOM_ID);
+    for (const frame of frames) {
+      this.ingestLockedWinfinityWsFrame(vendor, frame);
+    }
+  }
+
+  private ingestLockedWinfinityWsFrame(vendorTableId: string, raw: string): void {
+    const publicId = this.winfinityParser.peekPublicId(vendorTableId)
+      ?? this.winfinityParser.resolveTableId(vendorTableId);
+    if (publicId === undefined) return;
+    this.ensureRoomForTable(publicId, DAFABET_WINFINITY_ROOM_ID);
+    if (this.isTableSelected(publicId)) this.noteTableObservation(publicId);
+    this.ingestParsedEvents(this.winfinityParser.parseFrame(raw), DAFABET_WINFINITY_ROOM_ID);
+  }
+
+  private discoverWinfinityTable(publicId: string, vendorTableId?: string): void {
+    if (vendorTableId !== undefined) {
+      this.winfinityParser.lockPublicId(vendorTableId, publicId);
+    } else {
+      const fallbackVendor = winfinityFallbackVendorId(publicId);
+      if (fallbackVendor !== undefined) this.winfinityParser.lockPublicId(fallbackVendor, publicId);
+    }
+    this.ensureRoomForTable(publicId, DAFABET_WINFINITY_ROOM_ID);
+    if (vendorTableId !== undefined) this.flushWinfinityWsBuffer(vendorTableId);
   }
 
   private ensureRoomForTable(tableId: string, roomId = DAFABET_PRAGMATIC_ROOM_ID): void {
     if (roomId === DAFABET_BG_ROOM_ID && normalizeBgTableId(tableId) === undefined) return;
     if (roomId === DAFABET_WINFINITY_ROOM_ID && normalizeWinfinityTableId(tableId) === undefined) return;
+    if (roomId === DAFABET_WINFINITY_ROOM_ID) {
+      const fallbackVendor = winfinityFallbackVendorId(tableId);
+      if (fallbackVendor !== undefined) this.winfinityParser.lockPublicId(fallbackVendor, tableId);
+    }
     const displayName = roomId === DAFABET_WINFINITY_ROOM_ID
       ? 'Dafabet Winfinity'
       : roomId === DAFABET_BG_ROOM_ID
