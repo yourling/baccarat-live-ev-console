@@ -183,3 +183,77 @@ describe('Winfinity cards', () => {
     expect(events.filter(event => event.type === 'cardObserved')).toHaveLength(0);
   });
 });
+
+describe('Winfinity settlement and shoes', () => {
+  it('settles pairs from roundResult and ignores duplicates and winners lists', () => {
+    const parser = new WinfinityRuntimeParser();
+    parser.registerAlias(VENDOR, 'tyn-bac8');
+    parser.parseFrame(wsFrame('CARDS_TAKEN', {
+      cards: {
+        cards: [
+          { id: 'p1', card: { rank: 'FIVE', suit: 'SPADE' }, position: { area: 'PLAYER', order: 'ORDER_LEFT' } },
+          { id: 'p2', card: { rank: 'ACE', suit: 'HEART' }, position: { area: 'PLAYER', order: 'ORDER_RIGHT' } },
+          { id: 'b1', card: { rank: 'NINE', suit: 'CLUB' }, position: { area: 'BANKER', order: 'ORDER_LEFT' } },
+          { id: 'b2', card: { rank: 'EIGHT', suit: 'DIAMOND' }, position: { area: 'BANKER', order: 'ORDER_RIGHT' } },
+        ],
+        allCards: [],
+      },
+    }));
+    const settled = parser.parseFrame(wsFrame('GAME_RESULTS', {
+      gameResults: {
+        roundResult: {
+          roundId: HAND_1,
+          won: 'PLAYER',
+          pPair: false,
+          bPair: true,
+          score: 6,
+        },
+      },
+    }));
+    expect(settled.filter(event => event.type === 'handSettled')).toEqual([
+      expect.objectContaining({
+        tableId: 'tyn-bac8',
+        shoeId: SHOE_A,
+        handId: HAND_1,
+        outcomes: { playerPair: false, bankerPair: true },
+        playerCards: [expect.objectContaining({ rank: '5' }), expect.objectContaining({ rank: 'A' })],
+        bankerCards: [expect.objectContaining({ rank: '9' }), expect.objectContaining({ rank: '8' })],
+      }),
+    ]);
+    const dup = parser.parseFrame(wsFrame('GAME_RESULTS', {
+      gameResults: { roundResult: { roundId: HAND_1, won: 'PLAYER', pPair: true, bPair: true } },
+    }));
+    expect(dup.filter(event => event.type === 'handSettled')).toHaveLength(0);
+    expect(parser.parseFrame(wsFrame('WINNERS_LIST', { winners: [{ name: 'secret' }] }))).toEqual([]);
+    expect(parser.parseFrame('not-json')).toEqual([]);
+  });
+
+  it('records the first shoe token as attach and the second as protocol-shuffle', () => {
+    const parser = new WinfinityRuntimeParser();
+    parser.registerAlias(VENDOR, 'tyn-bac8');
+    const first = parser.parseFrame(wsFrame('GAME_STATE_CHANGED', {
+      state: { state: 'BETS_OPEN', bettingTime: '0', bettingTimeDuration: '0', allowedSideBets: [] },
+    }));
+    expect(parser.shoeEvidence('tyn-bac8')).toEqual({ reason: 'attach' });
+    expect(first.some(event => event.type === 'newShoeSignal' && event.baseline === 'physical-shoe')).toBe(false);
+    const second = parser.parseFrame(JSON.stringify({
+      id: 'evt-2',
+      timestamp: '1788889999999',
+      type: 'GAME_STATE_CHANGED',
+      meta: {
+        tableId: VENDOR,
+        round: { id: 'hand-2', startedAt: '1788889999999', shoeId: SHOE_B },
+      },
+      state: { state: 'BETS_OPEN', bettingTime: '0', bettingTimeDuration: '0', allowedSideBets: [] },
+    }));
+    expect(parser.shoeEvidence('tyn-bac8')).toEqual({ reason: 'protocol-shuffle' });
+    expect(second).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'newShoeSignal',
+        shoeId: SHOE_B,
+        baseline: 'physical-shoe',
+        tableId: 'tyn-bac8',
+      }),
+    ]));
+  });
+});
