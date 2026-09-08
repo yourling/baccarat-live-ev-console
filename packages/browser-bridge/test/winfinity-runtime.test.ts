@@ -117,3 +117,69 @@ describe('Winfinity betting windows', () => {
     expect(events.filter(event => event.type === 'bettingWindowClosed')).toHaveLength(2);
   });
 });
+
+describe('Winfinity cards', () => {
+  it('emits only incremental cards and maps rank/position', () => {
+    const parser = new WinfinityRuntimeParser();
+    parser.registerAlias(VENDOR, 'tyn-bac8');
+    const first = parser.parseFrame(wsFrame('CARDS_TAKEN', {
+      cards: {
+        cards: [{
+          id: 'card-1',
+          card: { rank: 'QUEEN', suit: 'DIAMOND' },
+          position: { area: 'PLAYER', order: 'ORDER_LEFT' },
+        }],
+        allCards: [{
+          id: 'card-1',
+          card: { rank: 'QUEEN', suit: 'DIAMOND' },
+          position: { area: 'PLAYER', order: 'ORDER_LEFT' },
+        }],
+      },
+    }));
+    expect(first.filter(event => event.type === 'cardObserved')).toEqual([
+      expect.objectContaining({
+        type: 'cardObserved',
+        tableId: 'tyn-bac8',
+        shoeId: SHOE_A,
+        handId: HAND_1,
+        card: expect.objectContaining({ rank: 'Q', suit: 'DIAMOND' }),
+        position: 'player:left',
+      }),
+    ]);
+    const second = parser.parseFrame(wsFrame('CARDS_TAKEN', {
+      cards: {
+        cards: [{
+          id: 'card-1',
+          card: { rank: 'QUEEN', suit: 'DIAMOND' },
+          position: { area: 'PLAYER', order: 'ORDER_LEFT' },
+        }],
+        allCards: [{
+          id: 'card-1',
+          card: { rank: 'QUEEN', suit: 'DIAMOND' },
+          position: { area: 'PLAYER', order: 'ORDER_LEFT' },
+        }, {
+          id: 'card-2',
+          card: { rank: 'ACE', suit: 'SPADE' },
+          position: { area: 'BANKER', order: 'ORDER_EXTRA' },
+        }],
+      },
+    }));
+    expect(second.filter(event => event.type === 'cardObserved')).toHaveLength(0);
+  });
+
+  it('drops unknown ranks instead of inventing cards', () => {
+    const parser = new WinfinityRuntimeParser();
+    parser.registerAlias(VENDOR, 'tyn-bac8');
+    const events = parser.parseFrame(wsFrame('CARDS_TAKEN', {
+      cards: {
+        cards: [{
+          id: 'card-x',
+          card: { rank: 'JOKER', suit: 'SPADE' },
+          position: { area: 'PLAYER', order: 'ORDER_LEFT' },
+        }],
+        allCards: [],
+      },
+    }));
+    expect(events.filter(event => event.type === 'cardObserved')).toHaveLength(0);
+  });
+});

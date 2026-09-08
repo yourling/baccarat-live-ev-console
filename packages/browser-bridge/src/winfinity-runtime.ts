@@ -1,9 +1,29 @@
 import {
   EVENT_SCHEMA_VERSION,
+  type Card,
+  type CardRank,
   type NormalizedEvent,
 } from '@baccarat/contracts';
 
 const PAIR_MARKETS = ['bankerPair', 'playerPair'] as const;
+
+const RANK: Record<string, CardRank> = {
+  ACE: 'A', TWO: '2', THREE: '3', FOUR: '4', FIVE: '5', SIX: '6', SEVEN: '7',
+  EIGHT: '8', NINE: '9', TEN: '10', JACK: 'J', QUEEN: 'Q', KING: 'K',
+};
+
+const AREA: Record<string, 'player' | 'banker'> = {
+  PLAYER: 'player',
+  BANKER: 'banker',
+};
+
+const ORDER: Record<string, 'left' | 'right' | 'extra'> = {
+  ORDER_LEFT: 'left',
+  ORDER_RIGHT: 'right',
+  ORDER_EXTRA: 'extra',
+};
+
+type HandCards = { playerCards: Card[]; bankerCards: Card[] };
 
 export const WINFINITY_STREAM_ID_PATTERN = /^[a-z0-9]+-bac\d+$/i;
 export const WINFINITY_FALLBACK_TABLE_ID_PATTERN = /^wnf-[a-f0-9]{24}$/i;
@@ -32,6 +52,8 @@ export class WinfinityRuntimeParser {
   private readonly openedWindows = new Set<string>();
   private readonly closedWindows = new Set<string>();
   private readonly seqByTable = new Map<string, number>();
+  private readonly seenCardIds = new Set<string>();
+  private readonly cardsByHand = new Map<string, HandCards>();
 
   registerAlias(vendorTableId: string, streamId: string): void {
     const vendor = vendorTableId.trim().toLowerCase();
@@ -62,32 +84,87 @@ export class WinfinityRuntimeParser {
     }
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
     const frame = parsed as Record<string, unknown>;
-    if (frame.type !== 'GAME_STATE_CHANGED') return [];
+    if (frame.type !== 'GAME_STATE_CHANGED' && frame.type !== 'CARDS_TAKEN') return [];
     const meta = asRecord(frame.meta);
     const round = asRecord(meta?.round);
-    const state = asRecord(frame.state);
-    if (meta === undefined || round === undefined || state === undefined) return [];
+    if (meta === undefined || round === undefined) return [];
     if (typeof meta.tableId !== 'string') return [];
     const tableId = this.resolveTableId(meta.tableId);
     if (tableId === undefined) return [];
     if (typeof round.id !== 'string' || typeof round.shoeId !== 'string') return [];
     const handId = round.id;
     const shoeId = round.shoeId;
-    const gameState = typeof state.state === 'string' ? state.state : undefined;
-    if (gameState === undefined) return [];
     const timestamp = isoFromUnixMs(frame.timestamp) ?? new Date(0).toISOString();
     const events: NormalizedEvent[] = [];
-    if (gameState === 'BETS_OPEN') {
-      this.emitOpened(tableId, shoeId, handId, timestamp, isoFromUnixMs(state.bettingTime), events, false);
-    } else if (gameState === 'BETS_CLOSING') {
-      const closesAt = isoFromUnixMs(state.bettingTime);
-      if (closesAt !== undefined) {
-        this.emitOpened(tableId, shoeId, handId, timestamp, closesAt, events, true);
+    if (frame.type === 'GAME_STATE_CHANGED') {
+      const state = asRecord(frame.state);
+      if (state === undefined) return [];
+      const gameState = typeof state.state === 'string' ? state.state : undefined;
+      if (gameState === undefined) return [];
+      if (gameState === 'BETS_OPEN') {
+        this.emitOpened(tableId, shoeId, handId, timestamp, isoFromUnixMs(state.bettingTime), events, false);
+      } else if (gameState === 'BETS_CLOSING') {
+        const closesAt = isoFromUnixMs(state.bettingTime);
+        if (closesAt !== undefined) {
+          this.emitOpened(tableId, shoeId, handId, timestamp, closesAt, events, true);
+        }
+      } else if (gameState === 'BETS_CLOSED' || gameState === 'GAME_STARTED') {
+        this.emitClosed(tableId, shoeId, handId, timestamp, events);
       }
-    } else if (gameState === 'BETS_CLOSED' || gameState === 'GAME_STARTED') {
-      this.emitClosed(tableId, shoeId, handId, timestamp, events);
+    } else {
+      this.emitCards(tableId, shoeId, handId, timestamp, frame, events);
     }
     return events;
+  }
+
+  private emitCards(
+    tableId: string,
+    shoeId: string,
+    handId: string,
+    timestamp: string,
+    frame: Record<string, unknown>,
+    events: NormalizedEvent[],
+  ): void {
+    const payload = asRecord(frame.cards);
+    if (payload === undefined || !Array.isArray(payload.cards)) return;
+    const handKey = `${tableId}:${handId}`;
+    for (const entry of payload.cards) {
+      const item = asRecord(entry);
+      if (item === undefined || typeof item.id !== 'string' || item.id.length === 0) continue;
+      const seenKey = `${tableId}:${item.id}`;
+      if (this.seenCardIds.has(seenKey)) continue;
+      const rawCard = asRecord(item.card);
+      if (rawCard === undefined || typeof rawCard.rank !== 'string') continue;
+      const rank = RANK[rawCard.rank];
+      if (rank === undefined) continue;
+      const card: Card = typeof rawCard.suit === 'string'
+        ? { rank, suit: rawCard.suit }
+        : { rank };
+      const rawPos = asRecord(item.position);
+      const area = rawPos !== undefined && typeof rawPos.area === 'string'
+        ? AREA[rawPos.area]
+        : undefined;
+      const order = rawPos !== undefined && typeof rawPos.order === 'string'
+        ? ORDER[rawPos.order]
+        : undefined;
+      const position = area !== undefined && order !== undefined ? `${area}:${order}` : undefined;
+      this.seenCardIds.add(seenKey);
+      if (area === 'player' || area === 'banker') {
+        const remembered = this.cardsByHand.get(handKey) ?? { playerCards: [], bankerCards: [] };
+        if (area === 'player') remembered.playerCards.push(card);
+        else remembered.bankerCards.push(card);
+        this.cardsByHand.set(handKey, remembered);
+      }
+      events.push(this.makeWindowEvent(
+        tableId,
+        'cardObserved',
+        `card:${handId}:${item.id}`,
+        timestamp,
+        position === undefined
+          ? { shoeId, handId, card }
+          : { shoeId, handId, card, position },
+      ));
+    }
   }
 
   private emitOpened(
@@ -156,7 +233,7 @@ export class WinfinityRuntimeParser {
 
   private makeWindowEvent(
     tableId: string,
-    type: 'bettingWindowOpened' | 'bettingWindowClosed',
+    type: 'bettingWindowOpened' | 'bettingWindowClosed' | 'cardObserved',
     stableKey: string,
     timestamp: string,
     extra: Record<string, unknown>,
