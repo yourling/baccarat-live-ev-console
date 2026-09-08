@@ -51,7 +51,7 @@ const ROAD_WRAP_MAX = 8;
 const EARLY_SHOE_ROAD_MAX = 20;
 /** HISTORY 29→18 is a correction; 72→18 after a dealt shoe is a missed shuffle. */
 const INFLATED_ROAD_PREVIOUS_MAX = 40;
-const DEEP_SHOE_ROAD_MIN = 50;
+const DEEP_SHOE_ROAD_MIN = 45;
 const ROAD_WRAP_MIN_PREVIOUS = 10;
 const ROAD_WRAP_MIN_DROP = 8;
 /** First START_BET often lands at 1, then HISTORY dumps the whole bead plate. */
@@ -667,7 +667,6 @@ export class BgRuntimeParser {
     // After an idle-gap shuffle the packet often still holds the previous
     // shoe. Do not backfill those cards onto the new inventory.
     const previousShoeHistory = openedPhysical
-      && idleShuffle
       && historyHands.length > EARLY_SHOE_ROAD_MAX
       && (gameCount === undefined
         || gameCount <= ROAD_WRAP_MAX
@@ -857,6 +856,7 @@ export class BgRuntimeParser {
         && previousSeq !== undefined
         && nextSeq !== undefined
         && nextSeq > previousSeq
+        && nextSeq - previousSeq <= GAME_COUNT_CATCH_UP_MAX
         && !isRoadWrapToNewShoe(previousRoad, incomingRoad ?? 0)
         && !exhaustedDrop;
       this.lastShoeResetByTable.set(tableId, token);
@@ -909,7 +909,9 @@ export class BgRuntimeParser {
   }
 
   private setLastRound(tableId: string, handId: string, observedAt: string): void {
+    const previous = this.lastRoundByTable.get(tableId);
     this.lastRoundByTable.set(tableId, handId);
+    if (previous === handId) return;
     const at = Date.parse(observedAt);
     if (Number.isFinite(at)) this.lastHandAtByTable.set(tableId, at);
   }

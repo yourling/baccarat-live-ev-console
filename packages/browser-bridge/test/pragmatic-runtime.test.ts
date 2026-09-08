@@ -7,11 +7,12 @@ import { pragmaticNetworkObservation } from '../src/server.js';
 function snapshot(
   tables: Array<Record<string, unknown>>,
   view: 'single' | 'multi' = 'single',
+  observedAt = '2026-08-29T01:00:00.000Z',
 ): string {
   return JSON.stringify({
     version: 1,
     view,
-    observedAt: '2026-08-29T01:00:00.000Z',
+    observedAt,
     tables,
   });
 }
@@ -1067,6 +1068,76 @@ describe('PragmaticRuntimeParser', () => {
     }
 
     expectLedgerAppend([...opened, ...closed, ...reopened, ...closedAgain]);
+  });
+
+  it('opens a physical shoe after a dealt pragmatic table is silent for a shuffle-length gap', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1',
+      roundId: '1',
+      shoeReset: 'shoe-1',
+      source: 'protocol',
+    }], 'single', '2026-09-08T08:00:00.000Z'));
+    parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1',
+      roundId: '1',
+      shoeReset: 'shoe-2',
+      source: 'protocol',
+    }], 'single', '2026-09-08T08:00:01.000Z'));
+    const physicalId = parser.currentShoeId('speedbca14gesbc1');
+    for (let hand = 0; hand < 12; hand += 1) {
+      parser.parse(snapshot([{
+        tableId: 'speedbca14gesbc1',
+        roundId: String(10 + hand),
+        bettingOpen: true,
+        source: 'protocol',
+      }], 'single', new Date(Date.parse('2026-09-08T08:01:00.000Z') + hand * 50_000).toISOString()));
+    }
+    const resumed = parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1',
+      roundId: '90',
+      bettingOpen: true,
+      source: 'protocol',
+    }], 'single', '2026-09-08T08:20:00.000Z'));
+    expect(resumed.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({ baseline: 'physical-shoe', tableId: 'speedbca14gesbc1' }),
+    ]);
+    expect(parser.currentShoeId('speedbca14gesbc1')).not.toBe(physicalId);
+  });
+
+  it('fail-closes inventory after 80 pragmatic hands without shuffle evidence', () => {
+    const parser = new PragmaticRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1',
+      roundId: '1',
+      shoeReset: 'shoe-1',
+      source: 'protocol',
+    }]));
+    parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1',
+      roundId: '1',
+      shoeReset: 'shoe-2',
+      source: 'protocol',
+    }]));
+    const physicalId = parser.currentShoeId('speedbca14gesbc1');
+    for (let hand = 1; hand <= 80; hand += 1) {
+      parser.parse(snapshot([{
+        tableId: 'speedbca14gesbc1',
+        roundId: String(hand),
+        bettingOpen: true,
+        source: 'protocol',
+      }]));
+    }
+    const capped = parser.parse(snapshot([{
+      tableId: 'speedbca14gesbc1',
+      roundId: '81',
+      bettingOpen: true,
+      source: 'protocol',
+    }]));
+    expect(capped.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({ baseline: 'unknown-monitor-session', tableId: 'speedbca14gesbc1' }),
+    ]);
+    expect(parser.currentShoeId('speedbca14gesbc1')).not.toBe(physicalId);
   });
 
   it('isolates lifecycle state for forty simultaneously monitored tables'

@@ -30,7 +30,7 @@ const ROAD_WRAP_MAX = 8;
 const ROAD_WRAP_MIN_PREVIOUS = 10;
 const ROAD_WRAP_MIN_DROP = 8;
 const EARLY_SHOE_ROAD_MAX = 20;
-const DEEP_SHOE_HAND_MIN = 50;
+const DEEP_SHOE_HAND_MIN = 45;
 /** Recent BG cuts land around 127-165 remaining. Above this is not a cut. */
 const PREMATURE_RESET_REMAINING_MIN = 180;
 const UNDEALABLE_REMAINING = 26;
@@ -50,15 +50,11 @@ export function isWrapShapedRoadCount(handNumber: number, gameCount: number): bo
 }
 
 /**
- * Missed shuffle: live bead plate is still in early 局 9-20 while this shoeId
- * already played 50+ hands. 局18 + old inventory is how A05 advertised +31%.
- * Wrap-shaped 1-8 is not this; that is either a real wrap (parser opens a new
- * shoe) or a stuck early HISTORY road (keep tracked remaining/EV).
- */
-/**
  * A live physical shoe that still has a mid/late inventory must not be
  * replaced by a protocol-shuffle pulse. Typical cut is 127-165 remaining.
  * Road wrap to #1-#8 is allowed even with high remaining.
+ * Missed shuffle: bead plate still 局 9-20 while this shoeId already played
+ * 45+ hands. Wrap-shaped 1-8 is not this.
  */
 export function isPrematurePhysicalShoeReset(
   projection: Pick<
