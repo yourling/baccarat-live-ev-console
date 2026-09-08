@@ -70,6 +70,13 @@ h1, h2, p { margin: 0; }
 h1 { color: #f4f7fa; font-size: 26px; line-height: 1.15; }
 h2 { color: #f4f7fa; font-size: 18px; }
 .app-subtitle { margin-top: 8px; color: #9cafc0; font-size: 13px; }
+.app-build {
+  margin-top: 6px;
+  color: #8ea3b8;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+}
 
 .header-actions, .row-actions, .badge-line, .system-details__body, .summary-bar, .view-tabs {
   display: flex;

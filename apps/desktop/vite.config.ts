@@ -1,10 +1,12 @@
 import path from 'node:path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import { consoleBuildDefines } from './scripts/console-build-defines.mjs';
 
 export default defineConfig({
   root: __dirname,
   base: './',
+  define: consoleBuildDefines(),
   resolve: {
     alias: {
       'node:crypto': path.resolve(__dirname, 'src/node-crypto-shim.ts'),

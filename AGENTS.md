@@ -10,4 +10,5 @@
 * GPU 真人厅视频页仅限 Windows 桌面端；cos-box / Linux 不得打开视频页（仅文档与守卫，不新增 Linux GPU 视频路径）。
 * 关闭桌面窗口即退出进程，并关闭监控、桥接、保活和账本。不要再假设后台保活窗口。
 * 所有共享契约修改必须谨慎，合并前需同步测试夹具。
+* 中控台版本从 `1.0.0` 起。每次合入修改将 `apps/desktop/src/console-build-info.ts` 的 `CONSOLE_VERSION`、根 `package.json` 与 `apps/desktop/package.json` 的 patch +1（1.0.0 → 1.0.1）。界面与窗口标题显示 `V1.0.0+abc1234`（短 SHA）。
 * 使用 gh 管理仓库操作。

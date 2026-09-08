@@ -9,6 +9,7 @@ import {
   restoreOrCreateMainWindow,
   shouldHideMainWindowOnClose,
 } from './background-lifecycle.js';
+import { formatConsoleBuildLabel } from '../src/console-build-info.js';
 import {
   parseDesktopKeepaliveSettings,
   parseDesktopOperationalWagerCommand,
@@ -44,7 +45,7 @@ async function createWindow(): Promise<void> {
   const win = new BrowserWindow({
     width: 1360,
     height: 900,
-    title: '百家乐实时 EV 中控台',
+    title: `百家乐实时 EV 中控台 ${formatConsoleBuildLabel()}`,
     backgroundColor: '#0b1118',
     show: false,
     webPreferences: {

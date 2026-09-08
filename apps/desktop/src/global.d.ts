@@ -18,6 +18,7 @@ declare global {
   interface ImportMetaEnv {
     readonly DEV: boolean;
     readonly VITE_DISABLE_REACT_DEVTOOLS?: string;
+    readonly VITE_CONSOLE_GIT_SHA?: string;
   }
 
   interface ImportMeta {
