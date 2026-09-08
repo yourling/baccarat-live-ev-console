@@ -1,5 +1,6 @@
 import { rmSync } from 'node:fs';
 import { build } from 'esbuild';
+import { consoleBuildDefines } from './console-build-defines.mjs';
 
 rmSync('electron-dist', { recursive: true, force: true });
 
@@ -15,6 +16,7 @@ await build({
   format: 'cjs',
   target: 'node22',
   external: ['electron', 'better-sqlite3'],
+  define: consoleBuildDefines(),
   sourcemap: true,
   logLevel: 'info',
 });

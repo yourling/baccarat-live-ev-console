@@ -1,6 +1,9 @@
 import React, { Component, type ErrorInfo, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
+import { formatConsoleBuildLabel } from '../console-build-info';
 import { App } from './App.jsx';
+
+document.title = `百家乐实时 EV 中控台 ${formatConsoleBuildLabel()}`;
 
 if (import.meta.env.DEV && import.meta.env.VITE_DISABLE_REACT_DEVTOOLS !== '1') {
   void import('react-grab');

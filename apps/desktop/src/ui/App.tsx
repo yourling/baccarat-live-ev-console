@@ -44,6 +44,7 @@ import { isMissedShuffleRoadCount, monitorDisplayedRoundLabel } from './monitor-
 import { isLiveMonitorRoomId, selectLiveMonitorTableIds } from './monitor-table-selection';
 import { evaluateProjectionPairMarket } from './pair-evaluation';
 import { decisionHandExplanation, planRecordViewChange, recordKindForView, recordTabCount, type ConsoleView } from './record-view';
+import { formatConsoleBuildLabel } from '../console-build-info';
 import './styles.css';
 
 type View = ConsoleView;
@@ -915,6 +916,7 @@ export function App() {
       <header className="app-header">
         <div>
           <h1>百家乐实时监控</h1>
+          <p className="app-build">{formatConsoleBuildLabel()}</p>
         </div>
         <div className="header-actions">
           <button
