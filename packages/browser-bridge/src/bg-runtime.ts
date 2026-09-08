@@ -61,6 +61,8 @@ const GAME_COUNT_CATCH_UP_MAX = 5;
 const MAX_BACCARAT_SHOE_HANDS = 80;
 /** Live bead plate 1-8 stepping +1 while internal is deep: missed the 局1 wrap. */
 const AUTHENTIC_ROAD_STREAK = 5;
+/** A dealt shoe silent this long is shuffling. Missed NEXT_SHOES during stale. */
+const SHUFFLE_IDLE_GAP_MS = 6 * 60 * 1000;
 
 function isRoadWrapToNewShoe(
   previous: number | undefined,
@@ -119,6 +121,23 @@ export function isCredibleBgEndOfShoeShuffle(
     if (isExhaustedShoeRoadDrop(previousRoad, incomingRoad, handsThisShoe)) return true;
   }
   return (handsThisShoe ?? 0) >= DEEP_SHOE_ROAD_MIN;
+}
+
+export function isIdleDealtShoeShuffle(
+  handsThisShoe: number | undefined,
+  lastHandAtMs: number | undefined,
+  observedAtMs: number,
+): boolean {
+  if ((handsThisShoe ?? 0) < ROAD_WRAP_MIN_PREVIOUS) return false;
+  if (lastHandAtMs === undefined || !Number.isFinite(observedAtMs)) return false;
+  return observedAtMs - lastHandAtMs >= SHUFFLE_IDLE_GAP_MS;
+}
+
+function openedPhysicalShoe(events: readonly NormalizedEvent[], tableId: string): boolean {
+  return events.some(event =>
+    event.tableId === tableId
+    && event.type === 'newShoeSignal'
+    && event.baseline === 'physical-shoe');
 }
 
 function isExhaustedShoeRoadDrop(
@@ -454,6 +473,7 @@ export class BgRuntimeParser {
   private readonly lastFeltRoadByTable = new Map<string, number>();
   private readonly authenticRoadStreakByTable = new Map<string, number>();
   private readonly authenticHandsByTable = new Map<string, AuthenticHandCards[]>();
+  private readonly lastHandAtByTable = new Map<string, number>();
 
   stickyBankerLead(tableId: string): string | undefined {
     return this.stickyBankerLeadByTable.get(tableId);
@@ -537,6 +557,7 @@ export class BgRuntimeParser {
     this.lastGameCountByTable.delete(tableId);
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
+    this.lastHandAtByTable.delete(tableId);
     this.evidenceByTable.delete(tableId);
     this.clearAuthenticRoadTracking(tableId);
     this.clearHandState(tableId);
@@ -550,7 +571,12 @@ export class BgRuntimeParser {
     const tableId = normalizeBgTableId(table.tableId);
     if (tableId === undefined) return;
     table = { ...table, tableId };
-    this.ingestShoeReset(table, observedAt, events);
+    const idleShuffle = this.isIdleDealtShoeGap(tableId, observedAt);
+    this.ingestShoeReset(table, observedAt, events, idleShuffle);
+    if (idleShuffle && !openedPhysicalShoe(events, tableId)) {
+      this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
+      this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
+    }
 
     const lastResetSeq = seqFromShoeReset(this.lastShoeResetByTable.get(tableId));
     const historySeq = seqFromShoeReset(table.shoeReset);
@@ -627,10 +653,7 @@ export class BgRuntimeParser {
       }
     }
 
-    const openedPhysical = events.some(event =>
-      event.tableId === tableId
-      && event.type === 'newShoeSignal'
-      && event.baseline === 'physical-shoe');
+    const openedPhysical = openedPhysicalShoe(events, tableId);
     const evidence = this.evidenceByTable.get(tableId);
     const physical = openedPhysical
       || evidence?.reason === 'protocol-shuffle'
@@ -641,10 +664,19 @@ export class BgRuntimeParser {
     // Deep HISTORY after NEXT_SHOES is the previous shoe only when its first
     // seq is still behind the shuffle token. Current-shoe roads of 21-80 must
     // still rebuild inventory or round and remaining cards contradict.
+    // After an idle-gap shuffle the packet often still holds the previous
+    // shoe. Do not backfill those cards onto the new inventory.
+    const previousShoeHistory = openedPhysical
+      && idleShuffle
+      && historyHands.length > EARLY_SHOE_ROAD_MAX
+      && (gameCount === undefined
+        || gameCount <= ROAD_WRAP_MAX
+        || historyHands.length - gameCount >= ROAD_WRAP_MIN_DROP);
     const canReplayHistory = physical
       && historyHands.length > 0
       && historyHands.length <= MAX_BACCARAT_SHOE_HANDS
       && !laggedPreviousShoeRoad
+      && !previousShoeHistory
       && (openedPhysical || historyHands.length > trackedHands);
     if (canReplayHistory) {
       const replayLiveSeq = parseHandSeq(this.lastRoundByTable.get(tableId));
@@ -735,7 +767,7 @@ export class BgRuntimeParser {
     } else if (previousHandId === undefined) {
       this.handsThisShoeByTable.set(tableId, 1);
     }
-    this.lastRoundByTable.set(tableId, handId);
+    this.setLastRound(tableId, handId, observedAt);
 
     const emptyOpenBoundary = table.bettingOpen === true
       && playerCards.length === 0
@@ -791,6 +823,7 @@ export class BgRuntimeParser {
     table: BgTableSnapshot,
     observedAt: string,
     events: NormalizedEvent[],
+    idleShuffle = false,
   ): void {
     const tableId = table.tableId;
     const token = typeof table.shoeReset === 'string' && table.shoeReset.length > 0
@@ -820,6 +853,7 @@ export class BgRuntimeParser {
       // HISTORY stamps shoeReset as seq:<first visible gameId>. That first id
       // walks forward during a live shoe. Treat it as drift, not a shuffle.
       const seqDrift = !shuffleEvent
+        && !idleShuffle
         && previousSeq !== undefined
         && nextSeq !== undefined
         && nextSeq > previousSeq
@@ -839,6 +873,7 @@ export class BgRuntimeParser {
         const handsThisShoe = this.handsThisShoeByTable.get(tableId);
         if (
           !alreadyPhysical
+          || idleShuffle
           || isCredibleBgEndOfShoeShuffle(previousRoad, incomingRoad, handsThisShoe)
         ) {
           this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
@@ -856,10 +891,27 @@ export class BgRuntimeParser {
       const incomingRoad = Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1
         ? table.gameCount
         : undefined;
-      if (isCredibleBgEndOfShoeShuffle(previousRoad, incomingRoad, this.handsThisShoeByTable.get(tableId))) {
+      if (
+        idleShuffle
+        || isCredibleBgEndOfShoeShuffle(previousRoad, incomingRoad, this.handsThisShoeByTable.get(tableId))
+      ) {
         this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
       }
     }
+  }
+
+  private isIdleDealtShoeGap(tableId: string, observedAt: string): boolean {
+    return isIdleDealtShoeShuffle(
+      this.handsThisShoeByTable.get(tableId),
+      this.lastHandAtByTable.get(tableId),
+      Date.parse(observedAt),
+    );
+  }
+
+  private setLastRound(tableId: string, handId: string, observedAt: string): void {
+    this.lastRoundByTable.set(tableId, handId);
+    const at = Date.parse(observedAt);
+    if (Number.isFinite(at)) this.lastHandAtByTable.set(tableId, at);
   }
 
   private hasVerifiedPhysicalEvidence(tableId: string): boolean {
@@ -1005,6 +1057,7 @@ export class BgRuntimeParser {
     this.historyFirstSeqByTable.delete(tableId);
     this.handsThisShoeByTable.delete(tableId);
     this.lastRoundByTable.delete(tableId);
+    this.lastHandAtByTable.delete(tableId);
     this.evidenceByTable.delete(tableId);
     this.clearAuthenticRoadTracking(tableId);
     this.bankerLeadByTable.delete(tableId);
@@ -1067,7 +1120,7 @@ export class BgRuntimeParser {
       const playerCards = parseCards(hand.playerCards);
       const bankerCards = parseCards(hand.bankerCards);
       this.handsThisShoeByTable.set(tableId, index + 1);
-      this.lastRoundByTable.set(tableId, handId);
+      this.setLastRound(tableId, handId, observedAt);
       const handKey = `${tableId}:${handId}`;
       if (this.settledHands.has(handKey)) continue;
       this.cardsByHand.set(handKey, { playerCards, bankerCards, source: 'protocol' });
