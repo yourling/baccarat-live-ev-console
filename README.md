@@ -6,7 +6,7 @@
 
 **截至 2026-09-01，代码层已经形成采集、对子 EV、受控执行、保活、结算和收益统计的完整链路，但真实资金发布仍未批准。** 当前只允许隔离、非资金的集成与长稳验证；不要把 `live`、`liveOn`、页面执行器或无人值守恢复能力视为资金使用许可。
 
-- 对子 EV 策略与庄对/闲对单次 `BetIntent` 经过 `TableActor`、`RiskManager`、reservation、桥接回执、结算，以及按桌/靴/局/市场的重复保护。自动对子只在有效 `physical-shoe`（protocol-shuffle / road-wrap / 人工确认）上评估；第一次见到 shoeReset、待牌靴或 `unknown-monitor-session` 时不下对子，避免假 EV 和 `UNKNOWN` 回执。路子 #55 配剩余 407 张这种入桌数字不得当成 8 副新靴。
+- 对子 EV 策略与庄对/闲对单次 `BetIntent` 经过 `TableActor`、`RiskManager`、reservation、桥接回执、结算，以及按桌/靴/局/市场的重复保护。自动对子只在有效 `physical-shoe`（protocol-shuffle / road-wrap / 人工确认）上评估；已打过的靴空窗约 6 分钟后恢复也按漏掉的洗牌开新靴。第一次见到 shoeReset、待牌靴或 `unknown-monitor-session` 时不下对子，避免假 EV 和 `UNKNOWN` 回执。路子 #55 配剩余 407 张这种入桌数字不得当成 8 副新靴。
 - 四市场 `OperationalWager` 支持 `banker`、`player`、`bankerPair` 和 `playerPair`，用于手动操作与庄/闲保活。它也统一进入同一 actor/风控/reservation/结算链路，并按桌/靴/局/市场/来源防重。当前受控路径要求 `executionMode === 'live'`。
 - 页头「开启保活」与「开启自动投注」互相独立：保活只打庄/闲，对子策略只打庄对/闲对。保活不再扫完整监控列表，只在刚开盘的那一桌尝试；窗口剩余不足 5 秒或没有 `closesAt` 则跳过，并进入约 10 秒冷却后再试下一窗，不因此更新间隔计时。
 - 所有可到达平台的请求都要求 `physical-shoe`、已连接投影、当前下注窗口、未封靴和可用桥接。对子自动/one-shot/手动对子还要求窗口剩余至少 3 秒（`closesAt` 缺失则不评估）；窗口未就绪且未提交（`commitStarted===false`）的预提交拒绝可在同一局重试，已提交则标 UNKNOWN。`UNKNOWN` 会保留风险敞口并阻断当事桌后续执行，不把单桌未知敞口当成全局保活开关关闭；新一局出现上一局未结算 reservation 时同样失败关闭该桌。

@@ -626,6 +626,118 @@ describe('BgRuntimeParser', () => {
     expect(parser.acceptedGameCount('B01')).toBe(18);
   });
 
+  it('opens a new physical shoe after a dealt shoe is silent for a shuffle-length gap', () => {
+    const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'A31',
+      roundId: '1187231',
+      shoeReset: 'seq:1187231',
+      source: 'protocol',
+    }], '2026-09-08T08:18:09.000Z'));
+    parser.parse(snapshot([{
+      tableId: 'A31',
+      shuffleEvent: true,
+      shoeReset: 'seq:1187231b',
+      source: 'protocol',
+    }], '2026-09-08T08:18:10.000Z'));
+    const physicalId = parser.currentShoeId('A31');
+    expect(physicalId).toBe('bg-A31-2');
+    for (let hand = 0; hand < 49; hand += 1) {
+      const at = new Date(Date.parse('2026-09-08T08:27:37.000Z') + hand * 50_000).toISOString();
+      parser.parse(snapshot([{
+        tableId: 'A31',
+        roundId: String(1187231 + hand),
+        gameCount: hand + 1,
+        bettingOpen: true,
+        shoeReset: `seq:${1187231 + hand}`,
+        playerCards: ['AS', '2S'],
+        bankerCards: ['KH', '5C'],
+        source: 'protocol',
+      }], at));
+    }
+    expect(parser.currentShoeId('A31')).toBe(physicalId);
+
+    const resumed = parser.parse(snapshot([{
+      tableId: 'A31',
+      roundId: '1187280',
+      gameCount: 8,
+      bettingOpen: true,
+      shoeReset: 'seq:1187280',
+      playerCards: ['3C', '4D'],
+      bankerCards: ['7H', '9S'],
+      source: 'protocol',
+    }], '2026-09-08T09:18:23.000Z'));
+    expect(resumed.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({ baseline: 'physical-shoe', tableId: 'A31' }),
+    ]);
+    expect(parser.shoeEvidence('A31')?.reason).toBe('protocol-shuffle');
+    expect(parser.currentShoeId('A31')).toBe('bg-A31-3');
+    const liveCards = resumed.filter(event =>
+      event.type === 'cardObserved' || event.type === 'handSettled' || event.type === 'bettingWindowOpened');
+    expect(liveCards.length).toBeGreaterThan(0);
+    expect(liveCards.every(event => event.shoeId === 'bg-A31-3')).toBe(true);
+  });
+
+  it('does not treat a 15s feed flap on a dealt shoe as a shuffle', () => {
+    const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'A31',
+      roundId: '1187231',
+      shoeReset: 'seq:1',
+      source: 'protocol',
+    }], '2026-09-08T08:18:09.000Z'));
+    parser.parse(snapshot([{
+      tableId: 'A31',
+      shuffleEvent: true,
+      shoeReset: 'seq:2',
+      source: 'protocol',
+    }], '2026-09-08T08:18:10.000Z'));
+    for (let hand = 0; hand < 49; hand += 1) {
+      parser.parse(snapshot([{
+        tableId: 'A31',
+        roundId: String(1187231 + hand),
+        gameCount: hand + 1,
+        bettingOpen: true,
+        source: 'protocol',
+      }], new Date(Date.parse('2026-09-08T08:27:37.000Z') + hand * 50_000).toISOString()));
+    }
+    const sameShoe = parser.parse(snapshot([{
+      tableId: 'A31',
+      roundId: '1187280',
+      gameCount: 50,
+      bettingOpen: true,
+      source: 'protocol',
+    }], '2026-09-08T09:08:21.000Z'));
+    expect(sameShoe.filter(event => event.type === 'newShoeSignal')).toEqual([]);
+    expect(parser.currentShoeId('A31')).toBe('bg-A31-2');
+  });
+
+  it('does not open a new shoe after a long gap on an early undealt attach', () => {
+    const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'A31',
+      roundId: '1187231',
+      shoeReset: 'seq:1',
+      source: 'protocol',
+    }], '2026-09-08T08:18:09.000Z'));
+    for (let hand = 0; hand < 3; hand += 1) {
+      parser.parse(snapshot([{
+        tableId: 'A31',
+        roundId: String(1187231 + hand),
+        bettingOpen: true,
+        source: 'protocol',
+      }], new Date(Date.parse('2026-09-08T08:18:10.000Z') + hand * 50_000).toISOString()));
+    }
+    const resumed = parser.parse(snapshot([{
+      tableId: 'A31',
+      roundId: '1187234',
+      bettingOpen: true,
+      source: 'protocol',
+    }], '2026-09-08T08:28:10.000Z'));
+    expect(resumed.filter(event => event.type === 'newShoeSignal' && event.baseline === 'physical-shoe')).toEqual([]);
+    expect(parser.currentShoeId('A31')).toBe('bg-A31-1');
+  });
+
   it('opens a physical shoe on a road wrap from 48 to 5', () => {
     const parser = new BgRuntimeParser();
     parser.parse(snapshot([{
