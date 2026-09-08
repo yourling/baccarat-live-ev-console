@@ -1541,6 +1541,65 @@ describe('desktop console demo sessions', () => {
     }
   });
 
+  it('applies unified EV settings when a factory-default pending table is promoted', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const unified = {
+      minEV: 0.05,
+      defaultBetAmount: 20,
+      betTiers: [
+        { minEV: 0.15, amount: 40 },
+        { minEV: 0.2, amount: 60 },
+      ],
+    };
+    try {
+      await service.updateMonitorTableIds(['A01']);
+      await service.updateAllTableSettings(unified);
+      service['orchestrator'].registerTable(defaultProfile('A23'), 'live', 100);
+      expect(service['orchestrator'].getActor('A23')?.snapshot()).toEqual(expect.objectContaining({
+        defaultBetAmount: 100,
+        profile: expect.objectContaining({ minEV: 0, betTiers: [] }),
+      }));
+      service['liveMonitorActivated'] = true;
+      service['promotePendingTable']('A23');
+      const promoted = service['orchestrator'].getActor('A23')?.snapshot();
+      expect(service.snapshot().monitorTableIds).toContain('A23');
+      expect(promoted?.profile.minEV).toBe(0.05);
+      expect(promoted?.defaultBetAmount).toBe(20);
+      expect(promoted?.profile.betTiers).toEqual(unified.betTiers);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('heals a monitored factory-default table from persisted unified settings on restart', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'baccarat-unified-bet-'));
+    const dbPath = join(dir, 'console.sqlite');
+    const unified = {
+      minEV: 0.05,
+      defaultBetAmount: 20,
+      betTiers: [{ minEV: 0.15, amount: 40 }],
+    };
+    const first = new DesktopConsoleService(dbPath);
+    try {
+      await first.updateMonitorTableIds(['A01', 'A23']);
+      await first.updateAllTableSettings(unified);
+      await first.updateTableSettings('A23', { minEV: 0, defaultBetAmount: 100, betTiers: [] });
+      expect(first['orchestrator'].getActor('A23')?.snapshot().defaultBetAmount).toBe(100);
+    } finally {
+      await first.close();
+    }
+    const restarted = new DesktopConsoleService(dbPath);
+    try {
+      const healed = restarted['orchestrator'].getActor('A23')?.snapshot();
+      expect(healed?.profile.minEV).toBe(0.05);
+      expect(healed?.defaultBetAmount).toBe(20);
+      expect(healed?.profile.betTiers).toEqual(unified.betTiers);
+    } finally {
+      await restarted.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('requires an explicit extension gate before enabling live execution for one table', async () => {
     // Given: the table is monitored in shadow mode and the extension command channel is available.
     const service = new DesktopConsoleService(':memory:');

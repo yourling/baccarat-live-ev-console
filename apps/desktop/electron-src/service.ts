@@ -87,6 +87,7 @@ const RETIRED_DEFAULT_MONITOR_TABLE_IDS = ['bc281koreanch281', 'tobcbaccaragen92
 const MONITOR_TABLE_CONFIG_KEY = 'desktop:monitor-tables:v1';
 const AUTOMATION_CONFIG_KEY = 'desktop:pair-automation:v1';
 const TABLE_METADATA_CONFIG_KEY = 'desktop:table-metadata:v1';
+const UNIFIED_BET_SETTINGS_CONFIG_KEY = 'desktop:unified-bet-settings:v1';
 const LEGACY_MONITOR_TABLE_ID_PATTERN = /^[A-Z]{1,4}\d{2,6}$/i;
 const PRAGMATIC_MONITOR_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
 const DISCONNECTED_MONITOR_REMOVAL_MS = 15_000;
@@ -115,6 +116,8 @@ type StoredTableMetadata = {
 type TableMetadataConfig = {
   readonly tables: readonly StoredTableMetadata[];
 };
+
+type UnifiedBetSettings = Pick<TableSettingsUpdate, 'minEV' | 'betTiers' | 'defaultBetAmount'>;
 
 interface OneShotLiveBetActor {
   placeOneShotBet(command: OneShotBetCommand): Promise<OneShotBetResult>;
@@ -243,6 +246,50 @@ function automationEnabledFromConfig(value: unknown): boolean {
   return typeof value === 'object' && value !== null && Reflect.get(value, 'enabled') === true;
 }
 
+function cloneUnifiedBetSettings(settings: UnifiedBetSettings): UnifiedBetSettings {
+  return {
+    minEV: settings.minEV,
+    defaultBetAmount: settings.defaultBetAmount,
+    betTiers: settings.betTiers.map(tier => ({ ...tier })),
+  };
+}
+
+function isFactoryUnifiedBetSettings(settings: UnifiedBetSettings): boolean {
+  return settings.minEV === 0
+    && settings.defaultBetAmount === 100
+    && settings.betTiers.length === 0;
+}
+
+function sameUnifiedBetSettings(left: UnifiedBetSettings, right: UnifiedBetSettings): boolean {
+  return left.minEV === right.minEV
+    && left.defaultBetAmount === right.defaultBetAmount
+    && left.betTiers.length === right.betTiers.length
+    && left.betTiers.every((tier, index) =>
+      tier.minEV === right.betTiers[index]?.minEV && tier.amount === right.betTiers[index]?.amount);
+}
+
+function unifiedBetSettingsFromConfig(value: unknown): UnifiedBetSettings | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const minEV = Reflect.get(value, 'minEV');
+  const defaultBetAmount = Reflect.get(value, 'defaultBetAmount');
+  const betTiers = Reflect.get(value, 'betTiers');
+  if (typeof minEV !== 'number' || !Number.isFinite(minEV) || minEV < 0) return undefined;
+  if (typeof defaultBetAmount !== 'number' || !Number.isFinite(defaultBetAmount) || defaultBetAmount <= 0) {
+    return undefined;
+  }
+  if (!Array.isArray(betTiers)) return undefined;
+  const tiers: UnifiedBetSettings['betTiers'] = [];
+  for (const tier of betTiers) {
+    if (typeof tier !== 'object' || tier === null) return undefined;
+    const tierMinEV = Reflect.get(tier, 'minEV');
+    const amount = Reflect.get(tier, 'amount');
+    if (typeof tierMinEV !== 'number' || !Number.isFinite(tierMinEV) || tierMinEV < 0) return undefined;
+    if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) return undefined;
+    tiers.push({ minEV: tierMinEV, amount });
+  }
+  return { minEV, defaultBetAmount, betTiers: tiers };
+}
+
 function defaultMonitorTableIds(): string[] {
   const rawTableIds = String(process.env.BACCARAT_LIVE_TABLES || '')
     .split(',')
@@ -352,6 +399,7 @@ export class DesktopConsoleService {
   private pendingMonitorTableIds?: readonly string[];
   /** Operator-managed, persisted ordered selection; mutation is the configuration operation. */
   private monitorTableIds: string[];
+  private unifiedBetSettings?: UnifiedBetSettings;
 
   constructor(readonly dbPath: string) {
     this.ledger = new SqliteLedger(dbPath);
@@ -448,6 +496,13 @@ export class DesktopConsoleService {
       this.ledger.getConfig<unknown>(AUTOMATION_CONFIG_KEY),
     );
     this.normalizeEvFloor();
+    this.unifiedBetSettings = unifiedBetSettingsFromConfig(
+      this.ledger.getConfig<unknown>(UNIFIED_BET_SETTINGS_CONFIG_KEY),
+    ) ?? this.deriveUnifiedBetSettingsFromMonitoredTables();
+    if (this.unifiedBetSettings !== undefined) {
+      this.ledger.setConfig(UNIFIED_BET_SETTINGS_CONFIG_KEY, cloneUnifiedBetSettings(this.unifiedBetSettings));
+      this.applyUnifiedBetSettingsToTables(this.monitorTableIds);
+    }
     this.startupFailCloseTask = this.initializeFailClosedRuntime();
     this.refreshAccountingIncidents();
   }
@@ -700,42 +755,73 @@ export class DesktopConsoleService {
 
   private ensureMonitorActors(
     tableIds: readonly string[],
-    inheritedSettings?: Pick<TableSettingsUpdate, 'minEV' | 'betTiers' | 'defaultBetAmount'>,
+    inheritedSettings?: UnifiedBetSettings,
   ): void {
+    const settings = inheritedSettings ?? this.currentUnifiedTableSettings();
     for (const tableId of tableIds) {
       if (!this.orchestrator.getActor(tableId)) {
         const profile = defaultProfile(tableId);
         this.orchestrator.registerTable(
-          inheritedSettings === undefined
+          settings === undefined
             ? profile
             : {
                 ...profile,
-                minEV: inheritedSettings.minEV,
-                betTiers: inheritedSettings.betTiers.map(tier => ({ ...tier })),
+                minEV: settings.minEV,
+                betTiers: settings.betTiers.map(tier => ({ ...tier })),
               },
           'live',
-          inheritedSettings?.defaultBetAmount ?? 100,
+          settings?.defaultBetAmount ?? 100,
         );
-      } else if (this.orchestrator.getActor(tableId)?.snapshot().executionMode !== 'live') {
-        this.orchestrator.updateTableExecutionMode(tableId, 'live');
+      } else {
+        if (this.orchestrator.getActor(tableId)?.snapshot().executionMode !== 'live') {
+          this.orchestrator.updateTableExecutionMode(tableId, 'live');
+        }
+        this.applyUnifiedBetSettingsToTables([tableId]);
       }
     }
   }
 
-  private currentUnifiedTableSettings(): Pick<
-    TableSettingsUpdate,
-    'minEV' | 'betTiers' | 'defaultBetAmount'
-  > | undefined {
+  private currentUnifiedTableSettings(): UnifiedBetSettings | undefined {
+    if (this.unifiedBetSettings !== undefined) return cloneUnifiedBetSettings(this.unifiedBetSettings);
+    return this.deriveUnifiedBetSettingsFromMonitoredTables();
+  }
+
+  private deriveUnifiedBetSettingsFromMonitoredTables(): UnifiedBetSettings | undefined {
+    let fallback: UnifiedBetSettings | undefined;
     for (const tableId of this.monitorTableIds) {
       const table = this.orchestrator.getActor(tableId)?.snapshot();
       if (table === undefined) continue;
-      return {
+      const candidate: UnifiedBetSettings = {
         minEV: table.profile.minEV,
         betTiers: (table.profile.betTiers ?? []).map(tier => ({ ...tier })),
         defaultBetAmount: table.defaultBetAmount,
       };
+      if (!isFactoryUnifiedBetSettings(candidate)) return candidate;
+      fallback ??= candidate;
     }
-    return undefined;
+    return fallback;
+  }
+
+  private persistUnifiedBetSettings(settings: UnifiedBetSettings): void {
+    this.unifiedBetSettings = cloneUnifiedBetSettings(settings);
+    this.ledger.setConfig(UNIFIED_BET_SETTINGS_CONFIG_KEY, cloneUnifiedBetSettings(settings));
+  }
+
+  private applyUnifiedBetSettingsToTables(tableIds: readonly string[]): void {
+    const settings = this.currentUnifiedTableSettings();
+    if (settings === undefined) return;
+    for (const tableId of tableIds) {
+      const actor = this.orchestrator.getActor(tableId);
+      if (!actor) continue;
+      const snapshot = actor.snapshot();
+      const current: UnifiedBetSettings = {
+        minEV: snapshot.profile.minEV,
+        betTiers: (snapshot.profile.betTiers ?? []).map(tier => ({ ...tier })),
+        defaultBetAmount: snapshot.defaultBetAmount,
+      };
+      if (sameUnifiedBetSettings(current, settings)) continue;
+      this.orchestrator.updateTableSettings(tableId, cloneUnifiedBetSettings(settings));
+    }
   }
 
   private normalizeEvFloor(): void {
@@ -1913,11 +1999,21 @@ export class DesktopConsoleService {
         if (!selectedTableIds.has(table.tableId) || !this.isObservedTable(table.tableId)) continue;
         if (this.liveFeeds.has(table.tableId)) continue;
         if (!this.orchestrator.getActor(table.tableId)) {
+          const settings = this.currentUnifiedTableSettings();
           const profile = defaultProfile(table.tableId);
+          const merged = table.profile === undefined
+            ? profile
+            : { ...profile, ...table.profile, tableId: table.tableId };
           this.orchestrator.registerTable(
-            table.profile === undefined ? profile : { ...profile, ...table.profile, tableId: table.tableId },
+            settings === undefined
+              ? merged
+              : {
+                  ...merged,
+                  minEV: settings.minEV,
+                  betTiers: settings.betTiers.map(tier => ({ ...tier })),
+                },
             this.liveExecutionMode,
-            100,
+            settings?.defaultBetAmount ?? 100,
           );
         }
         this.cancelDisconnectedMonitorRemoval(table.tableId);
@@ -2395,12 +2491,14 @@ export class DesktopConsoleService {
     if (this.monitorTableIds.length === 0) {
       throw new Error('at least one monitored table is required');
     }
-    this.ensureMonitorActors(this.monitorTableIds);
-    this.orchestrator.updateTableSettingsForTables(this.monitorTableIds, {
+    const unified: UnifiedBetSettings = {
       minEV: Math.max(0, settings.minEV),
-      betTiers: settings.betTiers,
+      betTiers: settings.betTiers.map(tier => ({ ...tier })),
       defaultBetAmount: settings.defaultBetAmount,
-    });
+    };
+    this.persistUnifiedBetSettings(unified);
+    this.ensureMonitorActors(this.monitorTableIds, unified);
+    this.orchestrator.updateTableSettingsForTables(this.monitorTableIds, unified);
     return this.snapshot();
   }
 
