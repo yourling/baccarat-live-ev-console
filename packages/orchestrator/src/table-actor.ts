@@ -236,6 +236,8 @@ export class TableActor {
     this.projection = emptyProjection(this.tableId);
     this.evaluatedWindows.clear();
     this.pausedDecisionKeys.clear();
+    this.lastSettledHandSeq = undefined;
+    this.missingUnobservedCards = 0;
   }
 
   setExecutor(executor: Pick<BrowserAdapter, 'requestBet'> | null): void {

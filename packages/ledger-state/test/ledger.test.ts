@@ -1934,22 +1934,66 @@ describe('monitor history retention', () => {
     ledger.close();
   });
 
-  it('drops previous-process table feed but keeps money rows', () => {
+  it('keeps previous-process table feed for audit but excludes it from live replay', () => {
     const ledger = new SqliteLedger();
+    const profile = { ...defaultProfile('t1'), autoConfirmNewShoe: true };
+    ledger.appendEvent(ev({
+      type: 'newShoeSignal',
+      shoeId: 'bg-A01-3',
+      baseline: 'physical-shoe',
+      profile,
+    }, 1));
     ledger.appendEvent(ev({
       type: 'handSettled',
-      shoeId: 'shoe-1',
+      shoeId: 'bg-A01-3',
       handId: 'h1',
       playerCards: [{ rank: 'A', suit: 'S' }, { rank: '2', suit: 'H' }],
       bankerCards: [{ rank: '3', suit: 'C' }, { rank: '4', suit: 'D' }],
       outcomes: { playerPair: false, bankerPair: false },
-    }, 1));
+    }, 2));
     ledger.saveDecision(decision('d1', 'h1', 'bankerPair', false, '2026-09-07T01:00:00.000Z'));
-    expect(ledger.countEvents()).toBeGreaterThan(0);
-    expect(ledger.listDecisions('t1')).toHaveLength(1);
+    expect(ledger.replay('t1', { latestShoeOnly: true }).state.get('t1')?.shoeId).toBe('bg-A01-3');
     ledger.abandonPreviousProcessTableFeed();
-    expect(ledger.countEvents()).toBe(0);
-    expect(ledger.listDecisions('t1')).toHaveLength(0);
+    expect(ledger.countEvents()).toBe(2);
+    expect(ledger.listDecisions('t1')).toHaveLength(1);
+    expect(ledger.listEvents('t1').map(event => event.type)).toEqual(['newShoeSignal', 'handSettled']);
+    expect(ledger.listBgShoeGenerations()).toEqual([{ tableId: 'A01', sequence: 3 }]);
+    expect(ledger.replay('t1', { latestShoeOnly: true }).state.get('t1')).toBeUndefined();
+    ledger.close();
+  });
+
+  it('replays only this-process shoe after abandoning previous-process feed', () => {
+    const ledger = new SqliteLedger();
+    const profile = { ...defaultProfile('t1'), autoConfirmNewShoe: true };
+    ledger.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'shoe-old', profile }, 1));
+    ledger.appendEvent(ev({
+      type: 'handSettled',
+      shoeId: 'shoe-old',
+      handId: 'old-h',
+      playerCards: [{ rank: 'A' }, { rank: '2' }],
+      bankerCards: [{ rank: '3' }, { rank: '4' }],
+    }, 2));
+    ledger.abandonPreviousProcessTableFeed();
+    ledger.appendEvent(ev({ type: 'newShoeSignal', shoeId: 'shoe-new', profile }, 3));
+    ledger.appendEvent(ev({
+      type: 'handSettled',
+      shoeId: 'shoe-new',
+      handId: 'new-h',
+      playerCards: [{ rank: 'K' }, { rank: 'Q' }],
+      bankerCards: [{ rank: 'J' }, { rank: '10' }],
+    }, 4));
+    expect(ledger.listEvents('t1').map(event => (
+      'shoeId' in event ? event.shoeId : undefined
+    ))).toEqual([
+      'shoe-old',
+      'shoe-old',
+      'shoe-new',
+      'shoe-new',
+    ]);
+    const projection = ledger.replay('t1', { latestShoeOnly: true }).state.get('t1');
+    expect(projection?.shoeId).toBe('shoe-new');
+    expect(projection?.seenCards).toHaveLength(4);
+    expect(projection?.seenCards.map(card => card.rank)).toEqual(['K', 'Q', 'J', '10']);
     ledger.close();
   });
 });

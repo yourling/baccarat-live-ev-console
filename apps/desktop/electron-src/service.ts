@@ -407,6 +407,8 @@ export class DesktopConsoleService {
     const repairedAcceptedReservations = this.ledger
       .restoreInvalidlyExpiredAcceptedOperationalReservations();
     this.ledger.pruneTransientHistory();
+    // Keep audit events/decisions; live actor replay skips previous-process rows.
+    this.ledger.abandonPreviousProcessTableFeed();
     this.currentExecutor = null;
     this.orchestrator = new Orchestrator({
       ledger: this.ledger,
@@ -471,7 +473,6 @@ export class DesktopConsoleService {
         settlement,
       );
     }
-    this.ledger.abandonPreviousProcessTableFeed();
     this.orchestrator.resetLiveShoeTracking();
     const persistedLiveTableIds = Object.values(this.orchestrator.listTableConfigs())
       .filter(config => config.executionMode === 'live')

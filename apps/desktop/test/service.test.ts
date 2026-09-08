@@ -3253,15 +3253,70 @@ describe('desktop console demo sessions', () => {
         baseline: 'physical-shoe',
         profile: defaultProfile('D055'),
       });
+      await first.injectEvent({
+        type: 'handSettled',
+        eventId: 'settled-1',
+        tableId: 'D055',
+        timestamp: '2026-09-07T01:00:30.000Z',
+        sourceSeq: 2,
+        source: 'test',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        shoeId: 'shoe-D055',
+        handId: 'h1',
+        playerCards: [{ rank: 'A', suit: 'S' }, { rank: '2', suit: 'H' }],
+        bankerCards: [{ rank: 'K', suit: 'C' }, { rank: '3', suit: 'D' }],
+        outcomes: { bankerPair: false, playerPair: false },
+      });
+      first['ledger'].saveDecision({
+        snapshotId: 'd-h1',
+        tableId: 'D055',
+        shoeId: 'shoe-D055',
+        handId: 'h1',
+        market: 'bankerPair',
+        eventWatermark: 1,
+        profileVersion: 1,
+        modelRevision: 'model-1',
+        pMean: 0.12,
+        pLower: 0.10,
+        evMean: 0.32,
+        evLower: 0.20,
+        eligible: true,
+        reason: 'threshold-met',
+        conservativePolicy: 'worst-case-burn-composition-v1',
+        createdAt: '2026-09-07T01:00:10.000Z',
+      });
       expect(first.snapshot().snapshot.tables.D055?.projection.shoeBaseline).toBe('physical-shoe');
       await first.close();
       const restarted = new DesktopConsoleService(dbPath);
       try {
-        expect(restarted.snapshot().events).toEqual([]);
+        expect(restarted.snapshot().events).toEqual(expect.arrayContaining([
+          expect.objectContaining({ type: 'newShoeSignal', shoeId: 'shoe-D055' }),
+          expect.objectContaining({ type: 'handSettled', handId: 'h1' }),
+        ]));
+        expect(restarted.queryRecords({ kind: 'decisions', page: 1, pageSize: 20 })).toEqual(
+          expect.objectContaining({
+            kind: 'decisions',
+            total: 1,
+            decisions: [expect.objectContaining({
+              tableId: 'D055',
+              shoeId: 'shoe-D055',
+              handId: 'h1',
+              eligible: true,
+              evLower: 0.20,
+            })],
+          }),
+        );
         const projection = restarted.snapshot().snapshot.tables.D055?.projection;
         expect(projection?.shoeBaseline).toBe('unknown-monitor-session');
+        expect(projection?.shoeId).toBe('');
         expect(projection?.seenCards).toEqual([]);
         expect(restarted.snapshot().monitorTableIds).toContain('D055');
+        const config = restarted['orchestrator'].listTableConfigs().D055!;
+        restarted['orchestrator'].registerTable(config.profile, 'live', config.defaultBetAmount);
+        const recreated = restarted['orchestrator'].getActor('D055')?.getProjection();
+        expect(recreated?.shoeId).toBe('');
+        expect(recreated?.shoeBaseline).toBe('unknown-monitor-session');
+        expect(recreated?.seenCards).toEqual([]);
       } finally {
         await restarted.close();
       }

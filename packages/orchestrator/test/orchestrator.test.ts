@@ -1518,6 +1518,88 @@ describe('table actor dedupe key retention', () => {
 });
 
 
+describe('resetLiveShoeTracking', () => {
+  it('forgets live inventory and missing-card counters without deleting ledger rows', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile = {
+      ...simProfile('t1'),
+      autoConfirmNewShoe: true,
+      autoBetArmedByDefault: false,
+    };
+    const orchestrator = new Orchestrator({ ledger, riskLimits });
+    const actor = orchestrator.registerTable(profile, 'live', 10);
+    await orchestrator.enqueue('t1', {
+      type: 'newShoeSignal',
+      eventId: 'shoe-physical',
+      tableId: 't1',
+      timestamp: '2026-09-08T01:00:00.000Z',
+      sourceSeq: 1,
+      source: 'bg-runtime',
+      schemaVersion: 1,
+      shoeId: 'bg-t1-2',
+      baseline: 'physical-shoe',
+      profile,
+    } as NormalizedEvent);
+    await orchestrator.enqueue('t1', {
+      type: 'handSettled',
+      eventId: 'settled-10',
+      tableId: 't1',
+      timestamp: '2026-09-08T01:01:00.000Z',
+      sourceSeq: 2,
+      source: 'bg-runtime',
+      schemaVersion: 1,
+      shoeId: 'bg-t1-2',
+      handId: '10',
+      playerCards: [{ rank: 'A', suit: 'S', raw: 'AS' }, { rank: '8', suit: 'H', raw: '8H' }],
+      bankerCards: [{ rank: 'K', suit: 'D', raw: 'KD' }, { rank: '7', suit: 'C', raw: '7C' }],
+    } as NormalizedEvent);
+    await orchestrator.enqueue('t1', {
+      type: 'handSettled',
+      eventId: 'settled-12',
+      tableId: 't1',
+      timestamp: '2026-09-08T01:02:00.000Z',
+      sourceSeq: 3,
+      source: 'bg-runtime',
+      schemaVersion: 1,
+      shoeId: 'bg-t1-2',
+      handId: '12',
+      playerCards: [{ rank: '2', suit: 'S', raw: '2S' }, { rank: '3', suit: 'H', raw: '3H' }],
+      bankerCards: [{ rank: '4', suit: 'D', raw: '4D' }, { rank: '5', suit: 'C', raw: '5C' }],
+    } as NormalizedEvent);
+    await actor.flush();
+    expect(actor.getProjection().shoeId).toBe('bg-t1-2');
+    expect(actor.missingUnobservedCardCount()).toBe(6);
+    ledger.saveDecision({
+      snapshotId: 'd-keep',
+      tableId: 't1',
+      shoeId: 'bg-t1-2',
+      handId: '10',
+      market: 'bankerPair',
+      eventWatermark: 1,
+      profileVersion: 1,
+      modelRevision: 'model-1',
+      pMean: 0.1,
+      pLower: 0.08,
+      evMean: 0.2,
+      evLower: 0.1,
+      eligible: true,
+      reason: 'threshold-met',
+      conservativePolicy: 'worst-case-burn-composition-v1',
+      createdAt: '2026-09-08T01:00:30.000Z',
+    });
+
+    orchestrator.resetLiveShoeTracking();
+
+    expect(actor.getProjection().shoeId).toBe('');
+    expect(actor.getProjection().shoeBaseline).toBe('unknown-monitor-session');
+    expect(actor.getProjection().seenCards).toEqual([]);
+    expect(actor.missingUnobservedCardCount()).toBe(0);
+    expect(ledger.listEvents('t1')).toHaveLength(3);
+    expect(ledger.listDecisions('t1')).toHaveLength(1);
+    ledger.close();
+  });
+});
+
 describe('restart attach must not wipe a rebuilt physical shoe', () => {
   it('ignores an unknown attach shoe and keeps ledger inventory', async () => {
     const { ledger, riskLimits } = makeContext();

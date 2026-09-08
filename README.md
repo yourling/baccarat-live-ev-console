@@ -21,9 +21,9 @@
 - 精确组合概率、烧牌后验、保守 EV，以及从剩余库存直接评估（`packages/probability`）
 - 契约与输入校验（`packages/contracts`，`EVENT_SCHEMA_VERSION=1`）
 - SQLite（better-sqlite3 + WAL）事件账本、投影、重放（`packages/ledger-state`，账本 schema `5`）
-- 牌面热路径留内存：`cardObserved` 不落 SQLite，当前靴牌面全留内存；SQLite 只持久化新靴/结算/回执/决策和少量窗口事件，并做 WAL 自动回收
+- 牌面热路径留内存：`cardObserved` 不落 SQLite，当前靴牌面全留内存；SQLite 持久化新靴/结算/回执/决策和少量窗口事件。进程重启不清这些审计行，只丢内存牌面并让实盘跟靴待牌靴从头跟
 - 事件冲突检测：event_id 相同但 payload 不同 / sourceSeq 冲突均拒绝，绝不静默改写历史
-- 每桌串行 Actor、决策与回执幂等、重启恢复（`packages/orchestrator`）；Actor 重放默认 `latestShoeOnly`
+- 每桌串行 Actor、决策与回执幂等、重启恢复（`packages/orchestrator`）；Actor 重放默认 `latestShoeOnly`。进程重启会给实盘跟靴打上一进程水位，历史牌局/决策仍可复查，但不会把上一进程库存接着拿来算 EV
 - 持久化全局风控：预留/释放/结算、日/桌/靴亏损、重启恢复（`packages/risk-execution`）
 - 影子/模拟执行桥仍用于演示与测试；桌面实盘监控默认强制 `live`。Pragmatic Play 的庄对/闲对 `BetIntent` 与四市场受控 `OperationalWager` 执行实现（`packages/adapter-contract`、`packages/browser-bridge`、`apps/browser-extension`）
 - 房间级牌桌数据导出监控层：房间发现、逐桌导出、游标/批量/健康、断点续传（`packages/room-monitor`）
