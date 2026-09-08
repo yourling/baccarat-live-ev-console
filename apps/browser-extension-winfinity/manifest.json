@@ -1,0 +1,67 @@
+{
+  "manifest_version": 3,
+  "name": "Baccarat Winfinity Room Bridge",
+  "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzPwm6TaXnLIAOi98LoRRNXCXpDvNNNtpH7FQIwNirISb3QH4B3XZ4fnG7fyz25rN/Ck2uWMU4FOYZxbnlnDmJDrTX2bx4F36e+uHtdDCljCAKmtjoyQkVFwW2ch9aHbWr0ytmtZNAjj4s5Kr3zRx3lC4uOpXojPcYFxeltdFd8U2jiG71Dk7kno7o1UxCORFuZusbUMLQNkOxArdqoB9rk8DQpVMb6dE+8bjQmwWO8ZxdaNNxCIM6DWzZKaAgNSQZDdKVvgx+B3hAjYLC8ims+3HJpOhLhWi5h/gSn2tG9/qjBwHVmv8zKotSKVgoov5oM1OnlRAjckWlh5NWLyQowIDAQAB",
+  "description": "把 Dafabet 桃园厅 Winfinity 多桌数据桥接到本机 EV 中控台。第一期只采集，不下注。",
+  "permissions": [
+    "storage",
+    "tabs",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://*.dafabet.net/*",
+    "https://*.youngpoisson.xyz/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.dafabet.net/*",
+        "https://*.youngpoisson.xyz/*"
+      ],
+      "js": [
+        "winfinity-protocol.js",
+        "winfinity-network-hook.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://*.dafabet.net/*",
+        "https://*.youngpoisson.xyz/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://*.dafabet.net/*",
+        "https://*.youngpoisson.xyz/*"
+      ],
+      "js": [
+        "winfinity-dom-hook.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_title": "点击重载 Winfinity 桥接扩展"
+  },
+  "commands": {
+    "reload-extension": {
+      "suggested_key": {
+        "default": "Alt+Shift+R"
+      },
+      "description": "重新加载 Winfinity 桥接扩展（不刷新游戏弹窗）"
+    }
+  }
+}

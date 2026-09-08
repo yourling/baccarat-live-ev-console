@@ -6,6 +6,9 @@ import {
   BUNDLED_BROWSER_EXTENSION_ID,
   BUNDLED_BROWSER_EXTENSION_IDS,
   BUNDLED_BROWSER_EXTENSION_TOKEN,
+  BUNDLED_WINFINITY_BROWSER_EXTENSION_ID,
+  DAFABET_WINFINITY_ROOM_ID,
+  isLiveBridgeRoomId,
 } from '../src/index.js';
 
 function extensionIdFromManifestKey(key: string): string {
@@ -46,6 +49,23 @@ describe('bundled browser bridge identity', () => {
     expect(BUNDLED_BROWSER_EXTENSION_IDS).toEqual([
       BUNDLED_BROWSER_EXTENSION_ID,
       BUNDLED_BG_BROWSER_EXTENSION_ID,
+      BUNDLED_WINFINITY_BROWSER_EXTENSION_ID,
     ]);
+  });
+
+  it('keeps the Winfinity manifest key, extension ID, and background token synchronized', () => {
+    const manifest = JSON.parse(readFileSync(
+      new URL('../../../apps/browser-extension-winfinity/manifest.json', import.meta.url),
+      'utf8',
+    )) as { readonly key?: string };
+    if (manifest.key === undefined) throw new Error('Winfinity browser extension manifest key missing');
+    expect(extensionIdFromManifestKey(manifest.key)).toBe(BUNDLED_WINFINITY_BROWSER_EXTENSION_ID);
+    expect(BUNDLED_BROWSER_EXTENSION_IDS).toEqual([
+      BUNDLED_BROWSER_EXTENSION_ID,
+      BUNDLED_BG_BROWSER_EXTENSION_ID,
+      BUNDLED_WINFINITY_BROWSER_EXTENSION_ID,
+    ]);
+    expect(isLiveBridgeRoomId('dafabet-winfinity')).toBe(true);
+    expect(DAFABET_WINFINITY_ROOM_ID).toBe('dafabet-winfinity');
   });
 });

@@ -4,9 +4,11 @@
  */
 export const BUNDLED_BROWSER_EXTENSION_ID = 'igjpillacopnacpepahjfaokiopahmee';
 export const BUNDLED_BG_BROWSER_EXTENSION_ID = 'ckiomamppnakpgobcemidpojdiemfdlm';
+export const BUNDLED_WINFINITY_BROWSER_EXTENSION_ID = 'ebfnknenblmegkhhpfphcjebmpapbcjk';
 export const BUNDLED_BROWSER_EXTENSION_IDS = [
   BUNDLED_BROWSER_EXTENSION_ID,
   BUNDLED_BG_BROWSER_EXTENSION_ID,
+  BUNDLED_WINFINITY_BROWSER_EXTENSION_ID,
 ] as const;
 
 /**
@@ -18,7 +20,10 @@ export const BUNDLED_BROWSER_EXTENSION_TOKEN =
 
 export const DAFABET_PRAGMATIC_ROOM_ID = 'dafabet-pragmatic';
 export const DAFABET_BG_ROOM_ID = 'dafabet-bg';
+export const DAFABET_WINFINITY_ROOM_ID = 'dafabet-winfinity';
 
 export function isLiveBridgeRoomId(roomId: string): boolean {
-  return roomId === DAFABET_PRAGMATIC_ROOM_ID || roomId === DAFABET_BG_ROOM_ID;
+  return roomId === DAFABET_PRAGMATIC_ROOM_ID
+    || roomId === DAFABET_BG_ROOM_ID
+    || roomId === DAFABET_WINFINITY_ROOM_ID;
 }
