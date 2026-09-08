@@ -66,11 +66,12 @@
   function closestTile(node) {
     let current = node;
     for (let i = 0; i < 8 && current; i += 1) {
+      if (current === document.body || current === document.documentElement) break;
       const text = String(current.innerText || current.textContent || '');
       if (/baccarat/i.test(text) && text.length < 2000) return current;
       current = current.parentElement;
     }
-    return node && node.parentElement;
+    return node;
   }
 
   function collectTables() {
@@ -78,9 +79,10 @@
     const upsert = (href, tile) => {
       const streamId = extractStreamId(href);
       const vendorTableId = extractVendorTableId(href);
+      const text = tile ? String(tile.innerText || tile.textContent || '') : '';
+      if (!streamId && !/baccarat/i.test(text)) return;
       const tableId = streamId || (vendorTableId ? `wnf-${vendorTableId}` : '');
       if (!tableId) return;
-      const text = tile ? String(tile.innerText || tile.textContent || '') : '';
       const displayName = displayNameFromText(text);
       const gameCount = gameCountFromText(text);
       const prev = found.get(tableId) || {
