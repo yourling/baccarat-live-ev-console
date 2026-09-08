@@ -71,6 +71,26 @@ describe('Winfinity bridge integration', () => {
     expect(server.getDiscoveredRooms()[0]?.tables.map(table => table.tableId)).not.toContain(VENDOR);
   });
 
+  it('keeps the locked wnf fallback when a lobby snapshot arrives after WS', () => {
+    const server = new BrowserBridgeServer({ selectedTableIds: [`wnf-${VENDOR}`] });
+    server.ingestClientMessage(wnfWs('GAME_STATE_CHANGED', {
+      state: { state: 'BETS_OPEN', bettingTime: '0', bettingTimeDuration: '0', allowedSideBets: [] },
+    }));
+    server.ingestClientMessage(wnfState());
+    expect(server.getDiscoveredRooms()[0]?.tables.map(table => table.tableId))
+      .toEqual([`wnf-${VENDOR}`]);
+    expect(server.shoeEvidence(`wnf-${VENDOR}`)).toEqual({ reason: 'attach' });
+  });
+
+  it('uses the stream id when lobby state locks the alias before WS', () => {
+    const server = new BrowserBridgeServer({ selectedTableIds: ['tyn-bac8'] });
+    server.ingestClientMessage(wnfState());
+    server.ingestClientMessage(wnfWs('GAME_STATE_CHANGED', {
+      state: { state: 'BETS_OPEN', bettingTime: '0', bettingTimeDuration: '0', allowedSideBets: [] },
+    }));
+    expect(server.getDiscoveredRooms()[0]?.tables.map(table => table.tableId)).toEqual(['tyn-bac8']);
+  });
+
   it('rejects Winfinity operational wagers before sending them to the page', async () => {
     const server = new BrowserBridgeServer({ selectedTableIds: ['tyn-bac8'] });
     server.ingestClientMessage(wnfState());

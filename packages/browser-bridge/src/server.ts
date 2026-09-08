@@ -2030,10 +2030,11 @@ export class BrowserBridgeServer implements RoomMonitor {
       if (vendorTableId !== undefined && streamId !== undefined) {
         this.winfinityParser.registerAlias(vendorTableId, streamId);
       }
-      const publicId = publicWinfinityTableId({
-        ...(streamId === undefined ? {} : { streamId }),
-        ...(vendorTableId === undefined ? {} : { vendorTableId }),
-      }) ?? (typeof record.tableId === 'string' ? normalizeWinfinityTableId(record.tableId) : undefined);
+      const publicId = vendorTableId !== undefined
+        ? this.winfinityParser.resolveTableId(vendorTableId)
+        : publicWinfinityTableId({
+          ...(streamId === undefined ? {} : { streamId }),
+        }) ?? (typeof record.tableId === 'string' ? normalizeWinfinityTableId(record.tableId) : undefined);
       if (publicId === undefined) continue;
       const displayName = typeof record.displayName === 'string' ? record.displayName : undefined;
       const roundId = typeof record.roundId === 'string' ? record.roundId : undefined;
