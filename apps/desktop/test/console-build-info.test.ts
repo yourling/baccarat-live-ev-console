@@ -9,7 +9,7 @@ describe('console build label', () => {
   it('exposes the current console version', () => {
     const info = currentConsoleBuildInfo();
     expect(info.version).toBe(CONSOLE_VERSION);
-    expect(info.version).toBe('1.0.16');
+    expect(info.version).toBe('1.0.17');
     expect(info.gitSha.length).toBeGreaterThan(0);
     expect(formatConsoleBuildLabel(info)).toBe(`V${info.version}+${info.gitSha}`);
   });

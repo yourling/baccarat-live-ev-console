@@ -891,3 +891,119 @@ h2 { color: #f4f7fa; font-size: 18px; }
 .perf-card__meta { display: flex; flex-direction: column; gap: 4px; font-size: 12px; opacity: 0.8; }
 .perf-card__pnl--win { color: #c0392b; }
 .perf-card__pnl--loss { color: #27ae60; }
+
+/* ===== 侧边栏 IA（UI 重设计适配） ===== */
+.app-shell {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  width: 100%;
+  max-width: none;
+  padding: 0;
+}
+.app-sidebar {
+  flex: 0 0 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 20px 14px;
+  min-height: 100vh;
+  border-right: 1px solid #243241;
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  max-height: 100vh;
+  overflow-y: auto;
+}
+.app-sidebar__brand h1 { font-size: 17px; margin: 0 0 4px; }
+.app-sidebar__brand .app-build { margin: 0; font-size: 12px; opacity: 0.7; }
+.app-sidebar__nav { display: flex; flex-direction: column; gap: 2px; }
+.app-sidebar__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 12px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.app-sidebar__item:hover { background: rgba(127, 127, 127, 0.12); }
+.app-sidebar__item--active { background: rgba(59, 130, 246, 0.18); font-weight: 600; }
+.app-sidebar__count {
+  min-width: 22px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(127, 127, 127, 0.2);
+  font-size: 12px;
+  text-align: center;
+}
+.app-sidebar__count--danger { background: rgba(220, 38, 38, 0.3); }
+.app-sidebar__status { margin-top: auto; font-size: 12px; }
+.app-main { flex: 1 1 auto; min-width: 0; padding: 20px 24px 32px; }
+
+/* 厅房 chip（第一期仅展示） */
+.platform-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.platform-chip {
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid #243241;
+  font-size: 12px;
+}
+.platform-chip--active { border-color: rgba(59, 130, 246, 0.6); }
+.platform-chip--muted { opacity: 0.45; }
+
+/* 桌台状态分布 */
+.status-distribution { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.status-distribution__chip {
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: rgba(59, 130, 246, 0.14);
+  font-size: 12px;
+}
+.status-distribution__chip--muted { opacity: 0.45; }
+
+/* 风控中心 */
+.risk-center__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.risk-center__columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+.risk-card {
+  border: 1px solid #243241;
+  border-radius: 10px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.risk-card h3 { margin: 0; font-size: 13px; opacity: 0.8; }
+.risk-card__value { font-size: 22px; font-weight: 700; }
+.risk-card__cap { font-size: 13px; font-weight: 400; opacity: 0.65; margin-left: 6px; }
+.risk-card__note { margin: 0; font-size: 12px; opacity: 0.65; }
+.risk-card__table { font-size: 13px; }
+.risk-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(127, 127, 127, 0.2);
+  overflow: hidden;
+}
+.risk-bar__fill { display: block; height: 100%; border-radius: 999px; }
+.risk-bar__fill--ok { background: #2e9e5b; }
+.risk-bar__fill--warn { background: #d97706; }
+.risk-bar__fill--danger { background: #dc2626; }
+
+@media (max-width: 960px) {
+  .app-shell { flex-direction: column; }
+  .app-sidebar { flex: none; min-height: 0; width: 100%; border-right: none; border-bottom: 1px solid #243241; position: static; max-height: none; }
+}

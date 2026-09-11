@@ -1,7 +1,7 @@
 import type { DecisionHandRecord } from '@baccarat/ledger-state';
 import type { DesktopRecordPage, DesktopRecordQuery } from '../api-types';
 
-export type ConsoleView = 'overview' | 'monitor' | 'decisions' | 'events' | 'ledger' | 'settings';
+export type ConsoleView = 'overview' | 'monitor' | 'risk' | 'decisions' | 'events' | 'ledger' | 'settings';
 
 export type RecordViewChange = {
   readonly view: ConsoleView;

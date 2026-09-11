@@ -14,6 +14,7 @@ import type {
   ShoeStateProjection,
   TableStatus,
 } from '@baccarat/contracts';
+import { BUNDLED_PLATFORM_DESCRIPTORS } from '@baccarat/adapter-contract';
 import type { DecisionHandRecord, OperationalWagerRecord } from '@baccarat/ledger-state';
 import type {
   DesktopConsoleSnapshot,
@@ -45,6 +46,7 @@ import { isLiveMonitorRoomId, selectLiveMonitorTableIds } from './monitor-table-
 import { evaluateProjectionPairMarket } from './pair-evaluation';
 import { decisionHandExplanation, planRecordViewChange, recordKindForView, recordTabCount, type ConsoleView } from './record-view';
 import { PerformanceCard } from './performance-card';
+import { RiskCenter } from './risk-center';
 import { useConsoleSnapshot } from './use-console-snapshot';
 import { formatConsoleBuildLabel } from '../console-build-info';
 import './styles.css';
@@ -393,6 +395,25 @@ export function App() {
   const disconnectedMonitorCount = snapshot
     ? disconnectedMonitorTableIds(snapshot.monitorTableIds, snapshot.snapshot.tables, snapshot.runtime.tables).length
     : 0;
+  // 拍板决策 #4：预留敞口（RESERVED）与 UNKNOWN 敞口拆为两枚独立 KPI。
+  const reservedOnlyExposure = (snapshot?.reservations ?? [])
+    .filter(reservation => reservation.status === 'RESERVED')
+    .reduce((sum, reservation) => sum + reservation.amount, 0);
+  const unknownReservations = (snapshot?.reservations ?? [])
+    .filter(reservation => reservation.status === 'UNKNOWN');
+  const unknownExposure = unknownReservations.reduce((sum, reservation) => sum + reservation.maxLoss, 0);
+  // 拍板决策 #5：厅房 chip（第一期仅展示，按候选桌归属房间聚合）。
+  const platformChips = BUNDLED_PLATFORM_DESCRIPTORS.map(descriptor => ({
+    platformId: descriptor.platformId,
+    label: descriptor.roomDisplayName,
+    count: monitorCandidates.filter(candidate => candidate.roomId === descriptor.roomId).length,
+  }));
+  // 清单 §3：桌台状态分布（监控 / 待加入 / 断线）。
+  const statusDistribution = [
+    { label: '监控中', count: tables.length },
+    { label: '待加入', count: monitorCandidates.length },
+    { label: '断线', count: disconnectedMonitorCount },
+  ];
   const selectedMonitorTable = selectedMonitorTableId === null ? undefined : tableMap.get(selectedMonitorTableId);
   const automationEnabled = snapshot?.automation.enabled ?? false;
   const keepaliveEnabled = snapshot?.keepalive.enabled ?? false;
@@ -879,11 +900,28 @@ export function App() {
 
   return (
     <div className="app-shell">
-      <header className="app-header">
-        <div>
+      <aside className="app-sidebar">
+        <div className="app-sidebar__brand">
           <h1>百家乐实时监控</h1>
           <p className="app-build">{formatConsoleBuildLabel()}</p>
         </div>
+        <nav className="app-sidebar__nav" aria-label="数据视图">
+          <NavItem active={view === 'overview'} onClick={() => changeView('overview')} label="总览" count={overview.rows.length} />
+          <NavItem active={view === 'monitor'} onClick={() => changeView('monitor')} label="监控桌台" count={visibleTables.length} />
+          <NavItem active={view === 'risk'} onClick={() => changeView('risk')} label="风控中心" count={unknownReservations.length} tone={unknownReservations.length > 0 ? 'danger' : undefined} />
+          <NavItem active={view === 'decisions'} onClick={() => changeView('decisions')} label="执行审计" count={recordTabCount({ currentView: view, targetKind: 'decisions', snapshotCount: snapshot?.recordCounts.decisions ?? 0, recordPage })} />
+          <NavItem active={view === 'events'} onClick={() => changeView('events')} label="事件流" count={recordTabCount({ currentView: view, targetKind: 'events', snapshotCount: snapshot?.recordCounts.events ?? 0, recordPage })} />
+          <NavItem active={view === 'ledger'} onClick={() => changeView('ledger')} label="资金账本" count={recordTabCount({ currentView: view, targetKind: 'ledger', snapshotCount: snapshot?.recordCounts.ledger ?? 0, recordPage })} />
+          <NavItem active={view === 'settings'} onClick={() => changeView('settings')} label="策略与 EV" />
+        </nav>
+        <div className="app-sidebar__status">
+          <span className={cx('summary-connection', snapshot?.isOpen ? 'summary-connection--good' : 'summary-connection--muted')}>
+            <span className="status-dot" aria-hidden="true" />{snapshot?.isOpen ? '账本已连接' : '账本未连接'}
+          </span>
+        </div>
+      </aside>
+      <div className="app-main">
+      <header className="app-header">
         <div className="header-actions">
           <button
             className={cx('button', keepaliveEnabled ? 'button--danger-ghost' : 'button--primary')}
@@ -932,7 +970,13 @@ export function App() {
           tone={alertCount > 0 ? 'warning' : 'good'}
           onClick={() => setAlertCenterOpen(true)}
         />
-        <SummaryItem label="预留敞口" value={risk ? formatAmount(risk.reservedExposure) : '-'} />
+        <SummaryItem label="预留敞口（RESERVED）" value={formatAmount(reservedOnlyExposure)} />
+        <SummaryItem
+          label="UNKNOWN 敞口（待勾销）"
+          value={`${unknownReservations.length} 笔 / ${formatAmount(unknownExposure)}`}
+          tone={unknownReservations.length > 0 ? 'danger' : 'good'}
+          onClick={() => changeView('risk')}
+        />
         <SummaryItem label="全局当日净盈亏" value={risk ? formatSignedAmount(-risk.dayLoss) : '-'} tone={risk && risk.dayLoss > 0 ? 'danger' : undefined} />
         <span className={cx('summary-connection', snapshot?.isOpen ? 'summary-connection--good' : 'summary-connection--muted')}>
           <span className="status-dot" aria-hidden="true" />{snapshot?.isOpen ? '账本已连接' : '账本未连接'}
@@ -948,15 +992,6 @@ export function App() {
           onClose={() => setAlertCenterOpen(false)}
         />
       )}
-
-      <nav className="view-tabs" aria-label="数据视图">
-        <TabButton active={view === 'overview'} onClick={() => changeView('overview')} label="总览" count={overview.rows.length} />
-        <TabButton active={view === 'monitor'} onClick={() => changeView('monitor')} label="监控" count={visibleTables.length} />
-        <TabButton active={view === 'decisions'} onClick={() => changeView('decisions')} label="决策" count={recordTabCount({ currentView: view, targetKind: 'decisions', snapshotCount: snapshot?.recordCounts.decisions ?? 0, recordPage })} />
-        <TabButton active={view === 'events'} onClick={() => changeView('events')} label="事件" count={recordTabCount({ currentView: view, targetKind: 'events', snapshotCount: snapshot?.recordCounts.events ?? 0, recordPage })} />
-        <TabButton active={view === 'ledger'} onClick={() => changeView('ledger')} label="账本" count={recordTabCount({ currentView: view, targetKind: 'ledger', snapshotCount: snapshot?.recordCounts.ledger ?? 0, recordPage })} />
-        <TabButton active={view === 'settings'} onClick={() => changeView('settings')} label="设置" />
-      </nav>
 
       {view !== 'monitor' && view !== 'settings' && (
       <section className="filters" aria-label="筛选条件">
@@ -1014,7 +1049,21 @@ export function App() {
 
       {recordLoading && recordKind && <div className="notice notice--info">正在从账本加载当前页…</div>}
 
-      {view === 'overview' && <><PerformanceCard /><OverviewPanel stats={overviewTotals} rows={pagedOverviewRows} incomePoints={overview.incomePoints} tableLabel={tableLabel} /><Pagination page={page} pageSize={pageSize} totalItems={visibleOverviewRows.length} onPageChange={setPage} onPageSizeChange={size => { setPageSize(size); setPage(1); }} /></>}
+      {view === 'risk' && (
+        <RiskCenter
+          riskState={risk}
+          riskLimits={snapshot?.snapshot.riskLimits}
+          reservations={snapshot?.reservations ?? []}
+        />
+      )}
+
+      {view === 'overview' && <><div className="status-distribution" aria-label="桌台状态分布">
+        {statusDistribution.map(item => (
+          <span className={cx('status-distribution__chip', item.count > 0 ? undefined : 'status-distribution__chip--muted')} key={item.label}>
+            {item.label} <strong>{item.count}</strong>
+          </span>
+        ))}
+      </div><PerformanceCard /><OverviewPanel stats={overviewTotals} rows={pagedOverviewRows} incomePoints={overview.incomePoints} tableLabel={tableLabel} /><Pagination page={page} pageSize={pageSize} totalItems={visibleOverviewRows.length} onPageChange={setPage} onPageSizeChange={size => { setPageSize(size); setPage(1); }} /></>}
 
       {view === 'monitor' && (
         <main>
@@ -1095,6 +1144,15 @@ export function App() {
         </main>
       )}
 
+      {view === 'monitor' && (
+        <div className="platform-chips" aria-label="厅房（第一期仅展示）">
+          {platformChips.map(chip => (
+            <span key={chip.platformId} className={cx('platform-chip', chip.count > 0 ? 'platform-chip--active' : 'platform-chip--muted')}>
+              {chip.label} <strong>{chip.count}</strong>
+            </span>
+          ))}
+        </div>
+      )}
       {view === 'monitor' && monitorCandidates.length > 0 && (
         <section className="monitor-candidates" aria-labelledby="monitor-candidates-title">
           <div className="section-heading">
@@ -1180,6 +1238,7 @@ export function App() {
         />
       )}
       {dialog}
+    </div>
     </div>
   );
 }
@@ -2394,7 +2453,6 @@ function AlertCenter(props: {
     </div>
   );
 }
-
 function SummaryItem(props: {
   label: string;
   value: string;
@@ -2409,6 +2467,28 @@ function SummaryItem(props: {
 
 function FilterControl({ label, children }: { label: string; children: ReactNode }) {
   return <label className="filter-control"><span>{label}</span>{children}</label>;
+}
+
+function NavItem({ active, onClick, label, count, tone }: {
+  active: boolean;
+  onClick: () => void;
+  label: string;
+  count?: number;
+  tone?: 'danger';
+}) {
+  return (
+    <button
+      type="button"
+      className={cx('app-sidebar__item', active && 'app-sidebar__item--active')}
+      onClick={onClick}
+      aria-current={active ? 'page' : undefined}
+    >
+      <span className="app-sidebar__label">{label}</span>
+      {count !== undefined && count > 0 && (
+        <span className={cx('app-sidebar__count', tone === 'danger' && 'app-sidebar__count--danger')}>{count}</span>
+      )}
+    </button>
+  );
 }
 
 function TabButton({ active, onClick, label, count }: { active: boolean; onClick: () => void; label: string; count?: number }) {
