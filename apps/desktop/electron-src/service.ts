@@ -87,6 +87,10 @@ import {
   type MonitorConsoleHost,
 } from './monitor-console.js';
 import {
+  LiveFeedConsole,
+  type LiveFeedConsoleHost,
+} from './live-feed-console.js';
+import {
   MAX_LIVE_MONITOR_TABLES,
   MONITOR_TABLE_CONFIG_KEY,
   TABLE_METADATA_CONFIG_KEY,
@@ -237,7 +241,7 @@ function defaultConsoleLimits(): RiskLimits {
   };
 }
 
-export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHost {
+export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHost, LiveFeedConsoleHost {
   readonly ledger: SqliteLedger;
   readonly orchestrator: Orchestrator;
   readonly operationalWagers: OperationalWagerCoordinator;
@@ -253,19 +257,19 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
   private demoError?: string;
   browserBridge?: BrowserBridgeServer;
   private browserBridgePort = 0;
-  private liveExecutionMode: ExecutionMode = 'live';
+  liveExecutionMode: ExecutionMode = 'live';
   readonly liveFeeds = new Map<string, TableExport>();
-  private readonly liveRoomIdsByTable = new Map<string, string>();
+  readonly liveRoomIdsByTable = new Map<string, string>();
   readonly tableMetadata: Map<string, StoredTableMetadata>;
-  private readonly disconnectedMonitorRemovalTimers = new Map<string, NodeJS.Timeout>();
-  private readonly shuffleHoldUntilByTable = new Map<string, number>();
-  private readonly lastFeedDisconnectReason = new Map<string, string>();
-  private readonly runtimeObservedTableIds = new Set<string>();
+  readonly disconnectedMonitorRemovalTimers = new Map<string, NodeJS.Timeout>();
+  readonly shuffleHoldUntilByTable = new Map<string, number>();
+  readonly lastFeedDisconnectReason = new Map<string, string>();
+  readonly runtimeObservedTableIds = new Set<string>();
   private readonly liveAuthorizationSources = new Map<string, 'manual' | 'unattended'>();
   persistentLiveGateEnabled = false;
-  private transportDownAt?: number;
-  private recoverySuppressUntil = 0;
-  private readonly tableFlapStats = new Map<string, {
+  transportDownAt?: number;
+  recoverySuppressUntil = 0;
+  readonly tableFlapStats = new Map<string, {
     disconnects: number;
     lastDisconnectAt: number;
     lastRecoveredAt?: number;
@@ -275,20 +279,20 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
   private liveMonitorRetryAttempt = 0;
   private liveMonitorOperation: Promise<void> = Promise.resolve();
   liveMonitorActivated = false;
-  private liveMonitorStartedAt = 0;
-  private readonly connectedThisProcess = new Set<string>();
+  liveMonitorStartedAt = 0;
+  readonly connectedThisProcess = new Set<string>();
   readonly missedShuffleRequested = new Set<string>();
   private oneShotLiveBetInFlight: Promise<OneShotLiveBetResult> | null = null;
   private executionStateOperation: Promise<void> = Promise.resolve();
   cachedRecordCounts?: DesktopRecordCounts;
   cachedSummary?: MonitorSummary;
-  private cachedLightSnapshot?: { key: string; at: number; value: DesktopConsoleSnapshot };
+  cachedLightSnapshot?: { key: string; at: number; value: DesktopConsoleSnapshot };
   private lastAccountingRefreshAt = 0;
   /** 本进程启动时刻。用于区分"运行期新产生的敞口"与"启动时从账本恢复的历史敞口"。 */
   private readonly runtimeStartedAt = Date.now();
   closing = false;
   suppressDiscoveredMonitorAutoAdd = false;
-  private automationEnabled = false;
+  automationEnabled = false;
   readonly pendingGameCountByTable = new Map<string, number>();
   readonly demotedPendingTableIds = new Set<string>();
   readonly demotedPendingShoeIds = new Map<string, string>();
@@ -298,9 +302,11 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
   monitorTableIds: string[];
   private unifiedBetSettings?: UnifiedBetSettings;
   /** 受控下注生命周期切片（execute / reconcile / writeOff / settle）。 */
-  private readonly wagerConsole = new OperationalWagerConsole(this);
+  readonly wagerConsole = new OperationalWagerConsole(this);
   /** 监控桌生命周期切片（发现表 / promote / demote / 选桌事务）。 */
-  private readonly monitorConsole = new MonitorConsole(this);
+  readonly monitorConsole = new MonitorConsole(this);
+  /** live feed 管线切片（attach/stop/断联分级/事件泵）。 */
+  readonly liveFeedConsole = new LiveFeedConsole(this);
 
   constructor(readonly dbPath: string) {
     this.ledger = new SqliteLedger(dbPath);
@@ -693,7 +699,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     this.ledger.checkpoint();
   }
 
-  private detectSettlementGap(
+  detectSettlementGap(
     event: Extract<NormalizedEvent, { type: 'bettingWindowOpened' }>,
   ): boolean {
     const unresolved = this.orchestrator.getReservations(event.tableId).filter(reservation =>
@@ -710,7 +716,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     return true;
   }
 
-  private resolveSettlementGapIfCleared(tableId: string): void {
+  resolveSettlementGapIfCleared(tableId: string): void {
     const actor = this.orchestrator.getActor(tableId);
     if (!actor) return;
     const currentHandId = actor.getProjection().currentHandId;
@@ -1056,7 +1062,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
 
   /** 为监控层导出的源事件与连接事件分配不冲突的账本 sourceSeq。 */
   private nextMonitorSourceSeq(tableId: string): number {
-    return this.ledger.allocateSourceSeq(tableId);
+    return this.liveFeedConsole.nextMonitorSourceSeq(tableId);
   }
 
   enqueueLiveMonitorOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -1092,137 +1098,19 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
   }
 
   private isCurrentLiveFeed(tableId: string, feed: TableExport): boolean {
-    return this.isObservedTable(tableId) && this.liveFeeds.get(tableId) === feed;
+    return this.liveFeedConsole.isCurrentLiveFeed(tableId, feed);
   }
 
   private isLiveTableFeedEvent(event: NormalizedEvent): boolean {
-    return event.type === 'newShoeSignal'
-      || event.type === 'cardObserved'
-      || event.type === 'bettingWindowOpened'
-      || event.type === 'bettingWindowClosed'
-      || event.type === 'handSettled'
-      || event.type === 'redCardSeen'
-      || event.type === 'shoeInvalidated';
+    return this.liveFeedConsole.isLiveTableFeedEvent(event);
   }
 
   private async restoreDisconnectedFeed(event: NormalizedEvent): Promise<NormalizedEvent> {
-    const disconnectReason = this.lastFeedDisconnectReason.get(event.tableId) ?? '';
-    const resumable = disconnectReason === 'table-feed-stale'
-      || disconnectReason.startsWith('continuity gap');
-    if (!resumable) return event;
-    const actor = this.orchestrator.getActor(event.tableId);
-    if (actor?.getProjection().connectionStatus !== 'DISCONNECTED') return event;
-    await this.orchestrator.enqueue(event.tableId, {
-      type: 'connectionRestored',
-      eventId: newId('evt'),
-      tableId: event.tableId,
-      timestamp: event.timestamp,
-      sourceSeq: event.sourceSeq,
-      source: 'room-monitor',
-      schemaVersion: EVENT_SCHEMA_VERSION,
-      continuityProof: cursorContinuityProof({
-        tableId: event.tableId,
-        reason: 'protocol-resume',
-        at: event.timestamp,
-      }),
-    });
-    this.lastFeedDisconnectReason.delete(event.tableId);
-    return { ...event, sourceSeq: this.nextMonitorSourceSeq(event.tableId) };
+    return this.liveFeedConsole.restoreDisconnectedFeed(event);
   }
 
   private async enqueueMonitorEvent(event: NormalizedEvent): Promise<void> {
-    if (
-      event.type === 'newShoeSignal'
-      || event.type === 'cardObserved'
-      || event.type === 'bettingWindowOpened'
-      || event.type === 'bettingWindowClosed'
-      || event.type === 'handSettled'
-      || event.type === 'redCardSeen'
-      || event.type === 'shoeInvalidated'
-    ) {
-      this.cancelDisconnectedMonitorRemoval(event.tableId);
-      if (event.type === 'newShoeSignal') {
-        this.shuffleHoldUntilByTable.set(event.tableId, Date.now() + SHUFFLE_MONITOR_HOLD_MS);
-      }
-      this.runtimeObservedTableIds.add(event.tableId);
-      this.runtimeIncidents.resolve('table-feed-stale', event.tableId);
-      this.runtimeIncidents.resolve('monitor-failure', event.tableId);
-      this.runtimeIncidents.resolve('bridge-disconnected', event.tableId);
-    }
-    if (event.type === 'connectionRestored') {
-      this.connectedThisProcess.add(event.tableId);
-      this.cancelDisconnectedMonitorRemoval(event.tableId);
-      this.runtimeIncidents.resolve('table-feed-stale', event.tableId);
-      this.runtimeIncidents.resolve('monitor-failure', event.tableId);
-      this.runtimeIncidents.resolve('bridge-disconnected', event.tableId);
-    }
-    if (event.type === 'bettingWindowOpened') {
-      this.connectedThisProcess.add(event.tableId);
-      this.detectSettlementGap(event);
-    }
-    if (event.type === 'newShoeSignal' && event.baseline === 'physical-shoe') {
-      this.connectedThisProcess.add(event.tableId);
-    }
-    if (
-      (event.type === 'newShoeSignal' && event.baseline === 'physical-shoe')
-      || event.type === 'bettingWindowOpened'
-    ) {
-      // Shuffle starts the evidence, but the table must still be monitored when
-      // the new shoe actually opens. Re-promote on the first post-shuffle window
-      // if a mid-shuffle demote/disconnect dropped it back to pending.
-      const evidence = this.browserBridge?.shoeEvidence(event.tableId);
-      if (isVerifiedPhysicalShoeEvidence(evidence)) {
-        this.promotePendingTable(event.tableId, event.shoeId);
-        if (event.type === 'newShoeSignal' && normalizeBgTableId(event.tableId) === undefined) {
-          this.clearStaleRoadCount(event.tableId);
-        }
-      }
-    }
-    this.cachedLightSnapshot = undefined;
-    const liveEvent = this.isLiveTableFeedEvent(event)
-      ? await this.restoreDisconnectedFeed(event)
-      : event;
-    await this.orchestrator.enqueue(liveEvent.tableId, liveEvent);
-    if (
-      event.type === 'handSettled'
-      || event.type === 'bettingWindowOpened'
-      || event.type === 'cardObserved'
-    ) {
-      if (this.demoteIfGameCountAnomaly(event.tableId)) {
-        await this.failCloseLiveExecution([event.tableId]);
-      }
-    }
-    if (
-      event.type === 'handSettled'
-      || event.type === 'betReceipt'
-      || event.type === 'connectionLost'
-      || event.type === 'connectionRestored'
-    ) {
-      this.refreshAccountingIncidents(true);
-    }
-    if (event.type === 'cardObserved' || event.type === 'handSettled') {
-      this.wagerConsole.trySettleReservedHand(event.tableId, event.shoeId, event.handId);
-    }
-    if (event.type === 'bettingWindowOpened') {
-      this.wagerConsole.trySettleReservedHand(event.tableId, event.shoeId);
-    }
-    if (event.type === 'handSettled') {
-      this.resolveSettlementGapIfCleared(event.tableId);
-    }
-    if (
-      event.type === 'newShoeSignal'
-      || event.type === 'connectionRestored'
-      || (event.type === 'shoeConfirmation' && event.approved)
-    ) {
-      await this.rearmPairAutomation(event.tableId);
-    }
-    if (
-      event.type === 'bettingWindowOpened'
-      || event.type === 'connectionLost'
-      || event.type === 'connectionRestored'
-    ) {
-      await this.reconcileUnattendedExecution();
-    }
+    return this.liveFeedConsole.enqueueMonitorEvent(event);
   }
 
   private async reconcilePairAutomation(enabled: boolean): Promise<void> {
@@ -1240,7 +1128,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     }
   }
 
-  private async rearmPairAutomation(tableId: string): Promise<void> {
+  async rearmPairAutomation(tableId: string): Promise<void> {
     if (!this.automationEnabled || !this.monitorTableIds.includes(tableId)) return;
     const actor = this.orchestrator.getActor(tableId);
     if (!actor) return;
@@ -1276,7 +1164,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     });
   }
 
-  private async resetMonitorExecutionState(tableId: string): Promise<void> {
+  async resetMonitorExecutionState(tableId: string): Promise<void> {
     const actor = this.orchestrator.getActor(tableId);
     if (!actor) return;
 
@@ -1375,123 +1263,30 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
   }
 
   async stopLiveFeed(tableId: string, feed: TableExport): Promise<void> {
-    this.cancelDisconnectedMonitorRemoval(tableId);
-    if (this.liveFeeds.get(tableId) === feed) {
-      this.liveFeeds.delete(tableId);
-      this.liveRoomIdsByTable.delete(tableId);
-    }
-    this.runtimeObservedTableIds.delete(tableId);
-    this.resolveTransientTableIncidents(tableId);
-    await this.failCloseLiveExecution([tableId]);
-    try {
-      await feed.stop();
-    } catch (error) {
-      this.recordLiveMonitorError(error, 'monitor-failure', 'degraded', tableId);
-    }
-    await this.resetMonitorExecutionState(tableId);
+    return this.liveFeedConsole.stopLiveFeed(tableId, feed);
   }
 
-  /**
-   * Strict shutdown used only while changing the selected monitor tables.
-   * Retain the old feed until stop succeeds, so a failed transition neither
-   * changes the Bridge selection nor creates a duplicate replacement export.
-   */
   async stopLiveFeedForTransition(
     tableId: string,
     feed: TableExport,
   ): Promise<MonitorFeedTransitionStopResult> {
-    if (this.liveFeeds.get(tableId) !== feed) return { kind: 'not-current' };
-    this.cancelDisconnectedMonitorRemoval(tableId);
-    try {
-      await this.failCloseLiveExecution([tableId]);
-    } catch (error) {
-      return { kind: 'failed', error };
-    }
-    try {
-      await feed.stop();
-    } catch (error) {
-      return { kind: 'failed', error };
-    }
-    if (this.liveFeeds.get(tableId) === feed) {
-      this.liveFeeds.delete(tableId);
-      this.liveRoomIdsByTable.delete(tableId);
-    }
-    this.runtimeObservedTableIds.delete(tableId);
-    this.resolveTransientTableIncidents(tableId);
-    return { kind: 'stopped' };
+    return this.liveFeedConsole.stopLiveFeedForTransition(tableId, feed);
   }
 
   private cancelDisconnectedMonitorRemoval(tableId: string): void {
-    const timer = this.disconnectedMonitorRemovalTimers.get(tableId);
-    if (timer === undefined) return;
-    clearTimeout(timer);
-    this.disconnectedMonitorRemovalTimers.delete(tableId);
+    this.liveFeedConsole.cancelDisconnectedMonitorRemoval(tableId);
   }
 
   private scheduleDisconnectedMonitorRemoval(tableId: string, reason?: string): void {
-    if (this.closing || !this.monitorTableIds.includes(tableId)) return;
-    const startupGap = reason === 'table-not-discovered'
-      || reason === 'process-restarted'
-      || reason === 'extension-session-restarted'
-      || reason === 'browser-extension-disconnected'
-      || reason === 'table-feed-stale'
-      || reason === undefined
-      || reason === '';
-    if (startupGap && !this.connectedThisProcess.has(tableId)) return;
-    if (this.liveMonitorStartedAt > 0 && Date.now() - this.liveMonitorStartedAt < 60_000) return;
-    const shuffleHoldUntil = this.shuffleHoldUntilByTable.get(tableId) ?? 0;
-    if (Date.now() < shuffleHoldUntil) return;
-    if (reason === 'table-not-discovered') {
-      this.noteTableDisconnect(tableId);
-      if (!this.browserBridge?.getExtensionStatus().authenticated) return;
-    }
-    // Multi-table pages reconnect the game socket often. A stale/disconnected
-    // feed must stay in the monitor list so the export can resume; dropping
-    // the table is what leaves the console stuck on 数据流已断开 / 已过期.
-    // Chronic flappers (4+ disconnects in 5 minutes) escalate to OPEN: schedule
-    // removal so a permanently dead table does not occupy the monitor list forever.
-    if (!this.flapEscalated(tableId) && (
-      reason === 'table-feed-stale'
-      || reason === 'browser-extension-disconnected'
-      || reason === 'process-restarted'
-      || reason === 'extension-session-restarted'
-    )) return;
-    if (this.disconnectedMonitorRemovalTimers.has(tableId)) return;
-    const delayMs = DISCONNECTED_MONITOR_REMOVAL_MS;
-    const timer = setTimeout(() => {
-      this.disconnectedMonitorRemovalTimers.delete(tableId);
-      void this.enqueueLiveMonitorOperation(async () => {
-        await this.removeDisconnectedMonitorTable(tableId);
-      }).catch(error => this.recordLiveMonitorError(error, 'monitor-failure', 'degraded', tableId));
-    }, delayMs);
-    timer.unref?.();
-    this.disconnectedMonitorRemovalTimers.set(tableId, timer);
+    this.liveFeedConsole.scheduleDisconnectedMonitorRemoval(tableId, reason);
   }
 
   private async removeDisconnectedMonitorTable(tableId: string): Promise<void> {
-    if (!this.monitorTableIds.includes(tableId)) return;
-    const shuffleHoldUntil = this.shuffleHoldUntilByTable.get(tableId) ?? 0;
-    if (Date.now() < shuffleHoldUntil) return;
-    const feed = this.liveFeeds.get(tableId);
-    const health = feed?.health();
-    const shouldRemove = feed === undefined
-      || health?.state === 'DISCONNECTED'
-      || (typeof health?.stalenessMs === 'number' && health.stalenessMs >= DISCONNECTED_MONITOR_REMOVAL_MS);
-    if (!shouldRemove) return;
-
-    if (feed !== undefined) await this.stopLiveFeed(tableId, feed);
-    await this.failCloseLiveExecution([tableId]);
-    const nextTableIds = this.monitorTableIds.filter(candidate => candidate !== tableId);
-    this.monitorTableIds = nextTableIds;
-    this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
-    this.syncLiveApprovalsToMonitorTables();
-    this.browserBridge?.setSelectedTableIds(this.observedTableIds());
+    return this.liveFeedConsole.removeDisconnectedMonitorTable(tableId);
   }
 
   private resolveTransientTableIncidents(tableId: string): void {
-    this.runtimeIncidents.resolve('table-feed-stale', tableId);
-    this.runtimeIncidents.resolve('monitor-failure', tableId);
-    this.runtimeIncidents.resolve('bridge-disconnected', tableId);
+    this.liveFeedConsole.resolveTransientTableIncidents(tableId);
   }
 
 
@@ -1655,159 +1450,11 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
   }
 
   private attachLiveTables(): Promise<void> {
-    return this.enqueueLiveMonitorOperation(() => this.attachLiveTablesInner());
+    return this.liveFeedConsole.attachLiveTables();
   }
 
   async attachLiveTablesInner(): Promise<void> {
-    const browserBridge = this.browserBridge;
-    if (!browserBridge) return;
-    const discoveredRooms = browserBridge.getDiscoveredRooms();
-    this.refreshTableMetadataFromRooms(discoveredRooms);
-    if (this.liveMonitorActivated && !this.suppressDiscoveredMonitorAutoAdd) {
-      this.promotePendingTablesFromRooms(discoveredRooms);
-    }
-    await this.applyCollapsedWinfinityMonitorTables();
-    browserBridge.setSelectedTableIds(this.observedTableIds());
-    if (
-      this.monitorTableIds.length === 0
-      && this.pendingJoinTableIds().length === 0
-      && !browserBridge.hasRuntimeTableSelection()
-      && !browserBridge.hasConfiguredTableSelection()
-    ) return;
-
-    const rooms = await browserBridge.discoverRooms();
-    this.refreshTableMetadataFromRooms(rooms);
-    if (this.liveMonitorActivated && !this.suppressDiscoveredMonitorAutoAdd) {
-      this.promotePendingTablesFromRooms(rooms);
-    }
-    await this.applyCollapsedWinfinityMonitorTables();
-    const discoveredTableIds = discoveredMonitorTableIds([...discoveredRooms, ...rooms]);
-    const discoveryReliable = browserBridge.getExtensionStatus().authenticated
-      && discoveredTableIds.size > 0;
-    for (const tableId of this.monitorTableIds) {
-      if (discoveredTableIds.has(tableId) || this.liveFeeds.has(tableId)) {
-        this.cancelDisconnectedMonitorRemoval(tableId);
-      } else if (
-        discoveryReliable
-        && !isVerifiedPhysicalShoeEvidence(this.browserBridge?.shoeEvidence(tableId))
-      ) {
-        this.scheduleDisconnectedMonitorRemoval(tableId, 'table-not-discovered');
-      } else {
-        this.cancelDisconnectedMonitorRemoval(tableId);
-      }
-    }
-    const selectedTableIds = new Set(this.observedTableIds());
-    this.browserBridge?.setSelectedTableIds([...selectedTableIds]);
-    for (const room of rooms) {
-      for (const table of room.tables) {
-        // The service is the final allowlist boundary; never rely solely on a bridge cache.
-        if (!selectedTableIds.has(table.tableId) || !this.isObservedTable(table.tableId)) continue;
-        if (this.liveFeeds.has(table.tableId)) continue;
-        if (!this.orchestrator.getActor(table.tableId)) {
-          const settings = this.currentUnifiedTableSettings();
-          const profile = defaultProfile(table.tableId);
-          const merged = table.profile === undefined
-            ? profile
-            : { ...profile, ...table.profile, tableId: table.tableId };
-          this.orchestrator.registerTable(
-            settings === undefined
-              ? merged
-              : {
-                  ...merged,
-                  minEV: settings.minEV,
-                  betTiers: settings.betTiers.map(tier => ({ ...tier })),
-                },
-            this.liveExecutionMode,
-            settings?.defaultBetAmount ?? 100,
-          );
-        }
-        this.cancelDisconnectedMonitorRemoval(table.tableId);
-        await this.resetMonitorExecutionState(table.tableId);
-
-        const feed = browserBridge.openTable(room.roomId, table.tableId);
-        this.liveRoomIdsByTable.set(table.tableId, room.roomId);
-        this.liveFeeds.set(table.tableId, feed);
-        try {
-          await feed.start({
-            onBatch: async batch => {
-              if (!this.isCurrentLiveFeed(table.tableId, feed)) return;
-              for (const event of batch.events) {
-                if (event.tableId !== table.tableId || !this.isCurrentLiveFeed(table.tableId, feed)) continue;
-                const sourceSeq = this.nextMonitorSourceSeq(event.tableId);
-                if (!this.isCurrentLiveFeed(table.tableId, feed)) continue;
-                void this.enqueueMonitorEvent({ ...event, sourceSeq })
-                  .catch(error => this.recordLiveMonitorError(error, 'monitor-failure', 'degraded', event.tableId));
-              }
-            },
-            onDisconnect: (tableId, reason) => {
-              if (!this.isCurrentLiveFeed(tableId, feed)) return;
-              this.lastFeedDisconnectReason.set(tableId, reason ?? '');
-              this.runtimeObservedTableIds.delete(tableId);
-              // BridgeTableExport performs its own reconnect. Keep the identity
-              // registered while it is disconnected: deleting it would make the
-              // periodic attach call start() on the same already-started export.
-              void this.enqueueExecutionStateOperation(async () => {
-                const health = this.liveFeeds.get(tableId)?.health();
-                if (health?.state === 'CONNECTED') return;
-                if (reason === 'table-feed-stale') {
-                  this.ensureRuntimeIncident({
-                    code: 'table-feed-stale',
-                    severity: 'blocked',
-                    tableId,
-                    message: reason,
-                  });
-                }
-                await this.failCloseLiveExecution([tableId]);
-                this.scheduleDisconnectedMonitorRemoval(tableId, reason);
-                const sourceSeq = this.nextMonitorSourceSeq(tableId);
-                await this.enqueueMonitorEvent({
-                  type: 'connectionLost',
-                  eventId: newId('evt'),
-                  tableId,
-                  timestamp: new Date().toISOString(),
-                  sourceSeq,
-                  source: 'room-monitor',
-                  schemaVersion: EVENT_SCHEMA_VERSION,
-                  ...(reason ? { reason } : {}),
-                });
-              }).catch(error => this.recordLiveMonitorError(error, 'monitor-failure', 'degraded', tableId));
-            },
-            onRestored: async (tableId, proof) => {
-              if (!this.isCurrentLiveFeed(tableId, feed)) return;
-              this.cancelDisconnectedMonitorRemoval(tableId);
-              this.noteTableRecovered(tableId);
-              const sourceSeq = this.nextMonitorSourceSeq(tableId);
-              await this.enqueueMonitorEvent({
-                type: 'connectionRestored',
-                eventId: newId('evt'),
-                tableId,
-                timestamp: new Date().toISOString(),
-                sourceSeq,
-                source: 'room-monitor',
-                schemaVersion: EVENT_SCHEMA_VERSION,
-                continuityProof: proof,
-              }).catch(error => this.recordLiveMonitorError(error, 'monitor-failure', 'degraded', tableId));
-            },
-          });
-          if (!this.isCurrentLiveFeed(table.tableId, feed)) {
-            await this.stopLiveFeed(table.tableId, feed);
-            continue;
-          }
-        } catch (error) {
-          if (this.liveFeeds.get(table.tableId) === feed) {
-            this.liveFeeds.delete(table.tableId);
-            this.liveRoomIdsByTable.delete(table.tableId);
-          }
-          this.runtimeObservedTableIds.delete(table.tableId);
-          try {
-            await feed.stop();
-          } catch (stopError) {
-            this.recordLiveMonitorError(stopError, 'monitor-failure', 'degraded', table.tableId);
-          }
-          throw error;
-        }
-      }
-    }
+    return this.liveFeedConsole.attachLiveTablesInner();
   }
 
   isOpen(): boolean {

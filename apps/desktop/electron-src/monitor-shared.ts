@@ -13,6 +13,8 @@ const PRAGMATIC_MONITOR_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
 const WINFINITY_MONITOR_TABLE_ID_PATTERN = /^[a-z0-9]+-bac\d+$/i;
 const WINFINITY_FALLBACK_MONITOR_TABLE_ID_PATTERN = /^wnf-[a-f0-9]{24}$/i;
 export const MAX_LIVE_MONITOR_TABLES = 64;
+export const DISCONNECTED_MONITOR_REMOVAL_MS = 15_000;
+export const SHUFFLE_MONITOR_HOLD_MS = 10 * 60 * 1000;
 
 export type MonitorTableConfig = {
   readonly tableIds: readonly string[];
