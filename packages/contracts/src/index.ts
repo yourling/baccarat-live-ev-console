@@ -413,3 +413,24 @@ export interface RawObservation {
   rawEvidenceRef?: string;
 }
 
+/**
+ * 受控下注（庄/闲主市场）条款：纯数据契约，供执行层与 UI 共用。
+ * 渲染层不得直接 import orchestrator（其 strategy.ts 依赖 node:crypto，
+ * 会破坏浏览器构建），因此条款常量下沉到 contracts，orchestrator 再导出。
+ */
+export interface OperationalWagerTerms {
+  readonly banker: OddsConfig;
+  readonly player: OddsConfig;
+  readonly tiePolicy: 'push';
+}
+
+/**
+ * 标准抽水百家乐条款（庄 0.95 / 闲 1 / 和局 push）。
+ * 无抽水或 Super Six 规则的平台必须提供独立条款，不得复用此常量。
+ */
+export const STANDARD_COMMISSION_BACCARAT_TERMS: OperationalWagerTerms = {
+  banker: { netWin: 0.95, loss: 1 },
+  player: { netWin: 1, loss: 1 },
+  tiePolicy: 'push',
+};
+

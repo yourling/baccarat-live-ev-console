@@ -6,8 +6,10 @@ import {
   type OperationalWagerSource,
 } from '@baccarat/adapter-contract';
 import {
+  STANDARD_COMMISSION_BACCARAT_TERMS,
   type ExecutionMode,
   type OddsConfig,
+  type OperationalWagerTerms,
   type ShoeStateProjection,
   type TableProfile,
   newId,
@@ -22,21 +24,9 @@ import {
 import { RiskManager } from '@baccarat/risk-execution';
 import { isPairBettingWindowReady } from './betting-window.js';
 
-export interface OperationalWagerTerms {
-  readonly banker: OddsConfig;
-  readonly player: OddsConfig;
-  readonly tiePolicy: 'push';
-}
-
-/**
- * Explicit standard commission baccarat terms. Platforms with no-commission
- * or Super Six rules must provide different terms instead of reusing this.
- */
-export const STANDARD_COMMISSION_BACCARAT_TERMS: OperationalWagerTerms = {
-  banker: { netWin: 0.95, loss: 1 },
-  player: { netWin: 1, loss: 1 },
-  tiePolicy: 'push',
-};
+// 条款常量与类型的事实来源在 @baccarat/contracts（渲染层可安全引用，
+// 且不会把 strategy.ts 的 node:crypto 拖进浏览器包）；此处再导出保持既有 API。
+export { STANDARD_COMMISSION_BACCARAT_TERMS, type OperationalWagerTerms };
 
 export interface ControlledOperationalWagerCommand {
   readonly market: OperationalWagerMarket;

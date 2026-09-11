@@ -44,7 +44,7 @@ import { disconnectedMonitorTableIds, monitorDisplayedConnection } from './monit
 import { isDisplayedPhysicalShoe, isVerifiedPhysicalShoeReason, monitorDisplayedRoundLabel } from './monitor-round';
 import { isLiveMonitorRoomId, selectLiveMonitorTableIds } from './monitor-table-selection';
 import { evaluateProjectionMainMarkets, evaluateProjectionPairMarket } from './pair-evaluation';
-import { STANDARD_COMMISSION_BACCARAT_TERMS } from '@baccarat/orchestrator';
+import { STANDARD_COMMISSION_BACCARAT_TERMS } from '@baccarat/contracts';
 import { BeadLegend, BeadPlate } from './bead-plate';
 import './bead-plate.css';
 import { decisionHandExplanation, planRecordViewChange, recordKindForView, recordTabCount, type ConsoleView } from './record-view';
