@@ -1007,3 +1007,5 @@ h2 { color: #f4f7fa; font-size: 18px; }
   .app-shell { flex-direction: column; }
   .app-sidebar { flex: none; min-height: 0; width: 100%; border-right: none; border-bottom: 1px solid #243241; position: static; max-height: none; }
 }
+
+.odds-baseline__note { margin: 0; font-size: 13px; }

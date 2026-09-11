@@ -229,6 +229,12 @@ export interface DesktopRuntimeState {
   readonly reasons: readonly string[];
   readonly tables: Readonly<Record<string, DesktopRuntimeTableState>>;
   readonly incidents: readonly DesktopRuntimeIncident[];
+  /** 本机 executor 租约（一 Chrome profile 一 lease，理论上恒 1/1）。 */
+  readonly executor?: {
+    readonly activeExecutorCount: number;
+    readonly leaseId?: string;
+    readonly profileId?: string;
+  };
 }
 
 export function parseDesktopOperationalWagerCommand(value: unknown): DesktopOperationalWagerCommand {

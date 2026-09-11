@@ -896,6 +896,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     const reasons = [...new Set(
       approvedLiveTableIds.flatMap(tableId => tables[tableId]?.reasons ?? []),
     )];
+    const executorStatus = this.browserBridge?.getExecutorStatus();
     const incidents = this.runtimeIncidents.list();
     const activeIncidents = incidents.filter(incident => incident.active);
     const globallyBlocked = activeIncidents.some(incident =>
@@ -917,6 +918,13 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
       reasons,
       tables,
       incidents,
+      ...(executorStatus === undefined ? {} : {
+        executor: {
+          activeExecutorCount: executorStatus.active_executor_count,
+          ...(executorStatus.leaseId === undefined ? {} : { leaseId: executorStatus.leaseId }),
+          ...(executorStatus.profileId === undefined ? {} : { profileId: executorStatus.profileId }),
+        },
+      }),
     };
   }
 

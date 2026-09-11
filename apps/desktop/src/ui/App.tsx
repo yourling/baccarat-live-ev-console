@@ -978,6 +978,13 @@ export function App() {
           onClick={() => changeView('risk')}
         />
         <SummaryItem label="全局当日净盈亏" value={risk ? formatSignedAmount(-risk.dayLoss) : '-'} tone={risk && risk.dayLoss > 0 ? 'danger' : undefined} />
+        <SummaryItem
+          label="Executor 租约"
+          value={snapshot?.runtime.executor
+            ? `${snapshot.runtime.executor.activeExecutorCount}/1`
+            : '-'}
+          tone={snapshot?.runtime.executor && snapshot.runtime.executor.activeExecutorCount > 1 ? 'danger' : undefined}
+        />
         <span className={cx('summary-connection', snapshot?.isOpen ? 'summary-connection--good' : 'summary-connection--muted')}>
           <span className="status-dot" aria-hidden="true" />{snapshot?.isOpen ? '账本已连接' : '账本未连接'}
         </span>
@@ -1223,6 +1230,19 @@ export function App() {
 
       {view === 'ledger' && recordPage?.kind === 'ledger' && <><BetLedgerView rows={recordLedgerRows} totalCount={recordTotal} reconcilingReservationId={reconcilingReservationId} tableLabel={tableLabel} onReconcile={reconcileUnknownOperationalWager} onWriteOff={writeOffUnknownOperationalWager} onSettle={settlePendingOperationalWager} /><Pagination page={page} pageSize={pageSize} totalItems={recordTotal} onPageChange={changeRecordPage} onPageSizeChange={changeRecordPageSize} /></>}
 
+      {view === 'settings' && snapshot && (() => {
+        const firstProfile = Object.values(snapshot.snapshot.tables)[0]?.profile;
+        const pairOdds = firstProfile?.odds;
+        return pairOdds ? (
+          <section className="record-section odds-baseline" aria-label="市场基线赔率">
+            <div className="record-heading"><h2>市场基线赔率</h2></div>
+            <p className="odds-baseline__note">
+              庄对 / 闲对（策略交易市场）：净赢 <strong>{pairOdds.bankerPair.netWin}</strong>（1 赔 {pairOdds.bankerPair.netWin}）、
+              失 <strong>-{pairOdds.bankerPair.loss}</strong>；庄/闲为保活市场，不参与对子 EV。
+            </p>
+          </section>
+        ) : null;
+      })()}
       {view === 'settings' && (
         <SystemSettingsView
           demoSpeed={demoSpeed}
