@@ -13,27 +13,27 @@
   width: min(440px, 100%);
   max-height: calc(100dvh - 32px);
   overflow: auto;
-  border: 1px solid var(--border-strong, #334657);
+  border: 1px solid var(--border-strong, #C7C7CC);
   border-radius: 8px;
-  background: var(--surface-panel, #101923);
-  color: var(--text-primary, #e6edf3);
+  background: var(--surface-panel, #FFFFFF);
+  color: var(--text-primary, #1D1D1F);
 }
 
 .confirmation-dialog__header {
   display: grid;
   gap: var(--space-2, 8px);
   padding: var(--space-4, 16px);
-  border-bottom: 1px solid var(--border-default, #263846);
+  border-bottom: 1px solid var(--border-default, #D2D2D7);
 }
 
 .confirmation-dialog__header h2 {
-  color: var(--text-strong, #f4f7fa);
+  color: var(--text-strong, #000000);
   font-size: 18px;
   line-height: 1.35;
 }
 
 .confirmation-dialog__header p {
-  color: var(--text-muted, #8ea3b3);
+  color: var(--text-muted, #6E6E73);
   font-size: 13px;
   line-height: 1.6;
   overflow-wrap: anywhere;
@@ -50,7 +50,7 @@
   grid-template-columns: minmax(72px, auto) minmax(0, 1fr);
   gap: var(--space-3, 12px);
   padding: var(--space-2, 8px) 0;
-  border-bottom: 1px solid var(--border-default, #263846);
+  border-bottom: 1px solid var(--border-default, #D2D2D7);
 }
 
 .confirmation-dialog__details div:last-child {
@@ -58,7 +58,7 @@
 }
 
 .confirmation-dialog__details dt {
-  color: var(--text-muted, #8ea3b3);
+  color: var(--text-muted, #6E6E73);
   font-size: 12px;
   font-weight: 700;
 }
@@ -66,7 +66,7 @@
 .confirmation-dialog__details dd {
   min-width: 0;
   margin: 0;
-  color: var(--text-primary, #e6edf3);
+  color: var(--text-primary, #1D1D1F);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 12px;
   overflow-wrap: anywhere;
@@ -77,15 +77,15 @@
   justify-content: flex-end;
   gap: var(--space-2, 8px);
   padding: var(--space-4, 16px);
-  border-top: 1px solid var(--border-default, #263846);
+  border-top: 1px solid var(--border-default, #D2D2D7);
 }
 
 .confirmation-dialog .button--primary {
-  background: var(--confirmation-primary, #11745f);
+  background: var(--confirmation-primary, #0066CC);
 }
 
 .confirmation-dialog .button--primary:hover {
-  background: var(--confirmation-primary-hover, #147d66);
+  background: var(--confirmation-primary-hover, #0071E3);
 }
 
 @media (max-width: 440px) {

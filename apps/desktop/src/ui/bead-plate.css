@@ -4,9 +4,9 @@
   grid-auto-flow: column;
   gap: 3px;
   padding: 10px;
-  border: 1px solid #2d3e4e;
+  border: 1px solid #D2D2D7;
   border-radius: 7px;
-  background: #0d1620;
+  background: #E5F1FF;
   width: fit-content;
   max-width: 100%;
   overflow-x: auto;
@@ -33,28 +33,28 @@
   font-size: calc(var(--bead-size) * 0.42);
   font-weight: 800;
   line-height: 1;
-  color: #ffffff;
+  color: #3A3A3C;
   pointer-events: none;
 }
 
 .bead--empty {
-  border: 1px dashed #22303d;
+  border: 1px dashed #D2D2D7;
   background: transparent;
 }
 
 .bead--banker {
-  background: #c0392b;
-  border: 1px solid #e0604f;
+  background: #C0392B;
+  border: 1px solid #C41E3D;
 }
 
 .bead--player {
-  background: #2f6fd0;
-  border: 1px solid #5b93e0;
+  background: #0066CC;
+  border: 1px solid #0066CC;
 }
 
 .bead--tie {
-  background: #1fa860;
-  border: 1px solid #4ec98b;
+  background: #0066CC;
+  border: 1px solid #248A3D;
 }
 
 .bead__mark {
@@ -62,19 +62,19 @@
   width: calc(var(--bead-size) * 0.34);
   height: calc(var(--bead-size) * 0.34);
   border-radius: 50%;
-  border: 1px solid #ffffff;
+  border: 1px solid #3A3A3C;
 }
 
 .bead__mark--banker {
   top: -1px;
   left: -1px;
-  background: #e23a2a;
+  background: #C41E3D;
 }
 
 .bead__mark--player {
   top: -1px;
   right: -1px;
-  background: #2f6fd0;
+  background: #0066CC;
 }
 
 .bead-legend {
@@ -83,7 +83,7 @@
   gap: 12px;
   align-items: center;
   margin-top: 8px;
-  color: #8ea3b3;
+  color: #6E6E73;
   font-size: 11px;
 }
 
@@ -120,36 +120,102 @@
 }
 
 .ev-market-card {
-  border: 1px solid #2d3e4e;
+  border: 1px solid #D2D2D7;
   border-radius: 7px;
   padding: 10px 12px;
   display: flex;
   flex-direction: column;
   gap: 4px;
-  background: #111c26;
+  background: #FFFFFF;
 }
 
 .ev-market-card__label {
   font-size: 11px;
-  color: #8ea3b3;
+  color: #6E6E73;
   font-weight: 800;
 }
 
 .ev-market-card__ev {
   font-size: 18px;
-  color: #d9e6ed;
+  color: #1D1D1F;
 }
 
 .ev-market-card--positive .ev-market-card__ev {
-  color: #4ec98b;
+  color: #248A3D;
 }
 
 .ev-market-card__p {
   font-size: 11px;
-  color: #8ea3b3;
+  color: #6E6E73;
 }
 
 .monitor-detail__note {
   margin-top: 10px;
   font-size: 11px;
 }
+
+/* 监控桌台卡网格（设计稿形态） */
+.monitor-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 12px;
+}
+
+.monitor-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  background: #FFFFFF;
+  border: 1px solid #D2D2D7;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.monitor-card:hover { border-color: #0066CC; }
+
+.monitor-card--selected {
+  border-color: #0066CC;
+  box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.18);
+}
+
+.monitor-card__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.monitor-card__name { font-size: 14px; color: #1D1D1F; }
+
+.monitor-card__platform {
+  font-size: 11px;
+  color: #6E6E73;
+  background: #F5F5F7;
+  border-radius: 980px;
+  padding: 2px 8px;
+}
+
+.monitor-card__stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin: 0;
+}
+
+.monitor-card__stats dt { font-size: 11px; color: #6E6E73; margin: 0 0 2px; }
+.monitor-card__stats dd { margin: 0; font-size: 13px; font-weight: 700; color: #1D1D1F; }
+
+.monitor-card__beads { min-height: 0; }
+
+.monitor-card__alerts { display: flex; flex-wrap: wrap; gap: 4px; }
+
+.monitor-card__actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-top: auto;
+}
+
+.monitor-view-toggle { display: inline-flex; gap: 4px; }

@@ -18,6 +18,7 @@ import { BUNDLED_PLATFORM_DESCRIPTORS } from '@baccarat/adapter-contract';
 import type { DecisionHandRecord, OperationalWagerRecord } from '@baccarat/ledger-state';
 import type {
   DesktopConsoleSnapshot,
+  DesktopBeadHand,
   DesktopKeepaliveState,
   DesktopRecordPage,
   DesktopRecordQuery,
@@ -232,6 +233,7 @@ export function App() {
   const [reconcilingReservationId, setReconcilingReservationId] = useState<string | null>(null);
   const [selectedMonitorTableId, setSelectedMonitorTableId] = useState<string | null>(null);
   const [monitorDetailTableId, setMonitorDetailTableId] = useState<string | null>(null);
+  const [monitorViewMode, setMonitorViewMode] = useState<'cards' | 'table'>('cards');
   const [monitorSort, setMonitorSort] = useState<MonitorSort | null>(null);
   const [pendingLiveExecutionTableId, setPendingLiveExecutionTableId] = useState<string | null>(null);
   const [alertCenterOpen, setAlertCenterOpen] = useState(false);
@@ -1104,6 +1106,18 @@ export function App() {
             <section className="record-section monitor-section">
               <div className="section-heading monitor-section__toolbar">
                 <span>监控牌桌</span>
+                <div className="monitor-view-toggle" role="group" aria-label="视图切换">
+                  <button
+                    className={cx('button button--small', monitorViewMode === 'cards' ? 'button--primary' : 'button--secondary')}
+                    type="button"
+                    onClick={() => setMonitorViewMode('cards')}
+                  >卡片</button>
+                  <button
+                    className={cx('button button--small', monitorViewMode === 'table' ? 'button--primary' : 'button--secondary')}
+                    type="button"
+                    onClick={() => setMonitorViewMode('table')}
+                  >表格</button>
+                </div>
                 <button
                   className="button button--small button--danger-ghost"
                   type="button"
@@ -1113,6 +1127,26 @@ export function App() {
                   一键移除未连接{disconnectedMonitorCount > 0 ? ` (${disconnectedMonitorCount})` : ''}
                 </button>
               </div>
+              {monitorViewMode === 'cards' && (
+                <div className="monitor-cards" aria-label="监控桌台卡片">
+                  {displayedMonitorTables.map(table => (
+                    <MonitorTableCard
+                      key={table.tableId}
+                      actor={table}
+                      metadata={monitorMetadata.get(table.tableId)}
+                      evidence={snapshot?.shoeEvidence?.[table.tableId]}
+                      runtime={snapshot?.runtime.tables[table.tableId]}
+                      beads={snapshot?.tableBeads?.[table.tableId] ?? []}
+                      selected={monitorDetailTable === table.tableId}
+                      onSelect={() => setMonitorDetailTableId(table.tableId)}
+                      onOpenSettings={() => setSelectedMonitorTableId(table.tableId)}
+                      onRemove={() => void removeMonitorTable(table.tableId)}
+                      now={monitorNow}
+                    />
+                  ))}
+                </div>
+              )}
+              {monitorViewMode === 'table' && (
               <div className="table-scroll">
                 <table className="record-table monitor-table">
                   <colgroup>
@@ -1170,6 +1204,7 @@ export function App() {
                   </tbody>
                 </table>
               </div>
+              )}
             </section>
           ) : (
             <EmptyState title="没有符合条件的牌桌" detail={tables.length === 0 ? '点击“开始持续模拟”创建可查看的模拟牌桌。' : '请调整筛选条件。'} />
@@ -1577,6 +1612,88 @@ function TableMonitorRow(props: {
         >移除</button>
       </td>
     </tr>
+  );
+}
+
+/** 监控桌台卡（设计稿形态）：状态徽章 + 关键指标 + 迷你珠盘 + 告警。 */
+function MonitorTableCard(props: {
+  actor: TableActorSnapshot;
+  metadata?: MonitorTableCandidate;
+  evidence?: DesktopShoeEvidence;
+  runtime?: DesktopConsoleSnapshot['runtime']['tables'][string];
+  beads: readonly DesktopBeadHand[];
+  selected: boolean;
+  onSelect: () => void;
+  onOpenSettings: () => void;
+  onRemove: () => void;
+  now: number;
+}) {
+  const { actor } = props;
+  const projection = actor.projection;
+  const physicalShoeKnown = isDisplayedPhysicalShoe(
+    actor.tableId,
+    projection,
+    props.evidence,
+    props.metadata?.gameCount,
+  );
+  const bankerPair = physicalShoeKnown
+    ? safeEvaluate(projection.profileSnapshot, 'bankerPair', projection.seenCards, projection.remainingCounts)
+    : null;
+  const alerts = tableAlerts(actor, props.runtime);
+  const displayName = props.metadata?.displayName ?? tableName(actor.tableId);
+  const round = monitorDisplayedRoundLabel(
+    actor.tableId,
+    projection,
+    props.metadata,
+    props.evidence?.reason,
+    physicalShoeKnown,
+  );
+  const bettingPhase = bettingPhaseLabel(actor, props.now);
+  const connection = monitorDisplayedConnection(projection, props.runtime);
+  const platform = props.metadata?.roomId
+    ? BUNDLED_PLATFORM_DESCRIPTORS.find(descriptor => descriptor.roomId === props.metadata?.roomId)
+    : undefined;
+  const evPct = bankerPair && Number.isFinite(bankerPair.evMean)
+    ? `${(bankerPair.evMean * 100).toFixed(2)}%`
+    : '—';
+  const remaining = physicalShoeKnown ? projection.remainingTotal : null;
+  return (
+    <div
+      className={cx('monitor-card', props.selected && 'monitor-card--selected')}
+      role="button"
+      tabIndex={0}
+      onClick={() => props.onSelect()}
+      onKeyDown={event => { if (event.key === 'Enter') props.onSelect(); }}
+    >
+      <div className="monitor-card__head">
+        <strong className="monitor-card__name">{displayName}</strong>
+        <span className="monitor-card__platform">{platform?.roomDisplayName ?? '—'}</span>
+      </div>
+      <div className="badge-line">
+        <Badge label={STATUS_LABELS[projection.status]} tone={statusTone(projection.status)} />
+        <Badge label={CONNECTION_LABELS[connection]} tone={connection === 'CONNECTED' ? 'ok' : 'warn'} />
+        {bettingPhase.open ? <Badge label="开盘" tone="ok" /> : null}
+      </div>
+      <dl className="monitor-card__stats">
+        <div><dt>局号</dt><dd title={round.title}>{round.label}</dd></div>
+        <div><dt>剩余</dt><dd>{remaining === null ? '—' : projection.remainingTotal}</dd></div>
+        <div><dt>对子EV</dt><dd>{evPct}</dd></div>
+        <div><dt>窗状态</dt><dd>{bettingPhase.text}</dd></div>
+      </dl>
+      <div className="monitor-card__beads">
+        <BeadPlate beads={props.beads.slice(-18)} rows={3} columns={6} compact ariaLabel={`${displayName} 迷你珠盘`} />
+      </div>
+      {alerts.length > 0 && (
+        <div className="monitor-card__alerts">
+          {alerts.slice(0, 3).map(alert => <Badge key={alert} label={alert} tone="warn" />)}
+        </div>
+      )}
+      <div className="monitor-card__actions" onClick={event => event.stopPropagation()}>
+        <button className="button button--small button--primary" type="button" onClick={props.onSelect}>详情</button>
+        <button className="button button--small button--secondary" type="button" onClick={props.onOpenSettings}>设置</button>
+        <button className="button button--small button--danger-ghost" type="button" onClick={props.onRemove}>移除</button>
+      </div>
+    </div>
   );
 }
 
