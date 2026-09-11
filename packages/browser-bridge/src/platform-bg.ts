@@ -4,6 +4,7 @@
 import type { NormalizedEvent } from '@baccarat/contracts';
 import type { PlatformAdapterDescriptor } from '@baccarat/adapter-contract';
 import type { BridgeRoomDescriptor } from './protocol.js';
+import { isWrapShapedRoadCount } from '@baccarat/ledger-state';
 import { BgRuntimeParser, normalizeBgTableId, selectBgRoadCount } from './bg-runtime.js';
 import {
   buildOperatorShoeEvent,
@@ -65,6 +66,26 @@ export class BgPlatformAdapter implements BridgePlatformAdapter {
 
   mergeGameCount(previous: number | undefined, next: number | undefined): number | undefined {
     return selectBgRoadCount(previous, next);
+  }
+
+  observeGameCount(
+    tableId: string,
+    _previous: number | undefined,
+    incoming: number | undefined,
+  ): number | undefined {
+    const accepted = this.parser.acceptedGameCount(tableId);
+    const reason = this.parser.shoeEvidence(tableId)?.reason;
+    if (reason === 'protocol-shuffle' && accepted === undefined && incoming !== undefined && incoming > 20) {
+      return undefined;
+    }
+    if (
+      typeof accepted === 'number'
+      && typeof incoming === 'number'
+      && isWrapShapedRoadCount(accepted, incoming)
+    ) {
+      return incoming;
+    }
+    return selectBgRoadCount(accepted, incoming);
   }
 
   ingestRoomGameCounts(room: BridgeRoomDescriptor, ctx: PlatformAdapterContext): void {

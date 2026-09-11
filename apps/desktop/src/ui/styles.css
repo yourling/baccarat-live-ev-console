@@ -884,3 +884,10 @@ h2 { color: #f4f7fa; font-size: 18px; }
 @media (max-width: 440px) {
   .unified-settings-fields { grid-template-columns: 1fr; }
 }
+
+/* 聚合复盘卡片 */
+.perf-card__body { display: flex; flex-direction: column; gap: 8px; }
+.perf-card__totals { display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; }
+.perf-card__meta { display: flex; flex-direction: column; gap: 4px; font-size: 12px; opacity: 0.8; }
+.perf-card__pnl--win { color: #c0392b; }
+.perf-card__pnl--loss { color: #27ae60; }

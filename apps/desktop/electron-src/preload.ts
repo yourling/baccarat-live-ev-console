@@ -18,6 +18,7 @@ const api = {
   platform: process.platform as string,
   snapshot: (options?: DesktopSnapshotOptions) => ipcRenderer.invoke('console:snapshot', options),
   queryRecords: (query: DesktopRecordQuery) => ipcRenderer.invoke('console:query-records', query),
+  performanceReport: () => ipcRenderer.invoke('console:performance-report'),
   runDemo: (seed?: number) => ipcRenderer.invoke('console:run-demo', seed),
   startDemo: (seed?: number) => ipcRenderer.invoke('console:start-demo', seed),
   stopDemo: () => ipcRenderer.invoke('console:stop-demo'),

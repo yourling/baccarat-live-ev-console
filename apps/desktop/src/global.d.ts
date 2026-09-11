@@ -1,5 +1,6 @@
 import type {
   DesktopConsoleSnapshot,
+  DesktopPerformanceReport,
   DesktopKeepaliveStrategySettings,
   DesktopOperationalWagerCommand,
   DesktopOperationalWagerResult,
@@ -30,6 +31,7 @@ declare global {
       platform: string;
       snapshot: (options?: DesktopSnapshotOptions) => Promise<DesktopConsoleSnapshot>;
       queryRecords: (query: DesktopRecordQuery) => Promise<DesktopRecordPage>;
+      performanceReport: () => Promise<DesktopPerformanceReport>;
       runDemo: (seed?: number) => Promise<DesktopConsoleSnapshot>;
       startDemo: (seed?: number) => Promise<DesktopConsoleSnapshot>;
       stopDemo: () => Promise<DesktopConsoleSnapshot>;

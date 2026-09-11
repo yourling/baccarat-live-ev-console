@@ -44,6 +44,8 @@ import { isDisplayedPhysicalShoe, isVerifiedPhysicalShoeReason, monitorDisplayed
 import { isLiveMonitorRoomId, selectLiveMonitorTableIds } from './monitor-table-selection';
 import { evaluateProjectionPairMarket } from './pair-evaluation';
 import { decisionHandExplanation, planRecordViewChange, recordKindForView, recordTabCount, type ConsoleView } from './record-view';
+import { PerformanceCard } from './performance-card';
+import { useConsoleSnapshot } from './use-console-snapshot';
 import { formatConsoleBuildLabel } from '../console-build-info';
 import './styles.css';
 
@@ -185,14 +187,12 @@ const RECEIPT_STATUS_LABELS: Record<string, string> = {
 };
 export function App() {
   const { confirm, dialog } = useConfirmationDialog();
-  const [snapshot, setSnapshot] = useState<DesktopConsoleSnapshot | null>(null);
   const [recordPage, setRecordPage] = useState<DesktopRecordPage | null>(null);
   const [recordLoading, setRecordLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [automationSaving, setAutomationSaving] = useState(false);
   const [keepaliveSaving, setKeepaliveSaving] = useState(false);
   const [demoSpeed, setDemoSpeed] = useState(1);
-  const [error, setError] = useState<string | null>(null);
   const [deckInputs, setDeckInputs] = useState<Record<string, string>>({});
   const [view, setView] = useState<View>('overview');
   const [tableFilter, setTableFilter] = useState<string>('all');
@@ -226,68 +226,18 @@ export function App() {
   const [pendingLiveExecutionTableId, setPendingLiveExecutionTableId] = useState<string | null>(null);
   const [alertCenterOpen, setAlertCenterOpen] = useState(false);
   const [acknowledgingIncidentId, setAcknowledgingIncidentId] = useState<string | null>(null);
-  const timerRef = useRef<number | null>(null);
   const recordRequestSequenceRef = useRef(0);
-  const snapshotSequenceRef = useRef(0);
-  const monitorMutationSequenceRef = useRef(0);
-  const pendingMonitorMutationsRef = useRef(0);
-  const desktopReady = typeof window !== 'undefined' && Boolean(window.desktop);
-
-  const beginSnapshotRequest = useCallback((): SnapshotRequestToken => ({
-    sequence: ++snapshotSequenceRef.current,
-    monitorMutationSequence: monitorMutationSequenceRef.current,
-  }), []);
-
-  const beginMonitorTableMutation = useCallback((): SnapshotRequestToken => {
-    pendingMonitorMutationsRef.current += 1;
-    const monitorMutationSequence = ++monitorMutationSequenceRef.current;
-    return {
-      sequence: ++snapshotSequenceRef.current,
-      monitorMutationSequence,
-    };
-  }, []);
-
-  const canApplySnapshot = useCallback((token: SnapshotRequestToken): boolean => (
-    token.sequence === snapshotSequenceRef.current
-      && token.monitorMutationSequence === monitorMutationSequenceRef.current
-      && pendingMonitorMutationsRef.current === 0
-  ), []);
-
-  const finishMonitorTableMutation = useCallback((token: SnapshotRequestToken, nextSnapshot?: DesktopConsoleSnapshot): boolean => {
-    pendingMonitorMutationsRef.current = Math.max(0, pendingMonitorMutationsRef.current - 1);
-    const isCurrentMutation = token.monitorMutationSequence === monitorMutationSequenceRef.current;
-    if (isCurrentMutation && nextSnapshot !== undefined) {
-      // A refresh that started while this mutation was in flight is now stale.
-      snapshotSequenceRef.current += 1;
-      setSnapshot(nextSnapshot);
-    }
-    return isCurrentMutation;
-  }, []);
-
-  const refreshBusyRef = useRef(false);
-  const refresh = useCallback(async () => {
-    if (!window.desktop || refreshBusyRef.current) return;
-    const request = beginSnapshotRequest();
-    refreshBusyRef.current = true;
-    try {
-      const nextSnapshot = await window.desktop.snapshot({
-        includeHistory: false,
-        includeRecordCounts: view !== 'monitor' && view !== 'settings',
-        includeSummary: view === 'overview',
-        tableId: tableFilter === 'all' ? undefined : tableFilter,
-        fromTime: startTime || undefined,
-        toTime: endTime || undefined,
-      });
-      if (!canApplySnapshot(request)) return;
-      setSnapshot(nextSnapshot);
-      setError(null);
-    } catch (e) {
-      if (!canApplySnapshot(request)) return;
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      refreshBusyRef.current = false;
-    }
-  }, [beginSnapshotRequest, canApplySnapshot, view, tableFilter, startTime, endTime]);
+  const {
+    snapshot,
+    setSnapshot,
+    error,
+    setError,
+    desktopReady,
+    refresh,
+    beginMonitorTableMutation,
+    finishMonitorTableMutation,
+    isMonitorMutationCurrent,
+  } = useConsoleSnapshot({ view, tableFilter, startTime, endTime });
 
   const toggleDemo = useCallback(async () => {
     if (!window.desktop) return;
@@ -346,15 +296,6 @@ export function App() {
       setBusy(false);
     }
   }, [confirm]);
-
-  useEffect(() => {
-    void refresh();
-    const intervalMs = view === 'monitor' ? 1_000 : 2_000;
-    timerRef.current = window.setInterval(() => void refresh(), intervalMs);
-    return () => {
-      if (timerRef.current !== null) window.clearInterval(timerRef.current);
-    };
-  }, [refresh, view]);
 
   useEffect(() => {
     if (snapshot) setDemoSpeed(snapshot.demoSpeed);
@@ -503,7 +444,7 @@ export function App() {
       setError(error instanceof Error ? error.message : String(error));
       return null;
     } finally {
-      if (request.monitorMutationSequence === monitorMutationSequenceRef.current) setMonitorTableSaving(false);
+      if (isMonitorMutationCurrent(request)) setMonitorTableSaving(false);
     }
   }, [beginMonitorTableMutation, finishMonitorTableMutation]);
 
@@ -1073,7 +1014,7 @@ export function App() {
 
       {recordLoading && recordKind && <div className="notice notice--info">正在从账本加载当前页…</div>}
 
-      {view === 'overview' && <><OverviewPanel stats={overviewTotals} rows={pagedOverviewRows} incomePoints={overview.incomePoints} tableLabel={tableLabel} /><Pagination page={page} pageSize={pageSize} totalItems={visibleOverviewRows.length} onPageChange={setPage} onPageSizeChange={size => { setPageSize(size); setPage(1); }} /></>}
+      {view === 'overview' && <><PerformanceCard /><OverviewPanel stats={overviewTotals} rows={pagedOverviewRows} incomePoints={overview.incomePoints} tableLabel={tableLabel} /><Pagination page={page} pageSize={pageSize} totalItems={visibleOverviewRows.length} onPageChange={setPage} onPageSizeChange={size => { setPageSize(size); setPage(1); }} /></>}
 
       {view === 'monitor' && (
         <main>

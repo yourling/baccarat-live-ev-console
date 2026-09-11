@@ -9,6 +9,7 @@
   "dependencies": {
     "@baccarat/adapter-contract": "0.1.0",
     "@baccarat/contracts": "0.1.0",
+    "@baccarat/ledger-state": "0.1.0",
     "@baccarat/room-monitor": "0.1.0",
     "ws": "^8.18.0"
   },

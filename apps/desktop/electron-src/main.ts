@@ -111,6 +111,7 @@ function registerIpc(): void {
     return getService().snapshot(options);
   });
   ipcMain.handle('console:query-records', (_event, query) => getService().queryRecords(query));
+  ipcMain.handle('console:performance-report', () => getService().performanceReport());
   ipcMain.handle('console:run-demo', (_event, seed?: number) => getService().runDemo(seed));
   ipcMain.handle('console:start-demo', (_event, seed?: number) => getService().startDemo(seed));
   ipcMain.handle('console:stop-demo', () => getService().stopDemo());

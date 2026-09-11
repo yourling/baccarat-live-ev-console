@@ -15,6 +15,7 @@ import {
 import {
   PragmaticRuntimeParser,
   pragmaticGameCountSnapshot,
+  selectObservedGameCount,
   selectStableGameCount,
 } from './pragmatic-runtime.js';
 import {
@@ -103,6 +104,18 @@ export class PragmaticPlatformAdapter implements BridgePlatformAdapter {
 
   mergeGameCount(previous: number | undefined, next: number | undefined): number | undefined {
     return next === undefined ? previous : selectStableGameCount(previous, next);
+  }
+
+  observeGameCount(
+    tableId: string,
+    _previous: number | undefined,
+    incoming: number | undefined,
+  ): number | undefined {
+    return selectObservedGameCount(
+      this.parser.shoeEvidence(tableId)?.reason,
+      this.parser.acceptedGameCount(tableId),
+      incoming,
+    );
   }
 
   ingestRoomGameCounts(room: BridgeRoomDescriptor, ctx: PlatformAdapterContext): void {

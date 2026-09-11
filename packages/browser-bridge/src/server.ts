@@ -1318,6 +1318,28 @@ export class BrowserBridgeServer implements RoomMonitor {
     return this.defaultAdapter;
   }
 
+  /**
+   * 中控读侧路子计数：按桌归属路由到平台适配器的守卫 + 平滑规则。
+   * previous 是中控元数据缓存的路子数（winfinity 的 protocol-shuffle 守卫依赖它）。
+   */
+  observedGameCountForTable(
+    tableId: string,
+    previous: number | undefined,
+    incoming: number | undefined,
+  ): number | undefined {
+    const adapter = this.adapterForRoomId(this.roomIdForTable(tableId)) ?? this.defaultAdapter;
+    return adapter.observeGameCount(tableId, previous, incoming);
+  }
+
+  /** 大厅晋升路径的路子数平滑：按桌 ID 形状路由（bg → winfinity → pragmatic）。 */
+  smoothRoadCountForTable(
+    tableId: string,
+    previous: number | undefined,
+    incoming: number | undefined,
+  ): number | undefined {
+    return this.gameCountAdapterForTableId(tableId).mergeGameCount(previous, incoming);
+  }
+
   /** Starts an independent logical monitor session without claiming a physical shoe reset. */
   currentPragmaticShoeId(tableId: string): string | undefined {
     const pragmatic = this.adaptersByRoomId.get(

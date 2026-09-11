@@ -49,3 +49,42 @@ function pickRandomMarket(handKey?: string): BettingMarket {
   const digest = sha256(`random-strategy:${handKey}`);
   return BETTING_MARKETS[Number.parseInt(digest.slice(0, 8), 16) % BETTING_MARKETS.length];
 }
+
+/** both 策略的评估摘要（取自 probability 层的下置信界 EV）。 */
+export interface PairEvaluationSummary {
+  evLower: number;
+}
+
+/**
+ * both 策略一手只押一个市场：EV 下界更低（更看好）的一侧。
+ * 同手两次评估（无 closesAt + 有 closesAt）必须给出同一偏好，
+ * 否则决策审计会出现自相矛盾 —— 因此这里是纯函数，输入只依赖评估值。
+ */
+export function preferredMarketForBoth(
+  banker: PairEvaluationSummary,
+  player: PairEvaluationSummary,
+): 'bankerPair' | 'playerPair' {
+  return player.evLower > banker.evLower ? 'playerPair' : 'bankerPair';
+}
+
+/**
+ * 注额选择：capitalPercent 模式按资金比例（可选上限封顶）；
+ * EV 阶梯模式取最后一个 minEV ≤ 当前 EV 的档位金额（阶梯必须按 minEV 升序）。
+ */
+export function selectBetAmount(
+  profile: { betTiers?: Array<{ minEV: number; amount: number }> },
+  ev: number,
+  defaultBetAmount: number,
+  sizing?: { mode: string; bankroll?: number; percent?: number; maxPerBet?: number },
+): number {
+  if (sizing?.mode === 'capitalPercent') {
+    const amount = (sizing.bankroll ?? 0) * (sizing.percent ?? 0);
+    return sizing.maxPerBet === undefined ? amount : Math.min(amount, sizing.maxPerBet);
+  }
+  let amount = defaultBetAmount;
+  for (const tier of profile.betTiers ?? []) {
+    if (ev >= tier.minEV) amount = tier.amount;
+    else break;
+  }
+  return amount;
+}

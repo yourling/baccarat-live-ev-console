@@ -71,6 +71,7 @@ import {
   type DesktopRecordQuery,
   type DesktopRuntimeState,
   type DesktopPendingSettlementCommand,
+  type DesktopPerformanceReport,
   type DesktopUnknownWagerReconciliationCommand,
   type DesktopUnknownWagerWriteOffCommand,
   type DesktopShoeEvidence,
@@ -90,6 +91,11 @@ import {
   LiveFeedConsole,
   type LiveFeedConsoleHost,
 } from './live-feed-console.js';
+import { DemoConsole, type DemoConsoleHost } from './demo-console.js';
+import {
+  ExecutionGateConsole,
+  type ExecutionGateHost,
+} from './execution-gate-console.js';
 import {
   MAX_LIVE_MONITOR_TABLES,
   MONITOR_TABLE_CONFIG_KEY,
@@ -241,20 +247,19 @@ function defaultConsoleLimits(): RiskLimits {
   };
 }
 
-export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHost, LiveFeedConsoleHost {
+export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHost, LiveFeedConsoleHost, DemoConsoleHost, ExecutionGateHost {
   readonly ledger: SqliteLedger;
   readonly orchestrator: Orchestrator;
   readonly operationalWagers: OperationalWagerCoordinator;
   readonly liveApprovals: LiveApprovalStore;
   readonly runtimeIncidents: RuntimeIncidentStore;
   readonly startupFailCloseTask: Promise<void>;
-  private currentExecutor: Pick<BrowserAdapter, 'requestBet'> | null;
-  private lastSeed?: number;
-  private demoRunning = false;
-  private demoSpeed = 1;
-  private demoStopRequested = false;
-  private demoTask: Promise<void> | null = null;
-  private demoError?: string;
+  currentExecutor: Pick<BrowserAdapter, 'requestBet'> | null;
+  /** demo 演示流切片（runDemo/start/stop/speed + 靴 ID 重映射）。 */
+  readonly demoConsole = new DemoConsole(this);
+  /** 执行门控切片（fail-close / 常驻 gate / 无人值守调和）。 */
+  readonly executionGateConsole = new ExecutionGateConsole(this);
+  demoError?: string;
   browserBridge?: BrowserBridgeServer;
   private browserBridgePort = 0;
   liveExecutionMode: ExecutionMode = 'live';
@@ -265,7 +270,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
   readonly shuffleHoldUntilByTable = new Map<string, number>();
   readonly lastFeedDisconnectReason = new Map<string, string>();
   readonly runtimeObservedTableIds = new Set<string>();
-  private readonly liveAuthorizationSources = new Map<string, 'manual' | 'unattended'>();
+  readonly liveAuthorizationSources = new Map<string, 'manual' | 'unattended'>();
   persistentLiveGateEnabled = false;
   transportDownAt?: number;
   recoverySuppressUntil = 0;
@@ -584,34 +589,12 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     }
   }
 
-  private async initializeFailClosedRuntime(): Promise<void> {
-    for (const actor of this.orchestrator.listActors()) {
-      if (this.monitorTableIds.includes(actor.tableId) && actor.snapshot().executionMode !== 'live') {
-        this.orchestrator.updateTableExecutionMode(actor.tableId, 'live');
-      }
-      const projection = actor.getProjection();
-      if (this.monitorTableIds.includes(actor.tableId) && projection.shoeId && projection.connectionStatus !== 'DISCONNECTED') {
-        await this.orchestrator.enqueue(actor.tableId, {
-          type: 'connectionLost',
-          eventId: newId('evt'),
-          tableId: actor.tableId,
-          timestamp: new Date().toISOString(),
-          sourceSeq: this.nextMonitorSourceSeq(actor.tableId),
-          source: 'console',
-          schemaVersion: EVENT_SCHEMA_VERSION,
-          reason: 'process-restarted',
-        });
-      }
-    }
-    this.liveAuthorizationSources.clear();
-    this.transportDownAt = undefined;
-    this.recoverySuppressUntil = 0;
-    this.setOrchestratorExecutor(null);
-    this.setOperationalWagerExecutor(false);
+  private initializeFailClosedRuntime(): Promise<void> {
+    return this.executionGateConsole.initializeFailClosedRuntime();
   }
 
-  private canExecuteAutomaticBets(_tableId: string): boolean {
-    return this.automationEnabled;
+  private canExecuteAutomaticBets(tableId: string): boolean {
+    return this.executionGateConsole.canExecuteAutomaticBets(tableId);
   }
 
   private hasSettlementGap(tableId: string): boolean {
@@ -699,6 +682,44 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     this.ledger.checkpoint();
   }
 
+  /** 聚合复盘报表（只读）：按靴汇总的结算/盈亏、UNKNOWN 敞口、断连排行。 */
+  performanceReport(): DesktopPerformanceReport {
+    const reservations = this.orchestrator.getReservations();
+    const reservationsByStatus: Record<string, number> = {};
+    let realizedPnl = 0;
+    let unknownCount = 0;
+    let unknownExposure = 0;
+    const byShoe = new Map<string, DesktopPerformanceReport['byShoe'][number]>();
+    for (const reservation of reservations) {
+      reservationsByStatus[reservation.status] = (reservationsByStatus[reservation.status] ?? 0) + 1;
+      if (reservation.status === 'UNKNOWN') {
+        unknownCount += 1;
+        unknownExposure += reservation.maxLoss;
+      }
+      if (reservation.status === 'SETTLED' && typeof reservation.realizedPnl === 'number') {
+        realizedPnl += reservation.realizedPnl;
+        const key = `${reservation.tableId}|${reservation.shoeId}`;
+        const entry = byShoe.get(key)
+          ?? { tableId: reservation.tableId, shoeId: reservation.shoeId, hands: 0, stake: 0, realizedPnl: 0 };
+        entry.hands += 1;
+        entry.stake += reservation.amount;
+        entry.realizedPnl += reservation.realizedPnl;
+        byShoe.set(key, entry);
+      }
+    }
+    const disconnectRanking = [...this.tableFlapStats.entries()]
+      .map(([tableId, stats]) => ({ tableId, disconnects: stats.disconnects, lastDisconnectAt: stats.lastDisconnectAt }))
+      .sort((left, right) => right.disconnects - left.disconnects || left.tableId.localeCompare(right.tableId))
+      .slice(0, 10);
+    return {
+      generatedAt: new Date().toISOString(),
+      totals: { reservations: reservations.length, realizedPnl, unknownCount, unknownExposure },
+      byShoe: [...byShoe.values()].sort((left, right) => right.realizedPnl - left.realizedPnl),
+      reservationsByStatus,
+      disconnectRanking,
+    };
+  }
+
   detectSettlementGap(
     event: Extract<NormalizedEvent, { type: 'bettingWindowOpened' }>,
   ): boolean {
@@ -727,7 +748,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     if (!stillMissing) this.runtimeIncidents.resolve('settlement-gap', tableId);
   }
 
-  private bridgeRuntimeStatus(): DesktopRuntimeState['bridge'] {
+  bridgeRuntimeStatus(): DesktopRuntimeState['bridge'] {
     if (!this.browserBridge) {
       return {
         running: false,
@@ -744,7 +765,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     };
   }
 
-  private liveTableReasons(
+  liveTableReasons(
     tableId: string,
     approved = true,
   ): LiveExecutionBlockReason[] {
@@ -900,69 +921,11 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
   }
 
   private async setPersistentLiveGate(enabled: boolean): Promise<void> {
-    if (this.persistentLiveGateEnabled === enabled) return;
-    if (enabled && !this.browserBridge) throw new Error('browser bridge is not running');
-    this.browserBridge?.setLiveBetEnabled(enabled);
-    this.persistentLiveGateEnabled = enabled;
+    return this.executionGateConsole.setPersistentLiveGate(enabled);
   }
 
   async reconcileUnattendedExecution(): Promise<void> {
-    await this.startupFailCloseTask;
-    this.refreshAccountingIncidents();
-    const selectedTableIds = this.currentMonitorTableIds();
-    const approvedTableIds = this.monitorTableIds
-      .filter(tableId => selectedTableIds.includes(tableId));
-    for (const tableId of approvedTableIds) {
-      const actor = this.orchestrator.getActor(tableId);
-      if (!actor) continue;
-      const reasons = this.keepaliveTableReasons(tableId);
-      const authorization = this.liveAuthorizationSources.get(tableId);
-      if (reasons.length > 0) {
-        if (authorization === 'unattended') {
-          await this.resetMonitorExecutionState(tableId);
-        }
-        continue;
-      }
-
-      this.runtimeIncidents.resolve('table-feed-stale', tableId);
-      if (authorization === undefined) {
-        await this.setPersistentLiveGate(true);
-        const bridge = this.browserBridge!;
-        this.setOrchestratorExecutor({ requestBet: request => bridge.requestBet(request) });
-        this.setOperationalWagerExecutor(true);
-        actor.setExecutionMode('live');
-        this.liveAuthorizationSources.set(tableId, 'unattended');
-      }
-      await this.rearmPairAutomation(tableId);
-    }
-
-    const hasActiveLiveTable = this.orchestrator.listActors().some(actor =>
-      actor.snapshot().executionMode === 'live'
-      && this.liveAuthorizationSources.has(actor.tableId));
-    if (!hasActiveLiveTable) {
-      this.setOrchestratorExecutor(null);
-      this.setOperationalWagerExecutor(false);
-      try {
-        await this.setPersistentLiveGate(false);
-      } catch (error) {
-        this.recordLiveMonitorError(error, 'bridge-disconnected', 'blocked');
-      }
-    }
-
-    const bridge = this.bridgeRuntimeStatus();
-    if (bridge.authenticated) {
-      this.runtimeIncidents.resolveAll('bridge-auth-failed');
-      this.runtimeIncidents.resolveAll('bridge-disconnected');
-    }
-    const liveApproved = approvedTableIds.filter(tableId => {
-      const reasons = this.liveTableReasons(tableId);
-      return !reasons.includes('table-feed-missing')
-        && !reasons.includes('table-feed-disconnected')
-        && !reasons.includes('table-feed-stale')
-        && !reasons.includes('table-connection-not-restored');
-    });
-    const continuityReady = liveApproved.length > 0 || approvedTableIds.length === 0;
-    if (continuityReady) this.runtimeIncidents.resolveAll('continuity-invalidated');
+    return this.executionGateConsole.reconcileUnattendedExecution();
   }
 
   private handleBridgeRuntimeEvent(event: BrowserBridgeRuntimeEvent): void {
@@ -1061,7 +1024,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
   }
 
   /** 为监控层导出的源事件与连接事件分配不冲突的账本 sourceSeq。 */
-  private nextMonitorSourceSeq(tableId: string): number {
+  nextMonitorSourceSeq(tableId: string): number {
     return this.liveFeedConsole.nextMonitorSourceSeq(tableId);
   }
 
@@ -1077,7 +1040,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     return run;
   }
 
-  private setOrchestratorExecutor(executor: Pick<BrowserAdapter, 'requestBet'> | null): void {
+  setOrchestratorExecutor(executor: Pick<BrowserAdapter, 'requestBet'> | null): void {
     this.currentExecutor = executor;
     this.orchestrator.setExecutor(executor);
   }
@@ -1165,36 +1128,15 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
   }
 
   async resetMonitorExecutionState(tableId: string): Promise<void> {
-    const actor = this.orchestrator.getActor(tableId);
-    if (!actor) return;
-
-    const state = actor.snapshot();
-    if (state.executionMode !== 'live') {
-      actor.setExecutionMode('live');
-    }
-    this.liveAuthorizationSources.delete(tableId);
-    if (state.projection.autoBetStatus === 'ARMED') {
-      await actor.setAutoBet(false, state.projection.shoeId || undefined, 'execution-reset');
-    }
+    return this.executionGateConsole.resetMonitorExecutionState(tableId);
   }
 
-  /**
-   * 分级断联：传输抖动只冻结真正有 live 敞口的桌。
-   * 有 live 授权或 RESERVED/UNKNOWN 在途预留的桌才 fail-close；
-   * 其余监控桌只进入 DEGRADED（暂停新单），保留观察记录、武装状态与授权。
-   */
   private hasLiveExposure(tableId: string): boolean {
-    if (this.liveAuthorizationSources.has(tableId)) return true;
-    try {
-      return this.orchestrator.getReservations(tableId).some(reservation =>
-        reservation.status === 'RESERVED' || reservation.status === 'UNKNOWN');
-    } catch {
-      return false;
-    }
+    return this.executionGateConsole.hasLiveExposure(tableId);
   }
 
   private failCloseExposedTables(tableIds: readonly string[]): Promise<void> {
-    return this.failCloseLiveExecution(tableIds.filter(tableId => this.hasLiveExposure(tableId)));
+    return this.executionGateConsole.failCloseExposedTables(tableIds);
   }
 
   private noteTableDisconnect(tableId: string, now = Date.now()): void {
@@ -1243,23 +1185,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
   }
 
   async failCloseLiveExecution(tableIds: readonly string[]): Promise<void> {
-    for (const tableId of tableIds) {
-      await this.resetMonitorExecutionState(tableId);
-    }
-
-    const hasLiveTable = this.orchestrator.listActors()
-      .some(actor => actor.snapshot().executionMode === 'live'
-        && this.liveAuthorizationSources.has(actor.tableId));
-    if (hasLiveTable) return;
-
-    this.liveExecutionMode = 'live';
-    this.setOrchestratorExecutor(null);
-    this.setOperationalWagerExecutor(false);
-    try {
-      await this.setPersistentLiveGate(false);
-    } catch (error) {
-      this.recordLiveMonitorError(error, 'bridge-disconnected', 'blocked');
-    }
+    return this.executionGateConsole.failCloseLiveExecution(tableIds);
   }
 
   async stopLiveFeed(tableId: string, feed: TableExport): Promise<void> {
@@ -1563,7 +1489,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
 
   private displayedTableIds(fullSnapshot: OrchestratorSnapshot): string[] {
     if (!this.liveMonitorActivated) return Object.keys(fullSnapshot.tables);
-    const demoTableIds = this.demoRunning
+    const demoTableIds = this.demoConsole.demoRunning
       ? Object.keys(fullSnapshot.tables)
         .filter(tableId => !this.monitorTableIds.includes(tableId))
       : [];
@@ -1642,7 +1568,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     const result: DesktopConsoleSnapshot = {
       dbPath: this.dbPath,
       isOpen: this.ledger.isOpen(),
-      seed: this.lastSeed,
+      seed: this.demoConsole.lastSeed,
       snapshot,
       monitorTableIds: [...this.monitorTableIds],
       monitorCandidates,
@@ -1657,8 +1583,8 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
       decisions: filterToDisplayedTables(decisions),
       receipts: filterToDisplayedTables(receipts),
       reservations: filterToDisplayedTables(reservations),
-      demoRunning: this.demoRunning,
-      demoSpeed: this.demoSpeed,
+      demoRunning: this.demoConsole.demoRunning,
+      demoSpeed: this.demoConsole.demoSpeed,
       summary: {
         ...summary,
         rows: summary.rows.filter(row => activeTableIds.has(row.tableId)),
@@ -1670,163 +1596,22 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
   }
 
   async runDemo(seed?: number): Promise<DesktopConsoleSnapshot> {
-    if (this.demoRunning) throw new Error('demo stream is already running');
-    this.demoRunning = true;
-    this.demoStopRequested = false;
     this.demoError = undefined;
-    try {
-      return await this.runDemoInner(seed);
-    } finally {
-      this.demoRunning = false;
-    }
+    return this.demoConsole.runDemo(seed);
   }
 
   async startDemo(seed?: number): Promise<DesktopConsoleSnapshot> {
-    if (this.demoRunning) return this.snapshot();
-    this.demoRunning = true;
-    this.demoStopRequested = false;
     this.demoError = undefined;
-    this.demoTask = this.runContinuousDemo(seed)
-      .catch(error => {
-        this.demoError = error instanceof Error ? error.message : String(error);
-      })
-      .finally(() => {
-        this.demoRunning = false;
-        this.demoTask = null;
-      });
-    return this.snapshot();
+    return this.demoConsole.startDemo(seed);
   }
 
   async stopDemo(): Promise<DesktopConsoleSnapshot> {
-    this.demoStopRequested = true;
-    if (this.demoTask) await this.demoTask;
-    return this.snapshot();
+    return this.demoConsole.stopDemo();
   }
 
   setDemoSpeed(speed: number): DesktopConsoleSnapshot {
-    if (!Number.isInteger(speed) || speed < 1 || speed > 10) {
-      throw new RangeError('demo speed must be an integer from 1 to 10');
-    }
-    this.demoSpeed = speed;
-    return this.snapshot();
+    return this.demoConsole.setDemoSpeed(speed);
   }
-
-  private async runContinuousDemo(seed?: number): Promise<void> {
-    let nextSeed = seed;
-    while (!this.demoStopRequested) {
-      await this.runDemoInner(nextSeed, true);
-      nextSeed = undefined;
-      if (!this.demoStopRequested) await wait(DEMO_PAUSE_MS / this.demoSpeed);
-    }
-  }
-
-  private async runDemoInner(seed?: number, paced = false): Promise<DesktopConsoleSnapshot> {
-      const sessionStartedAt = new Date();
-      const demo = buildRandomDemo(seed, newId('demo'));
-      const shoeIds = buildShoeIdMap(demo, this.ledger, sessionStartedAt);
-      this.lastSeed = demo.seed;
-      const amounts = { [demo.profiles[0].tableId]: 100, [demo.profiles[1].tableId]: 80 } as const;
-      const configuredProfiles = new Map<string, TableProfile>();
-      for (const profile of demo.profiles) {
-        const existingActor = this.orchestrator.getActor(profile.tableId);
-        const existingProfile = existingActor?.getProfile();
-        const effectiveProfile: TableProfile = {
-          ...profile,
-          minEV: existingProfile?.minEV ?? profile.minEV,
-          betTiers: existingProfile?.betTiers ?? profile.betTiers,
-          monitorUrl: existingProfile?.monitorUrl ?? profile.monitorUrl,
-        };
-        const defaultBetAmount = existingActor?.snapshot().defaultBetAmount
-          ?? amounts[profile.tableId as keyof typeof amounts]
-          ?? 100;
-        configuredProfiles.set(profile.tableId, effectiveProfile);
-        this.orchestrator.registerTable(effectiveProfile, 'simulated', defaultBetAmount);
-      }
-
-      // 监控层使用“源内局部序号”做游标/缺口检测；账本 sourceSeq 由消费方在导出时按账本水位分配。
-      const streams = new Map<string, NormalizedEvent[]>();
-      for (const profile of demo.profiles) {
-        const tableId = profile.tableId;
-        const effectiveProfile = configuredProfiles.get(tableId)!;
-        const stream = demo.streams[tableId].map(event => {
-          const remappedEvent = remapDemoEvent(event, tableId, shoeIds, sessionStartedAt);
-          return remappedEvent.type === 'newShoeSignal'
-            ? { ...remappedEvent, profile: effectiveProfile }
-            : remappedEvent;
-        });
-        streams.set(tableId, stream);
-      }
-
-      const room = {
-        roomId: 'demo-room',
-        displayName: 'Demo Room',
-        tables: [...configuredProfiles].map(([tableId, profile]) => ({
-          tableId,
-          profile,
-          events: streams.get(tableId)!,
-          monitorUrl: profile.monitorUrl,
-          maxBatchSize: paced ? 1 : 20,
-          latencyMs: paced ? DEMO_EVENT_INTERVAL_MS / this.demoSpeed : 0,
-        })),
-      };
-      const monitor = new ShadowRoomMonitor({ rooms: [room] });
-      const feeds: TableExport[] = [];
-      const previousExecutor = this.currentExecutor;
-      this.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
-      try {
-        const rooms = await monitor.discoverRooms();
-        for (const table of rooms[0].tables) {
-          let feed: TableExport;
-          feed = monitor.openTable(room.roomId, table.tableId);
-          await feed.start({
-            onBatch: async batch => {
-              if (this.demoStopRequested) {
-                feed.stop();
-                return;
-              }
-              for (const event of batch.events) {
-                const sourceSeq = this.nextMonitorSourceSeq(event.tableId);
-                await this.orchestrator.enqueue(event.tableId, { ...event, sourceSeq });
-              }
-            },
-            onDisconnect: (tableId, reason) => {
-              this.lastFeedDisconnectReason.set(tableId, reason ?? '');
-              const sourceSeq = this.nextMonitorSourceSeq(tableId);
-              void this.orchestrator.enqueue(tableId, {
-                type: 'connectionLost',
-                eventId: newId('evt'),
-                tableId,
-                timestamp: new Date().toISOString(),
-                sourceSeq,
-                source: 'room-monitor',
-                schemaVersion: EVENT_SCHEMA_VERSION,
-                ...(reason ? { reason } : {}),
-              });
-            },
-            onRestored: async (tableId, proof) => {
-              const sourceSeq = this.nextMonitorSourceSeq(tableId);
-              await this.orchestrator.enqueue(tableId, {
-                type: 'connectionRestored',
-                eventId: newId('evt'),
-                tableId,
-                timestamp: new Date().toISOString(),
-                sourceSeq,
-                source: 'room-monitor',
-                schemaVersion: EVENT_SCHEMA_VERSION,
-                continuityProof: proof,
-              });
-            },
-          });
-          feeds.push(feed);
-        }
-        await Promise.all(feeds.map(feed => feed.flush()));
-        await this.orchestrator.flush();
-      } finally {
-        await monitor.close();
-        this.setOrchestratorExecutor(previousExecutor);
-      }
-      return this.snapshot();
-    }
 
   queryRecords(query: DesktopRecordQuery): DesktopRecordPage {
     // Events/decisions stay scoped to the live monitor list so demo tables do not
@@ -2152,7 +1937,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
       }
     }
     if (this.liveMonitorActivated) this.ensureMonitorActors(this.monitorTableIds);
-    this.lastSeed = undefined;
+    this.demoConsole.lastSeed = undefined;
     this.demoError = undefined;
     return this.snapshot();
   }
@@ -2178,67 +1963,3 @@ function assertNeverBridgeRuntimeEvent(value: never): never {
   throw new Error(`unexpected browser bridge runtime event: ${String(value)}`);
 }
 
-function buildShoeIdMap(
-  demo: ReturnType<typeof buildRandomDemo>,
-  ledger: SqliteLedger,
-  startedAt: Date,
-): Map<string, string> {
-  const minute = formatShoeMinute(startedAt);
-  const result = new Map<string, string>();
-  for (const profile of demo.profiles) {
-    let nextSequence = 1;
-    const existing = ledger.listEvents(profile.tableId);
-    for (const event of existing) {
-      if (event.type !== 'newShoeSignal') continue;
-      const match = event.shoeId.match(new RegExp('^' + minute + '-([0-9]{3})$'));
-      if (match) nextSequence = Math.max(nextSequence, Number(match[1]) + 1);
-    }
-    for (const event of demo.streams[profile.tableId]) {
-      if (event.type !== 'newShoeSignal') continue;
-      const key = profile.tableId + '|' + event.shoeId;
-      result.set(key, minute + '-' + String(nextSequence).padStart(3, '0'));
-      nextSequence += 1;
-    }
-  }
-  return result;
-}
-
-function remapDemoEvent(
-  event: NormalizedEvent,
-  tableId: string,
-  shoeIds: Map<string, string>,
-  startedAt: Date,
-): NormalizedEvent {
-  const timestamp = new Date(startedAt.getTime() + Math.max(0, event.sourceSeq - 1) * 1000).toISOString();
-  const next = { ...event, timestamp } as NormalizedEvent;
-  if ('closesAt' in event && typeof event.closesAt === 'string') {
-    const originalTs = Date.parse(event.timestamp);
-    const remappedTs = Date.parse(timestamp);
-    const originalClose = Date.parse(event.closesAt);
-    if (Number.isFinite(originalTs) && Number.isFinite(remappedTs) && Number.isFinite(originalClose)) {
-      (next as { closesAt: string }).closesAt = new Date(remappedTs + (originalClose - originalTs)).toISOString();
-    }
-  }
-  const oldShoeId = 'shoeId' in event && typeof event.shoeId === 'string' ? event.shoeId : undefined;
-  const newShoeId = oldShoeId ? shoeIds.get(tableId + '|' + oldShoeId) : undefined;
-  if (newShoeId && 'shoeId' in next && typeof next.shoeId === 'string') {
-    (next as { shoeId: string }).shoeId = newShoeId;
-  }
-  if (oldShoeId && newShoeId && 'handId' in next && typeof next.handId === 'string' && next.handId.startsWith(oldShoeId)) {
-    (next as { handId: string }).handId = newShoeId + next.handId.slice(oldShoeId.length);
-  }
-  return next;
-}
-
-function formatShoeMinute(value: Date): string {
-  const pad2 = (number: number) => String(number).padStart(2, '0');
-  return String(value.getFullYear()) + pad2(value.getMonth() + 1) + pad2(value.getDate())
-    + pad2(value.getHours()) + pad2(value.getMinutes());
-}
-
-const DEMO_EVENT_INTERVAL_MS = 300;
-const DEMO_PAUSE_MS = 800;
-
-function wait(milliseconds: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, milliseconds));
-}

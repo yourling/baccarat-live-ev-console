@@ -3222,7 +3222,7 @@ describe('desktop console demo sessions', () => {
       await service.injectEvent(monitorShoeEvent('P001', 'p001-demo-record'));
 
       // When: the continuous demo is active.
-      service['demoRunning'] = true;
+      service['demoConsole']['demoRunning'] = true;
       const running = service.queryRecords({ kind: 'events', page: 1, pageSize: 20 });
 
       // Then: demo-running snapshots include the demo table without depending on execution mode.
@@ -3230,7 +3230,7 @@ describe('desktop console demo sessions', () => {
       expect(running.events?.map(event => event.tableId)).toEqual(['P001']);
 
       // When / Then: stopping the demo restores the real-monitor-only scope.
-      service['demoRunning'] = false;
+      service['demoConsole']['demoRunning'] = false;
       const stopped = service.queryRecords({ kind: 'events', page: 1, pageSize: 20 });
       expect(stopped.total).toBe(0);
     } finally {

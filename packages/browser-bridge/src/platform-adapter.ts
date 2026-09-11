@@ -78,6 +78,16 @@ export interface BridgePlatformAdapter {
   /** 大厅房间合并策略：true = upsert 增量合并；false = 整体替换。 */
   usesUpsertRoomMerge(): boolean;
   mergeGameCount(previous: number | undefined, next: number | undefined): number | undefined;
+  /**
+   * 中控读侧路子计数平滑：平台各自的守卫规则（如 protocol-shuffle 后拒绝
+   * 跳变计数）在这里实现。previous 来自中控元数据缓存（winfinity 语义），
+   * accepted/shoeEvidence 由适配器自己的解析器状态提供。
+   */
+  observeGameCount(
+    tableId: string,
+    previous: number | undefined,
+    incoming: number | undefined,
+  ): number | undefined;
   ingestRoomGameCounts(room: BridgeRoomDescriptor, ctx: PlatformAdapterContext): void;
   roomTableDisplayName(tableId: string): string | undefined;
   /** ensureRoomForTable 收编桌 ID 时的平台挂钩（winfinity 锁定 vendor alias）。 */

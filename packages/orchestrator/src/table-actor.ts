@@ -3,7 +3,7 @@ import type {
   BrowserAdapter,
 } from '@baccarat/adapter-contract';
 import { BUNDLED_PLATFORM_DESCRIPTORS } from '@baccarat/adapter-contract';
-import { ShoeHoldPolicy } from './shoe-hold.js';
+import { preferredMarketForBoth, selectBetAmount, selectMarkets } from './strategy.js';
 import {
   EVENT_SCHEMA_VERSION,
   assertValidRiskLimits,
@@ -51,7 +51,7 @@ import {
   type OneShotBetResult,
 } from './one-shot-bet.js';
 import { isPairBettingWindowReady } from './betting-window.js';
-import { selectMarkets } from './strategy.js';
+import { ShoeHoldPolicy } from './shoe-hold.js';
 
 export interface TableActorOptions {
   tableId: string;
@@ -694,9 +694,10 @@ export class TableActor {
       return;
     }
     if (this.profile.betStrategy.type === 'both') {
-      const banker = this.evaluatePair(projection, 'bankerPair');
-      const player = this.evaluatePair(projection, 'playerPair');
-      const preferredMarket = player.evLower > banker.evLower ? 'playerPair' : 'bankerPair';
+      const preferredMarket = preferredMarketForBoth(
+        this.evaluatePair(projection, 'bankerPair'),
+        this.evaluatePair(projection, 'playerPair'),
+      );
       if (event.market !== preferredMarket) {
         return;
       }
@@ -718,7 +719,7 @@ export class TableActor {
       shoeId: event.shoeId,
       handId: event.handId,
       market: event.market,
-      amount: selectBetAmount(this.profile, evaluation.evLower, this.defaultBetAmount, this.riskLimits),
+      amount: selectBetAmount(this.profile, evaluation.evLower, this.defaultBetAmount, this.riskLimits.betSizing),
       mode: 'live',
       idempotencyKey: `${this.tableId}:${event.shoeId}:${event.handId}:${event.market}:${projection.modelRevision}`,
       strategy: this.profile.betStrategy,
@@ -965,20 +966,6 @@ export class TableActor {
     };
     await this.enqueue(event);
   }
-}
-
-function selectBetAmount(profile: TableProfile, ev: number, defaultBetAmount: number, riskLimits: RiskLimits): number {
-  const sizing = riskLimits.betSizing;
-  if (sizing?.mode === 'capitalPercent') {
-    const amount = (sizing.bankroll ?? 0) * (sizing.percent ?? 0);
-    return sizing.maxPerBet === undefined ? amount : Math.min(amount, sizing.maxPerBet);
-  }
-  let amount = defaultBetAmount;
-  for (const tier of profile.betTiers ?? []) {
-    if (ev >= tier.minEV) amount = tier.amount;
-    else break;
-  }
-  return amount;
 }
 
 function unknownExecutionReceipt(

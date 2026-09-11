@@ -89,6 +89,18 @@ export class WinfinityPlatformAdapter implements BridgePlatformAdapter {
     return selectWinfinityRoadCount(previous, next);
   }
 
+  observeGameCount(
+    tableId: string,
+    previous: number | undefined,
+    incoming: number | undefined,
+  ): number | undefined {
+    const reason = this.parser.shoeEvidence(tableId)?.reason;
+    if (reason === 'protocol-shuffle' && incoming !== undefined && incoming > 8 && (previous === undefined || previous <= 8)) {
+      return previous;
+    }
+    return selectWinfinityRoadCount(previous, incoming);
+  }
+
   ingestRoomGameCounts(room: BridgeRoomDescriptor, ctx: PlatformAdapterContext): void {
     const tables = room.tables.flatMap(table => {
       const tableId = normalizeWinfinityTableId(table.tableId);

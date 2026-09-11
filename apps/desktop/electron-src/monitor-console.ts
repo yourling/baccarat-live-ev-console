@@ -13,14 +13,9 @@ import {
 } from '@baccarat/browser-bridge';
 import {
   isJoinableNewShoeRoadCount,
-  selectBgRoadCount,
-  selectObservedGameCount,
-  selectStableGameCount,
-  selectWinfinityRoadCount,
 } from '@baccarat/browser-bridge';
-import { isVerifiedPhysicalShoeEvidence, isWrapShapedRoadCount } from '@baccarat/ledger-state';
+import { isVerifiedPhysicalShoeEvidence } from '@baccarat/ledger-state';
 import type { SqliteLedger } from '@baccarat/ledger-state';
-import { normalizeBgTableId, normalizeWinfinityTableId } from '@baccarat/browser-bridge';
 import type { Orchestrator } from '@baccarat/orchestrator';
 import type { TableExport } from '@baccarat/room-monitor';
 import type { MonitorTableCandidate } from '../src/api-types.js';
@@ -103,32 +98,10 @@ export class MonitorConsole {
   }
 
   observedGameCount(tableId: string, incoming?: number): number | undefined {
-    if (normalizeWinfinityTableId(tableId) !== undefined) {
-      const previous = this.host.tableMetadata.get(tableId)?.gameCount;
-      const reason = this.host.browserBridge?.shoeEvidence(tableId)?.reason;
-      if (reason === 'protocol-shuffle' && incoming !== undefined && incoming > 8 && (previous === undefined || previous <= 8)) {
-        return previous;
-      }
-      return selectWinfinityRoadCount(previous, incoming);
-    }
-    if (normalizeBgTableId(tableId) !== undefined) {
-      const accepted = this.host.browserBridge?.acceptedGameCount(tableId);
-      const reason = this.host.browserBridge?.shoeEvidence(tableId)?.reason;
-      if (reason === 'protocol-shuffle' && accepted === undefined && incoming !== undefined && incoming > 20) {
-        return undefined;
-      }
-      if (
-        typeof accepted === 'number'
-        && typeof incoming === 'number'
-        && isWrapShapedRoadCount(accepted, incoming)
-      ) {
-        return incoming;
-      }
-      return selectBgRoadCount(accepted, incoming);
-    }
-    return selectObservedGameCount(
-      this.host.browserBridge?.shoeEvidence(tableId)?.reason,
-      this.host.browserBridge?.acceptedGameCount(tableId),
+    // 平台各自的守卫与平滑规则已上收桥适配器（见 platform-*.ts observeGameCount）。
+    return this.host.browserBridge?.observedGameCountForTable(
+      tableId,
+      this.host.tableMetadata.get(tableId)?.gameCount,
       incoming,
     );
   }
@@ -317,11 +290,7 @@ export class MonitorConsole {
         const gameCount = table.gameCount;
         if (!Number.isInteger(gameCount) || (gameCount ?? 0) < 1) continue;
         const previous = this.host.pendingGameCountByTable.get(tableId);
-        const stable = normalizeBgTableId(tableId) !== undefined
-          ? selectBgRoadCount(previous, gameCount)
-          : normalizeWinfinityTableId(tableId) !== undefined
-            ? selectWinfinityRoadCount(previous, gameCount)
-            : selectStableGameCount(previous, gameCount!);
+        const stable = this.host.browserBridge?.smoothRoadCountForTable(tableId, previous, gameCount);
         if (stable === undefined) continue;
         this.host.pendingGameCountByTable.set(tableId, stable);
         if (isJoinableNewShoeRoadCount(previous, stable)) this.promotePendingTable(tableId);

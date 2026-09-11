@@ -395,3 +395,27 @@ export interface DesktopConsoleSnapshot {
   summary: MonitorSummary;
   demoError?: string;
 }
+
+/** 聚合复盘报表（只读）：按靴汇总的结算/盈亏、UNKNOWN 敞口、断连排行。 */
+export interface DesktopPerformanceReport {
+  generatedAt: string;
+  totals: {
+    reservations: number;
+    realizedPnl: number;
+    unknownCount: number;
+    unknownExposure: number;
+  };
+  byShoe: Array<{
+    tableId: string;
+    shoeId: string;
+    hands: number;
+    stake: number;
+    realizedPnl: number;
+  }>;
+  reservationsByStatus: Record<string, number>;
+  disconnectRanking: Array<{
+    tableId: string;
+    disconnects: number;
+    lastDisconnectAt: number;
+  }>;
+}
