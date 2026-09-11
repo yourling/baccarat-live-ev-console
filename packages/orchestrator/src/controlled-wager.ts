@@ -62,6 +62,8 @@ export type OperationalWagerExecutor = {
 export interface ControlledOperationalWagerContext {
   readonly tableId: string;
   readonly projection: ShoeStateProjection;
+  /** 该桌是否处于"收到换靴信号但先按住旧靴"的不确定窗口。 */
+  readonly shoeHoldPending?: boolean;
   readonly profile: TableProfile;
   readonly ledger: SqliteLedger;
   readonly riskManager: RiskManager;
@@ -95,6 +97,8 @@ export async function executeControlledOperationalWager(
     ? command.handId.trim()
     : undefined;
   if (projection.connectionStatus !== 'CONNECTED') return rejected('connected-required');
+  // 收到过换靴信号、但按规则先按住旧靴：这段窗口里库存模型可能与牌桌不一致。
+  if (context.shoeHoldPending === true) return rejected('shoe-hold-pending');
   if (projection.status !== 'BETTING_WINDOW') return rejected('betting-window-required');
   if (
     (command.market === 'bankerPair' || command.market === 'playerPair')

@@ -97,7 +97,8 @@
     return countdown - (Date.now() - started) / 1000;
   }
 
-  function precommitReason(tableId, market) {
+  function precommitReason(tableId, market, options) {
+    const opts = options || {};
     if (!submitter()) return 'bg-adapter-missing';
     const custom = customAdapter();
     const session = protocolSession();
@@ -106,6 +107,30 @@
       const socket = session.betSocket;
       if (!socket || socket.readyState !== 1) return 'bg-socket-missing';
       if (session.betInFlight) return 'bet-in-flight';
+    }
+    // 回合一致性：真金下注必须落在当前开盘回合。只有确实采集到该桌回合号时
+    // 才拦截，采集不到就放行，避免误杀（正式通道 submit 里同样有这道校验）。
+    const normalized = normalizeTableId(tableId);
+    const currentSeq = session && session.seqNoByTable ? session.seqNoByTable[normalized] : undefined;
+    const handSeq = Number(opts.handId);
+    if (
+      Number.isFinite(currentSeq) && currentSeq > 0
+      && Number.isFinite(handSeq) && handSeq > 0
+      && handSeq !== currentSeq
+    ) {
+      return 'round-not-current';
+    }
+    // 桌台限注：采集到（自定义适配器或协议侧写入）才拦截。
+    const sessionLimits = session && session.tableLimitsByTable
+      ? session.tableLimitsByTable[normalized]
+      : undefined;
+    const limits = (custom && custom.tableLimits) || sessionLimits;
+    if (limits) {
+      const amount = Number(opts.amount);
+      if (Number.isFinite(amount)) {
+        if (Number.isFinite(limits.minBet) && amount < limits.minBet) return 'below-table-min';
+        if (Number.isFinite(limits.maxBet) && amount > limits.maxBet) return 'above-table-max';
+      }
     }
     const remaining = remainingWindowSec(tableId);
     if (!Number.isFinite(remaining) || remaining <= 0) {
@@ -238,7 +263,7 @@
     if (!Number.isFinite(amount) || amount <= 0) {
       return receipt(request, 'REJECTED', { reason: 'invalid-amount' });
     }
-    const blocked = precommitReason(tableId, market);
+    const blocked = precommitReason(tableId, market, { handId, amount });
     if (blocked) return receipt(request, 'REJECTED', { reason: blocked });
     const submit = submitter();
     if (!submit) return receipt(request, 'REJECTED', { reason: 'bg-adapter-missing' });

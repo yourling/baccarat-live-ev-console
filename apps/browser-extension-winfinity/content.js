@@ -90,7 +90,16 @@
     });
   }
 
+  function isKeepaliveFrame() {
+    try {
+      return /(^|\.)baccarat-multitable\.youngpoisson\.xyz$/i.test(String(location.hostname || ''));
+    } catch (_) {
+      return false;
+    }
+  }
+
   function syntheticKeepalive() {
+    if (!isKeepaliveFrame()) return;
     try {
       window.dispatchEvent(new Event('mousemove'));
       window.dispatchEvent(new Event('focus'));
@@ -101,16 +110,25 @@
   }
 
   async function beaconKeepalive() {
+    if (!isKeepaliveFrame() || typeof fetch !== 'function') return;
     try {
-      const response = await fetch(location.origin + '/', { method: 'HEAD', cache: 'no-store', credentials: 'include' });
-      if (!response.ok) throw new Error(String(response.status));
-    } catch (_) {
-      try {
-        await fetch(location.href, { method: 'GET', cache: 'no-store', credentials: 'include' });
-      } catch (error) {
-        sendSessionAction('beacon-failed', error && error.message);
-        return;
+      const response = await fetch(location.origin + '/', {
+        method: 'HEAD',
+        cache: 'no-store',
+        credentials: 'include',
+        redirect: 'follow',
+      });
+      if (!response.ok) {
+        await fetch(location.origin + '/', {
+          method: 'GET',
+          cache: 'no-store',
+          credentials: 'include',
+          redirect: 'follow',
+        });
       }
+    } catch (error) {
+      sendSessionAction('beacon-failed', error && error.message);
+      return;
     }
     sendSessionAction('keepalive-click', 'beacon');
   }
@@ -146,7 +164,38 @@
     window.postMessage({ kind: 'baccarat-winfinity-content-ready' }, '*');
   } catch (_) {}
 
+  function emitLaunchMapping() {
+    try {
+      const url = new URL(location.href);
+      const streamRaw = String(url.searchParams.get('streamId') || '').trim().toLowerCase();
+      const vendorRaw = String(url.searchParams.get('tableId') || '').trim().toLowerCase();
+      const streamId = /^[a-z0-9]+-bac\d+$/.test(streamRaw) ? streamRaw : undefined;
+      const vendorTableId = /^[a-f0-9]{24}$/.test(vendorRaw) ? vendorRaw : undefined;
+      if (!streamId && !vendorTableId) return;
+      const tableId = streamId || (vendorTableId ? `wnf-${vendorTableId}` : '');
+      if (!tableId) return;
+      sendToBackground({
+        kind: 'networkCapture',
+        source: 'baccarat-bridge-winfinity-state',
+        url: location.href,
+        direction: 'recv',
+        encoding: 'text',
+        data: JSON.stringify({
+          version: 1,
+          observedAt: new Date().toISOString(),
+          tables: [{
+            tableId,
+            source: 'launch',
+            ...(streamId ? { streamId } : {}),
+            ...(vendorTableId ? { vendorTableId } : {}),
+          }],
+        }),
+      });
+    } catch (_) {}
+  }
+
   sendSessionAction('trusted-activity', 'winfinity-content-boot');
+  emitLaunchMapping();
   scan();
   setInterval(scan, SCAN_INTERVAL_MS);
   setInterval(() => {

@@ -39,8 +39,8 @@ import {
 } from './operational-wager-controls';
 import { KeepaliveSettings } from './keepalive-settings';
 import { resolveVisibleHandCards } from './hand-cards';
-import { monitorDisplayedConnection } from './monitor-connection';
-import { isMissedShuffleRoadCount, monitorDisplayedRoundLabel } from './monitor-round';
+import { disconnectedMonitorTableIds, monitorDisplayedConnection } from './monitor-connection';
+import { isDisplayedPhysicalShoe, isVerifiedPhysicalShoeReason, monitorDisplayedRoundLabel } from './monitor-round';
 import { isLiveMonitorRoomId, selectLiveMonitorTableIds } from './monitor-table-selection';
 import { evaluateProjectionPairMarket } from './pair-evaluation';
 import { decisionHandExplanation, planRecordViewChange, recordKindForView, recordTabCount, type ConsoleView } from './record-view';
@@ -449,6 +449,9 @@ export function App() {
     .slice()
     .sort((left, right) => left.tableId.localeCompare(right.tableId, undefined, { numeric: true }));
   const monitorAtCapacity = (snapshot?.monitorTableIds.length ?? 0) >= 64;
+  const disconnectedMonitorCount = snapshot
+    ? disconnectedMonitorTableIds(snapshot.monitorTableIds, snapshot.snapshot.tables, snapshot.runtime.tables).length
+    : 0;
   const selectedMonitorTable = selectedMonitorTableId === null ? undefined : tableMap.get(selectedMonitorTableId);
   const automationEnabled = snapshot?.automation.enabled ?? false;
   const keepaliveEnabled = snapshot?.keepalive.enabled ?? false;
@@ -871,6 +874,28 @@ export function App() {
     await persistMonitorTableIds((snapshot?.monitorTableIds ?? []).filter(id => id !== tableId));
   }
 
+  async function removeDisconnectedMonitorTables() {
+    if (!snapshot) return;
+    const disconnectedIds = disconnectedMonitorTableIds(
+      snapshot.monitorTableIds,
+      snapshot.snapshot.tables,
+      snapshot.runtime.tables,
+    );
+    if (disconnectedIds.length === 0) return;
+    const confirmed = await confirm({
+      title: '移除未连接牌桌',
+      description: '将移出当前监控里所有未处于「已连接」的牌桌，包括已断开、已过期和同步中。已连接的牌桌不受影响。',
+      details: [
+        { label: '移出数量', value: String(disconnectedIds.length) },
+      ],
+      confirmLabel: '移除未连接',
+      tone: 'danger',
+    });
+    if (!confirmed) return;
+    const remove = new Set(disconnectedIds);
+    await persistMonitorTableIds(snapshot.monitorTableIds.filter(tableId => !remove.has(tableId)));
+  }
+
   async function confirmPhysicalShoe(tableId: string) {
     if (!window.desktop) return;
     const confirmed = await confirm({
@@ -1054,6 +1079,17 @@ export function App() {
         <main>
           {visibleTables.length > 0 ? (
             <section className="record-section monitor-section">
+              <div className="section-heading monitor-section__toolbar">
+                <span>监控牌桌</span>
+                <button
+                  className="button button--small button--danger-ghost"
+                  type="button"
+                  disabled={!desktopReady || monitorTableSaving || disconnectedMonitorCount === 0}
+                  onClick={() => void removeDisconnectedMonitorTables()}
+                >
+                  一键移除未连接{disconnectedMonitorCount > 0 ? ` (${disconnectedMonitorCount})` : ''}
+                </button>
+              </div>
               <div className="table-scroll">
                 <table className="record-table monitor-table">
                   <colgroup>
@@ -1252,8 +1288,8 @@ function compareMonitorTables(
     case 'auto':
       return leftProjection.autoBetStatus.localeCompare(rightProjection.autoBetStatus);
     case 'remaining': {
-      const leftKnown = isDisplayedPhysicalShoe(leftProjection, evidence?.[left.tableId], leftMeta?.gameCount);
-      const rightKnown = isDisplayedPhysicalShoe(rightProjection, evidence?.[right.tableId], rightMeta?.gameCount);
+      const leftKnown = isDisplayedPhysicalShoe(left.tableId, leftProjection, evidence?.[left.tableId], leftMeta?.gameCount);
+      const rightKnown = isDisplayedPhysicalShoe(right.tableId, rightProjection, evidence?.[right.tableId], rightMeta?.gameCount);
       return (leftKnown ? leftProjection.remainingTotal : -1) - (rightKnown ? rightProjection.remainingTotal : -1);
     }
     case 'ev': {
@@ -1290,7 +1326,7 @@ function monitorPairEv(
   events: readonly NormalizedEvent[] = [],
 ): number {
   if (stickyBankerLeadUntrusted(events, actor.tableId)) return Number.NEGATIVE_INFINITY;
-  if (!isDisplayedPhysicalShoe(actor.projection, evidence, gameCount)) return Number.NEGATIVE_INFINITY;
+  if (!isDisplayedPhysicalShoe(actor.tableId, actor.projection, evidence, gameCount)) return Number.NEGATIVE_INFINITY;
   return safeEvaluate(
     actor.projection.profileSnapshot,
     'bankerPair',
@@ -1320,14 +1356,20 @@ function TableMonitorRow(props: {
   const { actor } = props;
   const projection = actor.projection;
   const stickyCards = stickyBankerLeadUntrusted(props.events, actor.tableId);
-  const physicalShoeKnown = !stickyCards && isDisplayedPhysicalShoe(projection, props.evidence, props.metadata?.gameCount);
+  const physicalShoeKnown = !stickyCards && isDisplayedPhysicalShoe(actor.tableId, projection, props.evidence, props.metadata?.gameCount);
   const bankerPair = physicalShoeKnown
     ? safeEvaluate(projection.profileSnapshot, 'bankerPair', projection.seenCards, projection.remainingCounts)
     : null;
   const alerts = tableAlerts(actor, props.runtime);
   const displayName = props.metadata?.displayName ?? tableName(actor.tableId);
   const displayedRoundId = projection.currentHandId ?? props.metadata?.roundId;
-  const round = monitorDisplayedRoundLabel(actor.tableId, projection, props.metadata, props.evidence?.reason);
+  const round = monitorDisplayedRoundLabel(
+    actor.tableId,
+    projection,
+    props.metadata,
+    props.evidence?.reason,
+    physicalShoeKnown,
+  );
   const bettingPhase = bettingPhaseLabel(actor, props.now);
   const windowOpen = bettingPhase.open;
   const handCards = resolveVisibleHandCards(
@@ -1377,6 +1419,7 @@ function TableMonitorRow(props: {
           {round.pageRound !== undefined && round.label !== String(round.pageRound) && (
             <span className="muted">#{round.pageRound}</span>
           )}
+          {round.trackedLabel ? <span className="muted">{round.trackedLabel}</span> : null}
         </div>
       </td>
       <td data-label="开盘">
@@ -1438,7 +1481,7 @@ function MonitorTableSettingsDialog(props: {
   tableLabel: (tableId: string) => string;
 }) {
   const { actor } = props;
-  const physicalShoeKnown = isDisplayedPhysicalShoe(actor.projection, props.evidence, props.gameCount);
+  const physicalShoeKnown = isDisplayedPhysicalShoe(actor.tableId, actor.projection, props.evidence, props.gameCount);
 
   return (
     <div className="monitor-settings-overlay" role="presentation" onClick={props.onClose}>
@@ -2454,44 +2497,6 @@ function safeEvaluate(
   } catch {
     return null;
   }
-}
-
-function isVerifiedPhysicalShoeReason(reason: string | undefined, gameCount?: number): boolean {
-  if (reason === 'protocol-shuffle' || reason === 'manual-confirm') return true;
-  return reason === 'road-wrap' && typeof gameCount === 'number' && gameCount >= 1 && gameCount <= 8;
-}
-
-function isDisplayedPhysicalShoe(
-  projection: ShoeStateProjection,
-  evidence?: DesktopShoeEvidence,
-  gameCount?: number,
-): boolean {
-  const road = gameCount ?? evidence?.gameCount;
-  const initial = projection.profileSnapshot.numberOfDecks * 52;
-  // Only hide a protocol-shuffled shoe when inventory is still full and we
-  // have not actually tracked this shoe. A live shoe that already consumed
-  // cards must keep remaining/EV even if DOM road is ahead of seenCards.
-  if (
-    typeof road === 'number'
-    && road >= 8
-    && projection.handNumber < 8
-    && projection.seenCards.length < 8
-    && projection.remainingTotal >= initial - 16
-    && !isVerifiedPhysicalShoeReason(evidence?.reason, evidence?.gameCount)
-  ) {
-    return false;
-  }
-  // Missed shuffle: live bead 局 9-20 with a 50+ hand tracked shoe.
-  // Do not hide remaining when HISTORY is stuck at 局 1-8 on a live deep shoe.
-  if (typeof road === 'number' && isMissedShuffleRoadCount(projection.handNumber, road)) {
-    return false;
-  }
-  if (projection.remainingTotal < 26) return false;
-  return projection.shoeId.length > 0
-    && projection.shoeBaseline === 'physical-shoe'
-    && (evidence === undefined
-      || evidence.reason === 'attach'
-      || isVerifiedPhysicalShoeReason(evidence.reason, evidence.gameCount));
 }
 
 function tableAlerts(

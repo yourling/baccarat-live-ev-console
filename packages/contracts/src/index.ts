@@ -137,6 +137,12 @@ export interface BaseEvent {
   timestamp: string;
   sourceSeq: number;
   source?: string;
+  /**
+   * 可选的平台标识（如 'pragmatic' | 'bg' | 'winfinity'）。
+   * 由采集适配器盖戳；中控不得依赖该字段做行为分支——平台差异
+   * 必须收敛在 adapter-contract 的 PlatformAdapterDescriptor 之后。
+   */
+  platformId?: string;
   /** 事件契约版本。当前版本为 1。 */
   schemaVersion?: number;
 }

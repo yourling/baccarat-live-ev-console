@@ -18,6 +18,8 @@ export interface TableDescriptor {
 export interface RoomDescriptor {
   roomId: string;
   displayName?: string;
+  /** 可选的平台标识，由采集适配器下发；中控只读不改。 */
+  platformId?: string;
   tables: TableDescriptor[];
 }
 

@@ -51,6 +51,13 @@
   }
 
   function displayNameFromText(text) {
+    const compact = String(text || '').replace(/\s+/g, ' ').trim();
+    const labeled = /^(.*?)\s+(baccarat)\s+(\d+)\b/i.exec(compact);
+    if (labeled && labeled[1].trim()) {
+      const family = labeled[1].trim();
+      const word = labeled[2];
+      return `${family} ${word[0].toUpperCase()}${word.slice(1).toLowerCase()} ${labeled[3]}`;
+    }
     const lines = String(text || '').split(/\n+/).map(line => line.replace(/\s+/g, ' ').trim()).filter(Boolean);
     const line = lines.find(item => /baccarat/i.test(item) && item.length <= 80);
     return line || undefined;
@@ -99,6 +106,11 @@
     };
 
     upsert(location.href, null);
+    document.querySelectorAll('[id^="tableId_"]').forEach(node => {
+      const vendorTableId = String(node.id || '').slice('tableId_'.length).trim().toLowerCase();
+      if (!VENDOR_TABLE_ID.test(vendorTableId)) return;
+      upsert(`https://lobby.youngpoisson.xyz/?tableId=${vendorTableId}`, closestTile(node));
+    });
     document.querySelectorAll('iframe[src], a[href], [src]').forEach(node => {
       const href = node.getAttribute('src') || node.getAttribute('href') || '';
       if (!/streamId=|tableId=/i.test(href)) return;

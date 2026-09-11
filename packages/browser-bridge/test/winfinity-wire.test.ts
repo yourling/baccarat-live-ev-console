@@ -77,10 +77,19 @@ describe('Winfinity DOM lobby discovery', () => {
       <div>Shangrila Baccarat
         <iframe src="https://baccarat-multitable.youngpoisson.xyz/?tableId=bbbbbbbbbbbbbbbbbbbbbbbb"></iframe>
       </div>
+      <div id="tableId_638f55f0716f771a0c510f6d">Tao Yuan Baccarat 3:
+        ¥5 #16
+      </div>
     `);
     expect(tables).toEqual(expect.arrayContaining([
       expect.objectContaining({ tableId: 'tyn-bac8', streamId: 'tyn-bac8' }),
       expect.objectContaining({ tableId: 'wnf-bbbbbbbbbbbbbbbbbbbbbbbb' }),
+      expect.objectContaining({
+        tableId: 'wnf-638f55f0716f771a0c510f6d',
+        vendorTableId: '638f55f0716f771a0c510f6d',
+        displayName: 'Tao Yuan Baccarat 3',
+        gameCount: 16,
+      }),
     ]));
     expect(tables.map(table => table.tableId)).not.toContain('wnf-aaaaaaaaaaaaaaaaaaaaaaaa');
     expect(tables.map(table => table.tableId)).not.toContain('aaaaaaaaaaaaaaaaaaaaaaaa');

@@ -2,6 +2,8 @@ import type {
   BetExecutionRequest,
   BrowserAdapter,
 } from '@baccarat/adapter-contract';
+import { BUNDLED_PLATFORM_DESCRIPTORS } from '@baccarat/adapter-contract';
+import { ShoeHoldPolicy } from './shoe-hold.js';
 import {
   EVENT_SCHEMA_VERSION,
   assertValidRiskLimits,
@@ -23,6 +25,7 @@ import {
 import {
   SqliteLedger,
   applyEvent,
+  countHandInventory,
   effectiveShoeBaseline,
   emptyProjection,
   isPhysicalShoeBettable,
@@ -83,14 +86,11 @@ export interface TableActorSnapshot {
   missingUnobservedCards: number;
 }
 
-// allow: SIZE_OK — event-sourced per-table state machine; one-shot execution is extracted.
-function bgShoeGeneration(shoeId: string): number | undefined {
-  const matched = /^bg-[A-Za-z]\d{2}-(\d+)$/.exec(shoeId);
-  if (!matched) return undefined;
-  const generation = Number(matched[1]);
-  return Number.isInteger(generation) && generation > 0 ? generation : undefined;
-}
-
+/**
+ * 靴代际比较只信任声明了 shoeGenerationContinuity 的平台（如 BG，其解析器
+ * 通过 seedShoeSequence 保证代际跨进程重启单调）。其余平台的靴 ID 不携带
+ * 可信代际，保持 undefined —— 行为与旧版仅识别 BG 靴 ID 形状时一致。
+ */
 export class TableActor {
   readonly tableId: string;
   private readonly ledger: SqliteLedger;
@@ -117,6 +117,19 @@ export class TableActor {
   private readonly pausedDecisionKeys = new Set<string>();
   private lastSettledHandSeq: number | undefined;
   private missingUnobservedCards = 0;
+  /**
+   * 已做过"手内漏采"计数的手。同一手的结算会被重复投递：解析器身份变化
+   * （runId/generation bump）产生新 eventId 绕过两级 eventId 去重；
+   * ledger 按 event_id 去重命中的重复事件走 recoverSideEffects 再次进入本方法。
+   * 不去重的话每次重复投递都把同一手的缺牌数再累加一遍，几次就跨过
+   * 缺牌 >10 移出监控的阈值，桌被误移出。
+   */
+  private missingCountedHands = new Set<string>();
+  /**
+   * 靴保持策略：hold 判定/出口/一次性信号缓存/结算暂存，全部独立模块
+   * （见 ./shoe-hold.ts，AGENTS.md 靴硬规则的载体）。
+   */
+  private readonly shoeHold: ShoeHoldPolicy;
   private syntheticSeq = SYNTHETIC_SEQ_BASE;
   private alternateNext: 'bankerPair' | 'playerPair';
 
@@ -139,6 +152,10 @@ export class TableActor {
     this.defaultBetAmount = options.defaultBetAmount;
     this.riskLimits = structuredClone(options.riskLimits);
     this.requestTimeoutMs = options.requestTimeoutMs ?? 12_000;
+    this.shoeHold = new ShoeHoldPolicy(
+      this.tableId,
+      tableId => this.observedGameCount?.(tableId),
+    );
     this.syntheticSeq = Math.max(SYNTHETIC_SEQ_BASE, this.ledger.nextSourceSeq(this.tableId));
 
     const replay = this.ledger.replay(this.tableId, { latestShoeOnly: true });
@@ -188,6 +205,7 @@ export class TableActor {
       riskLimits: this.riskLimits,
       executor: this.executor,
       requestTimeoutMs: Math.max(this.requestTimeoutMs, 12_000),
+      shoeHoldPending: this.isShoeHoldPending(),
       observedGameCount: this.observedGameCount?.(this.tableId),
       observedShoeEvidence: this.observedShoeEvidence?.(this.tableId),
       recordReceipt: (receiptCommand, receipt) => this.recordOneShotReceipt(receiptCommand, receipt),
@@ -209,6 +227,7 @@ export class TableActor {
       terms: this.operationalWagerTerms,
       canExecuteAutomaticBets: () => this.canExecuteAutomaticBets(this.tableId),
       requestTimeoutMs: Math.max(this.requestTimeoutMs, 12_000),
+      shoeHoldPending: this.isShoeHoldPending(),
       observedGameCount: this.observedGameCount?.(this.tableId),
       observedShoeEvidence: this.observedShoeEvidence?.(this.tableId),
     }));
@@ -238,6 +257,12 @@ export class TableActor {
     this.pausedDecisionKeys.clear();
     this.lastSettledHandSeq = undefined;
     this.missingUnobservedCards = 0;
+    this.missingCountedHands.clear();
+    // 重置的语义是"干净重来、等下一条洗牌证据"（与进程重启后全部待牌靴一致）。
+    // 不清缓存的话：空投影的 shouldHoldCurrentPhysicalShoe 恒为 false，
+    // 下一个事件会把陈旧的新靴信号补投到重置后的状态上 —— 系统以
+    // "全新 416 张"的模型重建一个实际已打了一半的靴，看似合法实则 fail-open。
+    this.shoeHold.reset();
   }
 
   setExecutor(executor: Pick<BrowserAdapter, 'requestBet'> | null): void {
@@ -332,69 +357,79 @@ export class TableActor {
   }
 
   private shouldHoldCurrentPhysicalShoe(current: ShoeStateProjection): boolean {
-    if (!isPrematurePhysicalShoeReset(current)) return false;
-    const road = this.observedGameCount?.(this.tableId);
-    if (typeof road === 'number' && isWrapShapedRoadCount(current.handNumber, road)) return false;
-    return true;
+    return this.shoeHold.shouldHold(current);
   }
 
   private bindIncomingShoe(event: NormalizedEvent): NormalizedEvent | null {
-    const current = this.projection;
-    if (event.type === 'newShoeSignal') {
-      if (current.shoeId && event.shoeId === current.shoeId) return null;
-      const incomingBaseline = event.baseline ?? 'unknown-monitor-session';
-      if (
-        current.shoeId
-        && current.shoeBaseline === 'physical-shoe'
-        && current.seenCards.length > 0
-        && incomingBaseline !== 'physical-shoe'
-      ) {
-        // Restart attach must not wipe a live physical shoe. An exhausted or
-        // 80-hand-capped shoe must still be allowed to fail closed.
-        if (!current.sealed && current.remainingTotal >= 26 && current.handNumber < 80) {
-          return null;
-        }
-      }
-      if (
-        incomingBaseline === 'physical-shoe'
-        && this.shouldHoldCurrentPhysicalShoe(current)
-      ) {
-        const incomingGen = bgShoeGeneration(event.shoeId);
-        const currentGen = bgShoeGeneration(current.shoeId);
-        if (incomingGen === undefined || currentGen === undefined || incomingGen <= currentGen) {
-          return null;
-        }
-      }
-      return event;
-    }
-    if (!('shoeId' in event) || typeof event.shoeId !== 'string' || !current.shoeId) return event;
-    if (event.shoeId === current.shoeId) return event;
-    const incomingGen = bgShoeGeneration(event.shoeId);
-    const currentGen = bgShoeGeneration(current.shoeId);
-    if (incomingGen !== undefined && currentGen !== undefined && incomingGen > currentGen) {
-      if (this.shouldHoldCurrentPhysicalShoe(current)) return null;
-      return event;
-    }
-    if (current.shoeBaseline === 'physical-shoe' && current.seenCards.length > 0) {
-      if (current.sealed || current.remainingTotal < 26) return event;
-      return null;
-    }
-    return event;
+    return this.shoeHold.bind(event, this.projection);
+  }
+
+  /**
+   * 记录"我们收到了换靴信号、但按规则先按住旧靴"。
+   *
+   * 只记第一次：如果在已有 hold 期间不断刷新，超时就永远不会到，
+   * 退化成永久 hold。而 hold 的判据（handNumber / remainingTotal）在 hold
+   * 期间是冻结的 —— 只要新靴信号持续到来就会一直成立。
+   */
+  private noteShoeHoldDeferred(): void {
+    this.shoeHold.noteDeferred();
+  }
+
+  private deferShoeSignal(event: Extract<NormalizedEvent, { type: 'newShoeSignal' }>): void {
+    this.shoeHold.deferSignal(event);
+  }
+
+  private holdSettlement(event: Extract<NormalizedEvent, { type: 'handSettled' }>): void {
+    this.shoeHold.holdSettlement(event);
+  }
+
+  private clearShoeHold(): void {
+    this.shoeHold.clear();
+  }
+
+  /**
+   * 该桌是否处于"靴状态不确定"窗口。
+   *
+   * 这段窗口里系统仍显示旧靴的库存模型，但牌桌可能已经换靴 —— 所以下注必须
+   * fail-closed，而不是拿一个可能与现实无关的库存去评估 EV。
+   */
+  isShoeHoldPending(now = Date.now()): boolean {
+    return this.shoeHold.isPending(now);
   }
 
   private async handleEvent(event: NormalizedEvent): Promise<void> {
+    // hold 解除后补投被缓存的新靴信号，让系统回到平台真实靴。
+    // 解除判据必须与 bindIncomingShoe 的 hold 判据**同源**
+    // （shouldHoldCurrentPhysicalShoe：路子回绕确认或超时），不能只用
+    // isShoeHoldPending 的纯时间判 —— 否则路子回绕出口在 90 秒前解除 hold 时
+    // （branch 2/3 放行并 clearShoeHold），缓存信号会在补投前被销毁，
+    // 而新靴信号是一次性的，桌将永久僵在旧靴。
+    // 必须在处理当前事件之前做：否则新靴的牌会被 isCurrentShoe 忽略，
+    // 而 remainingTotal 又冻结着，等于永远追不上。
+    const { signal: deferred, settlements: droppedSettlements } = this.shoeHold.drain(this.projection);
+    if (deferred !== undefined) {
+      // 递归调用：此刻 hold 已解除，bindIncomingShoe 不会再拦它。
+      await this.handleEvent(deferred);
+      // 补投已切到该靴：回放 hold 期间被丢弃的结算（每手只发一次，不回放
+      // 那几手的牌就永远不从库存里扣）。回放先于当前事件，保持时序。
+      for (const settlement of droppedSettlements) {
+        await this.handleEvent(settlement);
+      }
+    }
     const bound = this.bindIncomingShoe(event);
     if (bound === null) return;
     event = bound;
     if (event.type === 'newShoeSignal') {
+      // 只有事件源显式声明的实体靴（协议洗牌 / 人工确认，三个 runtime 均带
+      // `autoConfirmNewShoe: true`）才自动进入跟踪。桌配置的 `autoConfirmNewShoe`
+      // 为 true 时同样自动确认。除此之外一律等待人工确认 —— 不能因为
+      // baseline 是 physical-shoe 就绕过桌配置。
       const incomingConfirm = event.profile?.autoConfirmNewShoe === true;
       event = {
         ...event,
         profile: {
           ...structuredClone(this.profile),
-          autoConfirmNewShoe: incomingConfirm
-            || event.baseline === 'physical-shoe'
-            || this.profile.autoConfirmNewShoe,
+          autoConfirmNewShoe: incomingConfirm || this.profile.autoConfirmNewShoe,
         },
       };
     }
@@ -414,6 +449,7 @@ export class TableActor {
       this.pausedDecisionKeys.clear();
       this.lastSettledHandSeq = undefined;
       this.missingUnobservedCards = 0;
+      this.missingCountedHands.clear();
       this.retainKeysForShoe(event.shoeId);
       if (previousProjection.shoeId && previousProjection.shoeId !== event.shoeId) {
         this.riskManager.expireOpenForShoe(this.tableId, previousProjection.shoeId, 'new-shoe-signal-received');
@@ -430,7 +466,7 @@ export class TableActor {
       return;
     }
     if (event.type === 'handSettled') {
-      this.applyHandSettlement(event);
+      this.applyHandSettlement(event, previousProjection);
       return;
     }
     if (event.type === 'betReceipt') {
@@ -461,7 +497,7 @@ export class TableActor {
       return;
     }
     if (event.type === 'handSettled') {
-      this.applyHandSettlement(event);
+      this.applyHandSettlement(event, previousProjection);
       return;
     }
     if (event.type === 'betReceipt') {
@@ -480,13 +516,30 @@ export class TableActor {
     return this.missingUnobservedCards;
   }
 
-  private applyHandSettlement(event: Extract<NormalizedEvent, { type: 'handSettled' }>): void {
+  private applyHandSettlement(
+    event: Extract<NormalizedEvent, { type: 'handSettled' }>,
+    previousProjection: ShoeStateProjection,
+  ): void {
     const seq = Number.parseInt(event.handId, 10);
     if (Number.isInteger(seq) && seq > 0) {
       if (this.lastSettledHandSeq !== undefined && seq > this.lastSettledHandSeq + 1) {
         this.missingUnobservedCards += (seq - this.lastSettledHandSeq - 1) * 6;
       }
       this.lastSettledHandSeq = seq;
+    }
+    // 手内漏采：这一手只 live 采到一部分牌、其余漏了。结算会把缺的补齐
+    // （库存恢复正确），但漏采本身必须计数 —— 上面那段只认"手序跳号"
+    // （整手丢失），看不见"手内少牌"，于是单张漏记既不告警也不触发
+    // service 的缺牌移出监控。observedCount > 0 用来排除整手都没采到的
+    // 情况（重启后只有 handSettled，那不算漏采）。
+    const settledCardCount = event.playerCards.length + event.bankerCards.length;
+    const missingKey = `${event.shoeId}:${event.handId}`;
+    if (!this.missingCountedHands.has(missingKey)) {
+      this.missingCountedHands.add(missingKey);
+      const observedCardCount = countHandInventory(previousProjection, event.handId);
+      if (observedCardCount > 0 && observedCardCount < settledCardCount) {
+        this.missingUnobservedCards += settledCardCount - observedCardCount;
+      }
     }
     const settlement = {
       outcomes: event.outcomes,
@@ -590,6 +643,9 @@ export class TableActor {
     if (this.riskManager.hasUnknownReservations(this.tableId)) {
       return;
     }
+    // 靴状态不确定（收到换靴信号但先按住旧靴）：这段窗口里剩余库存可能与
+    // 牌桌无关，不能拿它评估对子 EV。
+    if (this.isShoeHoldPending()) return;
     const evalKey = `${event.shoeId}:${event.handId}:${event.market}`;
     const previousEval = this.evaluatedWindows.get(evalKey);
     const hasClosesAt = typeof event.closesAt === 'string' && event.closesAt.length > 0;
@@ -975,6 +1031,16 @@ export interface OrchestratorSnapshot {
   tables: Record<string, TableActorSnapshot>;
 }
 
+/**
+ * 收到换靴信号后"先按住旧靴"的最长时长。
+ *
+ * hold 的本意是防止滞后 DOM 把刚洗完的实体靴误降级（见 isPrematurePhysicalShoeReset）。
+ * 但 hold 期间 handNumber 与 remainingTotal 都会冻结，只要新靴信号持续到来，
+ * 判据就永久成立 —— 而这段窗口里系统仍会拿旧靴库存继续下注，牌桌却可能已经换靴。
+ * 实测：换靴后 actor 仍停在旧靴，status 保持 BETTING_WINDOW，对子真金注照发。
+ * 90 秒足够覆盖 DOM/路子的正常滞后，又不会让错误模型维持太久。
+ */
+
 const SYNTHETIC_SEQ_BASE = 1_000_000_000;
 const TABLE_CONFIG_KEY = 'orchestrator:tables:v1';
 const RISK_LIMITS_KEY = 'orchestrator:risk-limits:v1';
@@ -1173,6 +1239,16 @@ export class Orchestrator {
     reason: string,
   ): ReturnType<RiskManager['writeOffUnknown']> {
     return this.riskManager.writeOffUnknown(reservationId, reason);
+  }
+
+  /** 把已提交但长期未结算的预留升级为 UNKNOWN，使其进入可处置的告警流程。 */
+  escalateOverdueReservations(
+    maxAgeMs: number,
+    now = Date.now(),
+    reason = 'unsettled-past-timeout',
+    notBefore?: number,
+  ): ReturnType<RiskManager['escalateOverdueSettlements']> {
+    return this.riskManager.escalateOverdueSettlements(maxAgeMs, now, reason, notBefore);
   }
 
   settleReservedReservationManually(

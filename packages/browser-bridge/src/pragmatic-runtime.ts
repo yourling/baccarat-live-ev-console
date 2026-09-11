@@ -1,12 +1,20 @@
 import {
-  EVENT_SCHEMA_VERSION,
-  defaultProfile,
-  type Card,
-  type CardRank,
   type NormalizedEvent,
-  type ShoeBaseline,
 } from '@baccarat/contracts';
-import { isIdleDealtShoeShuffle } from './bg-runtime.js';
+import { PRAGMATIC_PLATFORM_ID } from '@baccarat/adapter-contract';
+import {
+  MAX_BACCARAT_SHOE_HANDS,
+  ROAD_WRAP_MAX,
+  SnapshotRuntimeParserBase,
+  isIdleDealtShoeShuffle,
+  isRoadWrapToNewShoe,
+  mergeHandCards,
+  parseCards,
+  type SnapshotSource,
+} from './runtime-common.js';
+
+export { isIdleDealtShoeShuffle, isRoadWrapToNewShoe } from './runtime-common.js';
+export type { ParserShoeEvidence, ParserShoeReason } from './runtime-common.js';
 
 export interface PragmaticTableSnapshot {
   readonly tableId: string;
@@ -36,20 +44,8 @@ export interface PragmaticRuntimeSnapshot {
  * Countdown is not parsed as gameCount. A deep-road drop to an early count
  * is a new shoe; open it on the first observation.
  */
-const ROAD_WRAP_MAX = 8;
-const ROAD_WRAP_MIN_PREVIOUS = 10;
-const ROAD_WRAP_MIN_DROP = 8;
-
-export function isRoadWrapToNewShoe(
-  previous: number | undefined,
-  gameCount: number,
-): boolean {
-  return previous !== undefined
-    && previous >= ROAD_WRAP_MIN_PREVIOUS
-    && gameCount >= 1
-    && gameCount <= ROAD_WRAP_MAX
-    && previous - gameCount >= ROAD_WRAP_MIN_DROP;
-}
+const GAME_COUNT_ANOMALY_MIN_HANDS = 8;
+const GAME_COUNT_ANOMALY_MIN_GAP = 8;
 
 export function isJoinableNewShoeRoadCount(
   previous: number | undefined,
@@ -65,9 +61,6 @@ function isPhysicalShoeFromRoadCount(
   return isRoadWrapToNewShoe(previous, gameCount);
 }
 
-const GAME_COUNT_CATCH_UP_MAX = 5;
-const MAX_BACCARAT_SHOE_HANDS = 80;
-
 export function isPlausibleGameCountAdvance(
   previous: number | undefined,
   gameCount: number,
@@ -75,7 +68,7 @@ export function isPlausibleGameCountAdvance(
   if (!Number.isInteger(gameCount) || gameCount < 1) return false;
   if (previous === undefined) return true;
   if (gameCount === previous) return true;
-  if (gameCount > previous && gameCount - previous <= GAME_COUNT_CATCH_UP_MAX) return true;
+  if (gameCount > previous && gameCount - previous <= 5) return true;
   if (previous <= 8 && gameCount < previous) return true;
   return isRoadWrapToNewShoe(previous, gameCount);
 }
@@ -99,9 +92,6 @@ export function selectObservedGameCount(
   }
   return selectStableGameCount(accepted, incoming);
 }
-
-export const GAME_COUNT_ANOMALY_MIN_HANDS = 8;
-export const GAME_COUNT_ANOMALY_MIN_GAP = 8;
 
 /**
  * Internal handNumber is how many hands this shoeId has seen.
@@ -127,123 +117,6 @@ export function isInternalExternalGameCountAnomaly(
     return false;
   }
   return Math.abs(road - handNumber) >= GAME_COUNT_ANOMALY_MIN_GAP;
-}
-
-export type ParserShoeReason = 'attach' | 'protocol-shuffle' | 'road-wrap' | 'manual-confirm';
-
-export interface ParserShoeEvidence {
-  readonly reason: ParserShoeReason;
-  readonly previousGameCount?: number;
-  readonly gameCount?: number;
-}
-
-type SnapshotSource = 'dom' | 'protocol';
-type HandCards = { playerCards: Card[]; bankerCards: Card[]; source?: SnapshotSource };
-
-function cardIdentity(card: Card): string {
-  const raw = typeof card.raw === 'string' ? card.raw.trim().toUpperCase() : '';
-  if (raw.length > 0) return raw;
-  return `${card.rank}${card.suit ?? ''}`;
-}
-
-function mergeCardList(
-  existing: readonly Card[] | undefined,
-  incoming: readonly Card[],
-  incomingSource: SnapshotSource | undefined,
-  existingSource: SnapshotSource | undefined,
-): Card[] {
-  if (incoming.length === 0) return existing ? [...existing] : [];
-  if (!existing || existing.length === 0) return [...incoming];
-  const overlap = Math.min(existing.length, incoming.length);
-  let conflict = false;
-  for (let index = 0; index < overlap; index += 1) {
-    if (cardIdentity(existing[index]!) !== cardIdentity(incoming[index]!)) {
-      conflict = true;
-      break;
-    }
-  }
-  if (!conflict) {
-    const merged = incoming.length > existing.length ? [...incoming] : [...existing];
-    return merged.slice(0, 3);
-  }
-  if (incomingSource === 'protocol' && existingSource !== 'protocol') {
-    return incoming.slice(0, 3);
-  }
-  return existing.slice(0, 3);
-}
-
-function mergeHandCards(
-  existing: HandCards | undefined,
-  incomingPlayer: readonly Card[],
-  incomingBanker: readonly Card[],
-  incomingSource: SnapshotSource | undefined,
-): HandCards {
-  const source = incomingSource === 'protocol' || existing?.source === 'protocol'
-    ? 'protocol'
-    : incomingSource ?? existing?.source;
-  return {
-    playerCards: mergeCardList(existing?.playerCards, incomingPlayer, incomingSource, existing?.source),
-    bankerCards: mergeCardList(existing?.bankerCards, incomingBanker, incomingSource, existing?.source),
-    ...(source === undefined ? {} : { source }),
-  };
-}
-
-const CARD_PATTERN = /^(10|[2-9AJQK]|[01])([SHDC])([0-8])?$/i;
-
-function parseCard(value: string): Card | null {
-  const match = CARD_PATTERN.exec(value.trim());
-  if (!match) return null;
-  const rankToken = match[1]!.toUpperCase();
-  const rank = (rankToken === '0' ? '10' : rankToken === '1' ? 'A' : rankToken) as CardRank;
-  return {
-    rank,
-    suit: match[2]!.toUpperCase(),
-    raw: value.trim().toUpperCase(),
-  };
-}
-
-function parseCards(values: readonly string[] | undefined): Card[] {
-  return (values ?? []).map(parseCard).filter((card): card is Card => card !== null);
-}
-
-function cardPoint(card: { rank: string }): number {
-  if (card.rank === 'A') return 1;
-  if (card.rank === '10' || card.rank === 'J' || card.rank === 'Q' || card.rank === 'K') return 0;
-  return Number(card.rank);
-}
-
-function handScore(cards: readonly { rank: string }[]): number {
-  return cards.reduce((score, card) => (score + cardPoint(card)) % 10, 0);
-}
-
-function bankerDraws(bankerTotal: number, playerThird: number): boolean {
-  if (bankerTotal <= 2) return true;
-  if (bankerTotal === 3) return playerThird !== 8;
-  if (bankerTotal === 4) return playerThird >= 2 && playerThird <= 7;
-  if (bankerTotal === 5) return playerThird >= 4 && playerThird <= 7;
-  if (bankerTotal === 6) return playerThird === 6 || playerThird === 7;
-  return false;
-}
-
-export function isCompleteBaccaratHand(
-  playerCards: readonly { rank: string }[],
-  bankerCards: readonly { rank: string }[],
-): boolean {
-  if (playerCards.length < 2 || playerCards.length > 3 || bankerCards.length < 2 || bankerCards.length > 3) {
-    return false;
-  }
-  const playerInitial = handScore(playerCards.slice(0, 2));
-  const bankerInitial = handScore(bankerCards.slice(0, 2));
-  if (playerInitial >= 8 || bankerInitial >= 8) return playerCards.length === 2 && bankerCards.length === 2;
-  if (playerCards.length === 2) {
-    if (playerInitial < 6) return false;
-    return bankerCards.length === 2 ? bankerInitial >= 6 : bankerInitial <= 5;
-  }
-  if (playerInitial > 5) return false;
-  const playerThird = playerCards[2];
-  if (playerThird === undefined) return false;
-  const bankerShouldDraw = bankerDraws(bankerInitial, cardPoint(playerThird));
-  return bankerCards.length === 3 ? bankerShouldDraw : !bankerShouldDraw;
 }
 
 function validSnapshot(value: unknown): value is PragmaticRuntimeSnapshot {
@@ -285,28 +158,23 @@ export function pragmaticGameCountSnapshot(raw: string): string | undefined {
   });
 }
 
-export class PragmaticRuntimeParser {
-  private readonly runId = Math.random().toString(36).slice(2, 10);
-  private readonly generationByTable = new Map<string, number>();
-  private readonly seqByTable = new Map<string, number>();
-  private readonly shoeSeqByTable = new Map<string, number>();
-  private readonly shoeIdByTable = new Map<string, string>();
-  private readonly lastShoeResetByTable = new Map<string, string>();
-  private readonly lastGameCountByTable = new Map<string, number>();
-  private readonly handsThisShoeByTable = new Map<string, number>();
-  private readonly lastRoundByTable = new Map<string, string>();
-  private readonly cardBoundaryByHand = new Set<string>();
-  private readonly cardsByHand = new Map<string, HandCards>();
-  private readonly seenCardsByHand = new Map<string, Set<string>>();
-  private readonly openedWindows = new Set<string>();
-  private readonly closedWindows = new Set<string>();
-  private readonly windowOpenCount = new Map<string, number>();
-  private readonly windowClosesAtMs = new Map<string, number>();
-  private readonly lastWindowEmitAtMs = new Map<string, number>();
-  private readonly settledHands = new Set<string>();
-  private readonly finishedHands = new Set<string>();
-  private readonly evidenceByTable = new Map<string, ParserShoeEvidence>();
-  private readonly lastHandAtByTable = new Map<string, number>();
+export class PragmaticRuntimeParser extends SnapshotRuntimeParserBase {
+  constructor() {
+    super({
+      platformId: PRAGMATIC_PLATFORM_ID,
+      eventIdPrefix: 'pragmatic',
+      eventSourceName: 'pragmatic-runtime',
+      shoeIdPrefix: 'pragmatic',
+    });
+  }
+
+  protected clearPlatformState(_tableId: string): void {
+    // Pragmatic keeps no extra per-table state beyond the shared base.
+  }
+
+  protected clearPlatformShoeState(_tableId: string): void {
+    // Pragmatic keeps no extra per-shoe state beyond the shared base.
+  }
 
   parse(raw: string, isSelected: (tableId: string) => boolean = () => true): NormalizedEvent[] {
     let snapshot: unknown;
@@ -339,43 +207,6 @@ export class PragmaticRuntimeParser {
       .filter(tableId => tableId.length > 0);
   }
 
-  currentShoeId(tableId: string): string | undefined {
-    return this.shoeIdByTable.get(tableId);
-  }
-
-  acceptedGameCount(tableId: string): number | undefined {
-    return this.lastGameCountByTable.get(tableId);
-  }
-
-  shoeEvidence(tableId: string): ParserShoeEvidence | undefined {
-    const evidence = this.evidenceByTable.get(tableId);
-    return evidence === undefined ? undefined : { ...evidence };
-  }
-
-  recordShoeEvidence(tableId: string, evidence: ParserShoeEvidence): void {
-    this.evidenceByTable.set(tableId, evidence);
-  }
-
-  openPhysicalShoe(tableId: string, timestamp: string): NormalizedEvent[] {
-    const events: NormalizedEvent[] = [];
-    this.beginNewShoe(tableId, timestamp, events, 'physical-shoe', { reason: 'manual-confirm' });
-    return events;
-  }
-
-  resetTable(tableId: string): void {
-    this.generationByTable.set(tableId, (this.generationByTable.get(tableId) ?? 0) + 1);
-    this.seqByTable.delete(tableId);
-    this.shoeSeqByTable.delete(tableId);
-    this.shoeIdByTable.delete(tableId);
-    this.lastShoeResetByTable.delete(tableId);
-    this.lastGameCountByTable.delete(tableId);
-    this.handsThisShoeByTable.delete(tableId);
-    this.lastRoundByTable.delete(tableId);
-    this.lastHandAtByTable.delete(tableId);
-    this.evidenceByTable.delete(tableId);
-    this.clearHandState(tableId);
-  }
-
   private ingestTable(
     table: PragmaticTableSnapshot,
     observedAt: string,
@@ -383,8 +214,8 @@ export class PragmaticRuntimeParser {
   ): void {
     const tableId = table.tableId;
     const idleShuffle = isIdleDealtShoeShuffle(
-      this.handsThisShoeByTable.get(tableId),
-      this.lastHandAtByTable.get(tableId),
+      this.currentHandsThisShoe(tableId),
+      this.lastHandAtMs(tableId),
       Date.parse(observedAt),
     );
     this.ingestShoeReset(table, observedAt, events);
@@ -400,9 +231,9 @@ export class PragmaticRuntimeParser {
     }
 
     if (Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1) {
-      const previous = this.lastGameCountByTable.get(tableId);
+      const previous = this.acceptedGameCount(tableId);
       const gameCount = table.gameCount!;
-      const stalePreviousShoeRoad = this.evidenceByTable.get(tableId)?.reason === 'protocol-shuffle'
+      const stalePreviousShoeRoad = this.currentEvidenceReason(tableId) === 'protocol-shuffle'
         && previous === undefined
         && gameCount > ROAD_WRAP_MAX;
       if (stalePreviousShoeRoad) {
@@ -414,28 +245,29 @@ export class PragmaticRuntimeParser {
           previousGameCount: previous,
           gameCount,
         });
-        this.lastGameCountByTable.set(tableId, gameCount);
+        this.setAcceptedGameCount(tableId, gameCount);
       } else if (isPlausibleGameCountAdvance(previous, gameCount)) {
-        this.lastGameCountByTable.set(tableId, gameCount);
+        this.setAcceptedGameCount(tableId, gameCount);
       }
     }
 
     const handId = typeof table.roundId === 'string' ? table.roundId.trim() : '';
     if (!handId || handId === '—') return;
-    if (this.settledHands.has(`${tableId}:${handId}`)) return;
+    if (this.handSettledAlready(tableId, handId)) return;
 
     this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
 
-    const source = table.source === 'protocol' || table.source === 'dom' ? table.source : undefined;
+    const source: SnapshotSource | undefined =
+      table.source === 'protocol' || table.source === 'dom' ? table.source : undefined;
     const playerCards = parseCards(table.playerCards);
     const bankerCards = parseCards(table.bankerCards);
     const handKey = `${tableId}:${handId}`;
     const hasCardPayload = table.playerCards !== undefined || table.bankerCards !== undefined;
 
-    if (this.finishedHands.has(handKey)) {
+    if (this.handFinished(tableId, handId)) {
       if (hasCardPayload && (playerCards.length > 0 || bankerCards.length > 0)) {
-        const merged = mergeHandCards(this.cardsByHand.get(handKey), playerCards, bankerCards, source);
-        this.cardsByHand.set(handKey, merged);
+        const merged = mergeHandCards(this.handCards(tableId, handId), playerCards, bankerCards, source);
+        this.rememberHandCards(tableId, handId, merged);
         this.recordCards(tableId, handId, 'player', merged.playerCards, observedAt, events);
         this.recordCards(tableId, handId, 'banker', merged.bankerCards, observedAt, events);
       }
@@ -443,40 +275,40 @@ export class PragmaticRuntimeParser {
       return;
     }
 
-    const previousHandId = this.lastRoundByTable.get(tableId);
+    const previousHandId = this.lastRoundFor(tableId);
     if (previousHandId !== undefined && previousHandId !== handId) {
-      this.finishedHands.add(`${tableId}:${previousHandId}`);
+      this.markHandFinished(tableId, previousHandId);
       this.closeWindows(tableId, previousHandId, observedAt, events);
       this.settleRememberedHand(tableId, previousHandId, observedAt, events);
-      const nextHands = (this.handsThisShoeByTable.get(tableId) ?? 1) + 1;
+      const nextHands = (this.currentHandsThisShoe(tableId) ?? 1) + 1;
       if (nextHands > MAX_BACCARAT_SHOE_HANDS) {
         this.beginNewShoe(tableId, observedAt, events, 'unknown-monitor-session', {
           reason: 'attach',
         });
-        this.handsThisShoeByTable.set(tableId, 1);
+        this.setHandsThisShoe(tableId, 1);
       } else {
-        this.handsThisShoeByTable.set(tableId, nextHands);
+        this.setHandsThisShoe(tableId, nextHands);
       }
     } else if (previousHandId === undefined) {
-      this.handsThisShoeByTable.set(tableId, 1);
+      this.setHandsThisShoe(tableId, 1);
     }
     this.setLastRound(tableId, handId, observedAt);
 
     const emptyOpenBoundary = table.bettingOpen === true
       && playerCards.length === 0
       && bankerCards.length === 0;
-    if (emptyOpenBoundary) this.cardBoundaryByHand.add(handKey);
+    if (emptyOpenBoundary) this.markCardBoundary(tableId, handId);
     const mayAcceptCards = source === 'protocol'
       || previousHandId === undefined
-      || this.cardBoundaryByHand.has(handKey);
+      || this.handHasCardBoundary(tableId, handId);
     if (mayAcceptCards && hasCardPayload && (playerCards.length > 0 || bankerCards.length > 0)) {
-      const merged = mergeHandCards(this.cardsByHand.get(handKey), playerCards, bankerCards, source);
-      this.cardsByHand.set(handKey, merged);
+      const merged = mergeHandCards(this.handCards(tableId, handId), playerCards, bankerCards, source);
+      this.rememberHandCards(tableId, handId, merged);
       this.recordCards(tableId, handId, 'player', merged.playerCards, observedAt, events);
       this.recordCards(tableId, handId, 'banker', merged.bankerCards, observedAt, events);
     }
 
-    const rememberedCards = this.cardsByHand.get(handKey);
+    const rememberedCards = this.handCards(tableId, handId);
     const hasObservedCards = (rememberedCards?.playerCards.length ?? 0)
       + (rememberedCards?.bankerCards.length ?? 0) > 0;
     if (table.bettingOpen === true && !hasObservedCards) {
@@ -485,31 +317,6 @@ export class PragmaticRuntimeParser {
       this.closeWindows(tableId, handId, observedAt, events);
       this.settleRememberedHand(tableId, handId, observedAt, events);
     }
-  }
-
-  private nextSeq(tableId: string): number {
-    const next = (this.seqByTable.get(tableId) ?? 0) + 1;
-    this.seqByTable.set(tableId, next);
-    return next;
-  }
-
-  private makeEvent(
-    tableId: string,
-    type: NormalizedEvent['type'],
-    stableKey: string,
-    timestamp: string,
-    extra: Record<string, unknown>,
-  ): NormalizedEvent {
-    return {
-      type,
-      eventId: `pragmatic:${this.runId}:${this.generationByTable.get(tableId) ?? 0}:${tableId}:${type}:${stableKey}`,
-      tableId,
-      timestamp,
-      sourceSeq: this.nextSeq(tableId),
-      source: 'pragmatic-runtime',
-      schemaVersion: EVENT_SCHEMA_VERSION,
-      ...extra,
-    } as NormalizedEvent;
   }
 
   private ingestShoeReset(
@@ -521,13 +328,12 @@ export class PragmaticRuntimeParser {
     const token = typeof table.shoeReset === 'string' && table.shoeReset.length > 0
       ? table.shoeReset
       : undefined;
-    const shuffleEvent = table.shuffleEvent === true;
     if (token === undefined) {
       return;
     }
-    const previousToken = this.lastShoeResetByTable.get(tableId);
+    const previousToken = this.lastShoeResetToken(tableId);
     if (previousToken !== token) {
-      this.lastShoeResetByTable.set(tableId, token);
+      this.setLastShoeResetToken(tableId, token);
       this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
       // A leftover currentShoe token on first attach is not a shuffle.
       // startshuffling/endshuffling may set shuffleEvent on that first token;
@@ -538,205 +344,5 @@ export class PragmaticRuntimeParser {
       return;
     }
     // Same token + sticky shuffleEvent is leftover currentShoe, not a new shoe.
-  }
-
-  private ensureShoe(
-    tableId: string,
-    baseline: ShoeBaseline,
-    timestamp: string,
-    events: NormalizedEvent[],
-  ): void {
-    if (this.shoeIdByTable.has(tableId)) return;
-    this.shoeSeqByTable.set(tableId, 1);
-    if (!this.evidenceByTable.has(tableId)) this.evidenceByTable.set(tableId, { reason: 'attach' });
-    this.emitShoe(tableId, 1, baseline, timestamp, events);
-  }
-
-  private beginNewShoe(
-    tableId: string,
-    timestamp: string,
-    events: NormalizedEvent[],
-    baseline: ShoeBaseline,
-    evidence?: ParserShoeEvidence,
-  ): void {
-    this.clearShoeTracking(tableId);
-    const sequence = (this.shoeSeqByTable.get(tableId) ?? 1) + 1;
-    this.shoeSeqByTable.set(tableId, sequence);
-    if (evidence !== undefined) this.evidenceByTable.set(tableId, evidence);
-    this.emitShoe(tableId, sequence, baseline, timestamp, events);
-  }
-
-  private setLastRound(tableId: string, handId: string, observedAt: string): void {
-    const previous = this.lastRoundByTable.get(tableId);
-    this.lastRoundByTable.set(tableId, handId);
-    if (previous === handId) return;
-    const at = Date.parse(observedAt);
-    if (Number.isFinite(at)) this.lastHandAtByTable.set(tableId, at);
-  }
-
-  private clearShoeTracking(tableId: string): void {
-    this.lastGameCountByTable.delete(tableId);
-    this.handsThisShoeByTable.delete(tableId);
-    this.lastRoundByTable.delete(tableId);
-    this.lastHandAtByTable.delete(tableId);
-    this.evidenceByTable.delete(tableId);
-    this.clearHandState(tableId, { keepSettledHands: true });
-  }
-
-  private clearHandState(tableId: string, options: { readonly keepSettledHands?: boolean } = {}): void {
-    const prefix = `${tableId}:`;
-    for (const key of this.cardsByHand.keys()) if (key.startsWith(prefix)) this.cardsByHand.delete(key);
-    for (const key of this.seenCardsByHand.keys()) if (key.startsWith(prefix)) this.seenCardsByHand.delete(key);
-    for (const key of this.cardBoundaryByHand) if (key.startsWith(prefix)) this.cardBoundaryByHand.delete(key);
-    for (const key of this.openedWindows) if (key.startsWith(prefix)) this.openedWindows.delete(key);
-    for (const key of this.closedWindows) if (key.startsWith(prefix)) this.closedWindows.delete(key);
-    for (const key of this.windowOpenCount.keys()) if (key.startsWith(prefix)) this.windowOpenCount.delete(key);
-    for (const key of this.windowClosesAtMs.keys()) if (key.startsWith(prefix)) this.windowClosesAtMs.delete(key);
-    for (const key of this.lastWindowEmitAtMs.keys()) if (key.startsWith(prefix)) this.lastWindowEmitAtMs.delete(key);
-    for (const key of this.finishedHands) if (key.startsWith(prefix)) this.finishedHands.delete(key);
-    if (options.keepSettledHands === true) return;
-    for (const key of this.settledHands) if (key.startsWith(prefix)) this.settledHands.delete(key);
-  }
-
-  private emitShoe(
-    tableId: string,
-    sequence: number,
-    baseline: ShoeBaseline,
-    timestamp: string,
-    events: NormalizedEvent[],
-  ): void {
-    const shoeId = `pragmatic-${tableId}-${sequence}`;
-    this.shoeIdByTable.set(tableId, shoeId);
-    events.push(this.makeEvent(tableId, 'newShoeSignal', `shoe:${shoeId}`, timestamp, {
-      shoeId,
-      baseline,
-      profile: {
-        ...defaultProfile(tableId),
-        autoConfirmNewShoe: true,
-      },
-    }));
-  }
-
-  private recordCards(
-    tableId: string,
-    handId: string,
-    position: 'player' | 'banker',
-    cards: readonly Card[],
-    timestamp: string,
-    events: NormalizedEvent[],
-  ): void {
-    const handKey = `${tableId}:${handId}`;
-    const seen = this.seenCardsByHand.get(handKey) ?? new Set<string>();
-    this.seenCardsByHand.set(handKey, seen);
-    cards.slice(0, 3).forEach((card, index) => {
-      const identity = cardIdentity(card);
-      if ([...seen].some(key => {
-        const parts = key.split(':');
-        return parts[0] === position && parts.slice(2).join(':') === identity;
-      })) return;
-      const cardKey = `${position}:${index}:${identity}`;
-      if (seen.has(cardKey)) return;
-      seen.add(cardKey);
-      events.push(this.makeEvent(tableId, 'cardObserved', `card:${handId}:${cardKey}`, timestamp, {
-        shoeId: this.shoeIdByTable.get(tableId) ?? '',
-        handId,
-        card,
-        position,
-      }));
-    });
-  }
-
-  private openWindows(
-    tableId: string,
-    handId: string,
-    countdown: number | undefined,
-    timestamp: string,
-    events: NormalizedEvent[],
-  ): void {
-    const observedAtMs = Date.parse(timestamp);
-    const closesAtMs = Number.isFinite(countdown) && Number.isFinite(observedAtMs)
-      ? observedAtMs + Math.max(0, countdown!) * 1000
-      : undefined;
-    const shoeId = this.shoeIdByTable.get(tableId) ?? '';
-    for (const market of ['bankerPair', 'playerPair'] as const) {
-      const key = `${tableId}:${handId}:${market}`;
-      const alreadyOpen = this.openedWindows.has(key) && !this.closedWindows.has(key);
-      if (alreadyOpen) {
-        const hadClosesAt = this.windowClosesAtMs.get(key) !== undefined;
-        if (!Number.isFinite(closesAtMs) && !hadClosesAt) continue;
-        if (hadClosesAt) {
-          this.windowClosesAtMs.set(key, closesAtMs!);
-          continue;
-        }
-      }
-      this.openedWindows.add(key);
-      this.closedWindows.delete(key);
-      if (Number.isFinite(closesAtMs)) this.windowClosesAtMs.set(key, closesAtMs!);
-      if (Number.isFinite(observedAtMs)) this.lastWindowEmitAtMs.set(key, observedAtMs);
-      const closesAt = Number.isFinite(closesAtMs) ? new Date(closesAtMs!).toISOString() : undefined;
-      let openCount = this.windowOpenCount.get(key) ?? 0;
-      if (!alreadyOpen) {
-        openCount += 1;
-        this.windowOpenCount.set(key, openCount);
-      }
-      const base = `open:${shoeId}:${handId}:${market}`;
-      const reopen = openCount > 1 ? `:reopen:${openCount - 1}` : '';
-      const stableKey = alreadyOpen ? `${base}${reopen}:eta` : `${base}${reopen}`;
-      events.push(this.makeEvent(tableId, 'bettingWindowOpened', stableKey, timestamp, {
-        shoeId,
-        handId,
-        market,
-        ...(closesAt === undefined ? {} : { closesAt }),
-      }));
-    }
-  }
-
-  private closeWindows(
-    tableId: string,
-    handId: string,
-    timestamp: string,
-    events: NormalizedEvent[],
-  ): void {
-    const shoeId = this.shoeIdByTable.get(tableId) ?? '';
-    for (const market of ['bankerPair', 'playerPair'] as const) {
-      const key = `${tableId}:${handId}:${market}`;
-      if (this.closedWindows.has(key)) continue;
-      this.closedWindows.add(key);
-      this.windowClosesAtMs.delete(key);
-      const openCount = this.windowOpenCount.get(key) ?? 0;
-      const reopen = openCount > 1 ? `:reopen:${openCount - 1}` : '';
-      const unopened = openCount === 0 ? ':unopened' : '';
-      events.push(this.makeEvent(tableId, 'bettingWindowClosed', `close:${shoeId}:${handId}:${market}${reopen}${unopened}`, timestamp, {
-        shoeId,
-        handId,
-        market,
-        openingObserved: this.openedWindows.has(key),
-      }));
-    }
-  }
-
-  private settleRememberedHand(
-    tableId: string,
-    handId: string,
-    timestamp: string,
-    events: NormalizedEvent[],
-    force = false,
-  ): void {
-    const handKey = `${tableId}:${handId}`;
-    if (this.settledHands.has(handKey)) return;
-    const cards = this.cardsByHand.get(handKey);
-    if (!cards || cards.playerCards.length < 2 || cards.bankerCards.length < 2) return;
-    if (!force && !isCompleteBaccaratHand(cards.playerCards, cards.bankerCards)) return;
-    this.settledHands.add(handKey);
-    events.push(this.makeEvent(tableId, 'handSettled', `settled:${this.shoeIdByTable.get(tableId) ?? ''}:${handId}`, timestamp, {
-      shoeId: this.shoeIdByTable.get(tableId) ?? '',
-      handId,
-      playerCards: cards.playerCards,
-      bankerCards: cards.bankerCards,
-      outcomes: {
-        playerPair: cards.playerCards[0]!.rank === cards.playerCards[1]!.rank,
-        bankerPair: cards.bankerCards[0]!.rank === cards.bankerCards[1]!.rank,
-      },
-    }));
   }
 }

@@ -8,6 +8,17 @@ import {
   type BetReceipt,
   type NormalizedEvent,
 } from '@baccarat/contracts';
+import {
+  BG_BET_RUNTIME_FAMILY,
+  BG_BET_RUNTIME_REVISION,
+  BG_PLATFORM_ID,
+  PRAGMATIC_BET_RUNTIME_FAMILY,
+  PRAGMATIC_BET_RUNTIME_REVISION,
+  PRAGMATIC_PLATFORM_ID,
+  WINFINITY_PLATFORM_ID,
+  isCompatibleRuntimeRevision,
+  type PlatformAdapterDescriptor,
+} from '@baccarat/adapter-contract';
 import type {
   BetExecutionRequest,
   OperationalWagerExecutionRequest,
@@ -34,33 +45,29 @@ import type {
   BridgeRoomDescriptor,
   BridgeServerMessage,
 } from './protocol.js';
-import { PragmaticRuntimeParser, pragmaticGameCountSnapshot, selectStableGameCount, type ParserShoeEvidence } from './pragmatic-runtime.js';
-import { BgRuntimeParser, bgGameCountSnapshot, normalizeBgTableId, selectBgRoadCount } from './bg-runtime.js';
-import {
-  WinfinityRuntimeParser,
-  normalizeWinfinityTableId,
-  publicWinfinityTableId,
-} from './winfinity-runtime.js';
-import {
-  DAFABET_BG_ROOM_ID,
-  DAFABET_PRAGMATIC_ROOM_ID,
-  DAFABET_WINFINITY_ROOM_ID,
-  isLiveBridgeRoomId,
-} from './identity.js';
-import {
-  PragmaticProtocolState,
-  inspectPragmaticGameresult,
-  inspectPragmaticWsFrame,
-  pragmaticProtocolTableId,
-} from './pragmatic-protocol.js';
+import { inspectPragmaticWsFrame } from './pragmatic-protocol.js';
+import type { ParserShoeEvidence } from './runtime-common.js';
+import { PragmaticPlatformAdapter } from './platform-pragmatic.js';
+import { BgPlatformAdapter } from './platform-bg.js';
+import { WinfinityPlatformAdapter } from './platform-winfinity.js';
+import type {
+  BridgePlatformAdapter,
+  PlatformAdapterContext,
+  PlatformCaptureMessage,
+} from './platform-adapter.js';
+import { PLATFORM_REGISTRY, isLiveBridgeRoomId } from './identity.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { ExecutorLeaseRegistry, type HostExecutionChannelClaimResult } from './executor-lease.js';
+export { WINFINITY_WS_ALIAS_BUFFER_LIMIT } from './platform-winfinity.js';
 
-export const PRAGMATIC_BET_RUNTIME_REVISION = 'pragmatic-bet-runtime/2026-08-30.14';
-const PRAGMATIC_BET_RUNTIME_FAMILY = 'pragmatic-bet-runtime/';
-export const BG_BET_RUNTIME_REVISION = 'bg-bet-runtime/2026-09-05.1';
-const BG_BET_RUNTIME_FAMILY = 'bg-bet-runtime/';
+// 兼容导出：运行时版本常量已上收 platform-catalog（值不变）。
+export { PRAGMATIC_BET_RUNTIME_REVISION, BG_BET_RUNTIME_REVISION };
+
+export const OPERATIONAL_WAGER_RUNTIME_FAMILIES = [
+  PRAGMATIC_BET_RUNTIME_FAMILY,
+  BG_BET_RUNTIME_FAMILY,
+] as const;
 
 
 export class OperationalWagerRuntimeRevisionError extends Error {
@@ -121,15 +128,20 @@ type PendingBet = {
   ownerSocket: WebSocket | undefined;
 };
 
+type MergeGameCountSelector = (
+  tableId: string,
+  previous: number | undefined,
+  next: number | undefined,
+) => number | undefined;
+
 function mergeBridgeTableDescriptor(
   previous: BridgeRoomDescriptor['tables'][number] | undefined,
   next: BridgeRoomDescriptor['tables'][number],
+  mergeGameCount: MergeGameCountSelector,
 ): BridgeRoomDescriptor['tables'][number] {
   const gameCount = next.gameCount === undefined
     ? previous?.gameCount
-    : normalizeBgTableId(next.tableId) !== undefined
-      ? selectBgRoadCount(previous?.gameCount, next.gameCount)
-      : selectStableGameCount(previous?.gameCount, next.gameCount);
+    : mergeGameCount(next.tableId, previous?.gameCount, next.gameCount);
   return {
     ...(previous ?? { tableId: next.tableId }),
     tableId: next.tableId,
@@ -143,44 +155,23 @@ function mergeBridgeTableDescriptor(
   };
 }
 
-function sanitizeBgBridgeRoom(room: BridgeRoomDescriptor): BridgeRoomDescriptor {
-  return {
-    ...room,
-    tables: room.tables.flatMap(table => {
-      const tableId = normalizeBgTableId(table.tableId);
-      if (tableId === undefined) return [];
-      return [{ ...table, tableId }];
-    }),
-  };
-}
-
-function sanitizeWinfinityBridgeRoom(room: BridgeRoomDescriptor): BridgeRoomDescriptor {
-  return {
-    ...room,
-    tables: room.tables.flatMap(table => {
-      const tableId = normalizeWinfinityTableId(table.tableId);
-      if (tableId === undefined) return [];
-      return [{ ...table, tableId }];
-    }),
-  };
-}
-
 function upsertBridgeRoom(
   rooms: Map<string, BridgeRoomDescriptor>,
   next: BridgeRoomDescriptor,
+  mergeGameCount: MergeGameCountSelector,
 ): BridgeRoomDescriptor {
   const previous = rooms.get(next.roomId);
   if (previous === undefined) {
     const created = {
       ...next,
-      tables: next.tables.map(table => mergeBridgeTableDescriptor(undefined, table)),
+      tables: next.tables.map(table => mergeBridgeTableDescriptor(undefined, table, mergeGameCount)),
     };
     rooms.set(next.roomId, created);
     return created;
   }
   const tables = new Map(previous.tables.map(table => [table.tableId, table]));
   for (const table of next.tables) {
-    tables.set(table.tableId, mergeBridgeTableDescriptor(tables.get(table.tableId), table));
+    tables.set(table.tableId, mergeBridgeTableDescriptor(tables.get(table.tableId), table, mergeGameCount));
   }
   const merged = {
     ...previous,
@@ -194,6 +185,7 @@ function upsertBridgeRoom(
 function replaceBridgeRoom(
   rooms: Map<string, BridgeRoomDescriptor>,
   next: BridgeRoomDescriptor,
+  mergeGameCount: MergeGameCountSelector,
 ): BridgeRoomDescriptor {
   const previous = rooms.get(next.roomId);
   const previousTables = new Map((previous?.tables ?? []).map(table => [table.tableId, table]));
@@ -201,7 +193,7 @@ function replaceBridgeRoom(
     ...(previous ?? next),
     ...(next.displayName === undefined ? {} : { displayName: next.displayName }),
     roomId: next.roomId,
-    tables: next.tables.map(table => mergeBridgeTableDescriptor(previousTables.get(table.tableId), table)),
+    tables: next.tables.map(table => mergeBridgeTableDescriptor(previousTables.get(table.tableId), table, mergeGameCount)),
   };
   rooms.set(next.roomId, replaced);
   return replaced;
@@ -229,7 +221,6 @@ const NOISY_SESSION_ACTIONS = new Set([
   'native-idle-continue-cleared',
   'native-idle-continue-click',
 ]);
-const PRAGMATIC_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
 const PRAGMATIC_EXECUTION_LANE = 'pragmatic:shared-multitable-ui';
 
 /** 观察广播只透传游戏协议通道，不含视频/资源/页面 IPC。 */
@@ -246,37 +237,6 @@ const LIVE_PROTOCOL_CAPTURE_SOURCES = new Set([
   'baccarat-bridge-winfinity-state',
 ]);
 
-export const WINFINITY_WS_ALIAS_BUFFER_LIMIT = 32;
-
-function winfinityCaptureType(raw: string): string | undefined {
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== 'object' || parsed === null) return undefined;
-    const type = Reflect.get(parsed, 'type');
-    return typeof type === 'string' ? type : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function winfinityVendorTableIdFromCapture(raw: string): string | undefined {
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== 'object' || parsed === null) return undefined;
-    const meta = Reflect.get(parsed, 'meta');
-    if (typeof meta !== 'object' || meta === null) return undefined;
-    const tableId = Reflect.get(meta, 'tableId');
-    return typeof tableId === 'string' ? tableId : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function winfinityFallbackVendorId(publicId: string): string | undefined {
-  const match = /^wnf-([a-f0-9]{24})$/i.exec(publicId.trim());
-  return match?.[1]?.toLowerCase();
-}
-
 function isLiveProtocolCapture(
   message: Extract<BridgeClientMessage, { kind: 'networkCapture' }>,
 ): boolean {
@@ -284,25 +244,6 @@ function isLiveProtocolCapture(
   if (typeof message.data === 'string' && message.data.length > 65_536) return false;
   if (LIVE_PROTOCOL_CAPTURE_SOURCES.has(message.source)) return true;
   return OBSERVABLE_NETWORK_PATTERN.test(message.url);
-}
-
-function visibleTableIdsFromPragmaticState(raw: string): string[] | undefined {
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
-    const tables = Reflect.get(parsed, 'tables');
-    if (!Array.isArray(tables)) return undefined;
-    const tableIds: string[] = [];
-    for (const table of tables) {
-      if (typeof table !== 'object' || table === null) continue;
-      const tableId = Reflect.get(table, 'tableId');
-      if (typeof tableId !== 'string' || tableId.length === 0) continue;
-      if (Reflect.get(table, 'visible') === true) tableIds.push(tableId);
-    }
-    return tableIds;
-  } catch {
-    return undefined;
-  }
 }
 
 const LIVE_EXTENSION_CONNECTION_ERROR =
@@ -313,8 +254,41 @@ const COMMAND_PATH = '/command';
 const BRIDGE_DEBUG_ENABLED = process.env.BACCARAT_BRIDGE_DEBUG === '1';
 
 const TABLE_STALE_AFTER_MS = 45_000;
-const BG_TABLE_STALE_AFTER_MS = 300_000;
 const SHUFFLE_HOLD_MS = 10 * 60 * 1000;
+/**
+ * 单个桌导出的待消费事件上限。暂停（stale / 洗牌 hold）期间如果既无法消费、
+ * 又等不到可重放的实体洗牌，pending 会一直堆积；没有上限的话这就是一个
+ * 长达 SHUFFLE_HOLD_MS 的 OOM 通道。
+ */
+const TABLE_EXPORT_PENDING_LIMIT = 4_096;
+/**
+ * 单条 WebSocket 消息上限。ws 默认 100MB —— 一个畸形/失控的客户端足以把进程撑爆。
+ *
+ * 取值刻意留了很大余量：超限时 ws 会以 1009 直接**关闭连接**，扩展随后重连，
+ * 等于监控中断。桥里已有的最大消息（全量珠盘同步）在设计上远小于此值
+ * （`isLiveProtocolCapture` 对 capture 数据的门槛是 64KB），所以 8MB 既能把
+ * 100MB 的上限收回来，又不会误伤正常负载。
+ */
+const MAX_BRIDGE_MESSAGE_BYTES = 8 * 1_048_576;
+/**
+ * 允许从本机回环转发的扩展命令白名单。command 客户端可以提交任意字符串，
+ * 不校验的话，本机任意进程都能让扩展执行 liveOn / liveOff / reloadExtension。
+ * 集合必须覆盖三个扩展实际处理的所有命令。
+ */
+const BRIDGE_COMMAND_NAMES: ReadonlySet<string> = new Set([
+  'liveOn',
+  'liveOff',
+  'reloadExtension',
+  'probeBetReadiness',
+  'replayRuntimeState',
+  'probeExtensionManifest',
+  'calibrate',
+  'calibrateClear',
+  'startPragmaticNetworkCapture',
+  'stopPragmaticNetworkCapture',
+  'trustedOn',
+  'trustedOff',
+]);
 const EXTENSION_HEARTBEAT_TIMEOUT_MS = 15_000;
 const EXTENSION_DISCONNECT_GRACE_MS = 8_000;
 
@@ -603,35 +577,11 @@ function pragmaticGameStateObservation(value: unknown): Record<string, unknown> 
   };
 }
 
-function pragmaticCaptureDir(): string {
-  return process.cwd().endsWith('desktop')
+function pragmaticWsFrameCapturePath(): string {
+  const cwd = process.cwd().endsWith('desktop')
     ? join(process.cwd(), '..', '..', '.tmp-pragmatic')
     : join(process.cwd(), '.tmp-pragmatic');
-}
-
-function pragmaticGameresultCapturePath(): string {
-  return join(pragmaticCaptureDir(), 'gameresult-capture.jsonl');
-}
-
-function pragmaticWsFrameCapturePath(): string {
-  return join(pragmaticCaptureDir(), 'ws-frame-capture.jsonl');
-}
-
-function capturePragmaticGameresult(raw: string): void {
-  if (process.env.PRAGMATIC_WS_CAPTURE !== '1') return;
-  const inspection = inspectPragmaticGameresult(raw);
-  if (inspection === undefined) return;
-  const line = JSON.stringify({
-    observedAt: new Date().toISOString(),
-    ...inspection,
-  });
-  try {
-    const target = pragmaticGameresultCapturePath();
-    mkdirSync(dirname(target), { recursive: true });
-    appendFileSync(target, `${line}\n`);
-  } catch {
-    // Capture is diagnostic only; a filesystem miss must not break the table feed.
-  }
+  return join(cwd, 'ws-frame-capture.jsonl');
 }
 
 function inspectPragmaticBinaryFrame(base64: string): Record<string, unknown> {
@@ -766,6 +716,7 @@ class BridgeTableExport implements TableExport {
   private shuffleHoldUntil = 0;
   private transportContinuous = true;
   private disconnectReason?: string;
+  private pendingOverflowed = false;
 
   constructor(
     roomId: string,
@@ -789,6 +740,7 @@ class BridgeTableExport implements TableExport {
     this.stopped = false;
     this.paused = false;
     this.error = undefined;
+    this.pendingOverflowed = false;
     this.state = 'CONNECTED';
     if (cursor) {
       if (cursor.tableId !== this.tableId) {
@@ -843,13 +795,32 @@ class BridgeTableExport implements TableExport {
   }
 
   ingestEvent(event: NormalizedEvent): void {
-    if (this.stopped) return;
+    if (this.stopped || this.pendingOverflowed) return;
     this.noteObservation();
     if (event.type === 'newShoeSignal') this.shuffleHoldUntil = Date.now() + SHUFFLE_HOLD_MS;
     this.pending.push(event);
+    if (this.pending.length > TABLE_EXPORT_PENDING_LIMIT) {
+      this.overflowPendingBuffer();
+      return;
+    }
     if (this.started) {
       void this.drain();
     }
+  }
+
+  /**
+   * 缓冲已经涨到上限，说明我们既不消费、也无法恢复（典型是 paused 且等不到
+   * 可重放的实体洗牌）。继续堆积只会把进程 OOM 掉，所以保留最近一段用于
+   * 诊断、其余丢弃，并主动承认连接已断开，交回上层做重连/移除。
+   */
+  private overflowPendingBuffer(): void {
+    this.pending = this.pending.slice(-TABLE_EXPORT_PENDING_LIMIT);
+    this.pendingOverflowed = true;
+    const reason = `table-export-buffer-overflow:${this.tableId}`;
+    this.error = new Error(
+      `pending buffer for ${this.tableId} exceeded ${TABLE_EXPORT_PENDING_LIMIT} events`,
+    );
+    this.handleDisconnect(reason);
   }
 
   noteObservation(): void {
@@ -906,6 +877,8 @@ class BridgeTableExport implements TableExport {
       return;
     }
     this.error = undefined;
+    // 恢复流程会重新消费 pending；允许再次接收事件，否则溢出后会永久静默。
+    this.pendingOverflowed = false;
     try {
       const restored = this.sink?.onRestored?.(this.tableId, proof);
       if (restored !== undefined) {
@@ -1037,12 +1010,15 @@ export class BrowserBridgeServer implements RoomMonitor {
   private exports = new Map<string, BridgeTableExport>();
   private pendingBets = new Map<string, PendingBet>();
   private readonly tableExecutionTails = new Map<string, Promise<void>>();
-  private pragmaticParser = new PragmaticRuntimeParser();
-  private bgParser = new BgRuntimeParser();
-  private winfinityParser = new WinfinityRuntimeParser();
-  private readonly winfinityWsBuffer = new Map<string, string[]>();
+  /**
+   * 平台适配器：注册表顺序 [pragmatic, bg, winfinity]。
+   * 第一个为默认平台（roomIdForTable 兜底），其余按倒序参与归属判定。
+   */
+  private readonly platformAdapters: readonly BridgePlatformAdapter[];
+  private readonly defaultAdapter: BridgePlatformAdapter;
+  private readonly adaptersByRoomId = new Map<string, BridgePlatformAdapter>();
+  private readonly lastIngestedShoeByTable = new Map<string, string>();
   private readonly bgShoeSequenceSeed = new Map<string, number>();
-  private readonly pragmaticProtocol = new PragmaticProtocolState();
   private readonly parsedSourceSeqByTable = new Map<string, number>();
   private readonly parsedEventIds = new Set<string>();
   private readonly protocolObservationStartedAt = new Map<string, number>();
@@ -1072,6 +1048,18 @@ export class BrowserBridgeServer implements RoomMonitor {
 
   constructor(options: BrowserBridgeServerOptions = {}) {
     this.options = options;
+    this.platformAdapters = PLATFORM_REGISTRY.getAll().map(descriptor => {
+      switch (descriptor.platformId) {
+        case PRAGMATIC_PLATFORM_ID: return new PragmaticPlatformAdapter(descriptor);
+        case BG_PLATFORM_ID: return new BgPlatformAdapter(descriptor);
+        case WINFINITY_PLATFORM_ID: return new WinfinityPlatformAdapter(descriptor);
+        default: throw new Error(`no bridge platform adapter registered for '${descriptor.platformId}'`);
+      }
+    });
+    this.defaultAdapter = this.platformAdapters[0]!;
+    for (const adapter of this.platformAdapters) {
+      this.adaptersByRoomId.set(adapter.descriptor.roomId, adapter);
+    }
     this.betTimeoutMs = options.betTimeoutMs ?? 10_000;
     this.tableStaleAfterMs = Math.max(1_000, options.tableStaleAfterMs ?? TABLE_STALE_AFTER_MS);
     this.extensionHeartbeatTimeoutMs = Math.max(
@@ -1098,6 +1086,9 @@ export class BrowserBridgeServer implements RoomMonitor {
     const wss = new WebSocketServer({
       port: this.options.port ?? 0,
       host: this.options.host ?? '127.0.0.1',
+      // ws 默认 maxPayload 是 100MB。桥只跑在本机回环上，但没有上限就意味着
+      // 一个畸形/失控的客户端（扩展或本机进程）能把进程直接撑爆。
+      maxPayload: MAX_BRIDGE_MESSAGE_BYTES,
       verifyClient: (info: { origin: string; secure: boolean; req: IncomingMessage }) => {
         const role = bridgeSocketRole(info.origin, info.req.url, this.options);
         if (role === null && info.origin.startsWith('chrome-extension://')) {
@@ -1264,93 +1255,146 @@ export class BrowserBridgeServer implements RoomMonitor {
     return this.executorLeases.claimHostExecutionChannel(channelId);
   }
 
+  // -- 平台适配器解析与上下文 ------------------------------------------------
+
+  /** 非默认平台适配器（注册序 [bg, winfinity]，倒序用于归属判定优先级）。 */
+  private get nonDefaultAdapters(): BridgePlatformAdapter[] {
+    return this.platformAdapters.slice(1).reverse();
+  }
+
+  /** 兜底归属判定：无法由发现表确认时按桌 ID 形状识别（winfinity 优先于 bg）。 */
+  private adapterForTableIdShape(tableId: string): BridgePlatformAdapter {
+    for (const adapter of this.nonDefaultAdapters) {
+      if (adapter.matchesTableIdShape(tableId)) return adapter;
+    }
+    return this.defaultAdapter;
+  }
+
+  private adapterForRoomId(roomId: string): BridgePlatformAdapter | undefined {
+    return this.adaptersByRoomId.get(roomId);
+  }
+
+  private contextFor(adapter: BridgePlatformAdapter): PlatformAdapterContext {
+    return {
+      isTableSelected: tableId => this.isTableSelected(tableId),
+      noteTableObservation: tableId => this.noteTableObservation(tableId),
+      ingestEvents: events => this.ingestParsedEvents(events, adapter.descriptor.roomId),
+      ensureRoomForTable: tableId => this.ensureRoomForTable(tableId, adapter.descriptor.roomId),
+      upsertDiscoveredRoom: room => {
+        upsertBridgeRoom(this.discoveredRooms, room, this.mergeGameCountSelector());
+        const selected = this.discoveredRooms.get(room.roomId);
+        if (selected !== undefined) {
+          this.rooms.set(room.roomId, selectedBridgeRoom(selected, candidate => this.isTableSelected(candidate)));
+        }
+      },
+      lastIngestedShoeId: tableId => this.lastIngestedShoeByTable.get(tableId),
+      setVisibleTableIds: tableIds => {
+        this.visibleTableIds = new Set(tableIds);
+      },
+      addVisibleTableIds: tableIds => {
+        for (const tableId of tableIds) this.visibleTableIds.add(tableId);
+      },
+    };
+  }
+
+  /** 原合并逻辑：按桌 ID 形状选择 road-count 平滑器（bg → winfinity → pragmatic）。 */
+  private mergeGameCountSelector(): MergeGameCountSelector {
+    return (tableId, previous, next) => {
+      const adapter = this.gameCountAdapterForTableId(tableId);
+      return adapter.mergeGameCount(previous, next);
+    };
+  }
+
+  /** merge 顺序保持原行为：bg 形状优先，其次 winfinity，默认 pragmatic。 */
+  private gameCountAdapterForTableId(tableId: string): BridgePlatformAdapter {
+    for (const adapter of this.platformAdapters) {
+      if (adapter === this.defaultAdapter) continue;
+      if (adapter.descriptor.platformId === BG_PLATFORM_ID && adapter.matchesTableIdShape(tableId)) return adapter;
+    }
+    for (const adapter of this.platformAdapters) {
+      if (adapter === this.defaultAdapter) continue;
+      if (adapter.matchesTableIdShape(tableId)) return adapter;
+    }
+    return this.defaultAdapter;
+  }
+
   /** Starts an independent logical monitor session without claiming a physical shoe reset. */
   currentPragmaticShoeId(tableId: string): string | undefined {
-    return this.pragmaticParser.currentShoeId(tableId);
+    const pragmatic = this.adaptersByRoomId.get(
+      PLATFORM_REGISTRY.get(PRAGMATIC_PLATFORM_ID)!.roomId,
+    );
+    return pragmatic instanceof PragmaticPlatformAdapter
+      ? pragmatic.currentPragmaticShoeId(tableId)
+      : this.defaultAdapter.currentShoeId(tableId);
+  }
+
+  winfinityLockedAliases(): ReadonlyMap<string, string> {
+    for (const adapter of this.platformAdapters) {
+      if (adapter instanceof WinfinityPlatformAdapter) return adapter.lockedAliases();
+    }
+    return new Map();
   }
 
   shoeEvidence(tableId: string) {
-    return this.winfinityParser.shoeEvidence(tableId)
-      ?? this.bgParser.shoeEvidence(tableId)
-      ?? this.pragmaticParser.shoeEvidence(tableId);
+    for (const adapter of [...this.platformAdapters].reverse()) {
+      const evidence = adapter.shoeEvidence(tableId);
+      if (evidence !== undefined) return evidence;
+    }
+    return undefined;
   }
 
   acceptedGameCount(tableId: string): number | undefined {
-    return this.bgParser.acceptedGameCount(tableId) ?? this.pragmaticParser.acceptedGameCount(tableId);
+    for (const adapter of [...this.platformAdapters].reverse()) {
+      const gameCount = adapter.acceptedGameCount(tableId);
+      if (gameCount !== undefined) return gameCount;
+    }
+    return undefined;
   }
 
   seedBgShoeSequences(sequences: ReadonlyArray<{ tableId: string; sequence: number }>): void {
+    const bg = this.adaptersByRoomId.get(PLATFORM_REGISTRY.get(BG_PLATFORM_ID)!.roomId);
     for (const { tableId, sequence } of sequences) {
-      this.bgParser.seedShoeSequence(tableId, sequence);
+      bg?.seedShoeSequences?.([{ tableId, sequence }]);
       const current = this.bgShoeSequenceSeed.get(tableId) ?? 0;
       if (sequence > current) this.bgShoeSequenceSeed.set(tableId, sequence);
     }
   }
 
   recordShoeEvidence(tableId: string, evidence: ParserShoeEvidence): void {
-    const roomId = this.roomIdForTable(tableId);
-    if (roomId === DAFABET_WINFINITY_ROOM_ID) {
-      if (
-        evidence.reason === 'attach'
-        || evidence.reason === 'protocol-shuffle'
-        || evidence.reason === 'manual-confirm'
-      ) {
-        this.winfinityParser.recordShoeEvidence(tableId, { reason: evidence.reason });
-      }
-      return;
-    }
-    if (roomId === DAFABET_BG_ROOM_ID) {
-      this.bgParser.recordShoeEvidence(tableId, evidence);
-      return;
-    }
-    this.pragmaticParser.recordShoeEvidence(tableId, evidence);
+    const adapter = this.adapterForRoomId(this.roomIdForTable(tableId)) ?? this.defaultAdapter;
+    adapter.recordShoeEvidence(tableId, evidence);
   }
 
   openPhysicalShoe(tableId: string): void {
     if (!this.isTableSelected(tableId)) return;
     const timestamp = new Date().toISOString();
-    const roomId = this.roomIdForTable(tableId);
-    if (roomId === DAFABET_WINFINITY_ROOM_ID) {
-      this.ingestParsedEvents(this.winfinityParser.openPhysicalShoe(tableId, timestamp), DAFABET_WINFINITY_ROOM_ID);
-      return;
-    }
-    if (roomId === DAFABET_BG_ROOM_ID) {
-      this.ingestParsedEvents(this.bgParser.openPhysicalShoe(tableId, timestamp), DAFABET_BG_ROOM_ID);
-      return;
-    }
-    this.ingestParsedEvents(this.pragmaticParser.openPhysicalShoe(tableId, timestamp), DAFABET_PRAGMATIC_ROOM_ID);
+    const adapter = this.adapterForRoomId(this.roomIdForTable(tableId)) ?? this.defaultAdapter;
+    this.ingestParsedEvents(adapter.openPhysicalShoe(tableId, timestamp), adapter.descriptor.roomId);
   }
 
   beginMonitorSession(): void {
-    this.pragmaticParser = new PragmaticRuntimeParser();
-    this.bgParser = new BgRuntimeParser();
-    this.winfinityParser = new WinfinityRuntimeParser();
-    this.winfinityWsBuffer.clear();
+    for (const adapter of this.platformAdapters) adapter.reset();
     for (const [tableId, sequence] of this.bgShoeSequenceSeed) {
-      this.bgParser.seedShoeSequence(tableId, sequence);
+      this.seedBgShoeSequences([{ tableId, sequence }]);
     }
-    this.pragmaticProtocol.reset();
+    this.lastIngestedShoeByTable.clear();
     this.parsedSourceSeqByTable.clear();
     this.parsedEventIds.clear();
     this.protocolObservationStartedAt.clear();
     this.protocolLastObservedAt.clear();
     this.runtimeStateLastObservedAt.clear();
     this.runtimeStateStaleTableIds.clear();
+    const liveRoomIds = new Set(PLATFORM_REGISTRY.roomIds);
     for (const [key, exportInstance] of this.exports) {
-      if (
-        !key.startsWith(`${DAFABET_PRAGMATIC_ROOM_ID}::`)
-        && !key.startsWith(`${DAFABET_BG_ROOM_ID}::`)
-        && !key.startsWith(`${DAFABET_WINFINITY_ROOM_ID}::`)
-      ) continue;
+      const separator = key.indexOf('::');
+      if (separator < 0 || !liveRoomIds.has(key.slice(0, separator))) continue;
       void exportInstance.stop();
       this.exports.delete(key);
     }
-    this.rooms.delete(DAFABET_PRAGMATIC_ROOM_ID);
-    this.rooms.delete(DAFABET_BG_ROOM_ID);
-    this.rooms.delete(DAFABET_WINFINITY_ROOM_ID);
-    this.discoveredRooms.delete(DAFABET_PRAGMATIC_ROOM_ID);
-    this.discoveredRooms.delete(DAFABET_BG_ROOM_ID);
-    this.discoveredRooms.delete(DAFABET_WINFINITY_ROOM_ID);
+    for (const roomId of liveRoomIds) {
+      this.rooms.delete(roomId);
+      this.discoveredRooms.delete(roomId);
+    }
   }
 
   async discoverRooms(): Promise<RoomDescriptor[]> {
@@ -1366,36 +1410,11 @@ export class BrowserBridgeServer implements RoomMonitor {
 
   confirmPhysicalShoe(tableId: string): void {
     if (!this.isTableSelected(tableId)) throw new Error(`table ${tableId} is not selected`);
-    const roomId = this.roomIdForTable(tableId);
-    const prefix = roomId === DAFABET_WINFINITY_ROOM_ID
-      ? 'wnf'
-      : roomId === DAFABET_BG_ROOM_ID
-        ? 'bg'
-        : 'pragmatic';
-    if (roomId === DAFABET_WINFINITY_ROOM_ID) {
-      this.ingestParsedEvents(
-        this.winfinityParser.openPhysicalShoe(tableId, new Date().toISOString()),
-        DAFABET_WINFINITY_ROOM_ID,
-      );
-      return;
-    } else if (roomId === DAFABET_BG_ROOM_ID) {
-      this.bgParser.recordShoeEvidence(tableId, { reason: 'manual-confirm' });
-    } else {
-      this.pragmaticParser.recordShoeEvidence(tableId, { reason: 'manual-confirm' });
-    }
-    const shoeId = `${prefix}-${tableId}-operator`;
-    this.ingestParsedEvents([{
-      type: 'newShoeSignal',
-      eventId: `${prefix}-session:${shoeId}:new-shoe`,
-      tableId,
-      timestamp: new Date().toISOString(),
-      sourceSeq: 0,
-      source: 'operator',
-      schemaVersion: EVENT_SCHEMA_VERSION,
-      shoeId,
-      baseline: 'physical-shoe',
-      profile: { ...defaultProfile(tableId), autoConfirmNewShoe: true },
-    }], roomId);
+    const adapter = this.adapterForRoomId(this.roomIdForTable(tableId)) ?? this.defaultAdapter;
+    this.ingestParsedEvents(
+      adapter.confirmPhysicalShoe(tableId, new Date().toISOString()),
+      adapter.descriptor.roomId,
+    );
   }
   async requestBet(request: BetExecutionRequest): Promise<BetReceipt | null> {
     const receipt = await this.requestExecution(request);
@@ -1410,14 +1429,16 @@ export class BrowserBridgeServer implements RoomMonitor {
       const reason = typeof receipt.raw === 'object' && receipt.raw !== null
         ? Reflect.get(receipt.raw, 'reason')
         : undefined;
-      if (reason === 'winfinity-monitor-only') return receipt;
+      if (
+        reason !== undefined
+        && this.platformAdapters.some(adapter => adapter.descriptor.monitorOnlyReason === reason)
+      ) {
+        return receipt;
+      }
       const revision = typeof receipt.raw === 'object' && receipt.raw !== null
         ? Reflect.get(receipt.raw, 'runtimeRevision')
         : undefined;
-      if (
-        !isCompatibleOperationalRuntimeRevision(revision, PRAGMATIC_BET_RUNTIME_FAMILY)
-        && !isCompatibleOperationalRuntimeRevision(revision, BG_BET_RUNTIME_FAMILY)
-      ) {
+      if (!isCompatibleRuntimeRevision(revision, OPERATIONAL_WAGER_RUNTIME_FAMILIES)) {
         throw new OperationalWagerRuntimeRevisionError(receipt);
       }
       return receipt;
@@ -1427,10 +1448,9 @@ export class BrowserBridgeServer implements RoomMonitor {
 
   private async requestExecution(request: BridgeExecutionRequest): Promise<BridgeExecutionReceipt | null> {
     const tableId = 'intent' in request ? request.intent.tableId : request.wager.tableId;
-    const laneId = PRAGMATIC_TABLE_ID_PATTERN.test(tableId)
-      ? PRAGMATIC_EXECUTION_LANE
-      : tableId;
-    return await this.serializeExecutionLane(laneId, async () => await this.dispatchExecution(request));
+    const adapter = this.adapterForRoomId(this.roomIdForTable(tableId)) ?? this.defaultAdapter;
+    return await this.serializeExecutionLane(adapter.executionLaneId(tableId), async () =>
+      await this.dispatchExecution(request));
   }
 
   private async serializeExecutionLane<T>(laneId: string, operation: () => Promise<T>): Promise<T> {
@@ -1446,11 +1466,15 @@ export class BrowserBridgeServer implements RoomMonitor {
 
   private async dispatchExecution(request: BridgeExecutionRequest): Promise<BridgeExecutionReceipt | null> {
     const tableId = 'wager' in request ? request.wager.tableId : request.intent.tableId;
-    if (this.roomIdForTable(tableId) === DAFABET_WINFINITY_ROOM_ID) {
+    const adapter = this.adapterForRoomId(this.roomIdForTable(tableId)) ?? this.defaultAdapter;
+    const descriptor: PlatformAdapterDescriptor = adapter.descriptor;
+    if (descriptor.executionCapability === 'monitor-only') {
+      const reason = descriptor.monitorOnlyReason ?? 'platform-monitor-only';
+      const prefix = descriptor.monitorOnlyReceiptPrefix ?? descriptor.platformId;
       const now = new Date().toISOString();
       if ('wager' in request) {
         return {
-          receiptId: `wnf-rejected-${now}`,
+          receiptId: `${prefix}-rejected-${now}`,
           wagerId: request.wager.wagerId,
           tableId,
           shoeId: request.wager.shoeId,
@@ -1460,19 +1484,20 @@ export class BrowserBridgeServer implements RoomMonitor {
           source: request.wager.source,
           status: 'REJECTED',
           createdAt: now,
-          raw: { commitStarted: false, reason: 'winfinity-monitor-only' },
+          raw: { commitStarted: false, reason },
         };
       }
       return {
-        receiptId: `wnf-rejected-${now}`,
+        receiptId: `${prefix}-rejected-${now}`,
         intentId: request.intent.intentId,
-        reservationId: request.reservationId,
+        // 监控-only 桌不会先预留敞口；回执仍需携带稳定的 reservationId 供审计串联。
+        reservationId: request.reservationId ?? `${prefix}-unreserved-${request.intent.intentId}`,
         status: 'REJECTED',
         amount: request.intent.amount,
         market: request.intent.market,
         mode: request.mode,
         createdAt: now,
-        raw: { commitStarted: false, reason: 'winfinity-monitor-only' },
+        raw: { commitStarted: false, reason },
       };
     }
     const hostClaim = this.executorLeases.claimHostExecutionChannel('desktop-primary');
@@ -1571,14 +1596,11 @@ export class BrowserBridgeServer implements RoomMonitor {
         this.resetTableState(tableId);
       }
     }
-    for (const tableId of newlySelectedTableIds) {
-      this.pragmaticParser.resetTable(tableId);
-      const snapshot = this.pragmaticProtocol.snapshot(tableId);
-      if (snapshot === undefined) continue;
-      this.ingestParsedEvents(this.pragmaticParser.parse(
-        JSON.stringify(snapshot),
-        selectedTableId => this.isTableSelected(selectedTableId),
-      ), DAFABET_PRAGMATIC_ROOM_ID);
+    for (const adapter of this.platformAdapters) {
+      const ctx = this.contextFor(adapter);
+      for (const tableId of newlySelectedTableIds) {
+        adapter.onTableSelected(tableId, ctx);
+      }
     }
 
     if (newlySelectedTableIds.length > 0) {
@@ -1622,6 +1644,7 @@ export class BrowserBridgeServer implements RoomMonitor {
     return [...this.discoveredRooms.values()].map(room => ({
       roomId: room.roomId,
       ...(room.displayName === undefined ? {} : { displayName: room.displayName }),
+      ...(room.platformId === undefined ? {} : { platformId: room.platformId }),
       tables: room.tables.map(table => ({
         tableId: table.tableId,
         ...(table.displayName === undefined ? {} : { displayName: table.displayName }),
@@ -1639,6 +1662,7 @@ export class BrowserBridgeServer implements RoomMonitor {
     return [...this.rooms.values()].map(room => ({
       roomId: room.roomId,
       ...(room.displayName === undefined ? {} : { displayName: room.displayName }),
+      ...(room.platformId === undefined ? {} : { platformId: room.platformId }),
       tables: room.tables.map(table => ({
         tableId: table.tableId,
         ...(table.displayName === undefined ? {} : { displayName: table.displayName }),
@@ -1657,23 +1681,16 @@ export class BrowserBridgeServer implements RoomMonitor {
     switch (message.kind) {
       case 'roomDiscovered':
       case 'roomUpdated': {
-        const room = message.room.roomId === DAFABET_BG_ROOM_ID
-          ? sanitizeBgBridgeRoom(message.room)
-          : message.room.roomId === DAFABET_WINFINITY_ROOM_ID
-            ? sanitizeWinfinityBridgeRoom(message.room)
-            : message.room;
-        const merged = room.roomId === DAFABET_BG_ROOM_ID || room.roomId === DAFABET_WINFINITY_ROOM_ID
-          ? upsertBridgeRoom(this.discoveredRooms, room)
-          : replaceBridgeRoom(this.discoveredRooms, room);
+        const adapter = this.adapterForRoomId(message.room.roomId);
+        const room = adapter ? adapter.sanitizeRoom(message.room) : message.room;
+        const merged = adapter && adapter.usesUpsertRoomMerge()
+          ? upsertBridgeRoom(this.discoveredRooms, room, this.mergeGameCountSelector())
+          : replaceBridgeRoom(this.discoveredRooms, room, this.mergeGameCountSelector());
         this.rooms.set(
           room.roomId,
           selectedBridgeRoom(merged, tableId => this.isTableSelected(tableId)),
         );
-        if (room.roomId === DAFABET_PRAGMATIC_ROOM_ID) {
-          this.ingestPragmaticGameCountsFromRoom(room);
-        } else if (room.roomId === DAFABET_BG_ROOM_ID) {
-          this.ingestBgGameCountsFromRoom(room);
-        }
+        adapter?.ingestRoomGameCounts(room, this.contextFor(adapter));
         break;
       }
       case 'tableEvent': {
@@ -1712,63 +1729,13 @@ export class BrowserBridgeServer implements RoomMonitor {
         if (!isLiveProtocolCapture(message)) break;
         logNetworkCapture(message);
         capturePragmaticNetworkFrame(message);
-        if (message.source === 'baccarat-bridge-pragmatic-state') {
-          const visibleTableIds = visibleTableIdsFromPragmaticState(message.data);
-          if (visibleTableIds !== undefined) this.visibleTableIds = new Set(visibleTableIds);
-          for (const tableId of this.pragmaticParser.observedTableIds(message.data)) {
-            if (this.isTableSelected(tableId)) this.noteTableObservation(tableId);
-          }
-          const gameCountSnapshot = pragmaticGameCountSnapshot(message.data);
-          if (gameCountSnapshot !== undefined) {
-            this.ingestParsedEvents(this.pragmaticParser.parse(
-              gameCountSnapshot,
-              tableId => this.isTableSelected(tableId),
-            ), DAFABET_PRAGMATIC_ROOM_ID);
-          }
-        } else if (
-          message.source === 'baccarat-bridge-pragmatic-ws'
-          && message.encoding === 'text'
-          && message.direction !== 'send'
-        ) {
-          capturePragmaticGameresult(message.data);
-          const snapshot = this.pragmaticProtocol.ingest(message.data);
-          if (snapshot !== undefined) {
-            for (const table of snapshot.tables) {
-              this.ensureRoomForTable(table.tableId, DAFABET_PRAGMATIC_ROOM_ID);
-              if (this.isTableSelected(table.tableId)) this.noteTableObservation(table.tableId);
-            }
-            this.ingestParsedEvents(this.pragmaticParser.parse(
-              JSON.stringify(snapshot),
-              tableId => this.isTableSelected(tableId),
-            ), DAFABET_PRAGMATIC_ROOM_ID);
-          } else {
-            const tableId = pragmaticProtocolTableId(message.data);
-            if (tableId !== undefined && this.isTableSelected(tableId)) this.noteTableObservation(tableId);
-          }
-        } else if (message.source === 'baccarat-bridge-bg-state') {
-          const visibleTableIds = visibleTableIdsFromPragmaticState(message.data);
-          if (visibleTableIds !== undefined) {
-            for (const tableId of visibleTableIds) this.visibleTableIds.add(tableId);
-          }
-          this.recordBgSnapshotTables(message.data);
-          for (const tableId of this.bgParser.observedTableIds(message.data)) {
-            this.ensureRoomForTable(tableId, DAFABET_BG_ROOM_ID);
-            if (this.isTableSelected(tableId)) this.noteTableObservation(tableId);
-          }
-          this.ingestParsedEvents(this.bgParser.parse(
-            message.data,
-            () => true,
-          ), DAFABET_BG_ROOM_ID);
-        } else if (message.source === 'baccarat-bridge-winfinity-state') {
-          this.recordWinfinitySnapshotTables(message.data);
-        } else if (
-          message.source === 'baccarat-bridge-winfinity-ws'
-          && message.encoding === 'text'
-          && message.direction !== 'send'
-        ) {
-          this.ingestWinfinityWsFrame(message.data);
-        } else if (message.source === 'baccarat-bridge-runtime-selection') {
+        if (message.source === 'baccarat-bridge-runtime-selection') {
           this.applyRuntimeSelection(message.data);
+          break;
+        }
+        {
+          const adapter = this.adapterForCaptureSource(message.source);
+          adapter?.ingestNetworkCapture(message, this.contextFor(adapter));
         }
         break;
       case 'sessionExpired':
@@ -1795,6 +1762,11 @@ export class BrowserBridgeServer implements RoomMonitor {
       case 'command':
         if (BRIDGE_DEBUG_ENABLED) {
           console.log('[bridge-command]', JSON.stringify(message));
+        }
+        // 回环 command 客户端可以提交任意 name；只放行扩展认识的命令。
+        if (!BRIDGE_COMMAND_NAMES.has(message.name)) {
+          console.error('[bridge-command-rejected]', message.name);
+          break;
         }
         this.broadcastToSockets({
           kind: 'command',
@@ -1871,6 +1843,7 @@ export class BrowserBridgeServer implements RoomMonitor {
     this.protocolLastObservedAt.delete(tableId);
     this.runtimeStateLastObservedAt.delete(tableId);
     this.runtimeStateStaleTableIds.delete(tableId);
+    this.lastIngestedShoeByTable.delete(tableId);
   }
 
   private refreshSelectedRoomsFromDiscovery(): void {
@@ -1881,34 +1854,6 @@ export class BrowserBridgeServer implements RoomMonitor {
         tables: discovered.tables.filter(table => this.isTableSelected(table.tableId)),
       });
     }
-  }
-
-  private ingestPragmaticGameCountsFromRoom(room: BridgeRoomDescriptor): void {
-    const tables = room.tables.filter(table => Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1);
-    if (tables.length === 0) return;
-    this.ingestParsedEvents(this.pragmaticParser.parse(
-      JSON.stringify({
-        version: 1,
-        view: 'multi',
-        observedAt: new Date().toISOString(),
-        tables: tables.map(table => ({ tableId: table.tableId, gameCount: table.gameCount })),
-      }),
-      tableId => this.isTableSelected(tableId),
-    ), DAFABET_PRAGMATIC_ROOM_ID);
-  }
-
-  private ingestBgGameCountsFromRoom(room: BridgeRoomDescriptor): void {
-    const tables = room.tables.filter(table => Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1);
-    if (tables.length === 0) return;
-    this.ingestParsedEvents(this.bgParser.parse(
-      JSON.stringify({
-        version: 1,
-        view: 'multi',
-        observedAt: new Date().toISOString(),
-        tables: tables.map(table => ({ tableId: table.tableId, gameCount: table.gameCount })),
-      }),
-      () => true,
-    ), DAFABET_BG_ROOM_ID);
   }
 
   private ingestParsedEvents(events: readonly NormalizedEvent[], roomId: string): void {
@@ -1923,6 +1868,9 @@ export class BrowserBridgeServer implements RoomMonitor {
         this.parsedEventIds.clear();
       }
       this.parsedEventIds.add(event.eventId);
+      if (event.type === 'newShoeSignal' && typeof event.shoeId === 'string' && event.shoeId.length > 0) {
+        this.lastIngestedShoeByTable.set(event.tableId, event.shoeId);
+      }
       const sourceSeq = (this.parsedSourceSeqByTable.get(event.tableId) ?? 0) + 1;
       this.parsedSourceSeqByTable.set(event.tableId, sourceSeq);
       const normalizedEvent: NormalizedEvent = event.sourceSeq === sourceSeq
@@ -1963,195 +1911,39 @@ export class BrowserBridgeServer implements RoomMonitor {
   }
 
   private roomIdForTable(tableId: string): string {
-    const winfinity = this.discoveredRooms.get(DAFABET_WINFINITY_ROOM_ID);
-    if (winfinity?.tables.some(table => table.tableId === tableId)) return DAFABET_WINFINITY_ROOM_ID;
-    const bg = this.discoveredRooms.get(DAFABET_BG_ROOM_ID);
-    if (bg?.tables.some(table => table.tableId === tableId)) return DAFABET_BG_ROOM_ID;
-    if (normalizeWinfinityTableId(tableId) !== undefined) return DAFABET_WINFINITY_ROOM_ID;
-    if (normalizeBgTableId(tableId) !== undefined) return DAFABET_BG_ROOM_ID;
-    return DAFABET_PRAGMATIC_ROOM_ID;
+    // 保持原优先级：winfinity 发现表 → bg 发现表 → winfinity 形状 → bg 形状 → pragmatic。
+    for (const adapter of this.nonDefaultAdapters) {
+      const room = this.discoveredRooms.get(adapter.descriptor.roomId);
+      if (room?.tables.some(table => table.tableId === tableId)) return adapter.descriptor.roomId;
+    }
+    for (const adapter of this.nonDefaultAdapters) {
+      if (adapter.matchesTableIdShape(tableId)) return adapter.descriptor.roomId;
+    }
+    return this.defaultAdapter.descriptor.roomId;
   }
 
-  private recordBgSnapshotTables(raw: string): void {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return;
+  private adapterForCaptureSource(source: string): BridgePlatformAdapter | undefined {
+    for (const adapter of this.platformAdapters) {
+      if (source.startsWith(adapter.descriptor.captureSourcePrefix)) return adapter;
     }
-    if (typeof parsed !== 'object' || parsed === null) return;
-    const tables = (parsed as { tables?: unknown }).tables;
-    if (!Array.isArray(tables)) return;
-    const hall: BridgeRoomDescriptor['tables'] = [];
-    const rest: BridgeRoomDescriptor['tables'] = [];
-    for (const table of tables) {
-      if (!table || typeof table !== 'object') continue;
-      const rawTableId = typeof (table as { tableId?: unknown }).tableId === 'string'
-        ? (table as { tableId: string }).tableId
-        : '';
-      const tableId = normalizeBgTableId(rawTableId);
-      if (tableId === undefined) continue;
-      const roundId = typeof (table as { roundId?: unknown }).roundId === 'string'
-        ? (table as { roundId: string }).roundId
-        : undefined;
-      const gameCount = typeof (table as { gameCount?: unknown }).gameCount === 'number'
-        ? (table as { gameCount: number }).gameCount
-        : undefined;
-      const source = (table as { source?: unknown }).source;
-      const descriptor = {
-        tableId,
-        ...(roundId ? { roundId } : {}),
-        ...(gameCount !== undefined ? { gameCount } : {}),
-      };
-      if (source === 'hall') hall.push(descriptor);
-      else rest.push(descriptor);
-    }
-    const known = [...hall, ...rest];
-    for (const table of known) {
-      upsertBridgeRoom(this.discoveredRooms, {
-        roomId: DAFABET_BG_ROOM_ID,
-        displayName: 'Dafabet BG Live',
-        tables: [table],
-      });
-      if (this.isTableSelected(table.tableId)) this.noteTableObservation(table.tableId);
-    }
+    return undefined;
   }
 
-  private recordWinfinitySnapshotTables(raw: string): void {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return;
-    }
-    if (typeof parsed !== 'object' || parsed === null) return;
-    const tables = (parsed as { tables?: unknown }).tables;
-    if (!Array.isArray(tables)) return;
-    for (const table of tables) {
-      if (!table || typeof table !== 'object') continue;
-      const record = table as {
-        tableId?: unknown;
-        vendorTableId?: unknown;
-        streamId?: unknown;
-        displayName?: unknown;
-        gameCount?: unknown;
-        roundId?: unknown;
-      };
-      const vendorTableId = typeof record.vendorTableId === 'string' ? record.vendorTableId : undefined;
-      const streamId = typeof record.streamId === 'string' ? record.streamId : undefined;
-      if (vendorTableId !== undefined && streamId !== undefined) {
-        this.winfinityParser.registerAlias(vendorTableId, streamId);
-      }
-      const publicId = vendorTableId !== undefined
-        ? this.winfinityParser.resolveTableId(vendorTableId)
-        : publicWinfinityTableId({
-          ...(streamId === undefined ? {} : { streamId }),
-        }) ?? (typeof record.tableId === 'string' ? normalizeWinfinityTableId(record.tableId) : undefined);
-      if (publicId === undefined) continue;
-      const displayName = typeof record.displayName === 'string' ? record.displayName : undefined;
-      const roundId = typeof record.roundId === 'string' ? record.roundId : undefined;
-      const gameCount = typeof record.gameCount === 'number' ? record.gameCount : undefined;
-      upsertBridgeRoom(this.discoveredRooms, {
-        roomId: DAFABET_WINFINITY_ROOM_ID,
-        displayName: 'Dafabet Winfinity',
-        tables: [{
-          tableId: publicId,
-          ...(displayName === undefined ? {} : { displayName }),
-          ...(roundId === undefined ? {} : { roundId }),
-          ...(gameCount === undefined ? {} : { gameCount }),
-        }],
-      });
-      this.discoverWinfinityTable(publicId, vendorTableId);
-    }
-  }
-
-  private ingestWinfinityWsFrame(raw: string): void {
-    if (winfinityCaptureType(raw) === 'TABLES_LIST') {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        return;
-      }
-      for (const alias of this.winfinityParser.registerAliasesFromPayload(parsed)) {
-        this.discoverWinfinityTable(alias.publicId, alias.vendorTableId);
-      }
-      return;
-    }
-    const vendorTableId = winfinityVendorTableIdFromCapture(raw);
-    if (vendorTableId === undefined) return;
-    if (this.winfinityParser.hasLockedPublicId(vendorTableId)) {
-      this.flushWinfinityWsBuffer(vendorTableId);
-      this.ingestLockedWinfinityWsFrame(vendorTableId, raw);
-      return;
-    }
-    this.bufferWinfinityWsFrame(vendorTableId, raw);
-  }
-
-  private bufferWinfinityWsFrame(vendorTableId: string, raw: string): void {
-    const vendor = vendorTableId.trim().toLowerCase();
-    const frames = this.winfinityWsBuffer.get(vendor) ?? [];
-    frames.push(raw);
-    this.winfinityWsBuffer.set(vendor, frames);
-    if (frames.length < WINFINITY_WS_ALIAS_BUFFER_LIMIT) return;
-    const fallback = publicWinfinityTableId({ vendorTableId: vendor });
-    if (fallback === undefined) return;
-    this.winfinityParser.lockPublicId(vendor, fallback);
-    this.flushWinfinityWsBuffer(vendor);
-  }
-
-  private flushWinfinityWsBuffer(vendorTableId: string): void {
-    const vendor = vendorTableId.trim().toLowerCase();
-    const frames = this.winfinityWsBuffer.get(vendor);
-    this.winfinityWsBuffer.delete(vendor);
-    if (frames === undefined || frames.length === 0) return;
-    const publicId = this.winfinityParser.peekPublicId(vendor)
-      ?? this.winfinityParser.resolveTableId(vendor);
-    if (publicId === undefined) return;
-    this.winfinityParser.lockPublicId(vendor, publicId);
-    this.ensureRoomForTable(publicId, DAFABET_WINFINITY_ROOM_ID);
-    for (const frame of frames) {
-      this.ingestLockedWinfinityWsFrame(vendor, frame);
-    }
-  }
-
-  private ingestLockedWinfinityWsFrame(vendorTableId: string, raw: string): void {
-    const publicId = this.winfinityParser.peekPublicId(vendorTableId)
-      ?? this.winfinityParser.resolveTableId(vendorTableId);
-    if (publicId === undefined) return;
-    this.ensureRoomForTable(publicId, DAFABET_WINFINITY_ROOM_ID);
-    if (this.isTableSelected(publicId)) this.noteTableObservation(publicId);
-    this.ingestParsedEvents(this.winfinityParser.parseFrame(raw), DAFABET_WINFINITY_ROOM_ID);
-  }
-
-  private discoverWinfinityTable(publicId: string, vendorTableId?: string): void {
-    if (vendorTableId !== undefined) {
-      this.winfinityParser.lockPublicId(vendorTableId, publicId);
-    } else {
-      const fallbackVendor = winfinityFallbackVendorId(publicId);
-      if (fallbackVendor !== undefined) this.winfinityParser.lockPublicId(fallbackVendor, publicId);
-    }
-    this.ensureRoomForTable(publicId, DAFABET_WINFINITY_ROOM_ID);
-    if (vendorTableId !== undefined) this.flushWinfinityWsBuffer(vendorTableId);
-  }
-
-  private ensureRoomForTable(tableId: string, roomId = DAFABET_PRAGMATIC_ROOM_ID): void {
-    if (roomId === DAFABET_BG_ROOM_ID && normalizeBgTableId(tableId) === undefined) return;
-    if (roomId === DAFABET_WINFINITY_ROOM_ID && normalizeWinfinityTableId(tableId) === undefined) return;
-    if (roomId === DAFABET_WINFINITY_ROOM_ID) {
-      const fallbackVendor = winfinityFallbackVendorId(tableId);
-      if (fallbackVendor !== undefined) this.winfinityParser.lockPublicId(fallbackVendor, tableId);
-    }
-    const displayName = roomId === DAFABET_WINFINITY_ROOM_ID
-      ? 'Dafabet Winfinity'
-      : roomId === DAFABET_BG_ROOM_ID
-        ? 'Dafabet BG Live'
-        : 'Dafabet Pragmatic Play';
+  private ensureRoomForTable(tableId: string, roomId = this.defaultAdapter.descriptor.roomId): void {
+    const adapter = this.adapterForRoomId(roomId) ?? this.defaultAdapter;
+    if (adapter.normalizeTableId(tableId) === undefined) return;
+    adapter.onRoomTableAdopted(tableId);
     upsertBridgeRoom(this.discoveredRooms, {
       roomId,
-      displayName,
-      tables: [{ tableId }],
-    });
+      displayName: adapter.descriptor.roomDisplayName,
+      platformId: adapter.descriptor.platformId,
+      tables: [{
+        tableId,
+        ...(adapter.roomTableDisplayName(tableId) === undefined
+          ? {}
+          : { displayName: adapter.roomTableDisplayName(tableId) }),
+      }],
+    }, this.mergeGameCountSelector());
     if (!this.isTableSelected(tableId)) return;
     const discovered = this.discoveredRooms.get(roomId);
     if (discovered !== undefined) {
@@ -2435,8 +2227,9 @@ export class BrowserBridgeServer implements RoomMonitor {
     const key = exportKey(roomId, tableId);
     const existing = this.exports.get(key);
     if (existing) return existing;
-    const staleAfterMs = roomId === DAFABET_BG_ROOM_ID
-      ? Math.max(this.tableStaleAfterMs, BG_TABLE_STALE_AFTER_MS)
+    const descriptor = this.adapterForRoomId(roomId)?.descriptor;
+    const staleAfterMs = descriptor?.tableStaleAfterMs !== undefined
+      ? Math.max(this.tableStaleAfterMs, descriptor.tableStaleAfterMs)
       : this.tableStaleAfterMs;
     const created = new BridgeTableExport(
       roomId,
@@ -2463,14 +2256,6 @@ export class BrowserBridgeServer implements RoomMonitor {
     }
   }
 }
-
-function isCompatibleOperationalRuntimeRevision(
-  revision: unknown,
-  expectedFamily: string,
-): boolean {
-  return typeof revision === 'string' && revision.startsWith(expectedFamily);
-}
-
 
 function isBetReceipt(value: BridgeExecutionReceipt): value is BetReceipt {
   return 'intentId' in value;

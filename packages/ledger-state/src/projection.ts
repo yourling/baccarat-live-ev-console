@@ -217,6 +217,12 @@ function handHasInventory(projection: ShoeStateProjection, handId: string): bool
   return (projection.cardInventoryKeys ?? []).some(key => key.startsWith(`${handId}:`));
 }
 
+/** 该手已经计入库存的牌数（用于发现"手内漏采"，见 TableActor 的缺牌计数）。 */
+export function countHandInventory(projection: ShoeStateProjection, handId: string): number {
+  const prefix = `${handId}:`;
+  return (projection.cardInventoryKeys ?? []).filter(key => key.startsWith(prefix)).length;
+}
+
 function consumeInventoryCard(projection: ShoeStateProjection, handId: string, card: Card, position: 'player' | 'banker'): void {
   const copyId = cardCopyId(card);
   const inventoryKey = `${handId}:${position}:${copyId}`;
@@ -240,8 +246,21 @@ function applySettledHandCards(
   playerCards: readonly Card[],
   bankerCards: readonly Card[],
 ): void {
-  // cardObserved is memory-only. Restart/actor rebuild only has handSettled.
-  // If this hand already consumed live observations, do not double-count.
+  // cardObserved 是内存热数据、handSettled 是持久数据（重启后只剩后者），
+  // 所以这里必须"重复调用不重复扣减"。整手跳过是这个约束下唯一安全的选择。
+  //
+  // 已知代价：只要该手有任意一张牌被 live 采到，整手补录就被跳过 —— 手内漏采
+  // 的那几张永不扣减，剩余库存偏多、对子 EV 偏高（实测 4 张的手只采到 1 张时
+  // remainingTotal 是 415 而不是 412）。
+  //
+  // 试过改成"逐张补齐"，**不安全**：去重 key 是 `${handId}:${position}:${copyId}`，
+  // 而 cardObserved 的 position 与这里的 'player'/'banker' 并不是同一套语义 ——
+  // winfinity-runtime 可能给出 `player:left` 甚至完全不带 position
+  // （contracts 里 position 是可选字段）。key 对不上就会重复扣减。
+  //
+  // 因此这里只负责"不重复扣"，把"手内漏采"交给上层检测：
+  // TableActor.applyHandSettlement 会比对结算牌数与已计入张数，累加
+  // missingUnobservedCards，进而触发 service 的缺牌移出监控。
   if (handHasInventory(projection, handId)) return;
   for (const card of playerCards) consumeInventoryCard(projection, handId, card, 'player');
   for (const card of bankerCards) consumeInventoryCard(projection, handId, card, 'banker');

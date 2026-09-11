@@ -31,6 +31,12 @@ export type OneShotBetRejectionReason =
   | 'duplicate'
   | 'connected-required'
   | 'betting-window-required'
+  /**
+   * 该桌正处于"靴状态不确定"窗口：收到过换靴信号，但按规则先按住旧靴
+   * （防止滞后 DOM 误降级）。这段窗口里库存模型可能与牌桌不一致，
+   * 必须 fail-closed 而不是照常下注。
+   */
+  | 'shoe-hold-pending'
   | 'physical-shoe-required'
   | 'unknown-execution-pending'
   | 'current-hand-required'
@@ -60,6 +66,8 @@ export type OneShotBetResult =
 export interface OneShotBetContext {
   readonly tableId: string;
   readonly projection: ShoeStateProjection;
+  /** 该桌是否处于"收到换靴信号但先按住旧靴"的不确定窗口。 */
+  readonly shoeHoldPending?: boolean;
   readonly profile: TableProfile;
   readonly ledger: SqliteLedger;
   readonly riskManager: RiskManager;
@@ -80,6 +88,8 @@ export async function executeOneShotBet(
   if (context.executor === null) return rejected('executor-required');
   if (hasDuplicate(context.ledger, context.tableId, command)) return rejected('duplicate');
   if (context.projection.connectionStatus !== 'CONNECTED') return rejected('connected-required');
+  // 收到过换靴信号、但按规则先按住旧靴：这段窗口里库存模型可能与牌桌不一致。
+  if (context.shoeHoldPending === true) return rejected('shoe-hold-pending');
   if (context.projection.status !== 'BETTING_WINDOW') return rejected('betting-window-required');
   if (!isPairBettingWindowReady(context.projection.bettingWindowClosesAt)) {
     return rejected('betting-window-required');

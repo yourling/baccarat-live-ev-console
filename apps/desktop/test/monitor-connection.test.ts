@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { monitorDisplayedConnection } from '../src/ui/monitor-connection';
+import { disconnectedMonitorTableIds, monitorDisplayedConnection } from '../src/ui/monitor-connection';
 
 describe('monitorDisplayedConnection', () => {
   it('keeps ledger CONNECTED when the live feed is healthy', () => {
@@ -28,5 +28,19 @@ describe('monitorDisplayedConnection', () => {
       { connectionStatus: 'DISCONNECTED' },
       { feedState: 'CONNECTED', reasons: [] },
     )).toBe('RESYNCING');
+  });
+
+  it('lists monitor tables that are not connected, including missing actors', () => {
+    expect(disconnectedMonitorTableIds(
+      ['tyn-bac8', 'A30', 'B06'],
+      {
+        'tyn-bac8': { projection: { connectionStatus: 'CONNECTED' } },
+        A30: { projection: { connectionStatus: 'CONNECTED' } },
+      },
+      {
+        'tyn-bac8': { feedState: 'CONNECTED', reasons: [] },
+        A30: { feedState: 'DISCONNECTED', reasons: ['table-feed-disconnected'] },
+      },
+    )).toEqual(['A30', 'B06']);
   });
 });

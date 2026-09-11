@@ -27,18 +27,22 @@ function physicalShoe(tableId: string): Extract<NormalizedEvent, { type: 'newSho
 }
 
 function openWindow(tableId: string): Extract<NormalizedEvent, { type: 'bettingWindowOpened' }> {
+  // timestamp 与 closesAt 必须同轴：table-actor 在事件时钟与真实时钟偏差 <60s 时
+  // 用真实时钟评估窗口，否则退回事件时钟；one-shot / 受控下注路径直接用
+  // Date.now()。两条轴混用会让窗口校验永远失败。
+  const nowMs = Date.now();
   return {
     type: 'bettingWindowOpened',
     eventId: `open-${tableId}`,
     tableId,
-    timestamp: '2026-08-25T00:00:01.000Z',
+    timestamp: new Date(nowMs).toISOString(),
     sourceSeq: 2,
     source: 'pragmatic-runtime',
     schemaVersion: EVENT_SCHEMA_VERSION,
     shoeId: `shoe-${tableId}`,
     handId: `hand-${tableId}`,
     market: 'bankerPair',
-    closesAt: new Date(Date.now() + 12_000).toISOString(),
+    closesAt: new Date(nowMs + 12_000).toISOString(),
   };
 }
 
@@ -46,7 +50,7 @@ function nextOpenWindow(tableId: string): Extract<NormalizedEvent, { type: 'bett
   return {
     ...openWindow(tableId),
     eventId: `open-next-${tableId}`,
-    timestamp: '2026-08-25T00:00:04.000Z',
+    timestamp: new Date(Date.now() + 1_000).toISOString(),
     sourceSeq: 3,
     handId: `hand-next-${tableId}`,
   };
@@ -98,6 +102,17 @@ function authenticateBridge(bridge: BrowserBridgeServer): void {
 }
 
 describe('DesktopConsoleService operational wagers', () => {
+  it('keeps the window fixture timestamp and closesAt on the same clock', () => {
+    // 这条断言守着一个反复踩到的坑：夹具把 timestamp 写成固定过去时间、closesAt
+    // 却基于 Date.now()，于是窗口校验在两个时钟之间反复横跳 —— 修好
+    // pairBettingClockMs 之后一次性炸出 25 个失败用例。
+    const window = openWindow('D001');
+    const eventMs = Date.parse(window.timestamp);
+    const closesAtMs = Date.parse(window.closesAt ?? '');
+    expect(Math.abs(Date.now() - eventMs)).toBeLessThan(60_000);
+    expect(closesAtMs - eventMs).toBe(12_000);
+  });
+
   it('does not let a keepalive strategy payload set global automation state', () => {
     expect(parseDesktopKeepaliveSettings({
       enabled: true,
@@ -169,6 +184,42 @@ describe('DesktopConsoleService operational wagers', () => {
       expect(result.snapshot.snapshot.tables.D001?.executionMode).toBe('live');
       expect(result.snapshot.runtime.tables.D001?.active).toBe(true);
     } finally {
+      await service.close();
+    }
+  });
+
+  it('refuses a manual wager once the console is closing', async () => {
+    const service = new DesktopConsoleService(':memory:');
+    const bridge = new BrowserBridgeServer();
+    const requestOperationalWager = vi.spyOn(bridge, 'requestOperationalWager')
+      .mockImplementation(async () => {
+        throw new Error('a closing console must never reach the bridge');
+      });
+    authenticateBridge(bridge);
+
+    try {
+      service['browserBridge'] = bridge;
+      await service.updateMonitorTableIds(['D001']);
+      service['liveFeeds'].set('D001', freshFeed('D001'));
+      await service.injectEvent(physicalShoe('D001'));
+      await service.injectEvent(openWindow('D001'));
+
+      service['closing'] = true;
+
+      // 这道闸必须落在执行队列内部：下注可能排在 close() 之后才被调度，
+      // 那时桥已经开始拆除。
+      expect(service['wagerConsole']['runtimeBlockReason']('D001', 'manual')).toBe('console-closing');
+
+      const result = await service.executeOperationalWager({
+        tableId: 'D001',
+        market: 'banker',
+        amount: 20,
+      });
+
+      expect(result).toMatchObject({ status: 'REJECTED', reason: 'console-closing' });
+      expect(requestOperationalWager).not.toHaveBeenCalled();
+    } finally {
+      service['closing'] = false;
       await service.close();
     }
   });

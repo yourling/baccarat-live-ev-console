@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+#
+# 提交前门禁：类型检查 + 全量测试。
+#
+# 启用方式（每个 clone 执行一次）：
+#   git config core.hooksPath .githooks
+#
+# 这个仓库曾经把红构建直接提交进 HEAD（3 个 TS 错误 + 1 个失败用例），
+# 根因就是没有任何提交前校验。请不要轻易加 --no-verify。
+#
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "[pre-commit] build (extension syntax + version sync + typecheck)..."
+npm run build
+
+echo "[pre-commit] tests..."
+npm run test
+
+echo "[pre-commit] ok"

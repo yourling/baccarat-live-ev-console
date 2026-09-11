@@ -1,29 +1,48 @@
 /**
- * Identity of the bundled unpacked Chrome extensions. Manifest keys keep
- * these IDs stable across machines and rebuilds.
+ * 平台身份注册表（桥层入口）。
+ *
+ * 全部身份数据的唯一事实来源在 @baccarat/adapter-contract 的 platform-catalog；
+ * 这里只负责把它们组织成桥使用的 PlatformRegistry，并保留历史导出名。
  */
-export const BUNDLED_BROWSER_EXTENSION_ID = 'igjpillacopnacpepahjfaokiopahmee';
-export const BUNDLED_BG_BROWSER_EXTENSION_ID = 'ckiomamppnakpgobcemidpojdiemfdlm';
-export const BUNDLED_WINFINITY_BROWSER_EXTENSION_ID = 'ebfnknenblmegkhhpfphcjebmpapbcjk';
+import {
+  BUNDLED_BRIDGE_TOKEN,
+  BUNDLED_BG_EXTENSION_ID,
+  BUNDLED_PRAGMATIC_EXTENSION_ID,
+  BUNDLED_WINFINITY_EXTENSION_ID,
+  BUNDLED_PLATFORM_DESCRIPTORS,
+  DAFABET_BG_ROOM_ID,
+  DAFABET_PRAGMATIC_ROOM_ID,
+  DAFABET_WINFINITY_ROOM_ID,
+  PlatformRegistry,
+} from '@baccarat/adapter-contract';
+
+export {
+  BUNDLED_BRIDGE_TOKEN,
+  BUNDLED_BG_EXTENSION_ID,
+  BUNDLED_PRAGMATIC_EXTENSION_ID,
+  BUNDLED_WINFINITY_EXTENSION_ID,
+  BUNDLED_PLATFORM_DESCRIPTORS,
+  DAFABET_BG_ROOM_ID,
+  DAFABET_PRAGMATIC_ROOM_ID,
+  DAFABET_WINFINITY_ROOM_ID,
+} from '@baccarat/adapter-contract';
+
+/** 桥与中控共用的平台注册表（三个随包平台）。 */
+export const PLATFORM_REGISTRY = new PlatformRegistry(BUNDLED_PLATFORM_DESCRIPTORS);
+
+// -- 历史导出名（保持对外兼容，新代码请用 PLATFORM_REGISTRY / platform-catalog） --
+
+export const BUNDLED_BROWSER_EXTENSION_ID = BUNDLED_PRAGMATIC_EXTENSION_ID;
+export const BUNDLED_BG_BROWSER_EXTENSION_ID = BUNDLED_BG_EXTENSION_ID;
+export const BUNDLED_WINFINITY_BROWSER_EXTENSION_ID = BUNDLED_WINFINITY_EXTENSION_ID;
 export const BUNDLED_BROWSER_EXTENSION_IDS = [
   BUNDLED_BROWSER_EXTENSION_ID,
   BUNDLED_BG_BROWSER_EXTENSION_ID,
   BUNDLED_WINFINITY_BROWSER_EXTENSION_ID,
 ] as const;
 
-/**
- * Shared loopback credential for the bundled desktop/extension pair.
- * Rotate this value together with DEFAULT_BRIDGE_TOKEN in background.js.
- */
-export const BUNDLED_BROWSER_EXTENSION_TOKEN =
-  'd63a1a9d927e268d5b3d0ac2450836c0fa90de2e55398ccb73ae888ecf35d97b';
-
-export const DAFABET_PRAGMATIC_ROOM_ID = 'dafabet-pragmatic';
-export const DAFABET_BG_ROOM_ID = 'dafabet-bg';
-export const DAFABET_WINFINITY_ROOM_ID = 'dafabet-winfinity';
+export const BUNDLED_BROWSER_EXTENSION_TOKEN = BUNDLED_BRIDGE_TOKEN;
 
 export function isLiveBridgeRoomId(roomId: string): boolean {
-  return roomId === DAFABET_PRAGMATIC_ROOM_ID
-    || roomId === DAFABET_BG_ROOM_ID
-    || roomId === DAFABET_WINFINITY_ROOM_ID;
+  return PLATFORM_REGISTRY.isLiveRoomId(roomId);
 }

@@ -145,6 +145,114 @@ describe('Winfinity bridge integration', () => {
       .toEqual([`wnf-${VENDOR}`]);
   });
 
+  it('infers sibling Tao Yuan short ids from TABLES_LIST names after the launch alias', () => {
+    const vendor3 = '638f55f0716f771a0c510f6d';
+    const shangrila = '64f72835c860df661dc2b666';
+    const server = new BrowserBridgeServer({ selectedTableIds: ['tyn-bac8', 'tyn-bac3'] });
+    server.ingestClientMessage(wnfState());
+    server.ingestClientMessage(wnfTablesList({
+      data: {
+        gameParams: [
+          { tableId: VENDOR, tableName: 'Tao Yuan Baccarat 8' },
+          { tableId: vendor3, tableName: 'Tao Yuan Baccarat 3' },
+          { tableId: shangrila, tableName: 'Shangrila Baccarat 8' },
+        ],
+      },
+    }));
+    server.ingestClientMessage({
+      ...wnfWs('GAME_STATE_CHANGED', {
+        state: { state: 'BETS_OPEN', bettingTime: '0', bettingTimeDuration: '0', allowedSideBets: [] },
+      }),
+      data: JSON.stringify({
+        id: 'e2',
+        timestamp: '1788889925756',
+        type: 'GAME_STATE_CHANGED',
+        meta: {
+          tableId: vendor3,
+          round: { id: 'hand-3', startedAt: '1788889925756', shoeId: 'shoe-a' },
+        },
+        state: { state: 'BETS_OPEN', bettingTime: '0', bettingTimeDuration: '0', allowedSideBets: [] },
+      }),
+    });
+    const tables = server.getDiscoveredRooms()[0]?.tables ?? [];
+    expect(tables.map(table => table.tableId)).toEqual(expect.arrayContaining(['tyn-bac8', 'tyn-bac3']));
+    expect(tables.find(table => table.tableId === 'tyn-bac3')?.displayName).toBe('Tao Yuan Baccarat 3');
+    expect(tables.find(table => table.tableId === `wnf-${shangrila}`)?.displayName).toBe('Shangrila Baccarat 8');
+    expect(server.shoeEvidence('tyn-bac3')).toEqual({ reason: 'attach' });
+  });
+
+  it('infers sibling stream ids from one hall snapshot of named tiles', () => {
+    const vendor3 = '638f55f0716f771a0c510f6d';
+    const shangrila = '64f72835c860df661dc2b666';
+    const server = new BrowserBridgeServer({ selectedTableIds: ['tyn-bac8', 'tyn-bac3'] });
+    server.ingestClientMessage({
+      kind: 'networkCapture',
+      source: 'baccarat-bridge-winfinity-state',
+      url: 'https://baccarat-multitable.youngpoisson.xyz/?streamId=tyn-bac8&tableId=638f56dc65729f90d0636fb0',
+      direction: 'recv',
+      encoding: 'text',
+      data: JSON.stringify({
+        version: 1,
+        observedAt: '2026-09-09T12:00:00.000Z',
+        tables: [
+          {
+            tableId: 'tyn-bac8',
+            vendorTableId: VENDOR,
+            streamId: 'tyn-bac8',
+            displayName: 'Tao Yuan Baccarat 8',
+            gameCount: 10,
+            source: 'hall',
+          },
+          {
+            tableId: `wnf-${vendor3}`,
+            vendorTableId: vendor3,
+            displayName: 'Tao Yuan Baccarat 3',
+            gameCount: 16,
+            source: 'hall',
+          },
+          {
+            tableId: `wnf-${shangrila}`,
+            vendorTableId: shangrila,
+            displayName: 'Shangrila Baccarat 8',
+            gameCount: 41,
+            source: 'hall',
+          },
+        ],
+      }),
+    });
+    const tables = server.getDiscoveredRooms()[0]?.tables ?? [];
+    expect(tables.map(table => table.tableId).sort()).toEqual([
+      'tyn-bac3',
+      'tyn-bac8',
+      `wnf-${shangrila}`,
+    ].sort());
+    expect(tables.find(table => table.tableId === 'tyn-bac3')?.displayName).toBe('Tao Yuan Baccarat 3');
+    expect(tables.find(table => table.tableId === `wnf-${shangrila}`)?.displayName).toBe('Shangrila Baccarat 8');
+  });
+
+  it('replays the attach shoe when a Winfinity table becomes selected', async () => {
+    const server = new BrowserBridgeServer({ selectedTableIds: [] });
+    server.ingestClientMessage(wnfState());
+    server.ingestClientMessage(wnfWs('GAME_STATE_CHANGED', {
+      state: { state: 'BETS_OPEN', bettingTime: '0', bettingTimeDuration: '0', allowedSideBets: [] },
+    }));
+    expect(server.shoeEvidence('tyn-bac8')).toEqual({ reason: 'attach' });
+    server.setSelectedTableIds(['tyn-bac8']);
+    const feed = server.openTable(DAFABET_WINFINITY_ROOM_ID, 'tyn-bac8');
+    const events: NormalizedEvent[] = [];
+    await feed.start({ onBatch: batch => { events.push(...batch.events); } });
+    await feed.flush();
+    expect(events.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({
+        type: 'newShoeSignal',
+        tableId: 'tyn-bac8',
+        shoeId: 'shoe-a',
+        baseline: 'unknown-monitor-session',
+      }),
+    ]);
+    await server.close();
+  });
+
   it('uses the stream id when TABLES_LIST arrives before WS game frames', () => {
     const server = new BrowserBridgeServer({ selectedTableIds: ['tyn-bac8'] });
     server.ingestClientMessage(wnfTablesList({
@@ -155,6 +263,72 @@ describe('Winfinity bridge integration', () => {
     }));
     expect(server.getDiscoveredRooms()[0]?.tables.map(table => table.tableId)).toEqual(['tyn-bac8']);
     expect(server.shoeEvidence('tyn-bac8')).toEqual({ reason: 'attach' });
+  });
+
+  it('opens a road-wrap when the hall tile returns to #1 after a deep shoe', async () => {
+    const server = new BrowserBridgeServer({ selectedTableIds: ['tyn-bac8'] });
+    server.ingestClientMessage(wnfTablesList({
+      tables: [{ tableId: VENDOR, streamId: 'tyn-bac8' }],
+    }));
+    for (let hand = 0; hand < 16; hand += 1) {
+      const handId = `hand-${hand}`;
+      server.ingestClientMessage({
+        kind: 'networkCapture',
+        source: 'baccarat-bridge-winfinity-ws',
+        url: 'https://baccarat-multitable.youngpoisson.xyz/',
+        direction: 'recv',
+        encoding: 'text',
+        data: JSON.stringify({
+          id: `e-${hand}`,
+          timestamp: '1788889925756',
+          type: 'GAME_STATE_CHANGED',
+          meta: {
+            tableId: VENDOR,
+            round: { id: handId, startedAt: '1788889925756', shoeId: 'shoe-a' },
+          },
+          state: { state: 'BETS_OPEN', bettingTime: '0', bettingTimeDuration: '0', allowedSideBets: [] },
+        }),
+      });
+    }
+    server.ingestClientMessage({
+      kind: 'networkCapture',
+      source: 'baccarat-bridge-winfinity-state',
+      url: 'https://lobby.youngpoisson.xyz/',
+      direction: 'recv',
+      encoding: 'text',
+      data: JSON.stringify({
+        version: 1,
+        observedAt: '2026-09-09T12:00:00.000Z',
+        tables: [{
+          tableId: 'tyn-bac8',
+          vendorTableId: VENDOR,
+          streamId: 'tyn-bac8',
+          displayName: 'Tao Yuan Baccarat 8',
+          gameCount: 1,
+          source: 'hall',
+        }],
+      }),
+    });
+    expect(server.shoeEvidence('tyn-bac8')).toEqual({
+      reason: 'road-wrap',
+      previousGameCount: 16,
+      gameCount: 1,
+    });
+    const feed = server.openTable(DAFABET_WINFINITY_ROOM_ID, 'tyn-bac8');
+    const events: NormalizedEvent[] = [];
+    await feed.start({ onBatch: batch => { events.push(...batch.events); } });
+    await feed.flush();
+    expect(events.filter(event => event.type === 'newShoeSignal')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'newShoeSignal',
+          tableId: 'tyn-bac8',
+          shoeId: 'wnf-tyn-bac8-wrap-1',
+          baseline: 'physical-shoe',
+        }),
+      ]),
+    );
+    await server.close();
   });
 
   it('flushes buffered WS onto tyn-bac8 after TABLES_LIST', () => {

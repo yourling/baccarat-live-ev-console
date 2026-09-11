@@ -24,3 +24,18 @@ export function monitorDisplayedConnection(
   }
   return projection.connectionStatus;
 }
+
+export function disconnectedMonitorTableIds(
+  monitorTableIds: readonly string[],
+  tables: Readonly<Record<string, { projection: Pick<ShoeStateProjection, 'connectionStatus'> }>>,
+  runtimeTables?: Readonly<Record<string, {
+    readonly feedState?: string;
+    readonly reasons?: readonly string[];
+  }>>,
+): string[] {
+  return monitorTableIds.filter(tableId => {
+    const table = tables[tableId];
+    if (table === undefined) return true;
+    return monitorDisplayedConnection(table.projection, runtimeTables?.[tableId]) !== 'CONNECTED';
+  });
+}

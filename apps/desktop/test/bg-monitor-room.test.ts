@@ -1,7 +1,28 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BrowserBridgeServer } from '@baccarat/browser-bridge';
 import { EVENT_SCHEMA_VERSION, defaultProfile } from '@baccarat/contracts';
+import type { TableExport } from '@baccarat/room-monitor';
 import { DesktopConsoleService } from '../electron-src/service';
+
+function freshFeed(tableId: string): TableExport {
+  return {
+    tableId,
+    start: async () => undefined,
+    stop: async () => undefined,
+    flush: async () => undefined,
+    keepAlive: async () => ({ ok: true, latencyMs: 10 }),
+    health: () => ({
+      tableId,
+      state: 'CONNECTED',
+      lastAckedSeq: 2,
+      lastEmittedSeq: 2,
+      bufferDepth: 0,
+      reconnectCount: 0,
+      lastObservationAt: new Date().toISOString(),
+      stalenessMs: 10,
+    }),
+  };
+}
 
 function bgSettledHand(tableId: string, shoeId: string, handId: string, sourceSeq: number) {
   return {
@@ -259,6 +280,7 @@ describe('desktop BG monitor room', () => {
         gameCount: 5,
       });
       vi.spyOn(bridge, 'shoeEvidence').mockReturnValue({ reason: 'protocol-shuffle' });
+      service['liveFeeds'].set(tableId, freshFeed(tableId));
 
       await service.injectEvent({
         type: 'newShoeSignal',
@@ -293,6 +315,11 @@ describe('desktop BG monitor room', () => {
         expect.objectContaining({ type: 'autoDisarmChanged', reason: 'execution-reset' }),
       ]));
 
+      // 降级只把桌移出监控列表是不够的：它的采集连接会一直挂着占资源，
+      // 因为断开清理逻辑只处理仍在 monitorTableIds 里的桌。
+      await service['enqueueLiveMonitorOperation'](async () => undefined);
+      expect(service['liveFeeds'].has(tableId)).toBe(false);
+
       await service.injectEvent({
         type: 'bettingWindowOpened',
         eventId: 'b05-same-shoe-window',
@@ -307,7 +334,7 @@ describe('desktop BG monitor room', () => {
       });
       service['promotePendingTablesFromRooms']([{
         roomId: 'dafabet-bg',
-        tables: [{ tableId, gameCount: 5 }],
+        tables: [{ tableId, gameCount: 5, profile: defaultProfile(tableId) }],
       }]);
       expect(service['monitorTableIds']).not.toContain(tableId);
 

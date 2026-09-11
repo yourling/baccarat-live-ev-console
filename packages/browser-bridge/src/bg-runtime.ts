@@ -2,15 +2,31 @@
  * Big Gaming (BG) runtime snapshot parser.
  * Accepts only the versioned adapter snapshot schema. Raw vendor WebSocket
  * frames are captured elsewhere and are not decoded here.
+ *
+ * 共享机制（卡牌/开窗/结算/事件序号/靴发射）在 runtime-common 的基类里；
+ * 本文件只保留 BG 特有的靴代际启发式、HISTORY 重放与 banker lead 粘滞。
  */
 import {
-  EVENT_SCHEMA_VERSION,
-  defaultProfile,
   type Card,
-  type CardRank,
   type NormalizedEvent,
-  type ShoeBaseline,
 } from '@baccarat/contracts';
+import { BG_PLATFORM_ID } from '@baccarat/adapter-contract';
+import {
+  MAX_BACCARAT_SHOE_HANDS,
+  ROAD_WRAP_MAX,
+  ROAD_WRAP_MIN_DROP,
+  ROAD_WRAP_MIN_PREVIOUS,
+  SnapshotRuntimeParserBase,
+  cardIdentity,
+  isIdleDealtShoeShuffle,
+  isRoadWrapToNewShoe,
+  mergeHandCards,
+  parseCards,
+} from './runtime-common.js';
+
+export {
+  isIdleDealtShoeShuffle,
+} from './runtime-common.js';
 
 export interface BgTableSnapshot {
   readonly tableId: string;
@@ -47,48 +63,31 @@ export interface BgRuntimeSnapshot {
  * AGENTS.md: wrap only when this process saw previous>=10 and the road drops
  * by >=8 to <=8. A 29-row HISTORY packet correcting to felt 局 18 is not a shuffle.
  */
-const ROAD_WRAP_MAX = 8;
 const EARLY_SHOE_ROAD_MAX = 20;
 /** HISTORY 29→18 is a correction; 72→18 after a dealt shoe is a missed shuffle. */
 const INFLATED_ROAD_PREVIOUS_MAX = 40;
 const DEEP_SHOE_ROAD_MIN = 45;
-const ROAD_WRAP_MIN_PREVIOUS = 10;
-const ROAD_WRAP_MIN_DROP = 8;
 /** First START_BET often lands at 1, then HISTORY dumps the whole bead plate. */
 const GAME_COUNT_ATTACH_MAX = 1;
 const GAME_COUNT_CATCH_UP_MAX = 5;
-/** 8-deck shoe with a cut cannot produce 100+ hands. */
-const MAX_BACCARAT_SHOE_HANDS = 80;
 /** Live bead plate 1-8 stepping +1 while internal is deep: missed the 局1 wrap. */
 const AUTHENTIC_ROAD_STREAK = 5;
-/** A dealt shoe silent this long is shuffling. Missed NEXT_SHOES during stale. */
-const SHUFFLE_IDLE_GAP_MS = 6 * 60 * 1000;
+const GAME_COUNT_ANOMALY_MIN_HANDS = 8;
 
-function isRoadWrapToNewShoe(
+function isExhaustedShoeRoadDrop(
   previous: number | undefined,
   gameCount: number,
+  handsThisShoe?: number,
 ): boolean {
-  return previous !== undefined
-    && previous >= ROAD_WRAP_MIN_PREVIOUS
-    && gameCount >= 1
-    && gameCount <= ROAD_WRAP_MAX
-    && previous - gameCount >= ROAD_WRAP_MIN_DROP;
+  if (!Number.isInteger(gameCount) || gameCount < 1 || gameCount > EARLY_SHOE_ROAD_MAX) return false;
+  const deepRoad = previous !== undefined && previous >= DEEP_SHOE_ROAD_MIN;
+  const deepHands = handsThisShoe !== undefined && handsThisShoe >= DEEP_SHOE_ROAD_MIN;
+  if (!deepRoad && !deepHands) return false;
+  if (previous === undefined) return deepHands;
+  return previous - gameCount >= ROAD_WRAP_MIN_DROP;
 }
 
-function isJoinableNewShoeRoadCount(
-  previous: number | undefined,
-  gameCount: number,
-): boolean {
-  return isRoadWrapToNewShoe(previous, gameCount);
-}
-
-function isPhysicalShoeFromRoadCount(
-  previous: number | undefined,
-  gameCount: number,
-): boolean {
-  return isRoadWrapToNewShoe(previous, gameCount);
-}
-
+/** 历史 29→18 是修正；72→18 才可能是漏掉的洗牌。 */
 function isInflatedRoadCorrection(
   previous: number | undefined,
   gameCount: number,
@@ -110,6 +109,7 @@ function isMidShoeInflatedHistoryMismatch(handNumber: number, road: number): boo
     && low > ROAD_WRAP_MAX
     && high - low >= ROAD_WRAP_MIN_DROP;
 }
+void isMidShoeInflatedHistoryMismatch;
 
 export function isCredibleBgEndOfShoeShuffle(
   previousRoad: number | undefined,
@@ -121,36 +121,6 @@ export function isCredibleBgEndOfShoeShuffle(
     if (isExhaustedShoeRoadDrop(previousRoad, incomingRoad, handsThisShoe)) return true;
   }
   return (handsThisShoe ?? 0) >= DEEP_SHOE_ROAD_MIN;
-}
-
-export function isIdleDealtShoeShuffle(
-  handsThisShoe: number | undefined,
-  lastHandAtMs: number | undefined,
-  observedAtMs: number,
-): boolean {
-  if ((handsThisShoe ?? 0) < ROAD_WRAP_MIN_PREVIOUS) return false;
-  if (lastHandAtMs === undefined || !Number.isFinite(observedAtMs)) return false;
-  return observedAtMs - lastHandAtMs >= SHUFFLE_IDLE_GAP_MS;
-}
-
-function openedPhysicalShoe(events: readonly NormalizedEvent[], tableId: string): boolean {
-  return events.some(event =>
-    event.tableId === tableId
-    && event.type === 'newShoeSignal'
-    && event.baseline === 'physical-shoe');
-}
-
-function isExhaustedShoeRoadDrop(
-  previous: number | undefined,
-  gameCount: number,
-  handsThisShoe?: number,
-): boolean {
-  if (!Number.isInteger(gameCount) || gameCount < 1 || gameCount > EARLY_SHOE_ROAD_MAX) return false;
-  const deepRoad = previous !== undefined && previous >= DEEP_SHOE_ROAD_MIN;
-  const deepHands = handsThisShoe !== undefined && handsThisShoe >= DEEP_SHOE_ROAD_MIN;
-  if (!deepRoad && !deepHands) return false;
-  if (previous === undefined) return deepHands;
-  return previous - gameCount >= ROAD_WRAP_MIN_DROP;
 }
 
 function isPlausibleGameCountAdvance(
@@ -194,27 +164,6 @@ export function selectBgRoadCount(
   return isPlausibleGameCountAdvance(previous, incoming) ? incoming : previous;
 }
 
-function selectStableGameCount(
-  previous: number | undefined,
-  incoming: number,
-): number | undefined {
-  return selectBgRoadCount(previous, incoming);
-}
-
-function selectObservedGameCount(
-  evidenceReason: string | undefined,
-  accepted: number | undefined,
-  incoming: number | undefined,
-): number | undefined {
-  if (incoming === undefined) return accepted;
-  if (evidenceReason === 'protocol-shuffle' && accepted === undefined && incoming > EARLY_SHOE_ROAD_MAX) {
-    return undefined;
-  }
-  return selectStableGameCount(accepted, incoming);
-}
-
-const GAME_COUNT_ANOMALY_MIN_HANDS = 8;
-
 /**
  * Internal handNumber is how many hands this shoeId has seen.
  * DOM road is what the table shows. A wrap is a new shoe, not an anomaly.
@@ -243,47 +192,24 @@ export function normalizeBgTableId(tableId: string): string | undefined {
   return trimmed.toUpperCase();
 }
 
-type ParserShoeReason = 'attach' | 'protocol-shuffle' | 'road-wrap' | 'manual-confirm';
+type AuthenticHandCards = {
+  readonly handId: string;
+  readonly playerCards: readonly Card[];
+  readonly bankerCards: readonly Card[];
+};
 
-interface ParserShoeEvidence {
-  readonly reason: ParserShoeReason;
-  readonly previousGameCount?: number;
-  readonly gameCount?: number;
+function seqFromShoeReset(token: string | undefined): number | undefined {
+  if (!token) return undefined;
+  const match = /^seq:(\d+)$/.exec(token);
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  return Number.isInteger(value) ? value : undefined;
 }
 
-type SnapshotSource = 'dom' | 'protocol';
-type HandCards = { playerCards: Card[]; bankerCards: Card[]; source?: SnapshotSource };
-
-function cardIdentity(card: Card): string {
-  const raw = typeof card.raw === 'string' ? card.raw.trim().toUpperCase() : '';
-  if (raw.length > 0) return raw;
-  return `${card.rank}${card.suit ?? ''}`;
-}
-
-function mergeCardList(
-  existing: readonly Card[] | undefined,
-  incoming: readonly Card[],
-  incomingSource: SnapshotSource | undefined,
-  existingSource: SnapshotSource | undefined,
-): Card[] {
-  if (incoming.length === 0) return existing ? [...existing] : [];
-  if (!existing || existing.length === 0) return [...incoming];
-  const overlap = Math.min(existing.length, incoming.length);
-  let conflict = false;
-  for (let index = 0; index < overlap; index += 1) {
-    if (cardIdentity(existing[index]!) !== cardIdentity(incoming[index]!)) {
-      conflict = true;
-      break;
-    }
-  }
-  if (!conflict) {
-    const merged = incoming.length > existing.length ? [...incoming] : [...existing];
-    return merged.slice(0, 3);
-  }
-  if (incomingSource === 'protocol' && existingSource !== 'protocol') {
-    return incoming.slice(0, 3);
-  }
-  return existing.slice(0, 3);
+function normalizeFeltRoad(value: unknown): number | undefined {
+  if (value === 0) return 1;
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 1) return value;
+  return undefined;
 }
 
 function historyStickyBankerLead(
@@ -306,80 +232,6 @@ function stripMatchingBankerLead(cards: Card[], lead: string | undefined): Card[
   const raw = typeof first.raw === 'string' ? first.raw.trim().toUpperCase() : '';
   if (identity === lead.toUpperCase() || raw === lead.toUpperCase()) return cards.slice(1);
   return cards;
-}
-
-function mergeHandCards(
-  existing: HandCards | undefined,
-  incomingPlayer: readonly Card[],
-  incomingBanker: readonly Card[],
-  incomingSource: SnapshotSource | undefined,
-): HandCards {
-  const source = incomingSource === 'protocol' || existing?.source === 'protocol'
-    ? 'protocol'
-    : incomingSource ?? existing?.source;
-  return {
-    playerCards: mergeCardList(existing?.playerCards, incomingPlayer, incomingSource, existing?.source),
-    bankerCards: mergeCardList(existing?.bankerCards, incomingBanker, incomingSource, existing?.source),
-    ...(source === undefined ? {} : { source }),
-  };
-}
-
-const CARD_PATTERN = /^(10|[2-9AJQK]|[01])([SHDC])([0-8])?$/i;
-
-function parseCard(value: string): Card | null {
-  const match = CARD_PATTERN.exec(value.trim());
-  if (!match) return null;
-  const rankToken = match[1]!.toUpperCase();
-  const rank = (rankToken === '0' ? '10' : rankToken === '1' ? 'A' : rankToken) as CardRank;
-  return {
-    rank,
-    suit: match[2]!.toUpperCase(),
-    raw: value.trim().toUpperCase(),
-  };
-}
-
-function parseCards(values: readonly string[] | undefined): Card[] {
-  return (values ?? []).map(parseCard).filter((card): card is Card => card !== null);
-}
-
-function cardPoint(card: { rank: string }): number {
-  if (card.rank === 'A') return 1;
-  if (card.rank === '10' || card.rank === 'J' || card.rank === 'Q' || card.rank === 'K') return 0;
-  return Number(card.rank);
-}
-
-function handScore(cards: readonly { rank: string }[]): number {
-  return cards.reduce((score, card) => (score + cardPoint(card)) % 10, 0);
-}
-
-function bankerDraws(bankerTotal: number, playerThird: number): boolean {
-  if (bankerTotal <= 2) return true;
-  if (bankerTotal === 3) return playerThird !== 8;
-  if (bankerTotal === 4) return playerThird >= 2 && playerThird <= 7;
-  if (bankerTotal === 5) return playerThird >= 4 && playerThird <= 7;
-  if (bankerTotal === 6) return playerThird === 6 || playerThird === 7;
-  return false;
-}
-
-function isCompleteBaccaratHand(
-  playerCards: readonly { rank: string }[],
-  bankerCards: readonly { rank: string }[],
-): boolean {
-  if (playerCards.length < 2 || playerCards.length > 3 || bankerCards.length < 2 || bankerCards.length > 3) {
-    return false;
-  }
-  const playerInitial = handScore(playerCards.slice(0, 2));
-  const bankerInitial = handScore(bankerCards.slice(0, 2));
-  if (playerInitial >= 8 || bankerInitial >= 8) return playerCards.length === 2 && bankerCards.length === 2;
-  if (playerCards.length === 2) {
-    if (playerInitial < 6) return false;
-    return bankerCards.length === 2 ? bankerInitial >= 6 : bankerInitial <= 5;
-  }
-  if (playerInitial > 5) return false;
-  const playerThird = playerCards[2];
-  if (playerThird === undefined) return false;
-  const bankerShouldDraw = bankerDraws(bankerInitial, cardPoint(playerThird));
-  return bankerCards.length === 3 ? bankerShouldDraw : !bankerShouldDraw;
 }
 
 function validSnapshot(value: unknown): value is BgRuntimeSnapshot {
@@ -423,48 +275,8 @@ export function bgGameCountSnapshot(raw: string): string | undefined {
   });
 }
 
-function normalizeFeltRoad(value: unknown): number | undefined {
-  if (value === 0) return 1;
-  if (typeof value === 'number' && Number.isInteger(value) && value >= 1) return value;
-  return undefined;
-}
-
-type AuthenticHandCards = {
-  readonly handId: string;
-  readonly playerCards: readonly Card[];
-  readonly bankerCards: readonly Card[];
-};
-
-function seqFromShoeReset(token: string | undefined): number | undefined {
-  if (!token) return undefined;
-  const match = /^seq:(\d+)$/.exec(token);
-  if (!match) return undefined;
-  const value = Number(match[1]);
-  return Number.isInteger(value) ? value : undefined;
-}
-
-export class BgRuntimeParser {
-  private readonly runId = Math.random().toString(36).slice(2, 10);
-  private readonly generationByTable = new Map<string, number>();
-  private readonly seqByTable = new Map<string, number>();
-  private readonly shoeSeqByTable = new Map<string, number>();
-  private readonly shoeIdByTable = new Map<string, string>();
-  private readonly lastShoeResetByTable = new Map<string, string>();
+export class BgRuntimeParser extends SnapshotRuntimeParserBase {
   private readonly historyFirstSeqByTable = new Map<string, number>();
-  private readonly lastGameCountByTable = new Map<string, number>();
-  private readonly handsThisShoeByTable = new Map<string, number>();
-  private readonly lastRoundByTable = new Map<string, string>();
-  private readonly cardBoundaryByHand = new Set<string>();
-  private readonly cardsByHand = new Map<string, HandCards>();
-  private readonly seenCardsByHand = new Map<string, Set<string>>();
-  private readonly openedWindows = new Set<string>();
-  private readonly closedWindows = new Set<string>();
-  private readonly windowOpenCount = new Map<string, number>();
-  private readonly windowClosesAtMs = new Map<string, number>();
-  private readonly lastWindowEmitAtMs = new Map<string, number>();
-  private readonly settledHands = new Set<string>();
-  private readonly finishedHands = new Set<string>();
-  private readonly evidenceByTable = new Map<string, ParserShoeEvidence>();
   private readonly bankerLeadByTable = new Map<string, string>();
   private readonly bankerLeadStreakByTable = new Map<string, number>();
   private readonly bankerLeadOtherByTable = new Map<string, Set<string>>();
@@ -473,10 +285,69 @@ export class BgRuntimeParser {
   private readonly lastFeltRoadByTable = new Map<string, number>();
   private readonly authenticRoadStreakByTable = new Map<string, number>();
   private readonly authenticHandsByTable = new Map<string, AuthenticHandCards[]>();
-  private readonly lastHandAtByTable = new Map<string, number>();
+
+  constructor() {
+    super({
+      platformId: BG_PLATFORM_ID,
+      eventIdPrefix: 'bg',
+      eventSourceName: 'bg-runtime',
+      shoeIdPrefix: 'bg',
+    });
+  }
 
   stickyBankerLead(tableId: string): string | undefined {
     return this.stickyBankerLeadByTable.get(tableId);
+  }
+
+  /** Keep shoe generations monotonic across process restarts. */
+  seedShoeSequence(tableId: string, sequence: number): void {
+    const id = normalizeBgTableId(tableId);
+    if (id === undefined || !Number.isInteger(sequence) || sequence < 1) return;
+    const current = this.currentShoeSequence(id) ?? 0;
+    if (sequence > current) this.setShoeSequence(id, sequence);
+  }
+
+  protected clearPlatformState(tableId: string): void {
+    this.historyFirstSeqByTable.delete(tableId);
+    this.clearAuthenticRoadTracking(tableId);
+  }
+
+  protected clearPlatformShoeState(tableId: string): void {
+    this.historyFirstSeqByTable.delete(tableId);
+    this.clearAuthenticRoadTracking(tableId);
+    this.bankerLeadByTable.delete(tableId);
+    this.bankerLeadStreakByTable.delete(tableId);
+    this.bankerLeadOtherByTable.delete(tableId);
+    this.bankerLeadHandByTable.delete(tableId);
+    this.stickyBankerLeadByTable.delete(tableId);
+  }
+
+  protected beforeRecordCard(
+    tableId: string,
+    position: 'player' | 'banker',
+    index: number,
+    card: Card,
+  ): Card | null {
+    if (position !== 'banker' || index !== 0) return card;
+    const stickyLead = this.stickyBankerLeadByTable.get(tableId);
+    if (
+      stickyLead
+      && (cardIdentity(card) === stickyLead || (card.raw ?? '').toUpperCase() === stickyLead)
+    ) {
+      return null;
+    }
+    return card;
+  }
+
+  protected prepareSettlementCards(
+    tableId: string,
+    cards: { playerCards: Card[]; bankerCards: Card[] },
+  ): { playerCards: Card[]; bankerCards: Card[] } {
+    const stickyLead = this.stickyBankerLeadByTable.get(tableId);
+    return {
+      playerCards: cards.playerCards,
+      bankerCards: stripMatchingBankerLead([...cards.bankerCards], stickyLead),
+    };
   }
 
   parse(raw: string, isSelected: (tableId: string) => boolean = () => true): NormalizedEvent[] {
@@ -512,57 +383,6 @@ export class BgRuntimeParser {
       .filter((tableId): tableId is string => tableId !== undefined);
   }
 
-  currentShoeId(tableId: string): string | undefined {
-    return this.shoeIdByTable.get(tableId);
-  }
-
-  acceptedGameCount(tableId: string): number | undefined {
-    return this.lastGameCountByTable.get(tableId);
-  }
-
-  /** Keep shoe generations monotonic across process restarts. */
-  seedShoeSequence(tableId: string, sequence: number): void {
-    const id = normalizeBgTableId(tableId);
-    if (id === undefined || !Number.isInteger(sequence) || sequence < 1) return;
-    const current = this.shoeSeqByTable.get(id) ?? 0;
-    if (sequence > current) this.shoeSeqByTable.set(id, sequence);
-  }
-
-  currentShoeSequence(tableId: string): number | undefined {
-    return this.shoeSeqByTable.get(tableId);
-  }
-
-  shoeEvidence(tableId: string): ParserShoeEvidence | undefined {
-    const evidence = this.evidenceByTable.get(tableId);
-    return evidence === undefined ? undefined : { ...evidence };
-  }
-
-  recordShoeEvidence(tableId: string, evidence: ParserShoeEvidence): void {
-    this.evidenceByTable.set(tableId, evidence);
-  }
-
-  openPhysicalShoe(tableId: string, timestamp: string): NormalizedEvent[] {
-    const events: NormalizedEvent[] = [];
-    this.beginNewShoe(tableId, timestamp, events, 'physical-shoe', { reason: 'manual-confirm' });
-    return events;
-  }
-
-  resetTable(tableId: string): void {
-    this.generationByTable.set(tableId, (this.generationByTable.get(tableId) ?? 0) + 1);
-    this.seqByTable.delete(tableId);
-    this.shoeSeqByTable.delete(tableId);
-    this.shoeIdByTable.delete(tableId);
-    this.lastShoeResetByTable.delete(tableId);
-    this.historyFirstSeqByTable.delete(tableId);
-    this.lastGameCountByTable.delete(tableId);
-    this.handsThisShoeByTable.delete(tableId);
-    this.lastRoundByTable.delete(tableId);
-    this.lastHandAtByTable.delete(tableId);
-    this.evidenceByTable.delete(tableId);
-    this.clearAuthenticRoadTracking(tableId);
-    this.clearHandState(tableId);
-  }
-
   private ingestTable(
     table: BgTableSnapshot,
     observedAt: string,
@@ -571,16 +391,20 @@ export class BgRuntimeParser {
     const tableId = normalizeBgTableId(table.tableId);
     if (tableId === undefined) return;
     table = { ...table, tableId };
-    const idleShuffle = this.isIdleDealtShoeGap(tableId, observedAt);
+    const idleShuffle = isIdleDealtShoeShuffle(
+      this.currentHandsThisShoe(tableId),
+      this.lastHandAtMs(tableId),
+      Date.parse(observedAt),
+    );
     this.ingestShoeReset(table, observedAt, events, idleShuffle);
     if (idleShuffle && !openedPhysicalShoe(events, tableId)) {
       this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
       this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
     }
 
-    const lastResetSeq = seqFromShoeReset(this.lastShoeResetByTable.get(tableId));
+    const lastResetSeq = seqFromShoeReset(this.lastShoeResetToken(tableId));
     const historySeq = seqFromShoeReset(table.shoeReset);
-    const laggedPreviousShoeRoad = this.evidenceByTable.get(tableId)?.reason === 'protocol-shuffle'
+    const laggedPreviousShoeRoad = this.currentEvidenceReason(tableId) === 'protocol-shuffle'
       && lastResetSeq !== undefined
       && historySeq !== undefined
       && historySeq < lastResetSeq;
@@ -595,13 +419,13 @@ export class BgRuntimeParser {
     } else {
       const historyPacket = (table.historyHands?.length ?? 0) > 0;
       const liveSeq = historyPacket
-        ? parseHandSeq(this.lastRoundByTable.get(tableId))
+        ? parseHandSeq(this.lastRoundFor(tableId))
         : parseHandSeq(typeof table.roundId === 'string' ? table.roundId : undefined)
-          ?? parseHandSeq(this.lastRoundByTable.get(tableId));
+          ?? parseHandSeq(this.lastRoundFor(tableId));
       const firstSeq = historySeq ?? this.historyFirstSeqByTable.get(tableId);
       const seqRoad = roadCountFromSeqWindow(firstSeq, liveSeq);
-      const trackedHands = this.handsThisShoeByTable.get(tableId) ?? 0;
-      const previousRoad = this.lastGameCountByTable.get(tableId);
+      const trackedHands = this.currentHandsThisShoe(tableId) ?? 0;
+      const previousRoad = this.acceptedGameCount(tableId);
       // 局1 is an immediate wrap. 局2-8 after a deep internal shoe wait for
       // five +1 bead-plate steps so a missed 局1 can still latch.
       const wrapIncoming = feltRoad !== undefined
@@ -632,35 +456,35 @@ export class BgRuntimeParser {
     }
 
     if (gameCount !== undefined) {
-      const previousRoad = this.lastGameCountByTable.get(tableId);
-      const previousHands = this.handsThisShoeByTable.get(tableId);
+      const previousRoad = this.acceptedGameCount(tableId);
+      const previousHands = this.currentHandsThisShoe(tableId);
       const previous = previousRoad ?? previousHands;
-      const stalePreviousShoeRoad = this.evidenceByTable.get(tableId)?.reason === 'protocol-shuffle'
+      const stalePreviousShoeRoad = this.currentEvidenceReason(tableId) === 'protocol-shuffle'
         && previousRoad === undefined
         && gameCount > EARLY_SHOE_ROAD_MAX;
       if (stalePreviousShoeRoad) {
         // Protocol shuffle and lagged DOM still carry the previous shoe's road #.
-      } else if (isPhysicalShoeFromRoadCount(previous, gameCount)) {
+      } else if (isRoadWrapToNewShoe(previous, gameCount)) {
         this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
         this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', {
           reason: 'road-wrap',
           previousGameCount: previous,
           gameCount,
         });
-        this.lastGameCountByTable.set(tableId, gameCount);
+        this.setAcceptedGameCount(tableId, gameCount);
       } else if (isPlausibleGameCountAdvance(previousRoad, gameCount)) {
-        this.lastGameCountByTable.set(tableId, gameCount);
+        this.setAcceptedGameCount(tableId, gameCount);
       }
     }
 
     const openedPhysical = openedPhysicalShoe(events, tableId);
-    const evidence = this.evidenceByTable.get(tableId);
+    const evidence = this.shoeEvidence(tableId);
     const physical = openedPhysical
       || evidence?.reason === 'protocol-shuffle'
       || evidence?.reason === 'road-wrap'
       || evidence?.reason === 'manual-confirm';
     const historyHands = table.historyHands ?? [];
-    const trackedHands = this.handsThisShoeByTable.get(tableId) ?? 0;
+    const trackedHands = this.currentHandsThisShoe(tableId) ?? 0;
     // Deep HISTORY after NEXT_SHOES is the previous shoe only when its first
     // seq is still behind the shuffle token. Current-shoe roads of 21-80 must
     // still rebuild inventory or round and remaining cards contradict.
@@ -678,7 +502,7 @@ export class BgRuntimeParser {
       && !previousShoeHistory
       && (openedPhysical || historyHands.length > trackedHands);
     if (canReplayHistory) {
-      const replayLiveSeq = parseHandSeq(this.lastRoundByTable.get(tableId));
+      const replayLiveSeq = parseHandSeq(this.lastRoundFor(tableId));
       const replayFirstSeq = historySeq ?? this.historyFirstSeqByTable.get(tableId);
       const replayRoad = roadCountFromSeqWindow(replayFirstSeq, replayLiveSeq) ?? gameCount;
       const replayTable = replayRoad !== undefined && historyHands.length > replayRoad
@@ -692,7 +516,7 @@ export class BgRuntimeParser {
     if (!handId || handId === '—') return;
     // BG round ids are process-global. A leftover snapshot after shuffle must
     // not re-emit the same handSettled id onto the new shoe.
-    if (this.settledHands.has(`${tableId}:${handId}`)) return;
+    if (this.handSettledAlready(tableId, handId)) return;
 
     this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
 
@@ -723,10 +547,10 @@ export class BgRuntimeParser {
     const handKey = `${tableId}:${handId}`;
     const hasCardPayload = table.playerCards !== undefined || table.bankerCards !== undefined;
 
-    if (this.finishedHands.has(handKey)) {
+    if (this.handFinished(tableId, handId)) {
       if (hasCardPayload && (playerCards.length > 0 || bankerCards.length > 0)) {
-        const merged = mergeHandCards(this.cardsByHand.get(handKey), playerCards, bankerCards, source);
-        this.cardsByHand.set(handKey, merged);
+        const merged = mergeHandCards(this.handCards(tableId, handId), playerCards, bankerCards, source);
+        this.rememberHandCards(tableId, handId, merged);
         this.recordCards(tableId, handId, 'player', merged.playerCards, observedAt, events);
         this.recordCards(tableId, handId, 'banker', merged.bankerCards, observedAt, events);
       }
@@ -734,12 +558,12 @@ export class BgRuntimeParser {
       return;
     }
 
-    const previousHandId = this.lastRoundByTable.get(tableId);
+    const previousHandId = this.lastRoundFor(tableId);
     if (previousHandId !== undefined && previousHandId !== handId) {
-      this.finishedHands.add(`${tableId}:${previousHandId}`);
+      this.markHandFinished(tableId, previousHandId);
       this.closeWindows(tableId, previousHandId, observedAt, events);
       this.settleRememberedHand(tableId, previousHandId, observedAt, events);
-      const nextHands = (this.handsThisShoeByTable.get(tableId) ?? 1) + 1;
+      const nextHands = (this.currentHandsThisShoe(tableId) ?? 1) + 1;
       const latched = this.maybeLatchAuthenticRoad(
         tableId,
         table.gameCount,
@@ -749,9 +573,9 @@ export class BgRuntimeParser {
         events,
       );
       if (latched) {
-        this.handsThisShoeByTable.set(
+        this.setHandsThisShoe(
           tableId,
-          (this.handsThisShoeByTable.get(tableId) ?? 0) + 1,
+          (this.currentHandsThisShoe(tableId) ?? 0) + 1,
         );
       } else if (nextHands > MAX_BACCARAT_SHOE_HANDS) {
         // 80 hands without shuffle evidence is not a road-wrap. Reset to 待牌靴
@@ -759,30 +583,30 @@ export class BgRuntimeParser {
         this.beginNewShoe(tableId, observedAt, events, 'unknown-monitor-session', {
           reason: 'attach',
         });
-        this.handsThisShoeByTable.set(tableId, 1);
+        this.setHandsThisShoe(tableId, 1);
       } else {
-        this.handsThisShoeByTable.set(tableId, nextHands);
+        this.setHandsThisShoe(tableId, nextHands);
       }
     } else if (previousHandId === undefined) {
-      this.handsThisShoeByTable.set(tableId, 1);
+      this.setHandsThisShoe(tableId, 1);
     }
     this.setLastRound(tableId, handId, observedAt);
 
     const emptyOpenBoundary = table.bettingOpen === true
       && playerCards.length === 0
       && bankerCards.length === 0;
-    if (emptyOpenBoundary) this.cardBoundaryByHand.add(handKey);
+    if (emptyOpenBoundary) this.markCardBoundary(tableId, handId);
     const mayAcceptCards = source === 'protocol'
       || previousHandId === undefined
-      || this.cardBoundaryByHand.has(handKey);
+      || this.handHasCardBoundary(tableId, handId);
     if (mayAcceptCards && hasCardPayload && (playerCards.length > 0 || bankerCards.length > 0)) {
-      const merged = mergeHandCards(this.cardsByHand.get(handKey), playerCards, bankerCards, source);
-      this.cardsByHand.set(handKey, merged);
+      const merged = mergeHandCards(this.handCards(tableId, handId), playerCards, bankerCards, source);
+      this.rememberHandCards(tableId, handId, merged);
       this.recordCards(tableId, handId, 'player', merged.playerCards, observedAt, events);
       this.recordCards(tableId, handId, 'banker', merged.bankerCards, observedAt, events);
     }
 
-    const rememberedCards = this.cardsByHand.get(handKey);
+    const rememberedCards = this.handCards(tableId, handId);
     const hasObservedCards = (rememberedCards?.playerCards.length ?? 0)
       + (rememberedCards?.bankerCards.length ?? 0) > 0;
     if (table.bettingOpen === true && !hasObservedCards) {
@@ -791,31 +615,6 @@ export class BgRuntimeParser {
       this.closeWindows(tableId, handId, observedAt, events);
       this.settleRememberedHand(tableId, handId, observedAt, events);
     }
-  }
-
-  private nextSeq(tableId: string): number {
-    const next = (this.seqByTable.get(tableId) ?? 0) + 1;
-    this.seqByTable.set(tableId, next);
-    return next;
-  }
-
-  private makeEvent(
-    tableId: string,
-    type: NormalizedEvent['type'],
-    stableKey: string,
-    timestamp: string,
-    extra: Record<string, unknown>,
-  ): NormalizedEvent {
-    return {
-      type,
-      eventId: `bg:${this.runId}:${this.generationByTable.get(tableId) ?? 0}:${tableId}:${type}:${stableKey}`,
-      tableId,
-      timestamp,
-      sourceSeq: this.nextSeq(tableId),
-      source: 'bg-runtime',
-      schemaVersion: EVENT_SCHEMA_VERSION,
-      ...extra,
-    } as NormalizedEvent;
   }
 
   private ingestShoeReset(
@@ -832,18 +631,18 @@ export class BgRuntimeParser {
     if (token === undefined) {
       return;
     }
-    const previousToken = this.lastShoeResetByTable.get(tableId);
+    const previousToken = this.lastShoeResetToken(tableId);
     if (previousToken !== token) {
       const previousSeq = seqFromShoeReset(previousToken);
       const nextSeq = seqFromShoeReset(token);
       if (!shuffleEvent && previousSeq !== undefined && nextSeq !== undefined && nextSeq < previousSeq) {
         return;
       }
-      const previousRoad = this.lastGameCountByTable.get(tableId);
+      const previousRoad = this.acceptedGameCount(tableId);
       const incomingRoad = Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1
         ? table.gameCount
         : undefined;
-      const handsThisShoe = this.handsThisShoeByTable.get(tableId);
+      const handsThisShoe = this.currentHandsThisShoe(tableId);
       const exhaustedDrop = incomingRoad !== undefined
         && isExhaustedShoeRoadDrop(previousRoad, incomingRoad, handsThisShoe);
       const inflatedCorrection = incomingRoad !== undefined
@@ -859,7 +658,7 @@ export class BgRuntimeParser {
         && nextSeq - previousSeq <= GAME_COUNT_CATCH_UP_MAX
         && !isRoadWrapToNewShoe(previousRoad, incomingRoad ?? 0)
         && !exhaustedDrop;
-      this.lastShoeResetByTable.set(tableId, token);
+      this.setLastShoeResetToken(tableId, token);
       this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
       if (seqDrift) return;
       // Protocol HISTORY wrap used to fire at road<=20, so 29→18 arrived as
@@ -870,7 +669,7 @@ export class BgRuntimeParser {
       // only a later token change is protocol-shuffle.
       if (previousToken !== undefined) {
         const alreadyPhysical = this.hasVerifiedPhysicalEvidence(tableId);
-        const handsThisShoe = this.handsThisShoeByTable.get(tableId);
+        const handsThisShoe = this.currentHandsThisShoe(tableId);
         if (
           !alreadyPhysical
           || idleShuffle
@@ -882,62 +681,33 @@ export class BgRuntimeParser {
       return;
     }
     if (!shuffleEvent) return;
-    if (isInflatedRoadCorrection(this.lastGameCountByTable.get(tableId), table.gameCount ?? 0)) return;
+    if (isInflatedRoadCorrection(this.acceptedGameCount(tableId), table.gameCount ?? 0)) return;
     // Same token + sticky shuffleEvent is leftover currentShoe. A later
     // shuffle after real play must be a token change, road wrap, or a
     // credible end-of-shoe pulse on an already dealt shoe.
     if (this.shoeAlreadyDealt(tableId)) {
-      const previousRoad = this.lastGameCountByTable.get(tableId);
+      const previousRoad = this.acceptedGameCount(tableId);
       const incomingRoad = Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1
         ? table.gameCount
         : undefined;
       if (
         idleShuffle
-        || isCredibleBgEndOfShoeShuffle(previousRoad, incomingRoad, this.handsThisShoeByTable.get(tableId))
+        || isCredibleBgEndOfShoeShuffle(previousRoad, incomingRoad, this.currentHandsThisShoe(tableId))
       ) {
         this.beginNewShoe(tableId, observedAt, events, 'physical-shoe', { reason: 'protocol-shuffle' });
       }
     }
   }
 
-  private isIdleDealtShoeGap(tableId: string, observedAt: string): boolean {
-    return isIdleDealtShoeShuffle(
-      this.handsThisShoeByTable.get(tableId),
-      this.lastHandAtByTable.get(tableId),
-      Date.parse(observedAt),
-    );
-  }
-
-  private setLastRound(tableId: string, handId: string, observedAt: string): void {
-    const previous = this.lastRoundByTable.get(tableId);
-    this.lastRoundByTable.set(tableId, handId);
-    if (previous === handId) return;
-    const at = Date.parse(observedAt);
-    if (Number.isFinite(at)) this.lastHandAtByTable.set(tableId, at);
-  }
-
   private hasVerifiedPhysicalEvidence(tableId: string): boolean {
-    const reason = this.evidenceByTable.get(tableId)?.reason;
+    const reason = this.currentEvidenceReason(tableId);
     return reason === 'protocol-shuffle' || reason === 'road-wrap' || reason === 'manual-confirm';
   }
 
   private shoeAlreadyDealt(tableId: string): boolean {
     // First snapshot of a new shoe often still carries a round id, which
     // counts as 1. A later shuffle after real play is at least a second hand.
-    return (this.handsThisShoeByTable.get(tableId) ?? 0) >= 2;
-  }
-
-  private ensureShoe(
-    tableId: string,
-    baseline: ShoeBaseline,
-    timestamp: string,
-    events: NormalizedEvent[],
-  ): void {
-    if (this.shoeIdByTable.has(tableId)) return;
-    const sequence = (this.shoeSeqByTable.get(tableId) ?? 0) + 1;
-    this.shoeSeqByTable.set(tableId, sequence);
-    if (!this.evidenceByTable.has(tableId)) this.evidenceByTable.set(tableId, { reason: 'attach' });
-    this.emitShoe(tableId, sequence, baseline, timestamp, events);
+    return (this.currentHandsThisShoe(tableId) ?? 0) >= 2;
   }
 
   private clearAuthenticRoadTracking(tableId: string): void {
@@ -947,7 +717,7 @@ export class BgRuntimeParser {
   }
 
   private pushAuthenticHand(tableId: string, handId: string): void {
-    const cards = this.cardsByHand.get(`${tableId}:${handId}`);
+    const cards = this.handCards(tableId, handId);
     if (!cards || cards.playerCards.length + cards.bankerCards.length === 0) return;
     const list = this.authenticHandsByTable.get(tableId) ?? [];
     list.push({
@@ -1036,72 +806,8 @@ export class BgRuntimeParser {
     this.lastFeltRoadByTable.set(tableId, felt);
     this.authenticRoadStreakByTable.set(tableId, 0);
     this.authenticHandsByTable.set(tableId, []);
-    this.handsThisShoeByTable.set(tableId, replay.length);
+    this.setHandsThisShoe(tableId, replay.length);
     return true;
-  }
-
-  private beginNewShoe(
-    tableId: string,
-    timestamp: string,
-    events: NormalizedEvent[],
-    baseline: ShoeBaseline,
-    evidence?: ParserShoeEvidence,
-  ): void {
-    this.clearShoeTracking(tableId);
-    const sequence = (this.shoeSeqByTable.get(tableId) ?? 1) + 1;
-    this.shoeSeqByTable.set(tableId, sequence);
-    if (evidence !== undefined) this.evidenceByTable.set(tableId, evidence);
-    this.emitShoe(tableId, sequence, baseline, timestamp, events);
-  }
-
-  private clearShoeTracking(tableId: string): void {
-    this.lastGameCountByTable.delete(tableId);
-    this.historyFirstSeqByTable.delete(tableId);
-    this.handsThisShoeByTable.delete(tableId);
-    this.lastRoundByTable.delete(tableId);
-    this.lastHandAtByTable.delete(tableId);
-    this.evidenceByTable.delete(tableId);
-    this.clearAuthenticRoadTracking(tableId);
-    this.bankerLeadByTable.delete(tableId);
-    this.bankerLeadStreakByTable.delete(tableId);
-    this.bankerLeadOtherByTable.delete(tableId);
-    this.bankerLeadHandByTable.delete(tableId);
-    this.stickyBankerLeadByTable.delete(tableId);
-    this.clearHandState(tableId, { keepSettledHands: true });
-  }
-
-  private clearHandState(tableId: string, options: { readonly keepSettledHands?: boolean } = {}): void {
-    const prefix = `${tableId}:`;
-    for (const key of this.cardsByHand.keys()) if (key.startsWith(prefix)) this.cardsByHand.delete(key);
-    for (const key of this.seenCardsByHand.keys()) if (key.startsWith(prefix)) this.seenCardsByHand.delete(key);
-    for (const key of this.cardBoundaryByHand) if (key.startsWith(prefix)) this.cardBoundaryByHand.delete(key);
-    for (const key of this.openedWindows) if (key.startsWith(prefix)) this.openedWindows.delete(key);
-    for (const key of this.closedWindows) if (key.startsWith(prefix)) this.closedWindows.delete(key);
-    for (const key of this.windowOpenCount.keys()) if (key.startsWith(prefix)) this.windowOpenCount.delete(key);
-    for (const key of this.windowClosesAtMs.keys()) if (key.startsWith(prefix)) this.windowClosesAtMs.delete(key);
-    for (const key of this.lastWindowEmitAtMs.keys()) if (key.startsWith(prefix)) this.lastWindowEmitAtMs.delete(key);
-    for (const key of this.finishedHands) if (key.startsWith(prefix)) this.finishedHands.delete(key);
-    if (options.keepSettledHands === true) return;
-    for (const key of this.settledHands) if (key.startsWith(prefix)) this.settledHands.delete(key);
-  }
-
-  private emitShoe(
-    tableId: string,
-    sequence: number,
-    baseline: ShoeBaseline,
-    timestamp: string,
-    events: NormalizedEvent[],
-  ): void {
-    const shoeId = `bg-${tableId}-${sequence}`;
-    this.shoeIdByTable.set(tableId, shoeId);
-    events.push(this.makeEvent(tableId, 'newShoeSignal', `shoe:${shoeId}`, timestamp, {
-      shoeId,
-      baseline,
-      profile: {
-        ...defaultProfile(tableId),
-        autoConfirmNewShoe: true,
-      },
-    }));
   }
 
   private replayHistoryRoad(
@@ -1115,154 +821,31 @@ export class BgRuntimeParser {
     if (stickyLead) this.stickyBankerLeadByTable.set(tableId, stickyLead);
     const lastRound = typeof table.roundId === 'string' ? Number(table.roundId) : NaN;
     const startSeq = Number.isFinite(lastRound) ? lastRound - hands.length + 1 : 1;
-    this.handsThisShoeByTable.set(tableId, 0);
+    this.setHandsThisShoe(tableId, 0);
     for (let index = 0; index < hands.length; index += 1) {
       const hand = hands[index]!;
       const handId = String(startSeq + index);
       const playerCards = parseCards(hand.playerCards);
       const bankerCards = parseCards(hand.bankerCards);
-      this.handsThisShoeByTable.set(tableId, index + 1);
+      this.setHandsThisShoe(tableId, index + 1);
       this.setLastRound(tableId, handId, observedAt);
       const handKey = `${tableId}:${handId}`;
-      if (this.settledHands.has(handKey)) continue;
-      this.cardsByHand.set(handKey, { playerCards, bankerCards, source: 'protocol' });
+      if (this.handSettledAlready(tableId, handId)) continue;
+      this.rememberHandCards(tableId, handId, { playerCards, bankerCards, source: 'protocol' });
       this.recordCards(tableId, handId, 'player', playerCards, observedAt, events);
       this.recordCards(tableId, handId, 'banker', bankerCards, observedAt, events);
-      this.finishedHands.add(handKey);
+      this.markHandFinished(tableId, handId);
       this.settleRememberedHand(tableId, handId, observedAt, events);
     }
     if (Number.isInteger(table.gameCount) && (table.gameCount ?? 0) >= 1) {
-      this.lastGameCountByTable.set(tableId, Math.min(table.gameCount!, MAX_BACCARAT_SHOE_HANDS));
+      this.setAcceptedGameCount(tableId, Math.min(table.gameCount!, MAX_BACCARAT_SHOE_HANDS));
     }
   }
-  private recordCards(
-    tableId: string,
-    handId: string,
-    position: 'player' | 'banker',
-    cards: readonly Card[],
-    timestamp: string,
-    events: NormalizedEvent[],
-  ): void {
-    const handKey = `${tableId}:${handId}`;
-    const seen = this.seenCardsByHand.get(handKey) ?? new Set<string>();
-    this.seenCardsByHand.set(handKey, seen);
-    const stickyLead = position === 'banker' ? this.stickyBankerLeadByTable.get(tableId) : undefined;
-    cards.slice(0, 3).forEach((card, index) => {
-      if (stickyLead && index === 0 && (cardIdentity(card) === stickyLead || (card.raw ?? '').toUpperCase() === stickyLead)) {
-        return;
-      }
-      const identity = cardIdentity(card);
-      if ([...seen].some(key => {
-        const parts = key.split(':');
-        return parts[0] === position && parts.slice(2).join(':') === identity;
-      })) return;
-      const cardKey = `${position}:${index}:${identity}`;
-      if (seen.has(cardKey)) return;
-      seen.add(cardKey);
-      events.push(this.makeEvent(tableId, 'cardObserved', `card:${handId}:${cardKey}`, timestamp, {
-        shoeId: this.shoeIdByTable.get(tableId) ?? '',
-        handId,
-        card,
-        position,
-      }));
-    });
-  }
+}
 
-  private openWindows(
-    tableId: string,
-    handId: string,
-    countdown: number | undefined,
-    timestamp: string,
-    events: NormalizedEvent[],
-  ): void {
-    const observedAtMs = Date.parse(timestamp);
-    const closesAtMs = Number.isFinite(countdown) && Number.isFinite(observedAtMs)
-      ? observedAtMs + Math.max(0, countdown!) * 1000
-      : undefined;
-    const shoeId = this.shoeIdByTable.get(tableId) ?? '';
-    for (const market of ['bankerPair', 'playerPair'] as const) {
-      const key = `${tableId}:${handId}:${market}`;
-      const alreadyOpen = this.openedWindows.has(key) && !this.closedWindows.has(key);
-      if (alreadyOpen) {
-        const hadClosesAt = this.windowClosesAtMs.get(key) !== undefined;
-        if (!Number.isFinite(closesAtMs) && !hadClosesAt) continue;
-        if (hadClosesAt) {
-          this.windowClosesAtMs.set(key, closesAtMs!);
-          continue;
-        }
-      }
-      this.openedWindows.add(key);
-      this.closedWindows.delete(key);
-      if (Number.isFinite(closesAtMs)) this.windowClosesAtMs.set(key, closesAtMs!);
-      if (Number.isFinite(observedAtMs)) this.lastWindowEmitAtMs.set(key, observedAtMs);
-      const closesAt = Number.isFinite(closesAtMs) ? new Date(closesAtMs!).toISOString() : undefined;
-      let openCount = this.windowOpenCount.get(key) ?? 0;
-      if (!alreadyOpen) {
-        openCount += 1;
-        this.windowOpenCount.set(key, openCount);
-      }
-      const base = `open:${shoeId}:${handId}:${market}`;
-      const reopen = openCount > 1 ? `:reopen:${openCount - 1}` : '';
-      const stableKey = alreadyOpen ? `${base}${reopen}:eta` : `${base}${reopen}`;
-      events.push(this.makeEvent(tableId, 'bettingWindowOpened', stableKey, timestamp, {
-        shoeId,
-        handId,
-        market,
-        ...(closesAt === undefined ? {} : { closesAt }),
-      }));
-    }
-  }
-
-  private closeWindows(
-    tableId: string,
-    handId: string,
-    timestamp: string,
-    events: NormalizedEvent[],
-  ): void {
-    const shoeId = this.shoeIdByTable.get(tableId) ?? '';
-    for (const market of ['bankerPair', 'playerPair'] as const) {
-      const key = `${tableId}:${handId}:${market}`;
-      if (this.closedWindows.has(key)) continue;
-      this.closedWindows.add(key);
-      this.windowClosesAtMs.delete(key);
-      const openCount = this.windowOpenCount.get(key) ?? 0;
-      const reopen = openCount > 1 ? `:reopen:${openCount - 1}` : '';
-      const unopened = openCount === 0 ? ':unopened' : '';
-      events.push(this.makeEvent(tableId, 'bettingWindowClosed', `close:${shoeId}:${handId}:${market}${reopen}${unopened}`, timestamp, {
-        shoeId,
-        handId,
-        market,
-        openingObserved: this.openedWindows.has(key),
-      }));
-    }
-  }
-
-  private settleRememberedHand(
-    tableId: string,
-    handId: string,
-    timestamp: string,
-    events: NormalizedEvent[],
-    force = false,
-  ): void {
-    const handKey = `${tableId}:${handId}`;
-    if (this.settledHands.has(handKey)) return;
-    const cards = this.cardsByHand.get(handKey);
-    if (!cards) return;
-    const stickyLead = this.stickyBankerLeadByTable.get(tableId);
-    const bankerCards = stripMatchingBankerLead([...cards.bankerCards], stickyLead);
-    const playerCards = cards.playerCards;
-    if (playerCards.length < 2 || bankerCards.length < 2) return;
-    if (!force && !isCompleteBaccaratHand(playerCards, bankerCards)) return;
-    this.settledHands.add(handKey);
-    events.push(this.makeEvent(tableId, 'handSettled', `settled:${this.shoeIdByTable.get(tableId) ?? ''}:${handId}`, timestamp, {
-      shoeId: this.shoeIdByTable.get(tableId) ?? '',
-      handId,
-      playerCards,
-      bankerCards,
-      outcomes: {
-        playerPair: playerCards[0]!.rank === playerCards[1]!.rank,
-        bankerPair: bankerCards[0]!.rank === bankerCards[1]!.rank,
-      },
-    }));
-  }
+function openedPhysicalShoe(events: readonly NormalizedEvent[], tableId: string): boolean {
+  return events.some(event =>
+    event.tableId === tableId
+    && event.type === 'newShoeSignal'
+    && event.baseline === 'physical-shoe');
 }

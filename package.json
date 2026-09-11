@@ -1,14 +1,16 @@
 {
   "name": "baccarat-ev-console",
-  "version": "1.0.2",
+  "version": "1.0.14",
   "private": true,
   "workspaces": [
     "packages/*",
     "apps/desktop"
   ],
   "scripts": {
-    "build": "npm run check:ext && tsc -p tsconfig.json --noEmit",
+    "build": "npm run sync:ext && npm run check:ext && npm run check:version && tsc -p tsconfig.json --noEmit",
+    "sync:ext": "node scripts/sync-extension-shared.mjs",
     "check:ext": "node scripts/check-extension-syntax.mjs",
+    "check:version": "node scripts/check-version-sync.mjs",
     "test": "vitest run --config vitest.config.ts",
     "test:watch": "vitest --config vitest.config.ts",
     "dev:web": "npm run dev -w @baccarat/desktop",

@@ -20,6 +20,8 @@ export interface BridgeTableDescriptor {
 export interface BridgeRoomDescriptor {
   roomId: string;
   displayName?: string;
+  /** 可选平台标识，由平台适配器下发，透传给中控。 */
+  platformId?: string;
   tables: BridgeTableDescriptor[];
 }
 

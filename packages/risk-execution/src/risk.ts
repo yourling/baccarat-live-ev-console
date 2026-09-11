@@ -52,6 +52,16 @@ function holdsRiskExposure(status: RiskReservation['status']): boolean {
   return status === 'RESERVED' || status === 'UNKNOWN';
 }
 
+/**
+ * 这些 UNKNOWN 只是"下注已提交、但等不到权威结算"的暂态，一旦该手的结算
+ * 到达就应当自动收敛。其它 UNKNOWN（回执不匹配、窗口不对等）表示执行结果
+ * 本身就不可信，不能用后来的结算去反推，必须走操作员确认流程。
+ */
+function isSettleableUnknown(reason: string | undefined): boolean {
+  return reason === 'hand-settled-without-authoritative-outcome'
+    || reason === 'unsettled-past-timeout';
+}
+
 export function activeReservationKey(
   tableId: string,
   shoeId: string,
@@ -329,6 +339,45 @@ export class RiskManager {
     return true;
   }
 
+  /**
+   * 把"已提交（有回执）但仍未结算、且已超过 maxAgeMs"的预留升级为 UNKNOWN。
+   *
+   * `expireOpenForShoe` 刻意跳过有回执的预留 —— 那笔钱确实下出去了，不能当没发生。
+   * 但结果是：一旦成交事件丢失，该预留会永远停在 RESERVED，静默占满
+   * `reservedExposure` 与 `pendingExecutions`（进而打满全局敞口与并发额度），
+   * 却没有任何可处置的状态。
+   *
+   * 这里不释放敞口（未知的钱仍要占额度），只把它变成显式的 UNKNOWN，
+   * 让它进入既有的 unknown-execution 告警与操作员勾销流程。
+   */
+  escalateOverdueSettlements(
+    maxAgeMs: number,
+    now = Date.now(),
+    reason = 'unsettled-past-timeout',
+    notBefore?: number,
+  ): RiskReservation[] {
+    // 这里只读字段，直接遍历内部 Map —— 这个方法跑在 UI 轮询路径上（约 2 秒一次），
+    // 用 snapshot() 会白白做一次全量 structuredClone。
+    const overdue: RiskReservation[] = [];
+    for (const reservation of this.reservations.values()) {
+      if (reservation.status !== 'RESERVED') continue;
+      if (reservation.receiptId === undefined) continue;
+      const createdAt = Date.parse(reservation.createdAt);
+      if (!Number.isFinite(createdAt) || now - createdAt < maxAgeMs) continue;
+      // 启动时从账本恢复的历史敞口由专门的重恢复流程处理，不在这里升级 ——
+      // 它们绝大多数早已超出任何时间阈值，一升级就会把该桌直接阻断。
+      if (notBefore !== undefined && createdAt < notBefore) continue;
+      overdue.push(reservation);
+    }
+    const escalated: RiskReservation[] = [];
+    for (const reservation of overdue) {
+      if (!this.markUnknown(reservation.reservationId, reason, reservation.receiptId)) continue;
+      const updated = this.reservations.get(reservation.reservationId);
+      if (updated) escalated.push(structuredClone(updated));
+    }
+    return escalated;
+  }
+
   settleUnknown(
     reservationId: string,
     settlement: {
@@ -482,10 +531,7 @@ export class RiskManager {
     const matches = this.snapshot().filter(
       r => (
         r.status === 'RESERVED'
-        || (
-          r.status === 'UNKNOWN'
-          && r.releaseReason === 'hand-settled-without-authoritative-outcome'
-        )
+        || (r.status === 'UNKNOWN' && isSettleableUnknown(r.releaseReason))
       )
       && r.tableId === tableId
       && r.handId === handId

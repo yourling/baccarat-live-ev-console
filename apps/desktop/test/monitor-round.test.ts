@@ -1,5 +1,26 @@
 import { describe, expect, it } from 'vitest';
-import { monitorDisplayedRoundLabel } from '../src/ui/monitor-round';
+import { isDisplayedPhysicalShoe, monitorDisplayedRoundLabel } from '../src/ui/monitor-round';
+import type { ShoeStateProjection } from '@baccarat/contracts';
+
+function physicalProjection(overrides: {
+  readonly tableId?: string;
+  readonly handNumber: number;
+  readonly remainingTotal: number;
+  readonly seenCards?: number;
+}): Pick<
+  ShoeStateProjection,
+  'handNumber' | 'seenCards' | 'remainingTotal' | 'shoeId' | 'shoeBaseline' | 'profileSnapshot'
+> {
+  const seen = overrides.seenCards ?? Math.max(overrides.handNumber * 4, 0);
+  return {
+    shoeId: 'shoe-1',
+    shoeBaseline: 'physical-shoe',
+    handNumber: overrides.handNumber,
+    remainingTotal: overrides.remainingTotal,
+    seenCards: Array.from({ length: seen }, () => ({ rank: 'A' as const })),
+    profileSnapshot: { numberOfDecks: 8 } as ShoeStateProjection['profileSnapshot'],
+  };
+}
 
 describe('monitorDisplayedRoundLabel', () => {
   it('shows the BG HISTORY road even when internal hand tracking is still at 1', () => {
@@ -120,5 +141,113 @@ describe('monitorDisplayedRoundLabel', () => {
     )).toMatchObject({
       label: 'GD065268230WF',
     });
+  });
+
+  it('shows the Winfinity tile road instead of the round uuid while remaining is unknown', () => {
+    expect(monitorDisplayedRoundLabel(
+      'tyn-bac2',
+      { currentHandId: '01a0865c-d85c-7724-91e5-1c2c9df89c43', handNumber: 6 },
+      { gameCount: 55 },
+    )).toEqual({
+      label: '55',
+      title: '本靴第 55 局 · 已跟 6 · 协议 01a0865c-d85c-7724-91e5-1c2c9df89c43',
+      pageRound: 55,
+      trackedLabel: '已跟 6',
+    });
+  });
+
+  it('keeps the Winfinity tile as 局号 once remaining matches that shoe', () => {
+    expect(monitorDisplayedRoundLabel(
+      'tyn-bac2',
+      { currentHandId: '01a0865c-d85c-7724-91e5-1c2c9df89c43', handNumber: 8 },
+      { gameCount: 8 },
+      'protocol-shuffle',
+      true,
+    )).toEqual({
+      label: '8',
+      title: '本靴第 8 局 · 协议 01a0865c-d85c-7724-91e5-1c2c9df89c43',
+      pageRound: 8,
+    });
+  });
+
+  it('keeps platform #8 and 已跟 when remaining still belongs to the previous shoe', () => {
+    expect(monitorDisplayedRoundLabel(
+      'tyn-bac2',
+      { currentHandId: '01a0865c-d85c-7724-91e5-1c2c9df89c43', handNumber: 55 },
+      { gameCount: 8 },
+    )).toEqual({
+      label: '8',
+      title: '本靴第 8 局 · 已跟 55 · 协议 01a0865c-d85c-7724-91e5-1c2c9df89c43',
+      pageRound: 8,
+      trackedLabel: '已跟 55',
+    });
+  });
+
+  it('does not advertise a lagged Winfinity tile after a real shuffle', () => {
+    expect(monitorDisplayedRoundLabel(
+      'tyn-bac2',
+      { currentHandId: '01a0865c-d85c-7724-91e5-1c2c9df89c43', handNumber: 8 },
+      { gameCount: 55 },
+      'protocol-shuffle',
+      true,
+    )).toEqual({
+      label: '8',
+      title: '本靴第 8 局 · 协议 01a0865c-d85c-7724-91e5-1c2c9df89c43',
+      pageRound: 8,
+    });
+  });
+
+  it('omits 已跟 when Winfinity road and internal hands already agree', () => {
+    expect(monitorDisplayedRoundLabel(
+      'tyn-bac8',
+      { currentHandId: 'hand-8', handNumber: 12 },
+      { gameCount: 12 },
+    )).toEqual({
+      label: '12',
+      title: '本靴第 12 局 · 协议 hand-8',
+      pageRound: 12,
+    });
+  });
+
+  it('does not let a mid-shoe attach overwrite the Winfinity felt count', () => {
+    expect(monitorDisplayedRoundLabel(
+      'wnf-64f72a1bc860df661dc2b668',
+      { currentHandId: 'hand-1', handNumber: 4 },
+      { gameCount: 41 },
+    )).toEqual({
+      label: '41',
+      title: '本靴第 41 局 · 已跟 4 · 协议 hand-1',
+      pageRound: 41,
+      trackedLabel: '已跟 4',
+    });
+  });
+});
+
+describe('isDisplayedPhysicalShoe', () => {
+  it('hides Winfinity remaining when the tile is #8 but inventory is still the previous shoe', () => {
+    expect(isDisplayedPhysicalShoe(
+      'tyn-bac2',
+      physicalProjection({ handNumber: 55, remainingTotal: 131, seenCards: 220 }),
+      { reason: 'protocol-shuffle' },
+      8,
+    )).toBe(false);
+  });
+
+  it('shows Winfinity remaining when #8 and inventory both belong to the new shoe', () => {
+    expect(isDisplayedPhysicalShoe(
+      'tyn-bac2',
+      physicalProjection({ handNumber: 8, remainingTotal: 376, seenCards: 40 }),
+      { reason: 'protocol-shuffle' },
+      8,
+    )).toBe(true);
+  });
+
+  it('does not hide a live BG shoe when HISTORY is stuck at 局 1-8', () => {
+    expect(isDisplayedPhysicalShoe(
+      'C07',
+      physicalProjection({ handNumber: 52, remainingTotal: 150, seenCards: 210 }),
+      { reason: 'protocol-shuffle' },
+      3,
+    )).toBe(true);
   });
 });

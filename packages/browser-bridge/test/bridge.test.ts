@@ -9,6 +9,7 @@ import {
   BUNDLED_BROWSER_EXTENSION_TOKEN,
   BrowserBridgeServer,
   PRAGMATIC_BET_RUNTIME_REVISION,
+  WINFINITY_WS_ALIAS_BUFFER_LIMIT,
   redactBridgeDiagnostic,
   type BrowserBridgeRuntimeEvent,
 } from '../src/index.js';
@@ -1851,3 +1852,64 @@ describe('browser bridge runtime supervision', () => {
   });
 });
 
+
+describe('bounded bridge buffers', () => {
+  it('caps a stalled table export buffer instead of growing without bound', async () => {
+    const server = new BrowserBridgeServer();
+    const tableExport = server['getOrCreateExport']('dafabet-pragmatic', 'D055') as unknown as {
+      start(sink: unknown): Promise<void>;
+      ingestEvent(event: NormalizedEvent): void;
+      health(): { bufferDepth: number; state: string; lastError?: string };
+    };
+    const disconnects: string[] = [];
+    await tableExport.start({
+      onBatch: async () => {
+        throw new Error('sink stalled');
+      },
+      onDisconnect: (_tableId: string, reason: string) => {
+        disconnects.push(reason);
+      },
+    });
+
+    // 消费永远失败 = 数据流已经卡死。此时继续灌事件不能让缓冲无限增长。
+    for (let seq = 1; seq <= 5_000; seq += 1) {
+      tableExport.ingestEvent({
+        type: 'connectionLost',
+        eventId: `overflow-${seq}`,
+        tableId: 'D055',
+        timestamp: new Date().toISOString(),
+        sourceSeq: seq,
+        source: 'room-monitor',
+        schemaVersion: 1,
+        reason: 'buffer-bound-probe',
+      } as NormalizedEvent);
+    }
+
+    expect(tableExport.health().bufferDepth).toBeLessThanOrEqual(4_096);
+    expect(disconnects).toContain('table-export-buffer-overflow:D055');
+    expect(tableExport.health().lastError).toContain('4096');
+  });
+
+  it('keeps the winfinity ws alias buffer bounded when no public id can be inferred', () => {
+    const server = new BrowserBridgeServer();
+    const adapter = (server as unknown as { platformAdapters: Array<Record<string, unknown>> })
+      .platformAdapters.find(candidate => candidate.constructor?.name === 'WinfinityPlatformAdapter')!;
+    const buffer = adapter['wsBuffer'] as Map<string, string[]>;
+    const vendor = 'not-a-table';
+    const frame = (index: number): string => JSON.stringify({
+      type: 'GAME_STATE_CHANGED',
+      meta: { tableId: vendor },
+      payload: `frame-${index}`,
+    });
+
+    for (let index = 0; index < WINFINITY_WS_ALIAS_BUFFER_LIMIT * 5; index += 1) {
+      (adapter['ingestNetworkCapture'] as (message: unknown, ctx: unknown) => void)({
+        source: 'baccarat-bridge-winfinity-ws',
+        url: '',
+        data: frame(index),
+      }, {} as never);
+    }
+
+    expect(buffer.get(vendor)?.length ?? 0).toBeLessThanOrEqual(WINFINITY_WS_ALIAS_BUFFER_LIMIT);
+  });
+});

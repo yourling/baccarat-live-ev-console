@@ -19,7 +19,7 @@
 - 只镜像游戏 JSON 文本 WebSocket（`baccarat-bridge-winfinity-ws`）。大厅短号映射走 `baccarat-bridge-winfinity-state`。
 - 房间 id 固定 `dafabet-winfinity`。控制台桌号优先 `streamId`（如 `tyn-bac8`），拿不到时用 `wnf-<24hex>`。
 - 无 bet-runtime，无 `scripting` 权限，不注入页面下注函数，不发送 autoBet，不视频入座，不点「重新连接」。
-- 页面保活：合成活动 + 同源 beacon。不创建 keeper 页。
+- 页面保活：只在 `baccarat-multitable` 游戏 iframe 做合成活动 + 对 `origin/` 的 HEAD/GET。不 `GET` 带 `masterSessionId` 的游戏 URL，避免被当成第二台设备入桌。不创建 keeper 页。
 
 改扩展文件后必须在 `chrome://extensions` 点重新加载，然后**人工刷新**桃园弹窗，钩子才能重新包住 WebSocket。扩展不会刷新游戏弹窗。
 

@@ -404,6 +404,92 @@ describe('risk manager', () => {
     expect(m.getState().pendingExecutions).toBe(0);
   });
 
+  it('escalates an accepted but long-unsettled reservation to UNKNOWN instead of leaving it RESERVED forever', () => {
+    const m = new RiskManager();
+    const reserved = m.tryReserve(intent('s1', 'h1'), profile, limits);
+    expect(reserved.ok).toBe(true);
+    m.attachReceipt(reserved.reservation!.reservationId, 'accepted-receipt');
+    const createdAt = Date.parse(reserved.reservation!.createdAt);
+
+    // 未到阈值：保持 RESERVED，正常结算仍有时间到达。
+    expect(m.escalateOverdueSettlements(10 * 60_000, createdAt + 60_000)).toEqual([]);
+    expect(m.snapshot()[0]?.status).toBe('RESERVED');
+
+    // 超过阈值：升级为 UNKNOWN，但敞口继续占用 —— 未知的钱不能当成没发生。
+    const escalated = m.escalateOverdueSettlements(10 * 60_000, createdAt + 11 * 60_000);
+    expect(escalated).toHaveLength(1);
+    expect(escalated[0]).toMatchObject({
+      status: 'UNKNOWN',
+      receiptId: 'accepted-receipt',
+      releaseReason: 'unsettled-past-timeout',
+    });
+    expect(m.getState()).toMatchObject({ reservedExposure: 10, pendingExecutions: 1 });
+
+    // 幂等：已经升级过的不会再升级一次。
+    expect(m.escalateOverdueSettlements(10 * 60_000, createdAt + 20 * 60_000)).toEqual([]);
+  });
+
+  it('does not escalate uncommitted reservations, which shoe rollover already expires', () => {
+    const m = new RiskManager();
+    const reserved = m.tryReserve(intent('s1', 'h1'), profile, limits);
+    expect(reserved.ok).toBe(true);
+    const createdAt = Date.parse(reserved.reservation!.createdAt);
+
+    expect(m.escalateOverdueSettlements(0, createdAt + 1000)).toEqual([]);
+    expect(m.snapshot()[0]?.status).toBe('RESERVED');
+  });
+
+  it('settles an escalated reservation once the authoritative hand settlement finally arrives', () => {
+    const m = new RiskManager();
+    const reserved = m.tryReserve(intent('s1', 'h1'), profile, limits);
+    expect(reserved.ok).toBe(true);
+    m.attachReceipt(reserved.reservation!.reservationId, 'accepted-receipt');
+    const createdAt = Date.parse(reserved.reservation!.createdAt);
+
+    const escalated = m.escalateOverdueSettlements(10 * 60_000, createdAt + 11 * 60_000);
+    expect(escalated[0]).toMatchObject({ status: 'UNKNOWN', releaseReason: 'unsettled-past-timeout' });
+
+    // 迟到的权威结算必须能自动把它收敛掉，而不是永远卡在 UNKNOWN 等人工勾销。
+    const settled = m.settleHand('t1', 's1', 'h1', {
+      bankerPair: true,
+      playerPair: false,
+    });
+    expect(settled).toHaveLength(1);
+    expect(settled[0]).toMatchObject({ status: 'SETTLED' });
+    expect(settled[0]?.realizedPnl).toBe(settled[0]?.maxProfit);
+    expect(m.getState()).toMatchObject({ reservedExposure: 0, pendingExecutions: 0 });
+    expect(m.hasUnknownReservations('t1')).toBe(false);
+  });
+
+  it('still refuses to auto-settle an UNKNOWN whose execution result itself is untrustworthy', () => {
+    const m = new RiskManager();
+    const reserved = m.tryReserve(intent('s1', 'h1'), profile, limits);
+    expect(reserved.ok).toBe(true);
+    m.markUnknown(reserved.reservation!.reservationId, 'receipt-mismatch', 'mismatched-receipt');
+
+    // 回执不匹配说明"到底下没下"不可信，不能用结算反推。
+    expect(m.settleHand('t1', 's1', 'h1', { bankerPair: true, playerPair: false })).toEqual([]);
+    expect(m.snapshot()[0]?.status).toBe('UNKNOWN');
+  });
+
+  it('leaves startup-recovered historical exposure under the recovery path, not the timeout path', () => {
+    const m = new RiskManager();
+    const reserved = m.tryReserve(intent('s1', 'h1'), profile, limits);
+    expect(reserved.ok).toBe(true);
+    m.attachReceipt(reserved.reservation!.reservationId, 'accepted-receipt');
+    const createdAt = Date.parse(reserved.reservation!.createdAt);
+
+    // notBefore 晚于该预留的创建时间 = 它是启动时从账本恢复的历史敞口。
+    const escalated = m.escalateOverdueSettlements(
+      10 * 60_000,
+      createdAt + 60 * 60_000,
+      'unsettled-past-timeout',
+      createdAt + 1000,
+    );
+    expect(escalated).toEqual([]);
+    expect(m.snapshot()[0]?.status).toBe('RESERVED');
+  });
+
   it('keeps an accepted reservation exposed across shoe rollover and restart until exact settlement', () => {
     const ledger = new SqliteLedger();
     const first = new RiskManager(ledger);

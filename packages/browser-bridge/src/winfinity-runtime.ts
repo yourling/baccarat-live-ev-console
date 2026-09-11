@@ -6,6 +6,7 @@ import {
   type NormalizedEvent,
   type ShoeBaseline,
 } from '@baccarat/contracts';
+import { WINFINITY_PLATFORM_ID } from '@baccarat/adapter-contract';
 
 const PAIR_MARKETS = ['bankerPair', 'playerPair'] as const;
 
@@ -25,8 +26,26 @@ const ORDER: Record<string, 'left' | 'right' | 'extra'> = {
   ORDER_EXTRA: 'extra',
 };
 
+const ROAD_WRAP_MAX = 8;
+const ROAD_WRAP_MIN_PREVIOUS = 10;
+const ROAD_WRAP_MIN_DROP = 8;
+const MAX_BACCARAT_SHOE_HANDS = 80;
+
 type HandCards = { playerCards: Card[]; bankerCards: Card[] };
-type ShoeEvidence = { readonly reason: 'attach' | 'protocol-shuffle' | 'manual-confirm' };
+type ParserShoeReason = 'attach' | 'protocol-shuffle' | 'road-wrap' | 'manual-confirm';
+type ShoeEvidence = {
+  readonly reason: ParserShoeReason;
+  readonly previousGameCount?: number;
+  readonly gameCount?: number;
+};
+
+function isWinfinityRoadWrap(previous: number | undefined, gameCount: number): boolean {
+  return previous !== undefined
+    && previous >= ROAD_WRAP_MIN_PREVIOUS
+    && gameCount >= 1
+    && gameCount <= ROAD_WRAP_MAX
+    && previous - gameCount >= ROAD_WRAP_MIN_DROP;
+}
 
 export const WINFINITY_STREAM_ID_PATTERN = /^[a-z0-9]+-bac\d+$/i;
 export const WINFINITY_FALLBACK_TABLE_ID_PATTERN = /^wnf-[a-f0-9]{24}$/i;
@@ -50,6 +69,116 @@ export function normalizeWinfinityTableId(tableId: string): string | undefined {
   return undefined;
 }
 
+export function selectWinfinityRoadCount(
+  previous: number | undefined,
+  incoming: number | undefined,
+): number | undefined {
+  if (incoming === undefined) return previous;
+  if (!Number.isInteger(incoming) || incoming < 1 || incoming > 80) return previous;
+  if (previous === undefined || incoming === previous) return incoming;
+  if (incoming > previous) return incoming;
+  if (previous >= 10 && incoming <= 8 && previous - incoming >= 8) return incoming;
+  if (previous - incoming <= 2) return incoming;
+  return previous;
+}
+
+export function parseWinfinityStreamParts(streamId: string): { prefix: string; number: number } | undefined {
+  const match = /^([a-z0-9]+)-bac(\d+)$/i.exec(streamId.trim());
+  if (match === null || match[1] === undefined || match[2] === undefined) return undefined;
+  return { prefix: match[1].toLowerCase(), number: Number(match[2]) };
+}
+
+export function parseWinfinityTableLabel(label: string): { family: string; number: number } | undefined {
+  const match = /^(.*?)\s+baccarat\s+(\d+)\b/i.exec(label.replace(/\s+/g, ' ').trim());
+  if (match === null || match[1] === undefined || match[2] === undefined) return undefined;
+  const family = match[1].trim().toLowerCase();
+  if (family.length === 0) return undefined;
+  return { family, number: Number(match[2]) };
+}
+
+export function winfinityVendorFromFallbackTableId(tableId: string): string | undefined {
+  const match = /^wnf-([a-f0-9]{24})$/i.exec(tableId.trim());
+  return match?.[1]?.toLowerCase();
+}
+
+export function collapseWinfinityDuplicateTableIds(
+  tableIds: readonly string[],
+  options: {
+    readonly aliasByVendor?: ReadonlyMap<string, string>;
+    readonly tables?: ReadonlyArray<{
+      readonly tableId: string;
+      readonly displayName?: string;
+      readonly roomId?: string;
+    }>;
+    readonly preferIds?: readonly string[];
+    readonly introduceAliases?: boolean;
+  } = {},
+): string[] {
+  const original = new Set(tableIds);
+  const prefer = new Set(options.preferIds ?? []);
+  const aliasByVendor = options.aliasByVendor ?? new Map<string, string>();
+  const metaById = new Map((options.tables ?? []).map(table => [table.tableId, table]));
+  const remap = (tableId: string): string => {
+    const vendor = winfinityVendorFromFallbackTableId(tableId);
+    if (vendor === undefined) return tableId;
+    const aliased = aliasByVendor.get(vendor);
+    if (aliased === undefined || aliased === tableId) return tableId;
+    if (
+      options.introduceAliases === true
+      || original.has(aliased)
+      || prefer.has(aliased)
+    ) return aliased;
+    return tableId;
+  };
+  const remapped = tableIds.map(remap);
+  const preferredByName = new Map<string, string>();
+  for (const tableId of remapped) {
+    const key = winfinityDuplicateNameKey(tableId, metaById.get(tableId) ?? metaById.get(remap(tableId)));
+    if (key === undefined) continue;
+    const current = preferredByName.get(key);
+    if (current === undefined || winfinityIdPreference(tableId) > winfinityIdPreference(current)) {
+      preferredByName.set(key, tableId);
+    }
+  }
+  const seen = new Set<string>();
+  const collapsed: string[] = [];
+  for (const tableId of remapped) {
+    const key = winfinityDuplicateNameKey(tableId, metaById.get(tableId));
+    if (key !== undefined && preferredByName.get(key) !== tableId) continue;
+    if (seen.has(tableId)) continue;
+    if (options.introduceAliases !== true && !original.has(tableId)) continue;
+    seen.add(tableId);
+    collapsed.push(tableId);
+  }
+  return collapsed;
+}
+
+function winfinityDuplicateNameKey(
+  tableId: string,
+  table?: { readonly displayName?: string; readonly roomId?: string },
+): string | undefined {
+  if (normalizeWinfinityTableId(tableId) === undefined) return undefined;
+  const displayName = table?.displayName?.replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!displayName) return undefined;
+  return `${table?.roomId ?? 'dafabet-winfinity'}::${displayName}`;
+}
+
+function winfinityIdPreference(tableId: string): number {
+  if (WINFINITY_STREAM_ID_PATTERN.test(tableId)) return 2;
+  if (WINFINITY_FALLBACK_TABLE_ID_PATTERN.test(tableId)) return 1;
+  return 0;
+}
+
+export function winfinityDisplayNameFromText(text: string): string | undefined {
+  const match = /^(.*?)\s+(baccarat)\s+(\d+)\b/i.exec(text.replace(/\s+/g, ' ').trim());
+  if (match === null || match[1] === undefined || match[2] === undefined || match[3] === undefined) {
+    return undefined;
+  }
+  const family = match[1].trim();
+  if (family.length === 0) return undefined;
+  return `${family} ${match[2][0]?.toUpperCase() ?? 'B'}${match[2].slice(1).toLowerCase()} ${match[3]}`;
+}
+
 export class WinfinityRuntimeParser {
   private readonly lockedByVendor = new Map<string, string>();
   private readonly openedWindows = new Set<string>();
@@ -60,7 +189,14 @@ export class WinfinityRuntimeParser {
   private readonly lastShoeToken = new Map<string, string>();
   private readonly currentShoeId = new Map<string, string>();
   private readonly evidenceByTable = new Map<string, ShoeEvidence>();
+  private readonly lastGameCountByTable = new Map<string, number>();
+  private readonly handsThisShoeByTable = new Map<string, number>();
+  private readonly handOrderByTable = new Map<string, string[]>();
+  private readonly lastHandIdByTable = new Map<string, string>();
+  private readonly wrapSeqByTable = new Map<string, number>();
   private readonly settledHands = new Set<string>();
+  private readonly tableNameByVendor = new Map<string, string>();
+  private readonly familyPrefix = new Map<string, string>();
 
   registerAlias(vendorTableId: string, streamId: string): void {
     const vendor = vendorTableId.trim().toLowerCase();
@@ -69,6 +205,7 @@ export class WinfinityRuntimeParser {
     const stream = streamId.trim().toLowerCase();
     if (!WINFINITY_STREAM_ID_PATTERN.test(stream)) return;
     this.applyLock(vendor, stream);
+    this.applyNameInferences();
   }
 
   lockPublicId(vendorTableId: string, publicId: string): void {
@@ -78,6 +215,7 @@ export class WinfinityRuntimeParser {
     const normalized = normalizeWinfinityTableId(publicId);
     if (normalized === undefined) return;
     this.applyLock(vendor, normalized);
+    this.applyNameInferences();
   }
 
   peekPublicId(vendorTableId: string): string | undefined {
@@ -98,8 +236,74 @@ export class WinfinityRuntimeParser {
 
   registerAliasesFromPayload(payload: unknown): Array<{ vendorTableId: string; publicId: string }> {
     const found = new Map<string, string>();
+    this.walkNamedTables(payload, 0);
     this.walkAliasPayload(payload, found, 0);
+    this.applyNameInferences();
+    for (const [vendorTableId, publicId] of this.lockedByVendor) {
+      if (!found.has(vendorTableId) && this.tableNameByVendor.has(vendorTableId)) {
+        found.set(vendorTableId, publicId);
+      }
+    }
     return [...found.entries()].map(([vendorTableId, publicId]) => ({ vendorTableId, publicId }));
+  }
+
+  noteNamedTablesFromPayload(payload: unknown): void {
+    this.walkNamedTables(payload, 0);
+    this.applyNameInferences();
+  }
+
+  displayNameForVendor(vendorTableId: string): string | undefined {
+    const vendor = vendorTableId.trim().toLowerCase();
+    return this.tableNameByVendor.get(vendor);
+  }
+
+  displayNameForTable(tableId: string): string | undefined {
+    const normalized = normalizeWinfinityTableId(tableId);
+    if (normalized === undefined) return undefined;
+    for (const [vendor, publicId] of this.lockedByVendor) {
+      if (publicId !== normalized) continue;
+      const name = this.tableNameByVendor.get(vendor);
+      if (name !== undefined) return name;
+    }
+    return undefined;
+  }
+
+  namedVendorTableIds(): string[] {
+    return [...this.tableNameByVendor.keys()];
+  }
+
+  hasLearnedStreamFamily(): boolean {
+    return this.familyPrefix.size > 0;
+  }
+
+  lockedAliases(): ReadonlyMap<string, string> {
+    return new Map(this.lockedByVendor);
+  }
+
+  inferredPublicId(vendorTableId: string): string | undefined {
+    const vendor = vendorTableId.trim().toLowerCase();
+    if (!WINFINITY_VENDOR_TABLE_ID_PATTERN.test(vendor)) return undefined;
+    const locked = this.lockedByVendor.get(vendor);
+    if (locked !== undefined) return locked;
+    return this.inferStreamId(vendor);
+  }
+
+  peekCurrentShoeId(tableId: string): string | undefined {
+    return this.currentShoeId.get(tableId);
+  }
+
+  emitCurrentShoe(tableId: string, timestamp: string): NormalizedEvent[] {
+    const shoeId = this.currentShoeId.get(tableId);
+    if (shoeId === undefined) return [];
+    const reason = this.evidenceByTable.get(tableId)?.reason;
+    const baseline: ShoeBaseline = reason === 'protocol-shuffle'
+      || reason === 'manual-confirm'
+      || reason === 'road-wrap'
+      ? 'physical-shoe'
+      : 'unknown-monitor-session';
+    const events: NormalizedEvent[] = [];
+    this.emitNewShoe(tableId, shoeId, baseline, timestamp, events);
+    return events;
   }
 
   shoeEvidence(tableId: string): ShoeEvidence | undefined {
@@ -107,13 +311,35 @@ export class WinfinityRuntimeParser {
     return evidence === undefined ? undefined : { ...evidence };
   }
 
+  acceptedGameCount(tableId: string): number | undefined {
+    return this.lastGameCountByTable.get(tableId);
+  }
+
   recordShoeEvidence(tableId: string, evidence: ShoeEvidence): void {
-    this.evidenceByTable.set(tableId, { reason: evidence.reason });
+    this.evidenceByTable.set(tableId, {
+      reason: evidence.reason,
+      ...(evidence.previousGameCount === undefined ? {} : { previousGameCount: evidence.previousGameCount }),
+      ...(evidence.gameCount === undefined ? {} : { gameCount: evidence.gameCount }),
+    });
+  }
+
+  noteGameCounts(
+    tables: ReadonlyArray<{ readonly tableId: string; readonly gameCount: number }>,
+    timestamp: string,
+  ): NormalizedEvent[] {
+    const events: NormalizedEvent[] = [];
+    for (const table of tables) {
+      const tableId = normalizeWinfinityTableId(table.tableId);
+      if (tableId === undefined) continue;
+      this.noteGameCount(tableId, table.gameCount, timestamp, events);
+    }
+    return events;
   }
 
   openPhysicalShoe(tableId: string, timestamp: string): NormalizedEvent[] {
     const events: NormalizedEvent[] = [];
     const shoeId = `wnf-${tableId}-operator`;
+    this.clearShoeTracking(tableId);
     this.evidenceByTable.set(tableId, { reason: 'manual-confirm' });
     this.currentShoeId.set(tableId, shoeId);
     this.emitNewShoe(tableId, shoeId, 'physical-shoe', timestamp, events);
@@ -129,7 +355,11 @@ export class WinfinityRuntimeParser {
     }
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
     const frame = parsed as Record<string, unknown>;
-    if (frame.type === 'TABLES_LIST') {
+    if (
+      frame.type === 'TABLES_LIST'
+      || frame.type === 'CURRENT_STATE'
+      || frame.type === 'TABLE_SETTINGS_CHANGED'
+    ) {
       this.registerAliasesFromPayload(frame);
       return [];
     }
@@ -150,6 +380,7 @@ export class WinfinityRuntimeParser {
     const timestamp = isoFromUnixMs(frame.timestamp) ?? new Date(0).toISOString();
     const events: NormalizedEvent[] = [];
     this.noteShoe(tableId, protocolShoeId, timestamp, events);
+    this.trackHand(tableId, handId);
     const shoeId = this.currentShoeId.get(tableId) ?? protocolShoeId;
     if (frame.type === 'GAME_STATE_CHANGED') {
       const state = asRecord(frame.state);
@@ -178,6 +409,71 @@ export class WinfinityRuntimeParser {
     this.lockedByVendor.set(vendor, publicId);
     const fallback = publicWinfinityTableId({ vendorTableId: vendor });
     if (fallback !== undefined && fallback !== publicId) this.rekeyTable(fallback, publicId);
+    this.learnFamilyFromVendor(vendor);
+  }
+
+  private inferStreamId(vendor: string): string | undefined {
+    const name = this.tableNameByVendor.get(vendor);
+    if (name === undefined) return undefined;
+    const label = parseWinfinityTableLabel(name);
+    if (label === undefined) return undefined;
+    const prefix = this.familyPrefix.get(label.family);
+    if (prefix === undefined) return undefined;
+    return `${prefix}-bac${label.number}`;
+  }
+
+  private learnFamilyFromVendor(vendor: string): void {
+    const publicId = this.lockedByVendor.get(vendor);
+    const name = this.tableNameByVendor.get(vendor);
+    if (publicId === undefined || name === undefined) return;
+    const stream = parseWinfinityStreamParts(publicId);
+    const label = parseWinfinityTableLabel(name);
+    if (stream === undefined || label === undefined) return;
+    if (stream.number !== label.number) return;
+    if (this.familyPrefix.has(label.family)) return;
+    this.familyPrefix.set(label.family, stream.prefix);
+  }
+
+  private applyNameInferences(): Array<{ vendorTableId: string; publicId: string }> {
+    const found: Array<{ vendorTableId: string; publicId: string }> = [];
+    for (const vendor of this.tableNameByVendor.keys()) {
+      if (this.lockedByVendor.has(vendor)) continue;
+      const inferred = this.inferStreamId(vendor);
+      if (inferred === undefined) continue;
+      this.applyLock(vendor, inferred);
+      found.push({ vendorTableId: vendor, publicId: inferred });
+    }
+    return found;
+  }
+
+  private walkNamedTables(value: unknown, depth: number): void {
+    if (depth > 6 || value === null || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const item of value) this.walkNamedTables(item, depth + 1);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    let vendor: string | undefined;
+    let tableName: string | undefined;
+    const tableId = record.tableId;
+    if (typeof tableId === 'string' && WINFINITY_VENDOR_TABLE_ID_PATTERN.test(tableId.trim().toLowerCase())) {
+      vendor = tableId.trim().toLowerCase();
+    }
+    for (const field of ['tableName', 'name', 'displayName']) {
+      const raw = record[field];
+      if (typeof raw !== 'string') continue;
+      const displayName = winfinityDisplayNameFromText(raw);
+      if (displayName === undefined) continue;
+      tableName = displayName;
+      break;
+    }
+    if (vendor !== undefined && tableName !== undefined && !this.tableNameByVendor.has(vendor)) {
+      this.tableNameByVendor.set(vendor, tableName);
+      this.learnFamilyFromVendor(vendor);
+    }
+    for (const field of Object.values(record)) {
+      if (field !== null && typeof field === 'object') this.walkNamedTables(field, depth + 1);
+    }
   }
 
   private rekeyTable(fromId: string, toId: string): void {
@@ -186,6 +482,11 @@ export class WinfinityRuntimeParser {
     moveMapKey(this.lastShoeToken, fromId, toId);
     moveMapKey(this.currentShoeId, fromId, toId);
     moveMapKey(this.evidenceByTable, fromId, toId);
+    moveMapKey(this.lastGameCountByTable, fromId, toId);
+    moveMapKey(this.handsThisShoeByTable, fromId, toId);
+    moveMapKey(this.handOrderByTable, fromId, toId);
+    moveMapKey(this.lastHandIdByTable, fromId, toId);
+    moveMapKey(this.wrapSeqByTable, fromId, toId);
     rekeyPrefixedMap(this.cardsByHand, fromId, toId);
     rekeyPrefixedSet(this.seenCardIds, fromId, toId);
     rekeyPrefixedSet(this.openedWindows, fromId, toId);
@@ -231,9 +532,23 @@ export class WinfinityRuntimeParser {
     events: NormalizedEvent[],
   ): void {
     const payload = asRecord(frame.cards);
-    if (payload === undefined || !Array.isArray(payload.cards)) return;
+    if (payload === undefined) return;
+    const incremental = Array.isArray(payload.cards) ? payload.cards : [];
+    const allCards = Array.isArray(payload.allCards) ? payload.allCards : [];
+    this.ingestCardEntries(tableId, shoeId, handId, timestamp, incremental, events);
+    this.ingestCardEntries(tableId, shoeId, handId, timestamp, allCards, events);
+  }
+
+  private ingestCardEntries(
+    tableId: string,
+    shoeId: string,
+    handId: string,
+    timestamp: string,
+    entries: readonly unknown[],
+    events: NormalizedEvent[],
+  ): void {
     const handKey = `${tableId}:${handId}`;
-    for (const entry of payload.cards) {
+    for (const entry of entries) {
       const item = asRecord(entry);
       if (item === undefined || typeof item.id !== 'string' || item.id.length === 0) continue;
       const seenKey = `${tableId}:${item.id}`;
@@ -346,9 +661,10 @@ export class WinfinityRuntimeParser {
       : handId;
     const key = `${tableId}:${shoeId}:${settledHandId}`;
     if (this.settledHands.has(key)) return;
-    this.settledHands.add(key);
     const remembered = this.cardsByHand.get(`${tableId}:${settledHandId}`)
       ?? { playerCards: [], bankerCards: [] };
+    if (remembered.playerCards.length < 2 || remembered.bankerCards.length < 2) return;
+    this.settledHands.add(key);
     events.push(this.makeWindowEvent(
       tableId,
       'handSettled',
@@ -377,17 +693,139 @@ export class WinfinityRuntimeParser {
     const previous = this.lastShoeToken.get(tableId);
     if (previous === shoeId) return;
     this.lastShoeToken.set(tableId, shoeId);
+    const reason = this.evidenceByTable.get(tableId)?.reason;
     if (previous === undefined) {
-      if (this.evidenceByTable.get(tableId)?.reason === 'manual-confirm') return;
+      if (reason === 'manual-confirm' || reason === 'road-wrap') return;
       this.evidenceByTable.set(tableId, { reason: 'attach' });
       this.currentShoeId.set(tableId, shoeId);
       this.emitNewShoe(tableId, shoeId, 'unknown-monitor-session', timestamp, events);
       return;
     }
+    if (reason === 'road-wrap' && (this.handsThisShoeByTable.get(tableId) ?? 0) <= ROAD_WRAP_MAX) {
+      return;
+    }
     this.evidenceByTable.set(tableId, { reason: 'protocol-shuffle' });
     this.currentShoeId.set(tableId, shoeId);
-    this.clearTableHandState(tableId);
+    this.clearShoeTracking(tableId);
     this.emitNewShoe(tableId, shoeId, 'physical-shoe', timestamp, events);
+  }
+
+  private noteGameCount(
+    tableId: string,
+    gameCount: number,
+    timestamp: string,
+    events: NormalizedEvent[],
+  ): void {
+    if (!Number.isInteger(gameCount) || gameCount < 1 || gameCount > MAX_BACCARAT_SHOE_HANDS) return;
+    const tracked = this.handsThisShoeByTable.get(tableId) ?? 0;
+    const lastRoad = this.lastGameCountByTable.get(tableId);
+    const evidence = this.evidenceByTable.get(tableId);
+    const laggedPreviousShoe = evidence?.reason === 'protocol-shuffle'
+      && tracked < ROAD_WRAP_MAX
+      && gameCount > ROAD_WRAP_MAX
+      && (lastRoad === undefined || lastRoad <= ROAD_WRAP_MAX);
+    if (laggedPreviousShoe) return;
+    if (tracked >= ROAD_WRAP_MIN_PREVIOUS) {
+      const previous = lastRoad ?? tracked;
+      if (
+        isWinfinityRoadWrap(previous, gameCount)
+        || isWinfinityRoadWrap(tracked, gameCount)
+      ) {
+        this.beginRoadWrap(tableId, previous, gameCount, timestamp, events);
+        return;
+      }
+    }
+    this.lastGameCountByTable.set(tableId, gameCount);
+  }
+
+  private beginRoadWrap(
+    tableId: string,
+    previous: number,
+    gameCount: number,
+    timestamp: string,
+    events: NormalizedEvent[],
+  ): void {
+    const order = this.handOrderByTable.get(tableId) ?? [];
+    const replayIds = order.slice(-gameCount);
+    const replayed: Array<{ handId: string; cards: HandCards }> = [];
+    for (const handId of replayIds) {
+      const cards = this.cardsByHand.get(`${tableId}:${handId}`);
+      if (cards === undefined) continue;
+      replayed.push({
+        handId,
+        cards: {
+          playerCards: [...cards.playerCards],
+          bankerCards: [...cards.bankerCards],
+        },
+      });
+    }
+    const sequence = (this.wrapSeqByTable.get(tableId) ?? 0) + 1;
+    this.wrapSeqByTable.set(tableId, sequence);
+    const shoeId = `wnf-${tableId}-wrap-${sequence}`;
+    this.evidenceByTable.set(tableId, {
+      reason: 'road-wrap',
+      previousGameCount: previous,
+      gameCount,
+    });
+    this.currentShoeId.set(tableId, shoeId);
+    this.clearTableHandState(tableId);
+    this.lastGameCountByTable.set(tableId, gameCount);
+    this.handOrderByTable.set(tableId, replayed.map(hand => hand.handId));
+    this.handsThisShoeByTable.set(tableId, replayed.length);
+    const lastReplayed = replayed[replayed.length - 1]?.handId;
+    if (lastReplayed !== undefined) this.lastHandIdByTable.set(tableId, lastReplayed);
+    else this.lastHandIdByTable.delete(tableId);
+    this.emitNewShoe(tableId, shoeId, 'physical-shoe', timestamp, events);
+    for (const hand of replayed) {
+      this.replayHandCards(tableId, shoeId, hand.handId, timestamp, hand.cards, events);
+    }
+  }
+
+  private replayHandCards(
+    tableId: string,
+    shoeId: string,
+    handId: string,
+    timestamp: string,
+    cards: HandCards,
+    events: NormalizedEvent[],
+  ): void {
+    const handKey = `${tableId}:${handId}`;
+    this.cardsByHand.set(handKey, {
+      playerCards: [...cards.playerCards],
+      bankerCards: [...cards.bankerCards],
+    });
+    const emit = (area: 'player' | 'banker', card: Card, index: number): void => {
+      const seenKey = `${tableId}:wrap:${handId}:${area}:${index}`;
+      this.seenCardIds.add(seenKey);
+      events.push(this.makeWindowEvent(
+        tableId,
+        'cardObserved',
+        `card:${handId}:wrap:${area}:${index}`,
+        timestamp,
+        { shoeId, handId, card, position: `${area}:${index === 2 ? 'extra' : index === 1 ? 'right' : 'left'}` },
+      ));
+    };
+    cards.playerCards.forEach((card, index) => emit('player', card, index));
+    cards.bankerCards.forEach((card, index) => emit('banker', card, index));
+  }
+
+  private trackHand(tableId: string, handId: string): void {
+    if (this.lastHandIdByTable.get(tableId) === handId) return;
+    this.lastHandIdByTable.set(tableId, handId);
+    const order = this.handOrderByTable.get(tableId) ?? [];
+    if (!order.includes(handId)) {
+      order.push(handId);
+      this.handOrderByTable.set(tableId, order);
+    }
+    this.handsThisShoeByTable.set(tableId, order.length);
+  }
+
+  private clearShoeTracking(tableId: string): void {
+    this.clearTableHandState(tableId);
+    this.lastGameCountByTable.delete(tableId);
+    this.handsThisShoeByTable.delete(tableId);
+    this.handOrderByTable.delete(tableId);
+    this.lastHandIdByTable.delete(tableId);
   }
 
   private emitNewShoe(
@@ -448,6 +886,7 @@ export class WinfinityRuntimeParser {
     return {
       type,
       eventId: `wnf:${tableId}:${type}:${stableKey}:${sourceSeq}`,
+      platformId: WINFINITY_PLATFORM_ID,
       tableId,
       timestamp,
       sourceSeq,

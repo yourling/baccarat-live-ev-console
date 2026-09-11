@@ -531,6 +531,11 @@
     seqNoByTable: Object.create(null),
     countdownByTable: Object.create(null),
     countdownAtByTable: Object.create(null),
+    // 桌台限注（{ minBet, maxBet }）。⚠️ 当前 BG 采集侧**没有**这个数据源：
+    // bg-network-hook / bg-dom-hook 都没解析过限红，parseGameDto 也只有
+    // tableId 与 seqNo。所以 submit 里的限注校验目前不会生效，需要先在
+    // 采集侧找到真实字段并写入这里，才会真正拦住超限金额。
+    tableLimitsByTable: Object.create(null),
     historyCountByTable: Object.create(null),
     historyEmittedCount: Object.create(null),
     firstGameIdByTable: Object.create(null),
@@ -693,6 +698,28 @@
     }
     if (!Number.isFinite(seqNo) || seqNo <= 0) {
       return { status: 'REJECTED', reason: 'invalid-hand', sent: false };
+    }
+    // 真金通道：必须确认要下注的回合就是当前开盘回合，否则钱会落到上一手或
+    // 已经关闭的回合上。Pragmatic 侧有 round-not-current 双重校验，这里对齐。
+    // 只有在确实采集到该桌回合号时才拦截，没采集到就放行，避免误杀。
+    const normalizedTableId = String(tableId).toUpperCase();
+    const currentSeq = session.seqNoByTable[normalizedTableId];
+    if (Number.isFinite(currentSeq) && currentSeq > 0 && currentSeq !== seqNo) {
+      return {
+        status: 'REJECTED',
+        reason: 'round-not-current',
+        sent: false,
+        expectedSeqNo: currentSeq,
+      };
+    }
+    const limits = session.tableLimitsByTable[normalizedTableId];
+    if (limits) {
+      if (Number.isFinite(limits.minBet) && amount < limits.minBet) {
+        return { status: 'REJECTED', reason: 'below-table-min', sent: false };
+      }
+      if (Number.isFinite(limits.maxBet) && amount > limits.maxBet) {
+        return { status: 'REJECTED', reason: 'above-table-max', sent: false };
+      }
     }
     const socket = pickBetSocket();
     if (!socket) {

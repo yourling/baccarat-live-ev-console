@@ -14,24 +14,11 @@ const PROTOCOL_CAPTURE_SOURCES = new Set([
   'baccarat-bridge-winfinity-ws',
   'baccarat-bridge-winfinity-state',
 ]);
-const BRIDGE_SESSION_ID = [
-  'bridge',
-  Date.now().toString(36),
-  Math.random().toString(36).slice(2, 12),
-].join('-');
 
 let liveBetSessionEnabled = false;
-let bridgeMessageSeq = 0;
-let executorProfileId = '';
-let executorLease = null;
-let socket = null;
-let socketGeneration = 0;
-let activeSocketGeneration = 0;
-let reconnectTimer = null;
-let heartbeatTimer = null;
-let reconnectDelay = 1000;
-const OUTBOX_LIMIT = 500;
-const outbox = [];
+
+// 共享 WS 管线：连接/重连/心跳/序号/发件箱/租约（定义 socket、send、connect 等）。
+importScripts('bridge-client.js');
 
 function isSentryHost(host) {
   return /(^|\.)skt\.youngpoisson\.xyz$/i.test(String(host || ''));
@@ -98,98 +85,6 @@ async function getBridgeUrl() {
   }
 }
 
-function isCurrentSocket(connection, generation) {
-  return socket === connection && activeSocketGeneration === generation;
-}
-
-async function connect() {
-  await loadFlags();
-  const url = await getBridgeUrl();
-  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
-  const generation = ++socketGeneration;
-  const connection = new WebSocket(url);
-  socket = connection;
-  activeSocketGeneration = generation;
-  connection.addEventListener('open', () => {
-    if (!isCurrentSocket(connection, generation)) return;
-    reconnectDelay = 1000;
-    flushOutbox();
-    send({
-      kind: 'hello',
-      extensionVersion: chrome.runtime.getManifest().version,
-      browser: navigator.userAgent,
-      timestamp: new Date().toISOString(),
-      ...(executorProfileId ? { executorProfileId } : {}),
-    });
-    send({
-      kind: 'sessionAction',
-      action: 'command-executed',
-      url: '',
-      frame: '',
-      detail: 'winfinity-sw-connected',
-      timestamp: new Date().toISOString(),
-    });
-    scheduleBridgeHeartbeat();
-  });
-  connection.addEventListener('message', event => {
-    if (!isCurrentSocket(connection, generation)) return;
-    let message;
-    try { message = JSON.parse(event.data); } catch (_) { return; }
-    if (!message) return;
-    if (message.kind === 'executorLeaseGranted') {
-      if (typeof message.leaseId === 'string' && typeof message.secret === 'string' && typeof message.profileId === 'string') {
-        executorLease = { leaseId: message.leaseId, profileId: message.profileId, secret: message.secret };
-      }
-      return;
-    }
-    if (message.kind === 'executorLeaseRejected') {
-      executorLease = null;
-      return;
-    }
-    if (message.kind === 'betRequest') handleBetRequest(message, generation);
-    if (message.kind === 'command') void handleCommand(message);
-  });
-  connection.addEventListener('close', () => {
-    if (!isCurrentSocket(connection, generation)) return;
-    stopBridgeHeartbeat();
-    scheduleReconnect();
-  });
-  connection.addEventListener('error', () => {
-    if (!isCurrentSocket(connection, generation)) return;
-    try { connection.close(); } catch (_) {}
-  });
-}
-
-function scheduleReconnect() {
-  if (reconnectTimer) return;
-  const delay = Math.round(reconnectDelay * (0.7 + Math.random() * 0.6));
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    void connect();
-  }, delay);
-  reconnectDelay = Math.min(reconnectDelay * 2, 15000);
-}
-
-function sendBridgeHeartbeat() {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-  send({ kind: 'heartbeat', timestamp: new Date().toISOString() });
-  return true;
-}
-
-function scheduleBridgeHeartbeat() {
-  if (heartbeatTimer) return;
-  heartbeatTimer = setTimeout(() => {
-    heartbeatTimer = null;
-    if (sendBridgeHeartbeat()) scheduleBridgeHeartbeat();
-  }, BRIDGE_HEARTBEAT_INTERVAL_MS);
-}
-
-function stopBridgeHeartbeat() {
-  if (!heartbeatTimer) return;
-  clearTimeout(heartbeatTimer);
-  heartbeatTimer = null;
-}
-
 function isProtocolNetworkCapture(message) {
   if (!message || message.kind !== 'networkCapture') return false;
   if (message.encoding === 'base64') return false;
@@ -197,41 +92,22 @@ function isProtocolNetworkCapture(message) {
   return PROTOCOL_CAPTURE_SOURCES.has(message.source);
 }
 
-function withBridgeSequence(message) {
-  return { ...message, bridgeSessionId: BRIDGE_SESSION_ID, bridgeSeq: ++bridgeMessageSeq };
+// -- 共享管线钩子（平台差异） -------------------------------------------------
+
+function bridgeOnSocketOpen() {
+  send({
+    kind: 'sessionAction',
+    action: 'command-executed',
+    url: '',
+    frame: '',
+    detail: 'winfinity-sw-connected',
+    timestamp: new Date().toISOString(),
+  });
 }
 
-function send(message) {
-  if (message && message.kind === 'betResult') return;
-  if (message && message.kind === 'networkCapture' && !isProtocolNetworkCapture(message)) return;
-  const sequenced = withBridgeSequence(message);
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(sequenced));
-    return;
-  }
-  if (outbox.length >= OUTBOX_LIMIT) outbox.shift();
-  outbox.push(sequenced);
-}
-
-function flushOutbox() {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  while (outbox.length > 0) {
-    const message = outbox.shift();
-    if (message && message.kind === 'betResult') continue;
-    if (message && message.kind === 'networkCapture' && !isProtocolNetworkCapture(message)) continue;
-    try { socket.send(JSON.stringify(message)); }
-    catch (_) { outbox.unshift(message); break; }
-  }
-}
-
-function sendBetResult(message, generation) {
-  if (!socket || !isCurrentSocket(socket, generation) || socket.readyState !== WebSocket.OPEN) return false;
-  try {
-    socket.send(JSON.stringify(withBridgeSequence(message)));
-    return true;
-  } catch (_) {
-    return false;
-  }
+function bridgeOnSocketMessage(message, generation) {
+  if (message.kind === 'betRequest') handleBetRequest(message, generation);
+  if (message.kind === 'command') void handleCommand(message);
 }
 
 function rejectedReceipt(request, requestId) {

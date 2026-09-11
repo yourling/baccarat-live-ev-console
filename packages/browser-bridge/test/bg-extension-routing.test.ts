@@ -13,6 +13,10 @@ const backgroundSource = readFileSync(
   new URL('../../../apps/browser-extension-bg/background.js', import.meta.url),
   'utf8',
 );
+const bridgeClientSource = readFileSync(
+  new URL('../../../apps/browser-extension-shared/bridge-client.js', import.meta.url),
+  'utf8',
+);
 const betRuntimeSource = readFileSync(
   new URL('../../../apps/browser-extension-bg/bg-bet-runtime.js', import.meta.url),
   'utf8',
@@ -137,6 +141,10 @@ async function createBgHarness(tabs: ReadonlyArray<{ id: number; url: string }>)
     console,
     URL,
     URLSearchParams,
+    importScripts: (script: string) => {
+      if (script !== 'bridge-client.js') throw new Error(`unexpected script import: ${script}`);
+      vm.runInContext(bridgeClientSource, context, { filename: script });
+    },
   });
   vm.runInContext(backgroundSource, context);
   Reflect.set(context, '__signExecutorPayload', (secret: string, payload: string) =>

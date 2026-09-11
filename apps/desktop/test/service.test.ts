@@ -165,18 +165,22 @@ function monitorShoeEvent(
 }
 
 function openedPlatformRound(tableId: string, eventId: string, handId: string): NormalizedEvent {
+  // timestamp 与 closesAt 必须落在同一条时间轴上。table-actor 在事件时钟与真实
+  // 时钟偏差 <60s 时用真实时钟评估窗口，否则退回事件时钟；两者跨轴会让窗口
+  // 校验永远失败。这里统一锚定到真实时钟。
+  const nowMs = Date.now();
   return {
     type: 'bettingWindowOpened',
     eventId,
     tableId,
-    timestamp: '2026-08-23T11:00:01.000Z',
+    timestamp: new Date(nowMs).toISOString(),
     sourceSeq: 2,
     source: 'pragmatic-runtime',
     schemaVersion: EVENT_SCHEMA_VERSION,
     shoeId: `monitor-session-${tableId}`,
     handId,
     market: 'bankerPair',
-    closesAt: new Date(Date.now() + 12_000).toISOString(),
+    closesAt: new Date(nowMs + 12_000).toISOString(),
   };
 }
 

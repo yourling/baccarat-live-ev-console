@@ -665,6 +665,8 @@ h2 { color: #f4f7fa; font-size: 18px; }
 
 
 .monitor-section { margin-top: 10px; padding: 0; overflow: hidden; }
+.monitor-section__toolbar { padding: 10px 12px 0; }
+.monitor-section__toolbar .button { flex: 0 0 auto; }
 .monitor-section .table-scroll { margin: 0; }
 .monitor-table {
   table-layout: fixed;

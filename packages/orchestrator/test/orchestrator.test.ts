@@ -65,13 +65,24 @@ function futureClosesAt(offsetMs = 10_000): string {
   return new Date(Date.now() + offsetMs).toISOString();
 }
 
-function withClosesAt(events: NormalizedEvent[], closesAt = futureClosesAt()): NormalizedEvent[] {
-  return events.map(event => (
-    event.type === 'bettingWindowOpened'
-    && (typeof event.closesAt !== 'string' || event.closesAt.length === 0)
-      ? { ...event, closesAt }
-      : event
-  ));
+function withClosesAt(events: NormalizedEvent[], offsetMs = 10_000): NormalizedEvent[] {
+  const firstMs = events.length > 0 ? Date.parse(events[0]!.timestamp ?? '') : Number.NaN;
+  // 夹具跑在 2025-01-01 这样的固定时间轴上，但窗口校验读的是真实时钟：
+  // one-shot 下注直接用 Date.now()，table-actor 也只在事件时钟与真实时钟
+  // 偏差 <60s 时才退回事件时钟。所以必须把整条时间轴平移到"现在"，
+  // timestamp 与 closesAt 的相对间隔保持不变。
+  const shift = Number.isFinite(firstMs) && Math.abs(Date.now() - firstMs) > 60_000
+    ? Date.now() - firstMs
+    : 0;
+  return events.map(event => {
+    const eventMs = Date.parse(event.timestamp ?? '');
+    const shiftedMs = Number.isFinite(eventMs) ? eventMs + shift : Date.now();
+    const next: NormalizedEvent = { ...event, timestamp: new Date(shiftedMs).toISOString() };
+    if (next.type !== 'bettingWindowOpened') return next;
+    const existing = Date.parse(next.closesAt ?? '');
+    const closesAtMs = Number.isFinite(existing) ? existing + shift : shiftedMs + offsetMs;
+    return { ...next, closesAt: new Date(closesAtMs).toISOString() };
+  });
 }
 
 class FixtureBuilder extends SimulatorFixtureBuilder {
@@ -232,12 +243,14 @@ describe('orchestrator table actor', () => {
       type: 'bettingWindowOpened',
       eventId: newId('evt'),
       tableId: 't1',
-      timestamp: '2025-01-01T00:00:05.000Z',
+      timestamp: new Date().toISOString(),
       sourceSeq: 5,
       shoeId: 's1',
       handId: 'h2',
       market: 'bankerPair',
-      closesAt: '2025-01-01T00:00:15.000Z',
+      // 真实时钟：本用例要验证的是断连后靴基线降级导致的拒绝，
+      // 不能让过期的 closesAt 先在窗口校验处把它挡掉。
+      closesAt: futureClosesAt(),
     };
 
     await Promise.all(events.map(event => orchestrator.enqueue('t1', event)));
@@ -1683,7 +1696,9 @@ describe('exhausted unknown new-shoe must replace mixed physical inventory', () 
       schemaVersion: 1,
       shoeId: 'bg-A26-11',
       baseline: 'physical-shoe',
-      profile: defaultProfile('A26'),
+      // 真实 runtime（协议洗牌 / 人工确认）开出的实体靴会显式声明自动确认；
+      // 桌配置的 autoConfirmNewShoe=false 不能把它压回等待确认。
+      profile: { ...defaultProfile('A26'), autoConfirmNewShoe: true },
     } as NormalizedEvent);
     await orchestrator.enqueue('A26', {
       type: 'bettingWindowOpened',
@@ -1830,6 +1845,549 @@ describe('restart attach must not wipe a rebuilt physical shoe', () => {
     expect(actor.getProjection().shoeId).toBe('bg-B01-3');
     expect(actor.getProjection().shoeBaseline).toBe('physical-shoe');
     expect(actor.getProjection().seenCards.length).toBe(0);
+    ledger.close();
+  });
+});
+
+describe('shoe handoff hold must fail closed', () => {
+  function shoeHoldStream(tableId: string, shoeId: string): NormalizedEvent[] {
+    const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'] as const;
+    const events: NormalizedEvent[] = [{
+      type: 'newShoeSignal',
+      eventId: `shoe-${shoeId}`,
+      tableId,
+      timestamp: new Date().toISOString(),
+      sourceSeq: 1,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId,
+      baseline: 'physical-shoe',
+      profile: { ...simProfile(tableId), autoConfirmNewShoe: true },
+    }];
+    // 打到 handNumber = 10、remaining 仍远高于 180 —— 正是 hold 生效的区间
+    for (let i = 1; i <= 10; i += 1) {
+      const picks = [0, 1, 2, 3, 4, 5].map(o => RANKS[(i * 6 + o) % RANKS.length]);
+      events.push({
+        type: 'handSettled',
+        eventId: `settled-${shoeId}-${i}`,
+        tableId,
+        timestamp: new Date().toISOString(),
+        sourceSeq: i + 1,
+        source: 'pragmatic-runtime',
+        schemaVersion: 1,
+        shoeId,
+        handId: String(1000 + i),
+        playerCards: picks.slice(0, 3).map(rank => ({ rank })),
+        bankerCards: picks.slice(3, 6).map(rank => ({ rank })),
+        outcomes: { bankerPair: false, playerPair: false },
+      });
+    }
+    return events;
+  }
+
+  it('refuses pair bets while holding the old shoe, then releases once the hold expires', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const executor = acceptingLiveExecutor();
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor });
+    const actor = orchestrator.registerTable({ ...simProfile(), autoBetArmedByDefault: false }, 'shadow', 20);
+
+    for (const event of shoeHoldStream('t1', 'shoe-1')) {
+      await orchestrator.enqueue('t1', event);
+    }
+    // 旧靴开一个窗口
+    await orchestrator.enqueue('t1', {
+      type: 'bettingWindowOpened',
+      eventId: 'window-1',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: 100,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId: 'shoe-1',
+      handId: '1011',
+      market: 'bankerPair',
+      closesAt: futureClosesAt(20_000),
+    });
+    await actor.flush();
+
+    const before = await actor.placeOneShotBet({
+      shoeId: 'shoe-1', handId: '1011', market: 'bankerPair', amount: 20,
+    });
+    expect(before.status).toBe('ACCEPTED');
+
+    // 平台换靴：hold 生效
+    await orchestrator.enqueue('t1', {
+      type: 'newShoeSignal',
+      eventId: 'shoe-2-signal',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: 200,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId: 'shoe-2',
+      baseline: 'physical-shoe',
+      profile: { ...simProfile('t1'), autoConfirmNewShoe: true },
+    });
+    await actor.flush();
+
+    expect(actor.isShoeHoldPending()).toBe(true);
+    // 关键：这段窗口里库存模型可能已与牌桌无关，必须拒绝下注
+    // 换一个市场，避免被上面那次 bankerPair 的 duplicate 检查先挡掉
+    const held = await actor.placeOneShotBet({
+      shoeId: 'shoe-1', handId: '1011', market: 'playerPair', amount: 20,
+    });
+    expect(held).toMatchObject({ status: 'REJECTED', reason: 'shoe-hold-pending' });
+
+    // 出口：hold 有上界，不会永久卡住
+    actor['shoeHold']['holdSince'] = Date.now() - 91_000;
+    expect(actor.isShoeHoldPending()).toBe(false);
+    const released = await actor.placeOneShotBet({
+      shoeId: 'shoe-1', handId: '1011', market: 'playerPair', amount: 20,
+    });
+    expect(released.status).not.toBe('REJECTED');
+    ledger.close();
+  });
+
+  it('must flush the deferred new-shoe signal once the hold expires (self-heal)', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const executor = acceptingLiveExecutor();
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor });
+    const actor = orchestrator.registerTable({ ...simProfile(), autoBetArmedByDefault: false }, 'shadow', 20);
+
+    for (const event of shoeHoldStream('t1', 'shoe-1')) {
+      await orchestrator.enqueue('t1', event);
+    }
+    await actor.flush();
+
+    // 一次性新靴信号：beginNewShoe 触发后会 clearShoeTracking，同一个换靴不会发第二次
+    await orchestrator.enqueue('t1', {
+      type: 'newShoeSignal',
+      eventId: 'shoe-2-signal',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: 200,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId: 'shoe-2',
+      baseline: 'physical-shoe',
+      profile: { ...simProfile('t1'), autoConfirmNewShoe: true },
+    });
+    await actor.flush();
+    expect(actor.isShoeHoldPending()).toBe(true);
+    expect(actor.getProjection().shoeId).toBe('shoe-1');
+
+    // hold 到期后，任何一个后续事件都必须把缓存的新靴信号补投进去 ——
+    // 否则系统永远僵在旧靴的冻结库存模型上（且下注已恢复，等于在错误模型上下注）
+    actor['shoeHold']['holdSince'] = Date.now() - 91_000;
+    await orchestrator.enqueue('t1', {
+      type: 'cardObserved',
+      eventId: 'card-after-timeout',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: 300,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId: 'shoe-2',
+      handId: '2001',
+      card: { rank: 'A', suit: 'spade' },
+      position: 'player',
+    });
+    await actor.flush();
+
+    expect(actor.getProjection().shoeId).toBe('shoe-2');
+    // 新靴重置为 416 张，已计入的那 1 张要扣掉
+    expect(actor.getProjection().remainingTotal).toBe(415);
+    expect(actor.getProjection().seenCards).toHaveLength(1);
+    ledger.close();
+  });
+
+  it('must flush the deferred signal as soon as the road-wrap exit lifts the hold, not only at timeout', async () => {
+    const { ledger, riskLimits } = makeContext();
+    let roadCount: number | undefined = undefined;
+    const executor = acceptingLiveExecutor();
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor, observedGameCount: () => roadCount });
+    const actor = orchestrator.registerTable({ ...simProfile(), autoBetArmedByDefault: false }, 'shadow', 20);
+
+    for (const event of shoeHoldStream('t1', 'shoe-1')) {
+      await orchestrator.enqueue('t1', event);
+    }
+    await actor.flush();
+
+    // 一次性信号被 hold
+    await orchestrator.enqueue('t1', {
+      type: 'newShoeSignal',
+      eventId: 'shoe-2-signal',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: 200,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId: 'shoe-2',
+      baseline: 'physical-shoe',
+      profile: { ...simProfile('t1'), autoConfirmNewShoe: true },
+    });
+    await actor.flush();
+    expect(actor.isShoeHoldPending()).toBe(true);
+    expect(actor['shoeHold']['deferredSignal']?.shoeId).toBe('shoe-2');
+
+    // 真实路子回绕：DOM 路子追到局 1（handNumber=10 → wrap-shaped）。
+    // 路子回绕出口解除 hold 的瞬间，branch 2/3 放行事件会 clearShoeHold ——
+    // 缓存若不在此前补投就被销毁，而信号是一次性的，桌将永久僵在旧靴。
+    roadCount = 1;
+    await orchestrator.enqueue('t1', {
+      type: 'cardObserved',
+      eventId: 'card-after-road-wrap',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: 300,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId: 'shoe-2',
+      handId: '2001',
+      card: { rank: 'A', suit: 'spade' },
+      position: 'player',
+    });
+    await actor.flush();
+
+    expect(actor.getProjection().shoeId).toBe('shoe-2');
+    expect(actor.getProjection().remainingTotal).toBe(415);
+    expect(actor.getProjection().seenCards).toHaveLength(1);
+    ledger.close();
+  });
+
+  it('must replace the deferred signal with a newer one when the platform switches twice during one hold', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const executor = acceptingLiveExecutor();
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor });
+    const actor = orchestrator.registerTable({ ...simProfile(), autoBetArmedByDefault: false }, 'shadow', 20);
+
+    for (const event of shoeHoldStream('t1', 'shoe-1')) {
+      await orchestrator.enqueue('t1', event);
+    }
+    await actor.flush();
+    await orchestrator.enqueue('t1', {
+      type: 'newShoeSignal', eventId: 'shoe-2-signal', tableId: 't1',
+      timestamp: new Date().toISOString(), sourceSeq: 200, source: 'pragmatic-runtime',
+      schemaVersion: 1, shoeId: 'shoe-2', baseline: 'physical-shoe',
+      profile: { ...simProfile('t1'), autoConfirmNewShoe: true },
+    });
+    await actor.flush();
+    expect(actor['shoeHold']['deferredSignal']?.shoeId).toBe('shoe-2');
+
+    // 补投 shoe-2 后打到深处，让 shoe-3 的信号也被 hold
+    actor['shoeHold']['holdSince'] = Date.now() - 91_000;
+    await orchestrator.enqueue('t1', {
+      type: 'cardObserved', eventId: 'card-shoe-2', tableId: 't1',
+      timestamp: new Date().toISOString(), sourceSeq: 250, source: 'pragmatic-runtime',
+      schemaVersion: 1, shoeId: 'shoe-2', handId: '2001',
+      card: { rank: 'A', suit: 'spade' }, position: 'player',
+    });
+    await actor.flush();
+    expect(actor.getProjection().shoeId).toBe('shoe-2');
+    const RANKS2 = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'] as const;
+    for (let i = 2; i <= 11; i += 1) {
+      const picks = [0, 1, 2, 3, 4, 5].map(o => RANKS2[(i * 6 + o) % RANKS2.length]);
+      await orchestrator.enqueue('t1', {
+        type: 'handSettled',
+        eventId: `settled-shoe-2-${i}`,
+        tableId: 't1',
+        timestamp: new Date().toISOString(),
+        sourceSeq: 250 + i,
+        source: 'pragmatic-runtime',
+        schemaVersion: 1,
+        shoeId: 'shoe-2',
+        handId: String(2000 + i),
+        playerCards: picks.slice(0, 3).map(rank => ({ rank })),
+        bankerCards: picks.slice(3, 6).map(rank => ({ rank })),
+        outcomes: { bankerPair: false, playerPair: false },
+      });
+    }
+    await actor.flush();
+
+    await orchestrator.enqueue('t1', {
+      type: 'newShoeSignal', eventId: 'shoe-3-signal', tableId: 't1',
+      timestamp: new Date().toISOString(), sourceSeq: 400, source: 'pragmatic-runtime',
+      schemaVersion: 1, shoeId: 'shoe-3', baseline: 'physical-shoe',
+      profile: { ...simProfile('t1'), autoConfirmNewShoe: true },
+    });
+    await actor.flush();
+    expect(actor['shoeHold']['deferredSignal']?.shoeId).toBe('shoe-3');
+
+    // 平台又切了一靴：缓存必须替换成最新的 shoe-4，否则补投后僵在 shoe-3
+    await orchestrator.enqueue('t1', {
+      type: 'newShoeSignal', eventId: 'shoe-4-signal', tableId: 't1',
+      timestamp: new Date().toISOString(), sourceSeq: 500, source: 'pragmatic-runtime',
+      schemaVersion: 1, shoeId: 'shoe-4', baseline: 'physical-shoe',
+      profile: { ...simProfile('t1'), autoConfirmNewShoe: true },
+    });
+    await actor.flush();
+    expect(actor['shoeHold']['deferredSignal']?.shoeId).toBe('shoe-4');
+
+    actor['shoeHold']['holdSince'] = Date.now() - 91_000;
+    await orchestrator.enqueue('t1', {
+      type: 'cardObserved', eventId: 'card-shoe-4', tableId: 't1',
+      timestamp: new Date().toISOString(), sourceSeq: 600, source: 'pragmatic-runtime',
+      schemaVersion: 1, shoeId: 'shoe-4', handId: '4001',
+      card: { rank: 'K', suit: 'heart' }, position: 'banker',
+    });
+    await actor.flush();
+    expect(actor.getProjection().shoeId).toBe('shoe-4');
+    expect(actor.getProjection().remainingTotal).toBe(415);
+    ledger.close();
+  });
+
+  it('must replay settlements dropped during the hold so their cards leave the new-shoe inventory', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const executor = acceptingLiveExecutor();
+    const orchestrator = new Orchestrator({ ledger, riskLimits, executor });
+    const actor = orchestrator.registerTable({ ...simProfile(), autoBetArmedByDefault: false }, 'shadow', 20);
+
+    for (const event of shoeHoldStream('t1', 'shoe-1')) {
+      await orchestrator.enqueue('t1', event);
+    }
+    await actor.flush();
+    await orchestrator.enqueue('t1', {
+      type: 'newShoeSignal', eventId: 'shoe-2-signal', tableId: 't1',
+      timestamp: new Date().toISOString(), sourceSeq: 200, source: 'pragmatic-runtime',
+      schemaVersion: 1, shoeId: 'shoe-2', baseline: 'physical-shoe',
+      profile: { ...simProfile('t1'), autoConfirmNewShoe: true },
+    });
+    await actor.flush();
+    expect(actor.isShoeHoldPending()).toBe(true);
+
+    // hold 期间新靴打了 2 手 —— 结算事件被丢弃，且每手只发一次、不会再来了
+    const RANKS3 = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'] as const;
+    for (let i = 1; i <= 2; i += 1) {
+      const picks = [0, 1, 2, 3, 4, 5].map(o => RANKS3[(i * 6 + o) % RANKS3.length]);
+      await orchestrator.enqueue('t1', {
+        type: 'handSettled',
+        eventId: `dropped-shoe-2-${i}`,
+        tableId: 't1',
+        timestamp: new Date().toISOString(),
+        sourceSeq: 210 + i,
+        source: 'pragmatic-runtime',
+        schemaVersion: 1,
+        shoeId: 'shoe-2',
+        handId: String(2000 + i),
+        playerCards: picks.slice(0, 3).map(rank => ({ rank })),
+        bankerCards: picks.slice(3, 6).map(rank => ({ rank })),
+        outcomes: { bankerPair: false, playerPair: false },
+      });
+    }
+    await actor.flush();
+
+    // 超时自愈 + 1 张新牌
+    actor['shoeHold']['holdSince'] = Date.now() - 91_000;
+    await orchestrator.enqueue('t1', {
+      type: 'cardObserved', eventId: 'card-shoe-2', tableId: 't1',
+      timestamp: new Date().toISOString(), sourceSeq: 300, source: 'pragmatic-runtime',
+      schemaVersion: 1, shoeId: 'shoe-2', handId: '2003',
+      card: { rank: 'A', suit: 'spade' }, position: 'player',
+    });
+    await actor.flush();
+
+    const projection = actor.getProjection();
+    expect(projection.shoeId).toBe('shoe-2');
+    // 416 − 2 手 × 6 张（回放）− 1 张（新牌）= 403；不回放则是 415，多 12 张
+    expect(projection.remainingTotal).toBe(403);
+    expect(projection.seenCards).toHaveLength(13);
+    ledger.close();
+  });
+});
+
+describe('duplicate hand settlement must not double-count missing unobserved cards', () => {
+  function settledHand(
+    eventId: string,
+    handId: string,
+    overrides: Partial<Record<string, unknown>> = {},
+  ): NormalizedEvent {
+    const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'] as const;
+    const picks = [0, 1, 2, 3, 4, 5].map(o => RANKS[(6 * 6 + o) % RANKS.length]);
+    return {
+      type: 'handSettled',
+      eventId,
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: 100,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId: 'shoe-1',
+      handId,
+      playerCards: picks.slice(0, 3).map(rank => ({ rank })),
+      bankerCards: picks.slice(3, 6).map(rank => ({ rank })),
+      outcomes: { bankerPair: false, playerPair: false },
+      ...overrides,
+    } as NormalizedEvent;
+  }
+
+  it('ignores re-delivered settlements across parser identity changes and ledger dedup', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const orchestrator = new Orchestrator({ ledger, riskLimits });
+    const actor = orchestrator.registerTable({ ...simProfile(), autoBetArmedByDefault: false }, 'shadow', 20);
+
+    await orchestrator.enqueue('t1', {
+      type: 'newShoeSignal',
+      eventId: 'pragmatic:runA:0:t1:newShoeSignal:s1',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: 1,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId: 'shoe-1',
+      baseline: 'physical-shoe',
+      profile: { ...simProfile('t1'), autoConfirmNewShoe: true },
+    } as NormalizedEvent);
+    for (let i = 1; i <= 5; i += 1) {
+      await orchestrator.enqueue('t1', settledHand(`pragmatic:runA:0:t1:handSettled:h${i}`, String(1000 + i), {
+        sourceSeq: 1 + i,
+      }));
+    }
+    await actor.flush();
+    const baseline = actor.getProjection();
+    expect(baseline.remainingTotal).toBe(386);
+
+    // 手 1006：只 live 采到 2 张，结算带 6 张 → 缺 4 张（真实漏采，计一次）
+    const observedRanks = ['A', '2'];
+    for (let c = 0; c < 2; c += 1) {
+      await orchestrator.enqueue('t1', {
+        type: 'cardObserved',
+        eventId: `pragmatic:runA:0:t1:cardObserved:h6:c${c}`,
+        tableId: 't1',
+        timestamp: new Date().toISOString(),
+        sourceSeq: 20 + c,
+        source: 'pragmatic-runtime',
+        schemaVersion: 1,
+        shoeId: 'shoe-1',
+        handId: '1006',
+        card: { rank: observedRanks[c], suit: 'spade' },
+        position: 'player',
+      } as NormalizedEvent);
+    }
+    await orchestrator.enqueue('t1', settledHand('pragmatic:runA:0:t1:handSettled:h6', '1006', {
+      sourceSeq: 30,
+    }));
+    await actor.flush();
+    expect(actor.missingUnobservedCardCount()).toBe(4);
+
+    // 路径 1：解析器身份变化（gen 1 / 新 runId）重新上报同一手 —— 新 eventId
+    // 绕过 parsedEventIds 与 ledger 的 event_id 去重，但缺牌计数不得再累加
+    await orchestrator.enqueue('t1', {
+      type: 'cardObserved',
+      eventId: 'pragmatic:runB:1:t1:cardObserved:h6:c0',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: 40,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId: 'shoe-1',
+      handId: '1006',
+      card: { rank: 'A', suit: 'spade' },
+      position: 'player',
+    } as NormalizedEvent);
+    await orchestrator.enqueue('t1', settledHand('pragmatic:runB:1:t1:handSettled:h6', '1006', {
+      sourceSeq: 41,
+    }));
+    await actor.flush();
+    expect(actor.missingUnobservedCardCount()).toBe(4);
+
+    // 路径 2：同 eventId 再投递 —— ledger 去重命中后走 recoverSideEffects，
+    // 同样不得再累加
+    await orchestrator.enqueue('t1', settledHand('pragmatic:runA:0:t1:handSettled:h6', '1006', {
+      sourceSeq: 30,
+    }));
+    await actor.flush();
+    expect(actor.missingUnobservedCardCount()).toBe(4);
+
+    // 库存与 seenCards 全程不受重复投递影响（cardInventoryKeys 去重）
+    const projection = actor.getProjection();
+    expect(projection.remainingTotal).toBe(baseline.remainingTotal - 2);
+    expect(projection.seenCards).toHaveLength(baseline.seenCards.length + 2);
+    ledger.close();
+  });
+});
+
+describe('resetLiveShoeTracking must discard held shoe state', () => {
+  function shoeHoldStreamLocal(tableId: string, shoeId: string): NormalizedEvent[] {
+    const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'] as const;
+    const events: NormalizedEvent[] = [{
+      type: 'newShoeSignal',
+      eventId: `shoe-${shoeId}`,
+      tableId,
+      timestamp: new Date().toISOString(),
+      sourceSeq: 1,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId,
+      baseline: 'physical-shoe',
+      profile: { ...simProfile(tableId), autoConfirmNewShoe: true },
+    }];
+    for (let i = 1; i <= 10; i += 1) {
+      const picks = [0, 1, 2, 3, 4, 5].map(o => RANKS[(i * 6 + o) % RANKS.length]);
+      events.push({
+        type: 'handSettled',
+        eventId: `settled-${shoeId}-${i}`,
+        tableId,
+        timestamp: new Date().toISOString(),
+        sourceSeq: i + 1,
+        source: 'pragmatic-runtime',
+        schemaVersion: 1,
+        shoeId,
+        handId: String(1000 + i),
+        playerCards: picks.slice(0, 3).map(rank => ({ rank })),
+        bankerCards: picks.slice(3, 6).map(rank => ({ rank })),
+        outcomes: { bankerPair: false, playerPair: false },
+      } as NormalizedEvent);
+    }
+    return events;
+  }
+
+  it('must not flush a stale deferred signal onto the freshly reset projection', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const orchestrator = new Orchestrator({ ledger, riskLimits });
+    const actor = orchestrator.registerTable({ ...simProfile(), autoBetArmedByDefault: false }, 'shadow', 20);
+
+    for (const event of shoeHoldStreamLocal('t1', 'shoe-1')) {
+      await orchestrator.enqueue('t1', event);
+    }
+    await actor.flush();
+    // 换靴信号被 hold + 缓存；期间新靴 1 手结算被丢弃入缓
+    await orchestrator.enqueue('t1', {
+      type: 'newShoeSignal', eventId: 'shoe-2-signal', tableId: 't1',
+      timestamp: new Date().toISOString(), sourceSeq: 200, source: 'pragmatic-runtime',
+      schemaVersion: 1, shoeId: 'shoe-2', baseline: 'physical-shoe',
+      profile: { ...simProfile('t1'), autoConfirmNewShoe: true },
+    } as NormalizedEvent);
+    await orchestrator.enqueue('t1', {
+      type: 'handSettled', eventId: 'dropped-shoe-2', tableId: 't1',
+      timestamp: new Date().toISOString(), sourceSeq: 210, source: 'pragmatic-runtime',
+      schemaVersion: 1, shoeId: 'shoe-2', handId: '2001',
+      playerCards: [{ rank: 'A' }, { rank: '2' }],
+      bankerCards: [{ rank: 'K' }, { rank: '7' }],
+      outcomes: { bankerPair: false, playerPair: false },
+    } as NormalizedEvent);
+    await actor.flush();
+    expect(actor['shoeHold']['deferredSignal']?.shoeId).toBe('shoe-2');
+    expect(actor.isShoeHoldPending()).toBe(true);
+
+    // 操作员重置：意图是干净重来、等下一条洗牌证据
+    orchestrator.resetLiveShoeTracking();
+    expect(actor['shoeHold']['deferredSignal']).toBeUndefined();
+    expect(actor.isShoeHoldPending()).toBe(false);
+    expect(actor['shoeHold']['heldSettlements'].size).toBe(0);
+
+    // 空投影下 shouldHold 恒为 false：若缓存未清，陈旧 shoe-2 信号会在此刻
+    // 被补投，把重置后的状态劫持成"全新 416 张的 shoe-2"（fail-open）
+    await orchestrator.enqueue('t1', {
+      type: 'newShoeSignal', eventId: 'reattach-signal', tableId: 't1',
+      timestamp: new Date().toISOString(), sourceSeq: 300, source: 'pragmatic-runtime',
+      schemaVersion: 1, shoeId: 'shoe-att', baseline: 'unknown-monitor-session',
+    } as NormalizedEvent);
+    await actor.flush();
+
+    const projection = actor.getProjection();
+    expect(projection.shoeId).toBe('shoe-att');
+    expect(projection.shoeBaseline).toBe('unknown-monitor-session');
+    expect(projection.remainingTotal).toBe(416);
     ledger.close();
   });
 });

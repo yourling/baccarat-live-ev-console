@@ -9,6 +9,11 @@ export const backgroundSource = readFileSync(
   'utf8',
 );
 
+export const bridgeClientSource = readFileSync(
+  new URL('../../../apps/browser-extension-shared/bridge-client.js', import.meta.url),
+  'utf8',
+);
+
 export const pragmaticRuntimeSource = readFileSync(
   new URL('../../../apps/browser-extension/pragmatic-bet-runtime.js', import.meta.url),
   'utf8',
@@ -411,6 +416,7 @@ export async function createHarness(options: HarnessOptions = {}) {
   let context: vm.Context;
   context = vm.createContext({
     chrome,
+    console,
     WebSocket: FakeWebSocket,
     navigator: { userAgent: 'test-browser' },
     crypto: webcrypto,
@@ -428,6 +434,10 @@ export async function createHarness(options: HarnessOptions = {}) {
     TextEncoder,
     Uint8Array,
     importScripts: (script: string) => {
+      if (script === 'bridge-client.js') {
+        vm.runInContext(bridgeClientSource, context, { filename: script });
+        return;
+      }
       if (script !== 'pragmatic-bet-runtime.js') throw new Error(`unexpected script import: ${script}`);
       vm.runInContext(pragmaticRuntimeSource, context, { filename: script });
     },

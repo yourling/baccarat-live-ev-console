@@ -30,11 +30,18 @@ let stopMainThreadWatchdog: (() => void) | undefined;
 type DesktopExecutionMode = 'shadow' | 'live';
 let appQuitting = false;
 
+/** close() 的最长等待时间，超过就放弃干净关闭直接退出。 */
+const SERVICE_CLOSE_TIMEOUT_MS = 15_000;
+
 function isDesktopExecutionMode(value: unknown): value is DesktopExecutionMode {
   return value === 'shadow' || value === 'live';
 }
 
 function getService(): DesktopConsoleService {
+  // 退出过程中绝不能再把服务拉起来：那会重新打开 console.sqlite、重建桥与
+  // 监控，等于在退出路径上又拉起一整套下注链路。`service = null` 与进程真正
+  // 退出之间有一个窗口期，IPC 调用会落在这里。
+  if (appQuitting) throw new Error('desktop console is shutting down');
   if (!service) {
     service = new DesktopConsoleService(path.join(app.getPath('userData'), 'console.sqlite'));
   }
@@ -204,9 +211,26 @@ if (acquireSingleInstance(app)) {
     event.preventDefault();
     closing = true;
     stopMainThreadWatchdog?.();
-    void service.close().finally(() => {
+    // close() 会排队等待正在进行的执行状态操作；如果队首卡在一次挂起的桥
+    // 网络调用上，退出就会被无限拖住。加一道超时保险，让进程总能退出。
+    // 只用**一个**定时器，且无论走哪条路径都会被清掉，不给退出过程留悬挂句柄。
+    const closingService = service;
+    let settled = false;
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    const finishQuit = (): void => {
+      if (settled) return;
+      settled = true;
+      if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
       service = null;
       app.quit();
+    };
+    timeoutHandle = setTimeout(() => {
+      console.error('desktop console close timed out; quitting anyway');
+      finishQuit();
+    }, SERVICE_CLOSE_TIMEOUT_MS);
+    void closingService.close().then(finishQuit, error => {
+      console.error('desktop console close failed during quit', error);
+      finishQuit();
     });
   });
 

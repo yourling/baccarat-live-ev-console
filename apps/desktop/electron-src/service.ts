@@ -36,13 +36,17 @@ import {
 import {
   BUNDLED_BROWSER_EXTENSION_IDS,
   BUNDLED_BROWSER_EXTENSION_TOKEN,
+  BUNDLED_PLATFORM_DESCRIPTORS,
   BrowserBridgeServer,
+  collapseWinfinityDuplicateTableIds,
   isCompleteBaccaratHand,
   isJoinableNewShoeRoadCount,
   normalizeBgTableId,
+  normalizeWinfinityTableId,
   selectBgRoadCount,
   selectObservedGameCount,
   selectStableGameCount,
+  selectWinfinityRoadCount,
   type BrowserBridgeRuntimeEvent,
 } from '@baccarat/browser-bridge';
 import {
@@ -75,6 +79,32 @@ import {
   type OneShotLiveBetResult,
 } from '../src/api-types.js';
 import {
+  OperationalWagerConsole,
+  type WagerConsoleHost,
+} from './operational-wager-console.js';
+import {
+  MonitorConsole,
+  type MonitorConsoleHost,
+} from './monitor-console.js';
+import {
+  MAX_LIVE_MONITOR_TABLES,
+  MONITOR_TABLE_CONFIG_KEY,
+  TABLE_METADATA_CONFIG_KEY,
+  defaultMonitorTableIds,
+  isLiveDesktopRoomId,
+  isRetiredDefaultMonitorList,
+  monitorTableIdsFromConfig,
+  normalizeMonitorTableIds,
+  normalizeOptionalMonitorTableId,
+  samePersistentTableMetadata,
+  tableMetadataFromConfig,
+  type MonitorFeedTransitionStopResult,
+  type MonitorTableConfig,
+  type StoredTableMetadata,
+  type TableMetadataConfig,
+  type UnifiedBetSettings,
+} from './monitor-shared.js';
+import {
   LiveApprovalStore,
   RuntimeIncidentStore,
   evaluateLiveExecutionReadiness,
@@ -83,43 +113,22 @@ import {
   type RuntimeIncidentSeverity,
 } from './runtime-supervisor.js';
 
-const RETIRED_DEFAULT_MONITOR_TABLE_IDS = ['bc281koreanch281', 'tobcbaccaragen92', 'speedbca14gesbc1', 'h22z8qhp17sa0vkh'] as const;
-const MONITOR_TABLE_CONFIG_KEY = 'desktop:monitor-tables:v1';
 const AUTOMATION_CONFIG_KEY = 'desktop:pair-automation:v1';
-const TABLE_METADATA_CONFIG_KEY = 'desktop:table-metadata:v1';
 const UNIFIED_BET_SETTINGS_CONFIG_KEY = 'desktop:unified-bet-settings:v1';
-const LEGACY_MONITOR_TABLE_ID_PATTERN = /^[A-Z]{1,4}\d{2,6}$/i;
-const PRAGMATIC_MONITOR_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
-const WINFINITY_MONITOR_TABLE_ID_PATTERN = /^[a-z0-9]+-bac\d+$/i;
-const WINFINITY_FALLBACK_MONITOR_TABLE_ID_PATTERN = /^wnf-[a-f0-9]{24}$/i;
 const DISCONNECTED_MONITOR_REMOVAL_MS = 15_000;
 const SHUFFLE_MONITOR_HOLD_MS = 10 * 60 * 1000;
 const MAX_LIVE_FEED_STALENESS_MS = 120_000;
 const LIVE_MONITOR_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000] as const;
-const MAX_LIVE_MONITOR_TABLES = 64;
 const EMPTY_RECORD_COUNTS: DesktopRecordCounts = { events: 0, decisions: 0, ledger: 0 };
 const EMPTY_MONITOR_SUMMARY: MonitorSummary = { rows: [], incomePoints: [] };
 const ACCOUNTING_REFRESH_MIN_MS = 2_000;
 
-type MonitorTableConfig = {
-  readonly tableIds: readonly string[];
-};
+/**
+ * 已提交的预留超过这个时长仍未收到结算，就升级为 UNKNOWN。
+ * 一手牌的结算通常在数秒内到达，10 分钟足以排除正常延迟。
+ */
+const SETTLEMENT_OVERDUE_MS = 10 * 60_000;
 
-type StoredTableMetadata = {
-  readonly tableId: string;
-  readonly roomId: string;
-  readonly updatedAt: string;
-  readonly roomName?: string;
-  readonly displayName?: string;
-  readonly roundId?: string;
-  readonly gameCount?: number;
-};
-
-type TableMetadataConfig = {
-  readonly tables: readonly StoredTableMetadata[];
-};
-
-type UnifiedBetSettings = Pick<TableSettingsUpdate, 'minEV' | 'betTiers' | 'defaultBetAmount'>;
 
 interface OneShotLiveBetActor {
   placeOneShotBet(command: OneShotBetCommand): Promise<OneShotBetResult>;
@@ -129,114 +138,6 @@ function hasOneShotLiveBetActor(value: unknown): value is OneShotLiveBetActor {
   return typeof value === 'object'
     && value !== null
     && typeof Reflect.get(value, 'placeOneShotBet') === 'function';
-}
-
-function isLiveDesktopRoomId(roomId: string): boolean {
-  return roomId === 'dafabet-pragmatic' || roomId === 'dafabet-bg' || roomId === 'dafabet-winfinity';
-}
-
-/**
- * A selection transition must distinguish a feed that stopped, disappeared on
- * its own, and one that may still be delivering events after a failed stop.
- */
-type MonitorFeedTransitionStopResult =
-  | { readonly kind: 'stopped' }
-  | { readonly kind: 'not-current' }
-  | { readonly kind: 'failed'; readonly error: unknown };
-
-function normalizeMonitorTableIds(tableIds: readonly string[], allowEmpty = false): string[] {
-  const normalized: string[] = [];
-  const seen = new Set<string>();
-  for (const rawTableId of tableIds) {
-    const trimmed = rawTableId.trim();
-    const tableId = LEGACY_MONITOR_TABLE_ID_PATTERN.test(trimmed)
-      ? trimmed.toUpperCase()
-      : trimmed.toLowerCase();
-    if (
-      !LEGACY_MONITOR_TABLE_ID_PATTERN.test(tableId)
-      && !PRAGMATIC_MONITOR_TABLE_ID_PATTERN.test(tableId)
-      && !WINFINITY_MONITOR_TABLE_ID_PATTERN.test(tableId)
-      && !WINFINITY_FALLBACK_MONITOR_TABLE_ID_PATTERN.test(tableId)
-    ) {
-      throw new RangeError(`invalid monitor table id: ${rawTableId}`);
-    }
-    if (!seen.has(tableId)) {
-      seen.add(tableId);
-      normalized.push(tableId);
-    }
-  }
-  if (!allowEmpty && normalized.length === 0) {
-    throw new RangeError('at least one monitor table id is required');
-  }
-  return normalized;
-}
-
-function monitorTableIdsFromConfig(value: unknown): string[] | null {
-  if (typeof value !== 'object' || value === null) return null;
-  const tableIds = Reflect.get(value, 'tableIds');
-  if (!Array.isArray(tableIds) || !tableIds.every((tableId): tableId is string => typeof tableId === 'string')) {
-    return null;
-  }
-  try {
-    return normalizeMonitorTableIds(tableIds, true);
-  } catch {
-    return null;
-  }
-}
-
-function normalizeOptionalMonitorTableId(tableId: string): string | undefined {
-  try {
-    return normalizeMonitorTableIds([tableId], true)[0];
-  } catch {
-    return undefined;
-  }
-}
-
-function tableMetadataFromConfig(value: unknown): Map<string, StoredTableMetadata> {
-  const result = new Map<string, StoredTableMetadata>();
-  if (typeof value !== 'object' || value === null) return result;
-  const tables = Reflect.get(value, 'tables');
-  if (!Array.isArray(tables)) return result;
-  for (const entry of tables) {
-    if (typeof entry !== 'object' || entry === null) continue;
-    const tableId = Reflect.get(entry, 'tableId');
-    const roomId = Reflect.get(entry, 'roomId');
-    const updatedAt = Reflect.get(entry, 'updatedAt');
-    if (typeof tableId !== 'string' || typeof roomId !== 'string' || typeof updatedAt !== 'string') continue;
-    const normalized = normalizeOptionalMonitorTableId(tableId);
-    if (normalized === undefined) continue;
-    result.set(normalized, {
-      tableId: normalized,
-      roomId,
-      updatedAt,
-      ...optionalString(entry, 'roomName'),
-      ...optionalString(entry, 'displayName'),
-      ...optionalString(entry, 'roundId'),
-      ...optionalNumber(entry, 'gameCount'),
-    });
-  }
-  return result;
-}
-
-function optionalString(value: object, field: string): Record<string, string> {
-  const raw = Reflect.get(value, field);
-  return typeof raw === 'string' && raw.trim().length > 0 ? { [field]: raw.trim() } : {};
-}
-
-function optionalNumber(value: object, field: string): Record<string, number> {
-  const raw = Reflect.get(value, field);
-  return typeof raw === 'number' && Number.isFinite(raw) ? { [field]: raw } : {};
-}
-
-function samePersistentTableMetadata(
-  left: StoredTableMetadata | undefined,
-  right: StoredTableMetadata,
-): boolean {
-  return left !== undefined
-    && left.tableId === right.tableId
-    && left.roomId === right.roomId
-    && left.roomName === right.roomName
-    && left.displayName === right.displayName;
 }
 
 function discoveredMonitorTableIds(rooms: readonly RoomDescriptor[]): Set<string> {
@@ -298,20 +199,6 @@ function unifiedBetSettingsFromConfig(value: unknown): UnifiedBetSettings | unde
   return { minEV, defaultBetAmount, betTiers: tiers };
 }
 
-function defaultMonitorTableIds(): string[] {
-  const rawTableIds = String(process.env.BACCARAT_LIVE_TABLES || '')
-    .split(',')
-    .map(value => value.trim())
-    .filter(value => value.length > 0);
-  return normalizeMonitorTableIds(rawTableIds, true).slice(0, MAX_LIVE_MONITOR_TABLES);
-}
-
-function isRetiredDefaultMonitorList(tableIds: readonly string[]): boolean {
-  if (tableIds.length !== RETIRED_DEFAULT_MONITOR_TABLE_IDS.length) return false;
-  const expected = new Set<string>(RETIRED_DEFAULT_MONITOR_TABLE_IDS);
-  return tableIds.every(tableId => expected.has(tableId));
-}
-
 export interface DesktopSnapshotOptions extends MonitorSummaryOptions {
   includeHistory?: boolean;
   includeRecordCounts?: boolean;
@@ -350,13 +237,13 @@ function defaultConsoleLimits(): RiskLimits {
   };
 }
 
-export class DesktopConsoleService {
-  private readonly ledger: SqliteLedger;
-  private readonly orchestrator: Orchestrator;
-  private readonly operationalWagers: OperationalWagerCoordinator;
-  private readonly liveApprovals: LiveApprovalStore;
-  private readonly runtimeIncidents: RuntimeIncidentStore;
-  private readonly startupFailCloseTask: Promise<void>;
+export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHost {
+  readonly ledger: SqliteLedger;
+  readonly orchestrator: Orchestrator;
+  readonly operationalWagers: OperationalWagerCoordinator;
+  readonly liveApprovals: LiveApprovalStore;
+  readonly runtimeIncidents: RuntimeIncidentStore;
+  readonly startupFailCloseTask: Promise<void>;
   private currentExecutor: Pick<BrowserAdapter, 'requestBet'> | null;
   private lastSeed?: number;
   private demoRunning = false;
@@ -364,18 +251,18 @@ export class DesktopConsoleService {
   private demoStopRequested = false;
   private demoTask: Promise<void> | null = null;
   private demoError?: string;
-  private browserBridge?: BrowserBridgeServer;
+  browserBridge?: BrowserBridgeServer;
   private browserBridgePort = 0;
   private liveExecutionMode: ExecutionMode = 'live';
-  private readonly liveFeeds = new Map<string, TableExport>();
+  readonly liveFeeds = new Map<string, TableExport>();
   private readonly liveRoomIdsByTable = new Map<string, string>();
-  private readonly tableMetadata: Map<string, StoredTableMetadata>;
+  readonly tableMetadata: Map<string, StoredTableMetadata>;
   private readonly disconnectedMonitorRemovalTimers = new Map<string, NodeJS.Timeout>();
   private readonly shuffleHoldUntilByTable = new Map<string, number>();
   private readonly lastFeedDisconnectReason = new Map<string, string>();
   private readonly runtimeObservedTableIds = new Set<string>();
   private readonly liveAuthorizationSources = new Map<string, 'manual' | 'unattended'>();
-  private persistentLiveGateEnabled = false;
+  persistentLiveGateEnabled = false;
   private transportDownAt?: number;
   private recoverySuppressUntil = 0;
   private readonly tableFlapStats = new Map<string, {
@@ -387,27 +274,33 @@ export class DesktopConsoleService {
   private liveRoomTimer?: NodeJS.Timeout;
   private liveMonitorRetryAttempt = 0;
   private liveMonitorOperation: Promise<void> = Promise.resolve();
-  private liveMonitorActivated = false;
+  liveMonitorActivated = false;
   private liveMonitorStartedAt = 0;
   private readonly connectedThisProcess = new Set<string>();
-  private readonly missedShuffleRequested = new Set<string>();
+  readonly missedShuffleRequested = new Set<string>();
   private oneShotLiveBetInFlight: Promise<OneShotLiveBetResult> | null = null;
   private executionStateOperation: Promise<void> = Promise.resolve();
-  private cachedRecordCounts?: DesktopRecordCounts;
-  private cachedSummary?: MonitorSummary;
+  cachedRecordCounts?: DesktopRecordCounts;
+  cachedSummary?: MonitorSummary;
   private cachedLightSnapshot?: { key: string; at: number; value: DesktopConsoleSnapshot };
   private lastAccountingRefreshAt = 0;
-  private closing = false;
-  private suppressDiscoveredMonitorAutoAdd = false;
+  /** 本进程启动时刻。用于区分"运行期新产生的敞口"与"启动时从账本恢复的历史敞口"。 */
+  private readonly runtimeStartedAt = Date.now();
+  closing = false;
+  suppressDiscoveredMonitorAutoAdd = false;
   private automationEnabled = false;
-  private readonly pendingGameCountByTable = new Map<string, number>();
-  private readonly demotedPendingTableIds = new Set<string>();
-  private readonly demotedPendingShoeIds = new Map<string, string>();
+  readonly pendingGameCountByTable = new Map<string, number>();
+  readonly demotedPendingTableIds = new Set<string>();
+  readonly demotedPendingShoeIds = new Map<string, string>();
   /** The transient allowlist used only while a serialized live transition is being validated. */
-  private pendingMonitorTableIds?: readonly string[];
+  pendingMonitorTableIds?: readonly string[];
   /** Operator-managed, persisted ordered selection; mutation is the configuration operation. */
-  private monitorTableIds: string[];
+  monitorTableIds: string[];
   private unifiedBetSettings?: UnifiedBetSettings;
+  /** 受控下注生命周期切片（execute / reconcile / writeOff / settle）。 */
+  private readonly wagerConsole = new OperationalWagerConsole(this);
+  /** 监控桌生命周期切片（发现表 / promote / demote / 选桌事务）。 */
+  private readonly monitorConsole = new MonitorConsole(this);
 
   constructor(readonly dbPath: string) {
     this.ledger = new SqliteLedger(dbPath);
@@ -498,7 +391,7 @@ export class DesktopConsoleService {
       monitorTableIds: () => this.monitorTableIds,
       keepaliveTableIds: () => this.keepaliveEligibleTableIds(),
       serialize: async operation => await this.enqueueExecutionStateOperation(operation),
-      runtimeBlockReason: (tableId, source) => this.operationalWagerRuntimeBlockReason(tableId, source),
+      runtimeBlockReason: (tableId, source) => this.wagerConsole.runtimeBlockReason(tableId, source),
       onError: error => this.recordLiveMonitorError(error, 'scheduler-failure', 'degraded'),
     });
     this.automationEnabled = automationEnabledFromConfig(
@@ -534,185 +427,75 @@ export class DesktopConsoleService {
   }
 
   private syncLiveApprovalsToMonitorTables(): void {
-    this.liveApprovals.retain(this.monitorTableIds);
-    for (const tableId of this.monitorTableIds) this.liveApprovals.approve(tableId);
+    this.monitorConsole.syncLiveApprovalsToMonitorTables();
   }
 
   private observedGameCount(tableId: string, incoming?: number): number | undefined {
-    if (normalizeBgTableId(tableId) !== undefined) {
-      const accepted = this.browserBridge?.acceptedGameCount(tableId);
-      const reason = this.browserBridge?.shoeEvidence(tableId)?.reason;
-      if (reason === 'protocol-shuffle' && accepted === undefined && incoming !== undefined && incoming > 20) {
-        return undefined;
-      }
-      if (
-        typeof accepted === 'number'
-        && typeof incoming === 'number'
-        && isWrapShapedRoadCount(accepted, incoming)
-      ) {
-        return incoming;
-      }
-      return selectBgRoadCount(accepted, incoming);
-    }
-    return selectObservedGameCount(
-      this.browserBridge?.shoeEvidence(tableId)?.reason,
-      this.browserBridge?.acceptedGameCount(tableId),
-      incoming,
-    );
+    return this.monitorConsole.observedGameCount(tableId, incoming);
   }
 
   private refreshTableMetadataFromRooms(rooms: readonly RoomDescriptor[]): void {
-    let changed = false;
-    const updatedAt = new Date().toISOString();
-    for (const room of rooms) {
-      for (const table of room.tables) {
-        const tableId = normalizeOptionalMonitorTableId(table.tableId);
-        if (tableId === undefined) continue;
-        const existing = this.tableMetadata.get(tableId);
-        const gameCount = this.observedGameCount(tableId, table.gameCount ?? existing?.gameCount);
-        const next: StoredTableMetadata = {
-          tableId,
-          roomId: room.roomId,
-          updatedAt,
-          ...(existing?.roomName === undefined ? {} : { roomName: existing.roomName }),
-          ...(existing?.displayName === undefined ? {} : { displayName: existing.displayName }),
-          ...(existing?.roundId === undefined ? {} : { roundId: existing.roundId }),
-          ...(room.displayName === undefined ? {} : { roomName: room.displayName }),
-          ...(table.displayName === undefined ? {} : { displayName: table.displayName }),
-          ...(table.roundId === undefined ? {} : { roundId: table.roundId }),
-          ...(gameCount === undefined ? {} : { gameCount }),
-        };
-        this.tableMetadata.set(tableId, next);
-        if (!samePersistentTableMetadata(existing, next)) changed = true;
-        if (this.demoteIfGameCountAnomaly(tableId)) {
-          void this.failCloseLiveExecution([tableId]).catch(error => {
-            this.recordLiveMonitorError(error, 'shoe-count-mismatch', 'degraded', tableId);
-          });
-        }
-      }
-    }
-    if (changed) this.persistTableMetadata();
-    this.recoverMissedShuffles(rooms);
+    this.monitorConsole.refreshTableMetadataFromRooms(rooms);
   }
 
-  private recoverMissedShuffles(_rooms: readonly RoomDescriptor[]): void {
-    // Automatic physical shoes come only from protocol token change or road wrap
-    // in the parser. Do not invent a full 8-deck shoe from lagged DOM counts.
-    this.missedShuffleRequested.clear();
+  private copyWinfinityAliasMetadata(): void {
+    this.monitorConsole.copyWinfinityAliasMetadata();
+  }
+
+  private recoverMissedShuffles(rooms: readonly RoomDescriptor[]): void {
+    this.monitorConsole.recoverMissedShuffles(rooms);
   }
 
   private persistTableMetadata(): void {
-    this.ledger.setConfig<TableMetadataConfig>(TABLE_METADATA_CONFIG_KEY, {
-      tables: [...this.tableMetadata.values()].map(table => ({
-        tableId: table.tableId,
-        roomId: table.roomId,
-        updatedAt: table.updatedAt,
-        ...(table.roomName === undefined ? {} : { roomName: table.roomName }),
-        ...(table.displayName === undefined ? {} : { displayName: table.displayName }),
-      })),
-    });
+    this.monitorConsole.persistTableMetadata();
   }
 
   private pendingJoinTableIds(): string[] {
-    const monitored = new Set(this.monitorTableIds);
-    const pending: string[] = [];
-    const add = (tableId: string): void => {
-      if (monitored.has(tableId) || pending.includes(tableId)) return;
-      pending.push(tableId);
-    };
-    for (const tableId of this.demotedPendingTableIds) add(tableId);
-    for (const candidate of this.monitorCandidates()) {
-      if (!isLiveDesktopRoomId(candidate.roomId)) continue;
-      const tableId = normalizeOptionalMonitorTableId(candidate.tableId);
-      if (tableId === undefined) continue;
-      add(tableId);
-    }
-    return pending;
+    return this.monitorConsole.pendingJoinTableIds();
   }
 
   private keepaliveEligibleTableIds(): string[] {
-    return [...this.monitorTableIds];
+    return this.monitorConsole.keepaliveEligibleTableIds();
   }
 
   private observedTableIds(): string[] {
-    const ids = [...this.currentMonitorTableIds()];
-    const seen = new Set(ids);
-    for (const tableId of this.pendingJoinTableIds()) {
-      if (seen.has(tableId)) continue;
-      seen.add(tableId);
-      ids.push(tableId);
-    }
-    return ids;
+    return this.monitorConsole.observedTableIds();
   }
 
   private isObservedTable(tableId: string): boolean {
-    return this.observedTableIds().includes(tableId);
+    return this.monitorConsole.isObservedTable(tableId);
   }
 
   private clearStaleRoadCount(tableId: string): void {
-    const existing = this.tableMetadata.get(tableId);
-    if (existing?.gameCount === undefined) return;
-    const { gameCount: _ignored, ...rest } = existing;
-    this.tableMetadata.set(tableId, { ...rest, updatedAt: new Date().toISOString() });
-    this.persistTableMetadata();
+    this.monitorConsole.clearStaleRoadCount(tableId);
   }
 
   private holdDemotedPendingTable(tableId: string, shoeId?: string): void {
-    this.demotedPendingTableIds.add(tableId);
-    this.demotedPendingShoeIds.set(tableId, shoeId ?? '');
+    this.monitorConsole.holdDemotedPendingTable(tableId, shoeId);
   }
 
   private clearDemotedPendingTable(tableId: string): void {
-    this.demotedPendingTableIds.delete(tableId);
-    this.demotedPendingShoeIds.delete(tableId);
+    this.monitorConsole.clearDemotedPendingTable(tableId);
   }
 
   private canAutoPromotePendingTable(tableId: string, incomingShoeId?: string): boolean {
-    if (!this.demotedPendingTableIds.has(tableId)) return true;
-    const heldShoeId = this.demotedPendingShoeIds.get(tableId) ?? '';
-    const nextShoeId = incomingShoeId
-      ?? this.orchestrator.getActor(tableId)?.getProjection().shoeId
-      ?? '';
-    return nextShoeId.length > 0 && nextShoeId !== heldShoeId;
+    return this.monitorConsole.canAutoPromotePendingTable(tableId, incomingShoeId);
+  }
+
+  private collapsedWinfinityTableIds(tableIds: readonly string[], introduceAliases = true): string[] {
+    return this.monitorConsole.collapsedWinfinityTableIds(tableIds, introduceAliases);
+  }
+
+  private sameTableIdList(left: readonly string[], right: readonly string[]): boolean {
+    return this.monitorConsole.sameTableIdList(left, right);
   }
 
   private promotePendingTable(tableId: string, incomingShoeId?: string): void {
-    if (this.monitorTableIds.includes(tableId)) return;
-    if (this.monitorTableIds.length >= MAX_LIVE_MONITOR_TABLES) return;
-    if (!this.canAutoPromotePendingTable(tableId, incomingShoeId)) return;
-    const nextTableIds = [...this.monitorTableIds, tableId];
-    this.ensureMonitorActors(nextTableIds, this.currentUnifiedTableSettings());
-    this.monitorTableIds = nextTableIds;
-    this.pendingGameCountByTable.delete(tableId);
-    this.clearDemotedPendingTable(tableId);
-    this.runtimeIncidents.resolve('shoe-count-mismatch', tableId);
-    this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
-    this.syncLiveApprovalsToMonitorTables();
-    this.browserBridge?.setSelectedTableIds(this.observedTableIds());
+    this.monitorConsole.promotePendingTable(tableId, incomingShoeId);
   }
 
   private promotePendingTablesFromRooms(rooms: readonly RoomDescriptor[]): void {
-    for (const room of rooms) {
-      if (!isLiveDesktopRoomId(room.roomId)) continue;
-      for (const table of room.tables) {
-        const tableId = normalizeOptionalMonitorTableId(table.tableId);
-        if (tableId === undefined || this.monitorTableIds.includes(tableId)) continue;
-        const evidence = this.browserBridge?.shoeEvidence(tableId);
-        if (isVerifiedPhysicalShoeEvidence(evidence)) {
-          this.promotePendingTable(tableId);
-          if (this.monitorTableIds.includes(tableId)) continue;
-        }
-        const gameCount = table.gameCount;
-        if (!Number.isInteger(gameCount) || (gameCount ?? 0) < 1) continue;
-        const previous = this.pendingGameCountByTable.get(tableId);
-        const stable = normalizeBgTableId(tableId) !== undefined
-          ? selectBgRoadCount(previous, gameCount)
-          : selectStableGameCount(previous, gameCount!);
-        if (stable === undefined) continue;
-        this.pendingGameCountByTable.set(tableId, stable);
-        if (isJoinableNewShoeRoadCount(previous, stable)) this.promotePendingTable(tableId);
-      }
-    }
+    this.monitorConsole.promotePendingTablesFromRooms(rooms);
   }
 
   private demoteAnomalousMonitorTable(
@@ -722,75 +505,25 @@ export class DesktopConsoleService {
     missingCards: number,
     shoeId?: string,
   ): boolean {
-    if (!this.liveMonitorActivated) return false;
-    if (!this.monitorTableIds.includes(tableId)) return false;
-    this.pendingGameCountByTable.set(tableId, roadCount);
-    this.holdDemotedPendingTable(tableId, shoeId);
-    const nextTableIds = this.monitorTableIds.filter(candidate => candidate !== tableId);
-    this.monitorTableIds = nextTableIds;
-    this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
-    this.syncLiveApprovalsToMonitorTables();
-    this.browserBridge?.setSelectedTableIds(this.observedTableIds());
-    this.ensureRuntimeIncident({
-      code: 'shoe-count-mismatch',
-      severity: 'degraded',
-      tableId,
-      message: `缺牌 ${missingCards} 张（内部 #${handNumber}，路子 #${roadCount}），已移出监控，等待下一靴`,
-    });
-    return true;
+    return this.monitorConsole.demoteAnomalousMonitorTable(tableId, handNumber, roadCount, missingCards, shoeId);
+  }
+
+  private scheduleDemotedTableFeedStop(tableId: string): void {
+    this.monitorConsole.scheduleDemotedTableFeedStop(tableId);
   }
 
   private demoteIfGameCountAnomaly(tableId: string): boolean {
-    if (!this.liveMonitorActivated) return false;
-    if (!this.monitorTableIds.includes(tableId)) return false;
-    const actor = this.orchestrator.getActor(tableId);
-    if (!actor) return false;
-    const missingCards = actor.missingUnobservedCardCount();
-    if (missingCards > 10) {
-      const projection = actor.getProjection();
-      const roadCount = this.tableMetadata.get(tableId)?.gameCount
-        ?? this.browserBridge?.acceptedGameCount(tableId)
-        ?? projection.handNumber;
-      return this.demoteAnomalousMonitorTable(
-        tableId,
-        projection.handNumber,
-        roadCount,
-        missingCards,
-        projection.shoeId || undefined,
-      );
-    }
-    return false;
+    return this.monitorConsole.demoteIfGameCountAnomaly(tableId);
   }
 
   private ensureMonitorActors(
     tableIds: readonly string[],
     inheritedSettings?: UnifiedBetSettings,
   ): void {
-    const settings = inheritedSettings ?? this.currentUnifiedTableSettings();
-    for (const tableId of tableIds) {
-      if (!this.orchestrator.getActor(tableId)) {
-        const profile = defaultProfile(tableId);
-        this.orchestrator.registerTable(
-          settings === undefined
-            ? profile
-            : {
-                ...profile,
-                minEV: settings.minEV,
-                betTiers: settings.betTiers.map(tier => ({ ...tier })),
-              },
-          'live',
-          settings?.defaultBetAmount ?? 100,
-        );
-      } else {
-        if (this.orchestrator.getActor(tableId)?.snapshot().executionMode !== 'live') {
-          this.orchestrator.updateTableExecutionMode(tableId, 'live');
-        }
-        this.applyUnifiedBetSettingsToTables([tableId]);
-      }
-    }
+    this.monitorConsole.ensureMonitorActors(tableIds, inheritedSettings);
   }
 
-  private currentUnifiedTableSettings(): UnifiedBetSettings | undefined {
+  currentUnifiedTableSettings(): UnifiedBetSettings | undefined {
     if (this.unifiedBetSettings !== undefined) return cloneUnifiedBetSettings(this.unifiedBetSettings);
     return this.deriveUnifiedBetSettingsFromMonitoredTables();
   }
@@ -816,7 +549,7 @@ export class DesktopConsoleService {
     this.ledger.setConfig(UNIFIED_BET_SETTINGS_CONFIG_KEY, cloneUnifiedBetSettings(settings));
   }
 
-  private applyUnifiedBetSettingsToTables(tableIds: readonly string[]): void {
+  applyUnifiedBetSettingsToTables(tableIds: readonly string[]): void {
     const settings = this.currentUnifiedTableSettings();
     if (settings === undefined) return;
     for (const tableId of tableIds) {
@@ -879,7 +612,7 @@ export class DesktopConsoleService {
     return this.runtimeIncidents.hasActive('settlement-gap', tableId);
   }
 
-  private ensureRuntimeIncident(input: {
+  ensureRuntimeIncident(input: {
     readonly code: RuntimeIncidentCode;
     readonly severity: RuntimeIncidentSeverity;
     readonly message: string;
@@ -893,10 +626,20 @@ export class DesktopConsoleService {
     this.runtimeIncidents.record(input);
   }
 
-  private refreshAccountingIncidents(force = false): void {
+  refreshAccountingIncidents(force = false): void {
     const now = Date.now();
     if (!force && now - this.lastAccountingRefreshAt < ACCOUNTING_REFRESH_MIN_MS) return;
     this.lastAccountingRefreshAt = now;
+    // 已提交（有回执）却长期等不到结算的预留，永远停在 RESERVED 会静默占满
+    // 全局敞口与并发额度。这里把它升级成 UNKNOWN：敞口照旧占用（未知的钱
+    // 不能当没发生），但状态变成显式可勾销，操作员不会再面对一个不可见、
+    // 也无法处置的额度黑洞。
+    this.orchestrator.escalateOverdueReservations(
+      SETTLEMENT_OVERDUE_MS,
+      now,
+      'unsettled-past-timeout',
+      this.runtimeStartedAt,
+    );
     const reservations = this.orchestrator.getReservations();
     const unknownTableIds = new Set(
       reservations
@@ -948,41 +691,6 @@ export class DesktopConsoleService {
     this.ledger.pruneTransientHistory();
     this.ledger.pruneMonitorHistory();
     this.ledger.checkpoint();
-  }
-
-  private trySettleReservedOperationalHand(
-    tableId: string,
-    _shoeId: string,
-    handId?: string,
-  ): void {
-    const reserved = this.orchestrator.getReservations(tableId).filter(reservation =>
-      (
-        reservation.status === 'RESERVED'
-        || (
-          reservation.status === 'UNKNOWN'
-          && reservation.releaseReason === 'hand-settled-without-authoritative-outcome'
-        )
-      )
-      && (handId === undefined || reservation.handId === handId));
-    if (reserved.length === 0) return;
-    const handIds = [...new Set(reserved.map(reservation => reservation.handId))];
-    for (const targetHandId of handIds) {
-      const { playerCards, bankerCards } = this.ledger.listHandCards(tableId, targetHandId);
-      if (!isCompleteBaccaratHand(playerCards, bankerCards)) continue;
-      const outcomes = pairOutcomesFromCards(playerCards, bankerCards);
-      for (const reservation of reserved.filter(candidate => candidate.handId === targetHandId)) {
-        this.orchestrator.recoverAcceptedHandSettlement(
-          tableId,
-          reservation.shoeId,
-          targetHandId,
-          {
-            playerCards,
-            bankerCards,
-            ...(outcomes === undefined ? {} : { outcomes }),
-          },
-        );
-      }
-    }
   }
 
   private detectSettlementGap(
@@ -1116,27 +824,13 @@ export class DesktopConsoleService {
     }
   }
 
-  private operationalWagerRuntimeBlockReason(
-    tableId: string,
-    source?: OperationalWagerSource,
-  ): string | undefined {
-    const actor = this.orchestrator.getActor(tableId);
-    if (actor?.snapshot().executionMode !== 'live') return undefined;
-    const reasons = source === 'manual'
-      ? this.manualLiveTableReasons(tableId)
-      : this.keepaliveTableReasons(tableId);
-    return reasons.length === 0
-      ? undefined
-      : `unattended-runtime-blocked:${reasons.join(',')}`;
-  }
-
-  private keepaliveTableReasons(tableId: string): LiveExecutionBlockReason[] {
+  keepaliveTableReasons(tableId: string): LiveExecutionBlockReason[] {
     // Fail-closed (#16 / AGENTS.md): keepalive is a platform-reaching path and
     // still requires physical-shoe. Do not strip physical-shoe-baseline-unknown.
     return this.liveTableReasons(tableId);
   }
 
-  private manualLiveTableReasons(tableId: string, approved = true): LiveExecutionBlockReason[] {
+  manualLiveTableReasons(tableId: string, approved = true): LiveExecutionBlockReason[] {
     return this.liveTableReasons(tableId, approved);
   }
 
@@ -1206,7 +900,7 @@ export class DesktopConsoleService {
     this.persistentLiveGateEnabled = enabled;
   }
 
-  private async reconcileUnattendedExecution(): Promise<void> {
+  async reconcileUnattendedExecution(): Promise<void> {
     await this.startupFailCloseTask;
     this.refreshAccountingIncidents();
     const selectedTableIds = this.currentMonitorTableIds();
@@ -1365,13 +1059,13 @@ export class DesktopConsoleService {
     return this.ledger.allocateSourceSeq(tableId);
   }
 
-  private enqueueLiveMonitorOperation<T>(operation: () => Promise<T>): Promise<T> {
+  enqueueLiveMonitorOperation<T>(operation: () => Promise<T>): Promise<T> {
     const run = this.liveMonitorOperation.then(operation, operation);
     this.liveMonitorOperation = run.then(() => undefined, () => undefined);
     return run;
   }
 
-  private enqueueExecutionStateOperation<T>(operation: () => Promise<T>): Promise<T> {
+  enqueueExecutionStateOperation<T>(operation: () => Promise<T>): Promise<T> {
     const run = this.executionStateOperation.then(operation, operation);
     this.executionStateOperation = run.then(() => undefined, () => undefined);
     return run;
@@ -1382,14 +1076,14 @@ export class DesktopConsoleService {
     this.orchestrator.setExecutor(executor);
   }
 
-  private setOperationalWagerExecutor(enabled: boolean): void {
+  setOperationalWagerExecutor(enabled: boolean): void {
     this.orchestrator.setOperationalExecutor(enabled ? {
       requestOperationalWager: request =>
         this.browserBridge?.requestOperationalWager(request) ?? Promise.resolve(null),
     } : null);
   }
 
-  private currentMonitorTableIds(): readonly string[] {
+  currentMonitorTableIds(): readonly string[] {
     return this.pendingMonitorTableIds ?? this.monitorTableIds;
   }
 
@@ -1507,10 +1201,10 @@ export class DesktopConsoleService {
       this.refreshAccountingIncidents(true);
     }
     if (event.type === 'cardObserved' || event.type === 'handSettled') {
-      this.trySettleReservedOperationalHand(event.tableId, event.shoeId, event.handId);
+      this.wagerConsole.trySettleReservedHand(event.tableId, event.shoeId, event.handId);
     }
     if (event.type === 'bettingWindowOpened') {
-      this.trySettleReservedOperationalHand(event.tableId, event.shoeId);
+      this.wagerConsole.trySettleReservedHand(event.tableId, event.shoeId);
     }
     if (event.type === 'handSettled') {
       this.resolveSettlementGapIfCleared(event.tableId);
@@ -1567,7 +1261,7 @@ export class DesktopConsoleService {
     await this.operationalWagers.updateKeepalive(settings);
   }
 
-  private recordLiveMonitorError(
+  recordLiveMonitorError(
     error: unknown,
     code: RuntimeIncidentCode = 'monitor-failure',
     severity: RuntimeIncidentSeverity = 'degraded',
@@ -1660,7 +1354,7 @@ export class DesktopConsoleService {
     return 'degraded';
   }
 
-  private async failCloseLiveExecution(tableIds: readonly string[]): Promise<void> {
+  async failCloseLiveExecution(tableIds: readonly string[]): Promise<void> {
     for (const tableId of tableIds) {
       await this.resetMonitorExecutionState(tableId);
     }
@@ -1680,7 +1374,7 @@ export class DesktopConsoleService {
     }
   }
 
-  private async stopLiveFeed(tableId: string, feed: TableExport): Promise<void> {
+  async stopLiveFeed(tableId: string, feed: TableExport): Promise<void> {
     this.cancelDisconnectedMonitorRemoval(tableId);
     if (this.liveFeeds.get(tableId) === feed) {
       this.liveFeeds.delete(tableId);
@@ -1702,7 +1396,7 @@ export class DesktopConsoleService {
    * Retain the old feed until stop succeeds, so a failed transition neither
    * changes the Bridge selection nor creates a duplicate replacement export.
    */
-  private async stopLiveFeedForTransition(
+  async stopLiveFeedForTransition(
     tableId: string,
     feed: TableExport,
   ): Promise<MonitorFeedTransitionStopResult> {
@@ -1964,7 +1658,7 @@ export class DesktopConsoleService {
     return this.enqueueLiveMonitorOperation(() => this.attachLiveTablesInner());
   }
 
-  private async attachLiveTablesInner(): Promise<void> {
+  async attachLiveTablesInner(): Promise<void> {
     const browserBridge = this.browserBridge;
     if (!browserBridge) return;
     const discoveredRooms = browserBridge.getDiscoveredRooms();
@@ -1972,6 +1666,7 @@ export class DesktopConsoleService {
     if (this.liveMonitorActivated && !this.suppressDiscoveredMonitorAutoAdd) {
       this.promotePendingTablesFromRooms(discoveredRooms);
     }
+    await this.applyCollapsedWinfinityMonitorTables();
     browserBridge.setSelectedTableIds(this.observedTableIds());
     if (
       this.monitorTableIds.length === 0
@@ -1985,6 +1680,7 @@ export class DesktopConsoleService {
     if (this.liveMonitorActivated && !this.suppressDiscoveredMonitorAutoAdd) {
       this.promotePendingTablesFromRooms(rooms);
     }
+    await this.applyCollapsedWinfinityMonitorTables();
     const discoveredTableIds = discoveredMonitorTableIds([...discoveredRooms, ...rooms]);
     const discoveryReliable = browserBridge.getExtensionStatus().authenticated
       && discoveredTableIds.size > 0;
@@ -2118,7 +1814,7 @@ export class DesktopConsoleService {
     return this.ledger.isOpen();
   }
 
-  private monitorCandidates(): MonitorTableCandidate[] {
+  monitorCandidates(): MonitorTableCandidate[] {
     const discovered = this.browserBridge?.getDiscoveredRooms() ?? [];
     const candidates = new Map<string, MonitorTableCandidate>();
     for (const room of discovered) {
@@ -2142,7 +1838,32 @@ export class DesktopConsoleService {
         });
       }
     }
-    return [...candidates.values()].sort((left, right) =>
+    const aliases = this.browserBridge?.winfinityLockedAliases();
+    if (aliases !== undefined) {
+      for (const [vendor, publicId] of aliases) {
+        const fallback = `wnf-${vendor}`;
+        if (fallback === publicId) continue;
+        const from = candidates.get(fallback);
+        const to = candidates.get(publicId);
+        if (from === undefined || to === undefined) continue;
+        candidates.set(publicId, {
+          ...to,
+          ...(to.displayName === undefined && from.displayName !== undefined ? { displayName: from.displayName } : {}),
+          ...(to.gameCount === undefined && from.gameCount !== undefined ? { gameCount: from.gameCount } : {}),
+          ...(to.roundId === undefined && from.roundId !== undefined ? { roundId: from.roundId } : {}),
+        });
+      }
+    }
+    const collapsedIds = collapseWinfinityDuplicateTableIds([...candidates.keys()], {
+      aliasByVendor: aliases,
+      tables: [...candidates.values()],
+      preferIds: this.monitorTableIds,
+      introduceAliases: false,
+    });
+    return collapsedIds.flatMap(tableId => {
+      const candidate = candidates.get(tableId);
+      return candidate === undefined ? [] : [candidate];
+    }).sort((left, right) =>
       left.tableId.localeCompare(right.tableId, undefined, { numeric: true }),
     );
   }
@@ -2516,64 +2237,12 @@ export class DesktopConsoleService {
     return await this.enqueueLiveMonitorOperation(() => this.updateMonitorTableIdsInner(nextTableIds));
   }
 
+  private async applyCollapsedWinfinityMonitorTables(): Promise<void> {
+    await this.monitorConsole.applyCollapsedWinfinityMonitorTables();
+  }
+
   private async updateMonitorTableIdsInner(nextTableIds: readonly string[]): Promise<DesktopConsoleSnapshot> {
-    const previousTableIds = [...this.monitorTableIds];
-    const nextTableIdSet = new Set(nextTableIds);
-    const inheritedSettings = this.currentUnifiedTableSettings();
-    this.pendingMonitorTableIds = [...nextTableIds];
-    try {
-      this.ensureMonitorActors(nextTableIds, inheritedSettings);
-      const keepFeedIds = new Set([...nextTableIds, ...this.pendingJoinTableIds()]);
-      const outgoingFeeds = [...this.liveFeeds].filter(([tableId]) => !keepFeedIds.has(tableId));
-      await this.failCloseLiveExecution(outgoingFeeds.map(([tableId]) => tableId));
-
-      // Stop outgoing tables before mutating the Bridge allowlist. The Bridge
-      // prunes exports as a side effect of selection changes, so doing this in
-      // reverse order would make a failed stop ambiguous and could duplicate a
-      // still-active export during rollback.
-      for (const [tableId, feed] of outgoingFeeds) {
-        const stopped = await this.stopLiveFeedForTransition(tableId, feed);
-        if (stopped.kind === 'failed') {
-          this.recordLiveMonitorError(stopped.error);
-          this.pendingMonitorTableIds = undefined;
-          return this.snapshot();
-        }
-      }
-
-      this.browserBridge?.setSelectedTableIds(this.observedTableIds());
-      await this.attachLiveTablesInner();
-      this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: nextTableIds });
-      this.monitorTableIds = [...nextTableIds];
-      for (const tableId of nextTableIds) this.clearDemotedPendingTable(tableId);
-      this.syncLiveApprovalsToMonitorTables();
-      this.pendingMonitorTableIds = undefined;
-      return this.snapshot();
-    } catch (error) {
-      this.pendingMonitorTableIds = undefined;
-      try {
-        const previousTableIdSet = new Set(previousTableIds);
-        // Any feed created for the failed target selection is safe to clean up:
-        // it remains outside the restored allowlist and will not be reopened.
-        const keepRollbackIds = new Set([...previousTableIds, ...this.pendingJoinTableIds()]);
-        for (const [tableId, feed] of [...this.liveFeeds]) {
-          if (keepRollbackIds.has(tableId)) continue;
-          await this.stopLiveFeed(tableId, feed);
-        }
-        this.monitorTableIds = previousTableIds;
-        this.browserBridge?.setSelectedTableIds(this.observedTableIds());
-        this.suppressDiscoveredMonitorAutoAdd = true;
-        try {
-          await this.attachLiveTablesInner();
-        } finally {
-          this.suppressDiscoveredMonitorAutoAdd = false;
-        }
-        this.ledger.setConfig<MonitorTableConfig>(MONITOR_TABLE_CONFIG_KEY, { tableIds: previousTableIds });
-        this.syncLiveApprovalsToMonitorTables();
-      } catch (rollbackError) {
-        this.recordLiveMonitorError(rollbackError);
-      }
-      throw error;
-    }
+    return this.monitorConsole.updateMonitorTableIdsInner(nextTableIds);
   }
 
   async registerTable(
@@ -2648,290 +2317,28 @@ export class DesktopConsoleService {
     readonly amount: number;
     readonly handId?: string;
   }): Promise<OperationalWagerResult & { readonly snapshot: DesktopConsoleSnapshot }> {
-    await this.startupFailCloseTask;
-    const actor = this.orchestrator.getActor(input.tableId);
-    const bridge = this.browserBridge;
-    const gateWasAlreadyEnabled = this.persistentLiveGateEnabled;
-    if (actor && bridge) {
-      this.orchestrator.updateTableExecutionMode(input.tableId, 'live');
-      this.setOperationalWagerExecutor(true);
-      if (!gateWasAlreadyEnabled) {
-        try {
-          bridge.setLiveBetEnabled(true);
-        } catch {
-          // Gate is restored in finally; a missing live session still fails closed in the extension.
-        }
-      }
-    }
-    let result: OperationalWagerResult;
-    try {
-      result = await this.operationalWagers.executeManual(input);
-    } finally {
-      if (actor && bridge && !gateWasAlreadyEnabled) {
-        try {
-          bridge.setLiveBetEnabled(false);
-        } catch {
-          this.persistentLiveGateEnabled = false;
-        }
-      }
-    }
-    if (result.status === 'UNKNOWN') {
-      this.refreshAccountingIncidents(true);
-    }
-    return { ...result, snapshot: this.snapshot() };
+    return this.wagerConsole.execute(input);
   }
 
-  async reconcileUnknownOperationalWager(
+    async reconcileUnknownOperationalWager(
     command: DesktopUnknownWagerReconciliationCommand,
   ): Promise<DesktopConsoleSnapshot> {
-    return await this.enqueueExecutionStateOperation(async () => {
-      await this.startupFailCloseTask;
-      const reservation = this.orchestrator.getReservations()
-        .find(candidate => candidate.reservationId === command.reservationId);
-      if (!reservation) throw new Error(`reservation ${command.reservationId} not found`);
-
-      const record = this.ledger.getOperationalWager(command.wagerId);
-      if (!record) throw new Error(`operational wager ${command.wagerId} not found`);
-      const matchesReservation = record.reservationId === reservation.reservationId
-        && record.wager.wagerId === reservation.intentId
-        && record.wager.tableId === reservation.tableId
-        && record.wager.shoeId === reservation.shoeId
-        && record.wager.handId === reservation.handId
-        && record.wager.market === reservation.market
-        && record.wager.amount === reservation.amount
-        && record.wager.source === reservation.executionSource;
-      if (!matchesReservation) {
-        throw new Error('operational wager does not match the reservation');
-      }
-
-      const receipt = record.receipt;
-      if (!receipt) throw new Error(`operational wager ${command.wagerId} has no platform receipt`);
-      const receiptRaw = receipt.raw;
-      const commitStarted = typeof receiptRaw === 'object'
-        && receiptRaw !== null
-        && Reflect.get(receiptRaw, 'commitStarted') === true;
-      const unknownExecution = record.status === 'UNKNOWN'
-        && commitStarted;
-      const committedRejectedExecution = record.status === 'REJECTED'
-        && receipt.status === 'REJECTED'
-        && commitStarted;
-      if (!unknownExecution && !committedRejectedExecution) {
-        throw new Error(`operational wager ${command.wagerId} is not a reconcilable committed execution`);
-      }
-      if (
-        reservation.status !== 'SETTLED'
-        && (record.status === 'UNKNOWN' ? reservation.status !== 'UNKNOWN' : reservation.status !== 'RELEASED')
-      ) {
-        throw new Error(`reservation ${command.reservationId} does not match the execution receipt state`);
-      }
-      const receiptMatchesWager = receipt.wagerId === record.wager.wagerId
-        && receipt.tableId === record.wager.tableId
-        && receipt.shoeId === record.wager.shoeId
-        && receipt.handId === record.wager.handId
-        && receipt.market === record.wager.market
-        && receipt.amount === record.wager.amount
-        && receipt.source === record.wager.source;
-      if (!receiptMatchesWager) {
-        throw new Error('platform receipt does not match the operational wager');
-      }
-      if (!commitStarted) {
-        throw new Error('platform receipt has no proof that the bet was submitted');
-      }
-
-      const settlement = this.ledger.getHandSettlement(
-        reservation.tableId,
-        reservation.shoeId,
-        reservation.handId,
-      );
-      if (!settlement) {
-        throw new Error('authoritative hand settlement is not available for this exact wager');
-      }
-      if (
-        (reservation.market === 'bankerPair' || reservation.market === 'playerPair')
-        && settlement.outcomes === undefined
-      ) {
-        throw new Error('authoritative pair outcome is not available for this exact wager');
-      }
-
-      if (
-        record.reconciliation !== undefined
-        && (
-          record.reconciliation.status !== 'ACCEPTED'
-          || (
-            record.reconciliation.reason !== 'operator-confirmed-platform-accepted'
-            && record.reconciliation.reason !== 'committed-hand-settled'
-          )
-        )
-      ) {
-        throw new Error('operational wager has an invalid reconciliation audit');
-      }
-      if (reservation.status === 'SETTLED') {
-        if (record.reconciliation === undefined) {
-          throw new Error('settled reservation has no matching reconciliation audit');
-        }
-        return this.snapshot();
-      }
-      const reconciliation = record.reconciliation ?? {
-        status: 'ACCEPTED' as const,
-        reason: 'operator-confirmed-platform-accepted' as const,
-        reconciledAt: new Date().toISOString(),
-      };
-      this.ledger.reconcileOperationalWager(command.wagerId, reconciliation);
-      if (record.status === 'UNKNOWN') {
-        this.orchestrator.settleUnknownReservation(
-          command.reservationId,
-          settlement,
-          reconciliation.reason,
-        );
-      } else {
-        this.orchestrator.settleReleasedReservation(
-          command.reservationId,
-          settlement,
-          reconciliation.reason,
-        );
-      }
-      this.refreshAccountingIncidents(true);
-      this.cachedSummary = undefined;
-      this.cachedRecordCounts = undefined;
-      return this.snapshot();
-    });
+    return this.wagerConsole.reconcileUnknown(command);
   }
 
-  async writeOffUnknownOperationalWager(
+    async writeOffUnknownOperationalWager(
     command: DesktopUnknownWagerWriteOffCommand,
   ): Promise<DesktopConsoleSnapshot> {
-    return await this.enqueueExecutionStateOperation(async () => {
-      await this.startupFailCloseTask;
-      const reservation = this.orchestrator.getReservations()
-        .find(candidate => candidate.reservationId === command.reservationId);
-      if (!reservation) throw new Error(`reservation ${command.reservationId} not found`);
-      if (reservation.status !== 'UNKNOWN') {
-        throw new Error(`reservation ${command.reservationId} is not an UNKNOWN exposure`);
-      }
-
-      const record = command.wagerId ? this.ledger.getOperationalWager(command.wagerId) : undefined;
-      if (record) {
-        const matchesReservation = record.reservationId === reservation.reservationId
-          && record.wager.wagerId === reservation.intentId
-          && record.wager.tableId === reservation.tableId
-          && record.wager.shoeId === reservation.shoeId
-          && record.wager.handId === reservation.handId
-          && record.wager.market === reservation.market
-          && record.wager.amount === reservation.amount
-          && record.wager.source === reservation.executionSource;
-        if (!matchesReservation) {
-          throw new Error('operational wager does not match the reservation');
-        }
-        if (record.status !== 'UNKNOWN') {
-          throw new Error(`operational wager ${command.wagerId} is not an UNKNOWN exposure`);
-        }
-        if (record.reconciliation !== undefined) {
-          throw new Error('operational wager already has a reconciliation audit');
-        }
-        const writeOff = record.writeOff ?? {
-          reason: 'operator-unconfirmed-write-off' as const,
-          writtenOffAt: new Date().toISOString(),
-        };
-        this.ledger.writeOffOperationalWager(record.wager.wagerId, writeOff);
-        this.orchestrator.writeOffUnknownReservation(
-          command.reservationId,
-          writeOff.reason,
-        );
-      } else {
-        this.orchestrator.writeOffUnknownReservation(
-          command.reservationId,
-          'operator-unconfirmed-write-off',
-        );
-      }
-      this.refreshAccountingIncidents(true);
-      this.cachedSummary = undefined;
-      this.cachedRecordCounts = undefined;
-      await this.reconcileUnattendedExecution();
-      return this.snapshot();
-    });
+    return this.wagerConsole.writeOffUnknown(command);
   }
 
-  async settlePendingOperationalWager(
+    async settlePendingOperationalWager(
     command: DesktopPendingSettlementCommand,
   ): Promise<DesktopConsoleSnapshot> {
-    return await this.enqueueExecutionStateOperation(async () => {
-      await this.startupFailCloseTask;
-      const reservation = this.orchestrator.getReservations()
-        .find(candidate => candidate.reservationId === command.reservationId);
-      if (!reservation) throw new Error(`reservation ${command.reservationId} not found`);
-
-      const record = this.ledger.getOperationalWager(command.wagerId);
-      if (!record) throw new Error(`operational wager ${command.wagerId} not found`);
-      const receipt = record.receipt;
-      const matchesReservation = record.reservationId === reservation.reservationId
-        && record.wager.wagerId === reservation.intentId
-        && record.wager.tableId === reservation.tableId
-        && record.wager.shoeId === reservation.shoeId
-        && record.wager.handId === reservation.handId
-        && record.wager.market === reservation.market
-        && record.wager.amount === reservation.amount
-        && record.wager.source === reservation.executionSource;
-      if (!matchesReservation) throw new Error('operational wager does not match the reservation');
-      if (record.status !== 'ACCEPTED' || receipt?.status !== 'ACCEPTED') {
-        throw new Error(`operational wager ${command.wagerId} is not an accepted pending settlement`);
-      }
-      const receiptMatchesWager = receipt.wagerId === record.wager.wagerId
-        && receipt.tableId === record.wager.tableId
-        && receipt.shoeId === record.wager.shoeId
-        && receipt.handId === record.wager.handId
-        && receipt.market === record.wager.market
-        && receipt.amount === record.wager.amount
-        && receipt.source === record.wager.source;
-      if (!receiptMatchesWager) throw new Error('platform receipt does not match the operational wager');
-
-      if (
-        command.outcome === 'PUSH'
-        && (reservation.market === 'bankerPair' || reservation.market === 'playerPair')
-      ) {
-        throw new Error('pair wagers cannot be settled as a push');
-      }
-      const realizedPnl = command.outcome === 'WIN'
-        ? reservation.maxProfit
-        : command.outcome === 'LOSS'
-          ? -reservation.maxLoss
-          : 0;
-
-      if (record.settlement !== undefined) {
-        if (
-          record.settlement.outcome !== command.outcome
-          || record.settlement.realizedPnl !== realizedPnl
-          || record.settlement.reason !== 'operator-confirmed-platform-settlement'
-        ) {
-          throw new Error('operational wager already has a different settlement audit');
-        }
-        if (reservation.status === 'SETTLED') return this.snapshot();
-      }
-      if (reservation.status !== 'RESERVED') {
-        throw new Error(`reservation ${command.reservationId} is not awaiting settlement`);
-      }
-      if (this.ledger.getHandSettlement(reservation.tableId, reservation.shoeId, reservation.handId)) {
-        throw new Error('authoritative hand settlement is already available for this exact wager');
-      }
-      const settlement = record.settlement ?? {
-        outcome: command.outcome,
-        realizedPnl,
-        reason: 'operator-confirmed-platform-settlement' as const,
-        settledAt: new Date().toISOString(),
-      };
-      this.ledger.settleOperationalWager(command.wagerId, settlement);
-      this.orchestrator.settleReservedReservationManually(
-        command.reservationId,
-        realizedPnl,
-        settlement.reason,
-      );
-      this.refreshAccountingIncidents(true);
-      this.cachedSummary = undefined;
-      this.cachedRecordCounts = undefined;
-      return this.snapshot();
-    });
+    return this.wagerConsole.settlePending(command);
   }
 
-  async updateKeepaliveSettings(settings: KeepaliveStrategySettings): Promise<DesktopConsoleSnapshot> {
+    async updateKeepaliveSettings(settings: KeepaliveStrategySettings): Promise<DesktopConsoleSnapshot> {
     return await this.enqueueExecutionStateOperation(async () => {
       const current = this.operationalWagers.getKeepaliveState();
       await this.applyKeepaliveSettings({
@@ -3114,17 +2521,6 @@ export class DesktopConsoleService {
       await this.orchestrator.close();
     });
   }
-}
-
-function pairOutcomesFromCards(
-  playerCards: readonly { rank: string }[],
-  bankerCards: readonly { rank: string }[],
-): { bankerPair: boolean; playerPair: boolean } | undefined {
-  if (playerCards.length < 2 || bankerCards.length < 2) return undefined;
-  return {
-    playerPair: playerCards[0]!.rank === playerCards[1]!.rank,
-    bankerPair: bankerCards[0]!.rank === bankerCards[1]!.rank,
-  };
 }
 
 function assertNeverOneShotBetResult(value: never): never {

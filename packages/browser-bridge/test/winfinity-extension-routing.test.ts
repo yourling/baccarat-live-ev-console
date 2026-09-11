@@ -9,6 +9,10 @@ const networkHookSource = readFileSync(
   new URL('../../../apps/browser-extension-winfinity/winfinity-network-hook.js', import.meta.url),
   'utf8',
 );
+const contentSource = readFileSync(
+  new URL('../../../apps/browser-extension-winfinity/content.js', import.meta.url),
+  'utf8',
+);
 const manifest = JSON.parse(readFileSync(
   new URL('../../../apps/browser-extension-winfinity/manifest.json', import.meta.url),
   'utf8',
@@ -30,6 +34,11 @@ describe('Winfinity extension routing', () => {
     expect(networkHookSource).toContain('baccarat-bridge-winfinity-ws');
     expect(networkHookSource).toContain('youngpoisson.xyz');
     expect(networkHookSource).not.toContain('autoBet');
+    expect(contentSource).toContain('emitLaunchMapping');
+    expect(contentSource).toContain('baccarat-bridge-winfinity-state');
+    expect(contentSource).toContain('baccarat-multitable');
+    expect(contentSource).toContain("location.origin + '/'");
+    expect(contentSource).not.toContain('fetch(location.href');
   });
 
   it('is included in extension syntax check dirs', () => {

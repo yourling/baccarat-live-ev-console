@@ -26,15 +26,10 @@ const PROTOCOL_CAPTURE_SOURCES = new Set([
 const betRequests = new Map();
 const pragmaticProtocolWindows = new Map();
 let liveBetSessionEnabled = false;
-const BRIDGE_SESSION_ID = [
-  'bridge',
-  Date.now().toString(36),
-  Math.random().toString(36).slice(2, 12),
-].join('-');
-let bridgeMessageSeq = 0;
 let pragmaticBetInputBusy = false;
-let executorProfileId = '';
-let executorLease = null; // { leaseId, profileId, secret }
+
+// 共享 WS 管线：连接/重连/心跳/序号/发件箱/租约（定义 socket、send、connect 等）。
+importScripts('bridge-client.js');
 
 function notePragmaticOutboundSend(message) {
   if (
@@ -155,12 +150,6 @@ function isTrustedGameSender(sender) {
     && !!sender.tab
     && isGameTabUrl(sender.url || sender.tab.url);
 }
-let socket = null;
-let socketGeneration = 0;
-let activeSocketGeneration = 0;
-let reconnectTimer = null;
-let heartbeatTimer = null;
-let reconnectDelay = 1000;
 let keeperTabId = null;
 let keeperCreationPromise = null;
 
@@ -339,19 +328,33 @@ async function connect() {
   });
 }
 
-function isCurrentSocket(connection, generation) {
-  return socket === connection && activeSocketGeneration === generation;
+function bridgeOnSocketOpen() {
+  void replayRuntimeStateInGameFrames();
 }
 
-function invalidateSocket(connection, generation) {
-  if (!isCurrentSocket(connection, generation)) return false;
+function bridgeOnSocketClose() {
+  // 断线即视为 live 会话失效，与旧 invalidateSocket 行为一致。
   liveBetSessionEnabled = false;
   executorLease = null;
   activeSocketGeneration = 0;
   socket = null;
-  stopBridgeHeartbeat();
-  scheduleReconnect();
-  return true;
+}
+
+function bridgeHeartbeatExtras() {
+  return { socketGeneration: activeSocketGeneration, pendingOutbox: outbox.length };
+}
+
+function bridgeOnSocketMessage(message, generation) {
+  if (message.kind === 'betRequest') {
+    void handleBetRequest(message, generation);
+    return;
+  }
+  if (message.kind === 'command') {
+    const tableIds = Array.isArray(message.tableIds)
+      ? message.tableIds.filter(value => typeof value === 'string')
+      : [];
+    void handleRemoteCommand(String(message.name || ''), tableIds, generation);
+  }
 }
 
 function assertLiveBetSession(generation) {
@@ -1252,41 +1255,6 @@ function handleBetRequest(message, generation) {
   return operation;
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer) return;
-  const delay = Math.round(reconnectDelay * (0.7 + Math.random() * 0.6));
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connect();
-  }, delay);
-  reconnectDelay = Math.min(reconnectDelay * 2, 15000);
-}
-
-function sendBridgeHeartbeat() {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-  send({
-    kind: 'heartbeat',
-    timestamp: new Date().toISOString(),
-    socketGeneration: activeSocketGeneration,
-    pendingOutbox: outbox.length,
-  });
-  return true;
-}
-
-function scheduleBridgeHeartbeat() {
-  if (heartbeatTimer) return;
-  heartbeatTimer = setTimeout(() => {
-    heartbeatTimer = null;
-    if (sendBridgeHeartbeat()) scheduleBridgeHeartbeat();
-  }, BRIDGE_HEARTBEAT_INTERVAL_MS);
-}
-
-function stopBridgeHeartbeat() {
-  if (!heartbeatTimer) return;
-  clearTimeout(heartbeatTimer);
-  heartbeatTimer = null;
-}
-
 function ensureBridgeReconnectAlarm() {
   if (!chrome.alarms?.create) return;
   chrome.alarms.create(BRIDGE_RECONNECT_ALARM, { periodInMinutes: 0.5 });
@@ -1304,67 +1272,12 @@ chrome.runtime.onConnect.addListener(port => {
   sendBridgeHeartbeat();
 });
 
-const OUTBOX_LIMIT = 500;
-const outbox = [];
-
-function sendBetResult(message, generation) {
-  if (
-    !socket
-    || !isCurrentSocket(socket, generation)
-    || socket.readyState !== WebSocket.OPEN
-  ) {
-    return false;
-  }
-  try {
-    socket.send(JSON.stringify(withBridgeSequence(message)));
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
 function isProtocolNetworkCapture(message) {
   if (!message || message.kind !== 'networkCapture') return false;
   if (message.encoding === 'base64') return false;
   if (typeof message.data === 'string' && message.data.length > 16_384) return false;
   if (PROTOCOL_CAPTURE_SOURCES.has(message.source)) return true;
   return /pragmaticplaylive\.net\/game/i.test(String(message.url || ''));
-}
-
-function send(message) {
-  if (message && message.kind === 'betResult') return;
-  if (message && message.kind === 'networkCapture' && !isProtocolNetworkCapture(message)) return;
-  const sequenced = withBridgeSequence(message);
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(sequenced));
-    return;
-  }
-  // 断线/重连窗口内排队,重连后按序补发,避免牌局消息被静默丢弃。
-  if (outbox.length >= OUTBOX_LIMIT) outbox.shift();
-  outbox.push(sequenced);
-}
-
-function withBridgeSequence(message) {
-  return {
-    ...message,
-    bridgeSessionId: BRIDGE_SESSION_ID,
-    bridgeSeq: ++bridgeMessageSeq,
-  };
-}
-
-function flushOutbox() {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  while (outbox.length > 0) {
-    const message = outbox.shift();
-    if (message && message.kind === 'betResult') continue;
-    if (message && message.kind === 'networkCapture' && !isProtocolNetworkCapture(message)) continue;
-    try {
-      socket.send(JSON.stringify(message));
-    } catch (_) {
-      outbox.unshift(message);
-      break;
-    }
-  }
 }
 
 /** 本机桥重连后，要求每个游戏 frame 重放当前已解码的运行时牌面和可见桌台选择。 */

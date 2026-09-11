@@ -32,7 +32,11 @@ apps/desktop/.trae/
 apps/desktop/skills/
 apps/lord-god-space/
 
-# Local scratch dumps
-/tmp-*
-/.tmp-*
+# Local scratch dumps / one-off agent patch scripts
+tmp-*
+.tmp-*
+_patch*
+_q_*
+*.dmp
+.debug-journal.md
 
