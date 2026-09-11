@@ -1,9 +1,9 @@
 import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 
-const { JSDOM } = createRequire(import.meta.url)('jsdom') as {
+const nativeModule = (process as any).getBuiltinModule ? (process as any).getBuiltinModule('module') : await import('node:module');
+const { JSDOM } = nativeModule.createRequire(import.meta.url)('jsdom') as {
   JSDOM: new (...args: any[]) => any;
 };
 

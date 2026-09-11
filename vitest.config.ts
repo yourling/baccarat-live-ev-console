@@ -8,6 +8,6 @@ export default defineConfig({
         external: [/better-sqlite3/]
       }
     },
-    pool: 'forks'
+    pool: 'vmThreads'
   }
 });
