@@ -47,6 +47,7 @@ import type {
 } from './protocol.js';
 import { inspectPragmaticWsFrame } from './pragmatic-protocol.js';
 import type { ParserShoeEvidence } from './runtime-common.js';
+import type { BeadHand } from './runtime-common.js';
 import { PragmaticPlatformAdapter } from './platform-pragmatic.js';
 import { BgPlatformAdapter } from './platform-bg.js';
 import { WinfinityPlatformAdapter } from './platform-winfinity.js';
@@ -1361,6 +1362,15 @@ export class BrowserBridgeServer implements RoomMonitor {
     for (const adapter of [...this.platformAdapters].reverse()) {
       const evidence = adapter.shoeEvidence(tableId);
       if (evidence !== undefined) return evidence;
+    }
+    return undefined;
+  }
+
+  /** 当前靴珠盘序列（结果 + 对子标记）；无认领平台或无数据时返回 undefined。 */
+  tableBeads(tableId: string): readonly BeadHand[] | undefined {
+    for (const adapter of [...this.platformAdapters].reverse()) {
+      const beads = adapter.beadSequence?.(tableId);
+      if (beads !== undefined) return beads;
     }
     return undefined;
   }

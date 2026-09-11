@@ -10,6 +10,7 @@ import type { PlatformAdapterDescriptor } from '@baccarat/adapter-contract';
 import { EVENT_SCHEMA_VERSION, defaultProfile, type NormalizedEvent } from '@baccarat/contracts';
 import type { BridgeRoomDescriptor } from './protocol.js';
 import type { ParserShoeEvidence } from './runtime-common.js';
+import type { BeadHand } from './runtime-common.js';
 
 /** 扩展上报的 networkCapture 消息中平台相关的切片。 */
 export interface PlatformCaptureMessage {
@@ -114,6 +115,11 @@ export interface BridgePlatformAdapter {
   currentShoeId(tableId: string): string | undefined;
   acceptedGameCount(tableId: string): number | undefined;
   shoeEvidence(tableId: string): ParserShoeEvidence | undefined;
+  /**
+   * 当前靴珠盘序列（结果 + 对子标记）；该平台不认领此桌时返回 undefined
+   * （默认平台不得用空数组抢占其他平台的桌）。
+   */
+  beadSequence?(tableId: string): readonly BeadHand[] | undefined;
 
   // -- 生命周期 ------------------------------------------------------------------
 

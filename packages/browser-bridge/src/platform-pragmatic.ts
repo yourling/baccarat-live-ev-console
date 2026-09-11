@@ -25,6 +25,7 @@ import {
   type PlatformCaptureMessage,
 } from './platform-adapter.js';
 import type { ParserShoeEvidence } from './runtime-common.js';
+import type { BeadHand } from './runtime-common.js';
 
 const PRAGMATIC_TABLE_ID_PATTERN = /^[a-z0-9]{8,32}$/i;
 
@@ -209,6 +210,11 @@ export class PragmaticPlatformAdapter implements BridgePlatformAdapter {
 
   shoeEvidence(tableId: string): ParserShoeEvidence | undefined {
     return this.parser.shoeEvidence(tableId);
+  }
+
+  beadSequence(tableId: string): readonly BeadHand[] | undefined {
+    if (!this.parser.hasShoeState(tableId)) return undefined;
+    return this.parser.beadSequence(tableId);
   }
 
   roomTableDisplayName(_tableId: string): string | undefined {

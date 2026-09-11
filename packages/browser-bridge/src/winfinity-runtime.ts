@@ -7,6 +7,7 @@ import {
   type ShoeBaseline,
 } from '@baccarat/contracts';
 import { WINFINITY_PLATFORM_ID } from '@baccarat/adapter-contract';
+import { beadSequenceFromHands, type BeadHand } from './runtime-common.js';
 
 const PAIR_MARKETS = ['bankerPair', 'playerPair'] as const;
 
@@ -309,6 +310,22 @@ export class WinfinityRuntimeParser {
   shoeEvidence(tableId: string): ShoeEvidence | undefined {
     const evidence = this.evidenceByTable.get(tableId);
     return evidence === undefined ? undefined : { ...evidence };
+  }
+
+  /** 该桌是否有解析器靴状态（适配器据此声明珠盘数据归属）。 */
+  hasShoeState(tableId: string): boolean {
+    return this.currentShoeId.has(tableId);
+  }
+
+  /** 当前靴珠盘序列（结果 + 对子标记）。cardsByHand 按靴清空，天然只含本靴。 */
+  beadSequence(tableId: string): BeadHand[] {
+    const prefix = `${tableId}:`;
+    const hands: Array<{ handId: string; playerCards: HandCards['playerCards']; bankerCards: HandCards['bankerCards'] }> = [];
+    for (const [key, cards] of this.cardsByHand) {
+      if (!key.startsWith(prefix)) continue;
+      hands.push({ handId: key.slice(prefix.length), playerCards: cards.playerCards, bankerCards: cards.bankerCards });
+    }
+    return beadSequenceFromHands(hands);
   }
 
   acceptedGameCount(tableId: string): number | undefined {

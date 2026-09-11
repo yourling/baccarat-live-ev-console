@@ -43,7 +43,10 @@ import { resolveVisibleHandCards } from './hand-cards';
 import { disconnectedMonitorTableIds, monitorDisplayedConnection } from './monitor-connection';
 import { isDisplayedPhysicalShoe, isVerifiedPhysicalShoeReason, monitorDisplayedRoundLabel } from './monitor-round';
 import { isLiveMonitorRoomId, selectLiveMonitorTableIds } from './monitor-table-selection';
-import { evaluateProjectionPairMarket } from './pair-evaluation';
+import { evaluateProjectionMainMarkets, evaluateProjectionPairMarket } from './pair-evaluation';
+import { STANDARD_COMMISSION_BACCARAT_TERMS } from '@baccarat/orchestrator';
+import { BeadLegend, BeadPlate } from './bead-plate';
+import './bead-plate.css';
 import { decisionHandExplanation, planRecordViewChange, recordKindForView, recordTabCount, type ConsoleView } from './record-view';
 import { PerformanceCard } from './performance-card';
 import { RiskCenter } from './risk-center';
@@ -57,6 +60,7 @@ type MarketFilter = FilterValue | ExecutionMarket;
 type MonitorSortKey = 'name' | 'status' | 'round' | 'betting' | 'connection' | 'auto' | 'remaining' | 'ev';
 type MonitorSort = { readonly key: MonitorSortKey; readonly dir: 'asc' | 'desc' };
 type DecisionFilter = FilterValue | 'eligible' | 'ineligible';
+type DecisionOutcomeFilter = FilterValue | 'settled' | 'unknown' | 'pending' | 'unsettled';
 type EventFilter = FilterValue | NormalizedEvent['type'];
 type MonitorDropTarget = {
   readonly tableId: string;
@@ -113,6 +117,7 @@ interface RecordQueryFilters {
   tableId: string;
   market: MarketFilter;
   decision: DecisionFilter;
+  outcome: DecisionOutcomeFilter;
   event: EventFilter;
   search: string;
   startTime: string;
@@ -204,6 +209,7 @@ export function App() {
   const [connectionFilter, setConnectionFilter] = useState<ConnectionStatus | FilterValue>('all');
   const [autoBetFilter, setAutoBetFilter] = useState<AutoBetStatus | FilterValue>('all');
   const [decisionFilter, setDecisionFilter] = useState<DecisionFilter>('all');
+  const [decisionOutcomeFilter, setDecisionOutcomeFilter] = useState<DecisionOutcomeFilter>('all');
   const [eventFilter, setEventFilter] = useState<EventFilter>('all');
   const [startTime, setStartTime] = useState('');
   const [endTime, setEndTime] = useState('');
@@ -214,6 +220,7 @@ export function App() {
     tableId: 'all',
     market: 'all',
     decision: 'all',
+    outcome: 'all',
     event: 'all',
     search: '',
     startTime: '',
@@ -224,6 +231,7 @@ export function App() {
   const [monitorTableSaving, setMonitorTableSaving] = useState(false);
   const [reconcilingReservationId, setReconcilingReservationId] = useState<string | null>(null);
   const [selectedMonitorTableId, setSelectedMonitorTableId] = useState<string | null>(null);
+  const [monitorDetailTableId, setMonitorDetailTableId] = useState<string | null>(null);
   const [monitorSort, setMonitorSort] = useState<MonitorSort | null>(null);
   const [pendingLiveExecutionTableId, setPendingLiveExecutionTableId] = useState<string | null>(null);
   const [alertCenterOpen, setAlertCenterOpen] = useState(false);
@@ -307,11 +315,12 @@ export function App() {
     tableId: tableFilter,
     market: marketFilter,
     decision: decisionFilter,
+    outcome: decisionOutcomeFilter,
     event: eventFilter,
     search: query,
     startTime,
     endTime,
-  }), [tableFilter, marketFilter, decisionFilter, eventFilter, query, startTime, endTime]);
+  }), [tableFilter, marketFilter, decisionFilter, decisionOutcomeFilter, eventFilter, query, startTime, endTime]);
 
   const loadRecords = useCallback(async () => {
     if (!window.desktop) return;
@@ -331,6 +340,7 @@ export function App() {
       market: activeRecordFilters.market === 'all' ? undefined : activeRecordFilters.market,
       eventType: kind === 'events' && activeRecordFilters.event !== 'all' ? activeRecordFilters.event : undefined,
       eligible: kind === 'decisions' && activeRecordFilters.decision !== 'all' ? activeRecordFilters.decision === 'eligible' : undefined,
+      outcome: kind === 'decisions' && activeRecordFilters.outcome !== 'all' ? activeRecordFilters.outcome : undefined,
       search: activeRecordFilters.search,
       fromTime: activeRecordFilters.startTime || undefined,
       toTime: activeRecordFilters.endTime || undefined,
@@ -361,7 +371,7 @@ export function App() {
   useEffect(() => {
     if (recordKindForView(view)) return;
     setPage(1);
-  }, [view, tableFilter, query, marketFilter, statusFilter, connectionFilter, autoBetFilter, decisionFilter, eventFilter, startTime, endTime, pageSize]);
+  }, [view, tableFilter, query, marketFilter, statusFilter, connectionFilter, autoBetFilter, decisionFilter, decisionOutcomeFilter, eventFilter, startTime, endTime, pageSize]);
 
   useEffect(() => {
     if (view !== 'ledger' && view !== 'overview' && (marketFilter === 'banker' || marketFilter === 'player')) {
@@ -439,6 +449,13 @@ export function App() {
       compareMonitorTables(left, right, monitorSort.key, tableLabel, monitorMetadata.get(left.tableId), monitorMetadata.get(right.tableId), snapshot?.shoeEvidence, snapshot?.runtime.tables) * direction
     ));
   }, [view, visibleTables, monitorSort, tableLabel, monitorMetadata, snapshot?.shoeEvidence]);
+
+  // 珠盘路子 + 四市场 EV 详情桌（默认取第一张监控桌）。
+  const monitorDetailTable = useMemo(() => {
+    const ids = visibleTables.map(table => table.tableId);
+    if (monitorDetailTableId !== null && ids.includes(monitorDetailTableId)) return monitorDetailTableId;
+    return ids[0] ?? null;
+  }, [visibleTables, monitorDetailTableId]);
 
   function toggleMonitorSort(key: MonitorSortKey): void {
     setMonitorSort(current => {
@@ -1036,6 +1053,15 @@ export function App() {
               <option value="ineligible">未达到条件</option>
             </select>
           </FilterControl>}
+          {view === 'decisions' && <FilterControl label="结算状态">
+            <select value={decisionOutcomeFilter} onChange={event => setDecisionOutcomeFilter(event.target.value as DecisionOutcomeFilter)}>
+              <option value="all">全部状态</option>
+              <option value="settled">已结算</option>
+              <option value="pending">待结算</option>
+              <option value="unknown">结算无权威结果</option>
+              <option value="unsettled">无权威结果（含待结算）</option>
+            </select>
+          </FilterControl>}
           {view === 'events' && <FilterControl label="事件类型">
             <select value={eventFilter} onChange={event => setEventFilter(event.target.value as EventFilter)}>
               <option value="all">全部事件</option>
@@ -1151,6 +1177,80 @@ export function App() {
         </main>
       )}
 
+      {view === 'monitor' && monitorDetailTable !== null && (() => {
+        const detailActor = tableMap.get(monitorDetailTable);
+        if (detailActor === undefined) return null;
+        const beads = snapshot?.tableBeads?.[monitorDetailTable] ?? [];
+        const metadataGameCount = monitorMetadata.get(monitorDetailTable)?.gameCount;
+        const physicalKnown = isDisplayedPhysicalShoe(
+          monitorDetailTable,
+          detailActor.projection,
+          snapshot?.shoeEvidence?.[monitorDetailTable],
+          metadataGameCount,
+        );
+        const pairEv = (market: BettingMarket) => physicalKnown
+          ? safeEvaluate(detailActor.projection.profileSnapshot, market, detailActor.projection.seenCards, detailActor.projection.remainingCounts)
+          : null;
+        const bankerPairEvaluation = pairEv('bankerPair');
+        const playerPairEvaluation = pairEv('playerPair');
+        let mainEvaluation: ReturnType<typeof evaluateProjectionMainMarkets> | null = null;
+        if (physicalKnown) {
+          try {
+            mainEvaluation = evaluateProjectionMainMarkets(
+              detailActor.projection.profileSnapshot,
+              STANDARD_COMMISSION_BACCARAT_TERMS,
+              detailActor.projection.seenCards,
+              detailActor.projection.remainingCounts,
+            );
+          } catch {
+            mainEvaluation = null;
+          }
+        }
+        const pct = (value: number) => `${(value * 100).toFixed(2)}%`;
+        const evMarkets: Array<{ label: string; ev: number | null; probability: string }> = [
+          { label: '庄', ev: mainEvaluation ? mainEvaluation.evBanker : null, probability: mainEvaluation ? `P ${pct(mainEvaluation.pBanker)}` : 'P —' },
+          { label: '闲', ev: mainEvaluation ? mainEvaluation.evPlayer : null, probability: mainEvaluation ? `P ${pct(mainEvaluation.pPlayer)}` : 'P —' },
+          { label: '庄对', ev: bankerPairEvaluation ? bankerPairEvaluation.evMean : null, probability: bankerPairEvaluation ? `P ${pct(bankerPairEvaluation.pMean)}` : 'P —' },
+          { label: '闲对', ev: playerPairEvaluation ? playerPairEvaluation.evMean : null, probability: playerPairEvaluation ? `P ${pct(playerPairEvaluation.pMean)}` : 'P —' },
+        ];
+        return (
+          <section className="record-section monitor-detail" aria-labelledby="monitor-detail-title">
+            <div className="section-heading monitor-section__toolbar">
+              <span id="monitor-detail-title">珠盘路子 · 四市场 EV</span>
+              <select
+                className="input"
+                value={monitorDetailTable}
+                onChange={event => setMonitorDetailTableId(event.target.value)}
+                aria-label="选择详情牌桌"
+              >
+                {visibleTables.map(table => (
+                  <option key={table.tableId} value={table.tableId}>{tableLabel(table.tableId)}</option>
+                ))}
+              </select>
+            </div>
+            <div className="monitor-detail__body">
+              <div className="monitor-detail__beads">
+                {beads.length > 0
+                  ? <BeadPlate beads={beads} ariaLabel={`${tableLabel(monitorDetailTable)} 当前靴珠盘，共 ${beads.length} 局`} />
+                  : <div className="empty-state"><strong>暂无珠盘数据</strong>{physicalKnown ? '等待本靴首局结算。' : '需要实体牌靴确认后才展示。'}</div>}
+                <BeadLegend />
+              </div>
+              <div className="ev-market-grid" aria-label="四市场期望值">
+                {evMarkets.map(market => (
+                  <div key={market.label} className={cx('ev-market-card', market.ev !== null && market.ev > 0 && 'ev-market-card--positive')}>
+                    <span className="ev-market-card__label">{market.label}</span>
+                    <strong className="ev-market-card__ev">{market.ev === null ? '—' : pct(market.ev)}</strong>
+                    <span className="ev-market-card__p">{market.probability}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <p className="muted monitor-detail__note">
+              庄/闲按受控下注条款（庄 0.95、闲 1、和局 push）计 EV；对子按桌台赔率计 EV。非实体牌靴不展示估值。
+            </p>
+          </section>
+        );
+      })()}
       {view === 'monitor' && (
         <div className="platform-chips" aria-label="厅房（第一期仅展示）">
           {platformChips.map(chip => (

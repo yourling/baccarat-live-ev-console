@@ -336,6 +336,8 @@ export interface DesktopRecordQuery extends DesktopSnapshotOptions {
   eventType?: string;
   search?: string;
   eligible?: boolean;
+  /** 审计按结算状态筛选（仅 decisions；与 DecisionHandOutcomeFilter 同口径）。 */
+  outcome?: 'settled' | 'unknown' | 'pending' | 'unsettled';
 }
 
 export interface LedgerPageRow {
@@ -372,6 +374,14 @@ export interface DesktopShoeEvidence {
   readonly gameCount?: number;
 }
 
+/** 珠盘路子单局（当前靴，桥解析器投影）。 */
+export interface DesktopBeadHand {
+  readonly handId: string;
+  readonly result: 'banker' | 'player' | 'tie';
+  readonly bankerPair: boolean;
+  readonly playerPair: boolean;
+}
+
 export interface DesktopRecordCounts {
   events: number;
   decisions: number;
@@ -387,6 +397,7 @@ export interface DesktopConsoleSnapshot {
   monitorCandidates: readonly MonitorTableCandidate[];
   tableMetadata: readonly MonitorTableCandidate[];
   shoeEvidence: Readonly<Record<string, DesktopShoeEvidence>>;
+  tableBeads: Readonly<Record<string, readonly DesktopBeadHand[]>>;
   recordCounts: DesktopRecordCounts;
   keepalive: DesktopKeepaliveState;
   automation: DesktopAutomationState;

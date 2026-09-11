@@ -1,4 +1,4 @@
-export const CONSOLE_VERSION = '1.0.18';
+export const CONSOLE_VERSION = '1.0.19';
 
 export interface ConsoleBuildInfo {
   readonly version: string;

@@ -1,0 +1,155 @@
+.bead-plate {
+  --bead-size: 26px;
+  display: grid;
+  grid-auto-flow: column;
+  gap: 3px;
+  padding: 10px;
+  border: 1px solid #2d3e4e;
+  border-radius: 7px;
+  background: #0d1620;
+  width: fit-content;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.bead-plate--compact {
+  --bead-size: 16px;
+  gap: 2px;
+  padding: 6px;
+}
+
+.bead {
+  position: relative;
+  width: var(--bead-size);
+  height: var(--bead-size);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+
+.bead__label {
+  font-size: calc(var(--bead-size) * 0.42);
+  font-weight: 800;
+  line-height: 1;
+  color: #ffffff;
+  pointer-events: none;
+}
+
+.bead--empty {
+  border: 1px dashed #22303d;
+  background: transparent;
+}
+
+.bead--banker {
+  background: #c0392b;
+  border: 1px solid #e0604f;
+}
+
+.bead--player {
+  background: #2f6fd0;
+  border: 1px solid #5b93e0;
+}
+
+.bead--tie {
+  background: #1fa860;
+  border: 1px solid #4ec98b;
+}
+
+.bead__mark {
+  position: absolute;
+  width: calc(var(--bead-size) * 0.34);
+  height: calc(var(--bead-size) * 0.34);
+  border-radius: 50%;
+  border: 1px solid #ffffff;
+}
+
+.bead__mark--banker {
+  top: -1px;
+  left: -1px;
+  background: #e23a2a;
+}
+
+.bead__mark--player {
+  top: -1px;
+  right: -1px;
+  background: #2f6fd0;
+}
+
+.bead-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin-top: 8px;
+  color: #8ea3b3;
+  font-size: 11px;
+}
+
+.bead-legend__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.bead-legend__item .bead {
+  width: 14px;
+  height: 14px;
+}
+
+.monitor-detail__body {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.monitor-detail__beads {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ev-market-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(110px, 1fr));
+  gap: 10px;
+  flex: 1;
+  min-width: 320px;
+}
+
+.ev-market-card {
+  border: 1px solid #2d3e4e;
+  border-radius: 7px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: #111c26;
+}
+
+.ev-market-card__label {
+  font-size: 11px;
+  color: #8ea3b3;
+  font-weight: 800;
+}
+
+.ev-market-card__ev {
+  font-size: 18px;
+  color: #d9e6ed;
+}
+
+.ev-market-card--positive .ev-market-card__ev {
+  color: #4ec98b;
+}
+
+.ev-market-card__p {
+  font-size: 11px;
+  color: #8ea3b3;
+}
+
+.monitor-detail__note {
+  margin-top: 10px;
+  font-size: 11px;
+}

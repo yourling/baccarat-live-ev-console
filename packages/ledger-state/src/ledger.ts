@@ -218,12 +218,24 @@ export interface DecisionHandRecord {
   readonly actualResult: DecisionHandActualResult;
 }
 
+/**
+ * 审计按结算状态筛选（SQL HAVING，精确匹配 table/shoe/hand 的 handSettled 事件）：
+ * - settled：已有带权威 outcomes 的结算（与 actualResult.status='SETTLED' 同口径）
+ * - unknown：已有结算但缺 outcomes（settlementActualResult 的 UNKNOWN）
+ * - pending：尚无任何该局结算事件（actualResult.status='PENDING' 的主路径）
+ * - unsettled：无权威结果（unknown + pending）
+ * 注意：JS 侧 actualResult 另有 (tableId, handId) 身份回填与"过期决策" UNKNOWN
+ * 两条派生路径，SQL 过滤无法覆盖这两个边界；筛选结果按精确键口径，属保守子集。
+ */
+export type DecisionHandOutcomeFilter = 'settled' | 'unknown' | 'pending' | 'unsettled';
+
 export interface DecisionHandPageOptions extends MonitorSummaryOptions {
   readonly page: number;
   readonly pageSize: number;
   readonly market?: string;
   readonly search?: string;
   readonly eligible?: boolean;
+  readonly outcome?: DecisionHandOutcomeFilter;
 }
 
 export interface DecisionHandRecordPage {
@@ -334,13 +346,52 @@ function decisionHandScope(options: DecisionHandPageOptions): {
     clauses.push('(table_id LIKE ? OR payload LIKE ?)');
     params.push(term, term);
   }
+  // 结算状态过滤走 HAVING（按 table/shoe/hand 分组后的每手判定）。走
+  // idx_events_table_type 索引（table_id, type），json_extract 只作用于该桌的
+  // 少量 handSettled 事件。裸列名 table_id/shoe_id/hand_id 在 HAVING 中解析为
+  // 分组列。
+  const havingClauses: string[] = [];
+  const havingParams: number[] = [];
+  if (options.eligible !== undefined) {
+    havingClauses.push("MAX(CASE WHEN json_extract(payload, '$.eligible') = 1 THEN 1 ELSE 0 END) = ?");
+    havingParams.push(options.eligible ? 1 : 0);
+  }
+  if (options.outcome) {
+    const settledExists = [
+      "EXISTS (SELECT 1 FROM events e",
+      "WHERE e.type = 'handSettled'",
+      'AND e.table_id = table_id',
+      "AND json_extract(e.payload, '$.shoeId') = shoe_id",
+      "AND json_extract(e.payload, '$.handId') = hand_id",
+      "AND json_extract(e.payload, '$.outcomes.bankerPair') IS NOT NULL)",
+    ].join(' ');
+    const anySettlementExists = [
+      "EXISTS (SELECT 1 FROM events e",
+      "WHERE e.type = 'handSettled'",
+      'AND e.table_id = table_id',
+      "AND json_extract(e.payload, '$.shoeId') = shoe_id",
+      "AND json_extract(e.payload, '$.handId') = hand_id)",
+    ].join(' ');
+    switch (options.outcome) {
+      case 'settled':
+        havingClauses.push(settledExists);
+        break;
+      case 'unknown':
+        havingClauses.push(`${anySettlementExists} AND NOT ${settledExists}`);
+        break;
+      case 'pending':
+        havingClauses.push(`NOT ${anySettlementExists}`);
+        break;
+      case 'unsettled':
+        havingClauses.push(`NOT ${settledExists}`);
+        break;
+    }
+  }
   return {
     where: clauses.join(' AND '),
     params,
-    having: options.eligible === undefined
-      ? ''
-      : "HAVING MAX(CASE WHEN json_extract(payload, '$.eligible') = 1 THEN 1 ELSE 0 END) = ?",
-    havingParams: options.eligible === undefined ? [] : [options.eligible ? 1 : 0],
+    having: havingClauses.length === 0 ? '' : `HAVING ${havingClauses.join(' AND ')}`,
+    havingParams,
   };
 }
 

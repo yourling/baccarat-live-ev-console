@@ -169,6 +169,63 @@ export function isCompleteBaccaratHand(
 }
 
 // ---------------------------------------------------------------------------
+// 珠盘路子（bead plate）投影：当前靴每局结果 + 对子标记，供中控 UI 渲染。
+// ---------------------------------------------------------------------------
+
+export type BeadResult = 'banker' | 'player' | 'tie';
+
+export interface BeadHand {
+  readonly handId: string;
+  readonly result: BeadResult;
+  readonly bankerPair: boolean;
+  readonly playerPair: boolean;
+}
+
+export function beadResultOf(
+  playerCards: readonly { rank: string }[],
+  bankerCards: readonly { rank: string }[],
+): BeadResult {
+  const player = handScore(playerCards);
+  const banker = handScore(bankerCards);
+  return banker === player ? 'tie' : banker > player ? 'banker' : 'player';
+}
+
+function compareBeadHandId(a: string, b: string): number {
+  const na = Number(a);
+  const nb = Number(b);
+  if (Number.isSafeInteger(na) && Number.isSafeInteger(nb) && `${na}` === a && `${nb}` === b) {
+    return na - nb;
+  }
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * 从逐手牌数据推导珠盘序列。仅收录完整成局的牌（与结算判定 isCompleteBaccaratHand
+ * 同源），避免把仍在发牌中的最后一手画进路子。按局号升序，最多保留一靴 80 局。
+ */
+export function beadSequenceFromHands(
+  hands: Iterable<{
+    readonly handId: string;
+    readonly playerCards: readonly { rank: string }[];
+    readonly bankerCards: readonly { rank: string }[];
+  }>,
+): BeadHand[] {
+  const beads: BeadHand[] = [];
+  for (const hand of hands) {
+    if (hand.playerCards.length < 2 || hand.bankerCards.length < 2) continue;
+    if (!isCompleteBaccaratHand(hand.playerCards, hand.bankerCards)) continue;
+    beads.push({
+      handId: hand.handId,
+      result: beadResultOf(hand.playerCards, hand.bankerCards),
+      bankerPair: hand.bankerCards[0]!.rank === hand.bankerCards[1]!.rank,
+      playerPair: hand.playerCards[0]!.rank === hand.playerCards[1]!.rank,
+    });
+  }
+  beads.sort((a, b) => compareBeadHandId(a.handId, b.handId));
+  return beads.slice(-MAX_BACCARAT_SHOE_HANDS);
+}
+
+// ---------------------------------------------------------------------------
 // 快照解析器基类
 // ---------------------------------------------------------------------------
 
@@ -294,6 +351,22 @@ export abstract class SnapshotRuntimeParserBase {
 
   protected rememberHandCards(tableId: string, handId: string, cards: HandCards): void {
     this.cardsByHand.set(`${tableId}:${handId}`, cards);
+  }
+
+  /** 当前靴珠盘序列（结果 + 对子标记）。cardsByHand 按靴清空，天然只含本靴。 */
+  beadSequence(tableId: string): BeadHand[] {
+    const prefix = `${tableId}:`;
+    const hands: Array<{ handId: string; playerCards: HandCards['playerCards']; bankerCards: HandCards['bankerCards'] }> = [];
+    for (const [key, cards] of this.cardsByHand) {
+      if (!key.startsWith(prefix)) continue;
+      hands.push({ handId: key.slice(prefix.length), playerCards: cards.playerCards, bankerCards: cards.bankerCards });
+    }
+    return beadSequenceFromHands(hands);
+  }
+
+  /** 该桌是否有解析器靴状态（用于适配器声明珠盘数据归属，避免默认平台误认领）。 */
+  hasShoeState(tableId: string): boolean {
+    return this.shoeIdByTable.has(tableId);
   }
 
   protected lastRoundFor(tableId: string): string | undefined {

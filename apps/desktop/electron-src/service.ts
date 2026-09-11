@@ -75,6 +75,7 @@ import {
   type DesktopUnknownWagerReconciliationCommand,
   type DesktopUnknownWagerWriteOffCommand,
   type DesktopShoeEvidence,
+  type DesktopBeadHand,
   type MonitorTableCandidate,
   type OneShotLiveBetCommand,
   type OneShotLiveBetResult,
@@ -1554,6 +1555,13 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
       }),
     );
     const snapshot: OrchestratorSnapshot = { ...fullSnapshot, tables };
+    const tableBeads: Record<string, readonly DesktopBeadHand[]> = {};
+    if (this.browserBridge) {
+      for (const tableId of displayedTableIds) {
+        const beads = this.browserBridge.tableBeads(tableId);
+        if (beads !== undefined && beads.length > 0) tableBeads[tableId] = beads;
+      }
+    }
     const filterToDisplayedTables = <T extends { tableId: string }>(rows: readonly T[]): T[] =>
       usingLiveMonitor ? rows.filter(row => activeTableIds.has(row.tableId)) : [...rows];
     const keepalive = this.operationalWagers.getKeepaliveState();
@@ -1582,6 +1590,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
       monitorCandidates,
       tableMetadata,
       shoeEvidence,
+      tableBeads,
       recordCounts,
       keepalive,
       automation: { enabled: this.automationEnabled },

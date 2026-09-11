@@ -1597,6 +1597,62 @@ describe('decision hand records', () => {
     ledger.close();
   });
 
+  it('filters decision hands by settlement outcome status', () => {
+    // Given: h1 已带权威结算；h2 有结算但缺 outcomes（UNKNOWN）；h3 无结算（PENDING）。
+    const ledger = new SqliteLedger();
+    for (const [index, handId] of ['h1', 'h2', 'h3'].entries()) {
+      const createdAt = `2026-08-24T01:0${index}:00.000Z`;
+      ledger.saveDecision(decision(`d-${handId}-banker`, handId, 'bankerPair', true, createdAt));
+      ledger.saveDecision(decision(`d-${handId}-player`, handId, 'playerPair', true, createdAt));
+    }
+    ledger.appendEvent({
+      type: 'handSettled',
+      eventId: 'settled-h1',
+      tableId: 't1',
+      timestamp: '2026-08-24T01:01:30.000Z',
+      sourceSeq: 1,
+      shoeId: 'shoe-1',
+      handId: 'h1',
+      playerCards: [{ rank: 'A' }, { rank: 'K' }],
+      bankerCards: [{ rank: 'Q' }, { rank: 'Q' }],
+      outcomes: { bankerPair: true, playerPair: false },
+    });
+    ledger.appendEvent({
+      type: 'handSettled',
+      eventId: 'settled-h2-no-outcomes',
+      tableId: 't1',
+      timestamp: '2026-08-24T01:02:30.000Z',
+      sourceSeq: 2,
+      shoeId: 'shoe-1',
+      handId: 'h2',
+      playerCards: [{ rank: 'A' }, { rank: 'K' }],
+      bankerCards: [{ rank: 'Q' }, { rank: 'Q' }],
+    } as never);
+
+    // Then: settled / unknown / pending / unsettled 各自精确匹配，total 与 rows 一致。
+    const settled = ledger.listDecisionHandsPage({ page: 1, pageSize: 20, outcome: 'settled' });
+    expect(settled.total).toBe(1);
+    expect(settled.rows.map(row => row.handId)).toEqual(['h1']);
+    expect(settled.rows[0]?.actualResult.status).toBe('SETTLED');
+
+    const unknown = ledger.listDecisionHandsPage({ page: 1, pageSize: 20, outcome: 'unknown' });
+    expect(unknown.total).toBe(1);
+    expect(unknown.rows.map(row => row.handId)).toEqual(['h2']);
+
+    const pending = ledger.listDecisionHandsPage({ page: 1, pageSize: 20, outcome: 'pending' });
+    expect(pending.total).toBe(1);
+    expect(pending.rows.map(row => row.handId)).toEqual(['h3']);
+    expect(pending.rows[0]?.actualResult.status).toBe('PENDING');
+
+    const unsettled = ledger.listDecisionHandsPage({ page: 1, pageSize: 20, outcome: 'unsettled' });
+    expect(unsettled.total).toBe(2);
+    expect(unsettled.rows.map(row => row.handId).sort()).toEqual(['h2', 'h3']);
+
+    const all = ledger.listDecisionHandsPage({ page: 1, pageSize: 20 });
+    expect(all.total).toBe(3);
+    ledger.close();
+  });
+
   it('keeps identical hand ids isolated across tables and shoes when attaching settlements', () => {
     // Given: the same platform hand id appears in three distinct table/shoe scopes.
     const ledger = new SqliteLedger();

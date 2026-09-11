@@ -222,3 +222,185 @@ export function evaluatePairMarketFromRemaining(
 export function defaultInitialCounts(decks: number): Counts {
   return initialDeckCounts(decks) as unknown as Counts;
 }
+
+// ---------------------------------------------------------------------------
+// 庄/闲/和主市场：从剩余库存精确计算概率（标准第三张牌规则）。
+// ---------------------------------------------------------------------------
+
+function rankPoint(rank: CardRank): number {
+  if (rank === 'A') return 1;
+  if (rank === '10' || rank === 'J' || rank === 'Q' || rank === 'K') return 0;
+  return Number(rank);
+}
+
+function bankerThirdDraws(bankerTotal: number, playerThirdPoint: number | undefined): boolean {
+  if (playerThirdPoint === undefined) return bankerTotal <= 5;
+  if (bankerTotal <= 2) return true;
+  if (bankerTotal === 3) return playerThirdPoint !== 8;
+  if (bankerTotal === 4) return playerThirdPoint >= 2 && playerThirdPoint <= 7;
+  if (bankerTotal === 5) return playerThirdPoint >= 4 && playerThirdPoint <= 7;
+  if (bankerTotal === 6) return playerThirdPoint === 6 || playerThirdPoint === 7;
+  return false;
+}
+
+export interface MainMarketProbabilities {
+  banker: number;
+  player: number;
+  tie: number;
+}
+
+function addOutcome(
+  result: MainMarketProbabilities,
+  weight: number,
+  playerFinal: number,
+  bankerFinal: number,
+): void {
+  if (bankerFinal > playerFinal) result.banker += weight;
+  else if (playerFinal > bankerFinal) result.player += weight;
+  else result.tie += weight;
+}
+
+/**
+ * 精确后验的庄/闲/和概率：枚举双方两张起手牌的无序组合（不放手权重），
+ * 再按标准第三张牌规则边缘化第三张牌分布。天然 8/9 即停牌。
+ * 剩余不足 4 张时无法成局，返回全 0（调用方按 fail-closed 处理，不渲染 EV）。
+ */
+export function mainMarketProbabilities(remaining: Counts): MainMarketProbabilities {
+  assertCounts(remaining, 'remaining');
+  const result: MainMarketProbabilities = { banker: 0, player: 0, tie: 0 };
+  const total = totalCards(remaining);
+  if (total < 4) return result;
+  const initialTotal2 = (total * (total - 1)) / 2;
+
+  // 双方起手牌的无序组合 {a, b}（a ≤ b，按牌面点数序不重要，直接按 rank 枚举）。
+  const hands: Array<{ a: CardRank; b: CardRank }> = [];
+  for (let i = 0; i < CARD_RANKS.length; i++) {
+    for (let j = i; j < CARD_RANKS.length; j++) {
+      hands.push({ a: CARD_RANKS[i]!, b: CARD_RANKS[j]! });
+    }
+  }
+
+  const handWeight = (counts: Counts, a: CardRank, b: CardRank, denomTotal: number): number => {
+    if (a === b) {
+      const n = counts[a]!;
+      return n >= 2 ? ((n * (n - 1)) / 2) / ((denomTotal * (denomTotal - 1)) / 2) : 0;
+    }
+    return (counts[a]! * counts[b]!) / ((denomTotal * (denomTotal - 1)) / 2);
+  };
+
+  for (const playerHand of hands) {
+    const wPlayerHand = handWeight(remaining, playerHand.a, playerHand.b, total);
+    if (wPlayerHand === 0) continue;
+    const afterPlayer = { ...remaining };
+    afterPlayer[playerHand.a]! -= 1;
+    afterPlayer[playerHand.b]! -= 1;
+    const totalAfterPlayer = total - 2;
+
+    for (const bankerHand of hands) {
+      const wBankerHand = handWeight(afterPlayer, bankerHand.a, bankerHand.b, totalAfterPlayer);
+      if (wBankerHand === 0) continue;
+      const weight = wPlayerHand * wBankerHand;
+      const afterInitial = { ...afterPlayer };
+      afterInitial[bankerHand.a]! -= 1;
+      afterInitial[bankerHand.b]! -= 1;
+      const totalAfterInitial = total - 4;
+
+      const playerInitial = (rankPoint(playerHand.a) + rankPoint(playerHand.b)) % 10;
+      const bankerInitial = (rankPoint(bankerHand.a) + rankPoint(bankerHand.b)) % 10;
+
+      // 天然 8/9：双方停牌，直接比较。
+      if (playerInitial >= 8 || bankerInitial >= 8) {
+        addOutcome(result, weight, playerInitial, bankerInitial);
+        continue;
+      }
+
+      const playerDraws = playerInitial <= 5;
+      if (!playerDraws || totalAfterInitial === 0) {
+        // 闲家停牌（或无牌可补）：庄家按 0-5 补牌规则处理。
+        const bankerDraws = bankerThirdDraws(bankerInitial, undefined) && totalAfterInitial > 0;
+        if (!bankerDraws) {
+          addOutcome(result, weight, playerInitial, bankerInitial);
+          continue;
+        }
+        for (const u of CARD_RANKS) {
+          const n = afterInitial[u]!;
+          if (n === 0) continue;
+          const bankerFinal = (bankerInitial + rankPoint(u)) % 10;
+          addOutcome(result, weight * (n / totalAfterInitial), playerInitial, bankerFinal);
+        }
+        continue;
+      }
+
+      // 闲家补第三张；庄家按标准规则依据闲家第三张牌面决定是否补牌。
+      for (const t of CARD_RANKS) {
+        const nt = afterInitial[t]!;
+        if (nt === 0) continue;
+        const wPlayerThird = weight * (nt / totalAfterInitial);
+        const playerFinal = (playerInitial + rankPoint(t)) % 10;
+        const afterPlayerThird = { ...afterInitial };
+        afterPlayerThird[t]! -= 1;
+        const totalAfterPlayerThird = totalAfterInitial - 1;
+
+        if (!bankerThirdDraws(bankerInitial, rankPoint(t)) || totalAfterPlayerThird === 0) {
+          addOutcome(result, wPlayerThird, playerFinal, bankerInitial);
+          continue;
+        }
+        for (const u of CARD_RANKS) {
+          const n = afterPlayerThird[u]!;
+          if (n === 0) continue;
+          const bankerFinal = (bankerInitial + rankPoint(u)) % 10;
+          addOutcome(result, wPlayerThird * (n / totalAfterPlayerThird), playerFinal, bankerFinal);
+        }
+      }
+    }
+  }
+
+  const sum = result.banker + result.player + result.tie;
+  if (sum > 0) {
+    result.banker /= sum;
+    result.player /= sum;
+    result.tie /= sum;
+  }
+  return result;
+}
+
+export interface MainMarketEvaluation {
+  pBanker: number;
+  pPlayer: number;
+  pTie: number;
+  evBanker: number;
+  evPlayer: number;
+}
+
+/**
+ * 庄/闲主市场 EV（和局 push：庄只在闲赢时输，反之亦然）。
+ * 赔率来自受控下注条款（如 STANDARD_COMMISSION_BACCARAT_TERMS）。
+ */
+export function evaluateMainMarketsFromRemaining(
+  bankerOdds: OddsConfig,
+  playerOdds: OddsConfig,
+  remainingCounts: Counts,
+): MainMarketEvaluation {
+  assertCounts(remainingCounts, 'remainingCounts');
+  const p = mainMarketProbabilities(remainingCounts);
+  return {
+    pBanker: p.banker,
+    pPlayer: p.player,
+    pTie: p.tie,
+    evBanker: bankerOdds.netWin * p.banker - bankerOdds.loss * p.player,
+    evPlayer: playerOdds.netWin * p.player - playerOdds.loss * p.banker,
+  };
+}
+
+export function evaluateMainMarketsFromObserved(
+  bankerOdds: OddsConfig,
+  playerOdds: OddsConfig,
+  numberOfDecks: number,
+  observedCards: Card[],
+): MainMarketEvaluation {
+  if (!Array.isArray(observedCards)) throw new TypeError('observedCards must be an array');
+  for (const card of observedCards) assertValidCard(card, 'observedCards');
+  const initial = initialDeckCounts(numberOfDecks);
+  const remaining = subtractCounts(initial as unknown as Counts, cardCountsFromList(observedCards));
+  return evaluateMainMarketsFromRemaining(bankerOdds, playerOdds, remaining);
+}

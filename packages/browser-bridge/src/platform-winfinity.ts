@@ -17,6 +17,7 @@ import type {
   PlatformCaptureMessage,
 } from './platform-adapter.js';
 import type { ParserShoeEvidence } from './runtime-common.js';
+import type { BeadHand } from './runtime-common.js';
 
 export const WINFINITY_WS_ALIAS_BUFFER_LIMIT = 32;
 
@@ -171,6 +172,11 @@ export class WinfinityPlatformAdapter implements BridgePlatformAdapter {
 
   shoeEvidence(tableId: string): ParserShoeEvidence | undefined {
     return this.parser.shoeEvidence(tableId);
+  }
+
+  beadSequence(tableId: string): readonly BeadHand[] | undefined {
+    if (!this.parser.hasShoeState(tableId)) return undefined;
+    return this.parser.beadSequence(tableId);
   }
 
   roomTableDisplayName(tableId: string): string | undefined {
