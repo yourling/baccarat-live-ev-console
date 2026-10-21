@@ -28,3 +28,29 @@ jobs:
 
       - name: Test
         run: npm run test
+
+  # FIX(D-P1-12): 打包产物验证。
+  # 修复前 `package:win` 只跑 build:web + build:electron，不跑类型检查/测试，
+  # CI 也从不打包 —— "main.cjs 里没有未内联的 @baccarat/* require" 这条保证
+  # 没有任何守卫（review 脚本 b10 只是人工跑过）。
+  # 独立 job 是因为要在 Node 22 上构建 electron bundle；Windows 原生模块
+  # better-sqlite3 的 ABI 校验在 ubuntu 上同样可验证（也是 Node ABI，不是 Electron ABI）。
+  package-verify:
+    name: verify packaged bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build desktop bundles (main + renderer)
+        run: npm run build:desktop -w @baccarat/desktop
+
+      - name: Verify packaged bundle
+        run: npm run verify:package -w @baccarat/desktop

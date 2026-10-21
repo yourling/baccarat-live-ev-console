@@ -40,12 +40,16 @@ export interface WagerConsoleHost {
   /** 快照缓存；受控下注落账后失效。 */
   cachedSummary?: MonitorSummary;
   cachedRecordCounts?: DesktopRecordCounts;
+  /** FIX(D-P2-4): 写路径用轻量快照（includeHistory:false），不拉全量历史。 */
+  readonly lightWriteSnapshotOptions: DesktopSnapshotOptions;
   snapshot(options?: DesktopSnapshotOptions): DesktopConsoleSnapshot;
   enqueueExecutionStateOperation<T>(operation: () => Promise<T>): Promise<T>;
   refreshAccountingIncidents(force?: boolean): void;
   setOperationalWagerExecutor(enabled: boolean): void;
-  manualLiveTableReasons(tableId: string, approved?: boolean): LiveExecutionBlockReason[];
-  keepaliveTableReasons(tableId: string): LiveExecutionBlockReason[];
+  /** FIX(D-P1-6): 全局 blocked 事故码（tableId === undefined），参与执行门控。 */
+  activeGlobalBlockedIncidentCode(): string | undefined;
+  manualLiveTableReasons(tableId: string, approved?: boolean, allowNewAuthorization?: boolean): LiveExecutionBlockReason[];
+  keepaliveTableReasons(tableId: string, requireAuthorization?: boolean): LiveExecutionBlockReason[];
   reconcileUnattendedExecution(): Promise<void>;
 }
 
@@ -206,7 +210,7 @@ export class OperationalWagerConsole {
         if (record.reconciliation === undefined) {
           throw new Error('settled reservation has no matching reconciliation audit');
         }
-        return this.host.snapshot();
+        return this.host.snapshot(this.host.lightWriteSnapshotOptions);
       }
       const reconciliation = record.reconciliation ?? {
         status: 'ACCEPTED' as const,
@@ -230,7 +234,7 @@ export class OperationalWagerConsole {
       this.host.refreshAccountingIncidents(true);
       this.host.cachedSummary = undefined;
       this.host.cachedRecordCounts = undefined;
-      return this.host.snapshot();
+      return this.host.snapshot(this.host.lightWriteSnapshotOptions);
     });
   }
 
@@ -284,7 +288,7 @@ export class OperationalWagerConsole {
       this.host.cachedSummary = undefined;
       this.host.cachedRecordCounts = undefined;
       await this.host.reconcileUnattendedExecution();
-      return this.host.snapshot();
+      return this.host.snapshot(this.host.lightWriteSnapshotOptions);
     });
   }
 
@@ -341,7 +345,7 @@ export class OperationalWagerConsole {
         ) {
           throw new Error('operational wager already has a different settlement audit');
         }
-        if (reservation.status === 'SETTLED') return this.host.snapshot();
+        if (reservation.status === 'SETTLED') return this.host.snapshot(this.host.lightWriteSnapshotOptions);
       }
       if (reservation.status !== 'RESERVED') {
         throw new Error(`reservation ${command.reservationId} is not awaiting settlement`);
@@ -364,7 +368,7 @@ export class OperationalWagerConsole {
       this.host.refreshAccountingIncidents(true);
       this.host.cachedSummary = undefined;
       this.host.cachedRecordCounts = undefined;
-      return this.host.snapshot();
+      return this.host.snapshot(this.host.lightWriteSnapshotOptions);
     });
   }
 
@@ -411,10 +415,24 @@ export class OperationalWagerConsole {
     // serialize 走的就是 enqueueExecutionStateOperation），因此能挡住"排在
     // close() 之后才被调度"的下注 —— 那时桥已经开始拆除。
     if (this.host.closing) return 'console-closing';
+    // FIX(D-P1-6): 全局 blocked 事故（桥认证失败 / 断联 / 连续性失效 /
+    // 会话恢复耗尽，且 tableId === undefined）必须参与执行门控。
+    // 修复前它们只影响 runtime.status 与 UI 横幅：桥仍可能"已认证、连接数 1"，
+    // 单桌 reasons 为空，于是操作员看到"已阻断"却仍能手写下真金（a1b 实证）。
+    // 放在 actor/executionMode 检查**之前**，避免"该桌刚好没 actor 就直接放行"。
+    const globalBlock = this.host.activeGlobalBlockedIncidentCode();
+    if (globalBlock !== undefined) return `runtime-blocked:${globalBlock}`;
     const actor = this.host.orchestrator.getActor(tableId);
     if (actor?.snapshot().executionMode !== 'live') return undefined;
+    // FIX(D-P0-1): 门控按来源分流 ——
+    //  · keepalive（无人值守）必须有**既有**授权（liveAuthorizationSources 命中）；
+    //  · manual 允许**本次调用建立**授权（execute() 会临时打开 live gate 并执行，
+    //    授权由 setExecutionMode / reconcileUnattendedExecution 之外的手动入口补写，
+    //    因此不能把"尚未授权"当成手动阻断，否则首次手动下注会被锁死）。
+    // 修复前两条路径都只查 liveTableReasons，完全不看授权：多桌时被撤销授权的桌
+    // 在 promote 后首个窗口仍能发真金（a1h/a1d 实证）。
     const reasons = source === 'manual'
-      ? this.host.manualLiveTableReasons(tableId)
+      ? this.host.manualLiveTableReasons(tableId, true)
       : this.host.keepaliveTableReasons(tableId);
     return reasons.length === 0
       ? undefined

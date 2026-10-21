@@ -7,6 +7,10 @@ export const RUNTIME_INCIDENT_CONFIG_KEY = 'desktop:runtime-incidents:v1';
 export type RuntimeIncidentCode =
   | 'bridge-auth-failed'
   | 'bridge-disconnected'
+  // FIX(P0-1): 扩展已连上但本机身份（installId）尚未被操作员批准。
+  // degraded 而非 blocked：pending 连接拿不到 lease、收不到 betRequest，
+  // 执行路径本身仍是 fail-closed，这里只是让操作员知道"有一台待批准的扩展"。
+  | 'bridge-extension-pairing-required'
   | 'continuity-invalidated'
   | 'table-feed-stale'
   | 'session-recovery-exhausted'
@@ -264,7 +268,14 @@ export type LiveExecutionBlockReason =
   | 'table-connection-not-restored'
   | 'shoe-sealed'
   | 'unknown-execution-pending'
-  | 'settlement-gap';
+  | 'settlement-gap'
+  // FIX(D-P0-1): 无人值守运行授权本身也是执行门控条件。修复前
+  // `liveTableReasons` 只转调 `evaluateLiveExecutionReadiness`，完全不看
+  // `liveAuthorizationSources`，于是多桌场景下"已被系统撤销授权的桌"仍能在
+  // promote 后第一个下注窗口发出真金保活请求（review 脚本 a1h/a1d 实证）。
+  // 注意：**只有保活/无人值守路径**需要它；手动下注允许本次调用建立授权，
+  // 所以这个 reason 不会出现在手动门控与 UI 手动按钮的禁用原因里。
+  | 'table-not-authorized';
 
 export interface RuntimeBridgeStatus {
   readonly running: boolean;
@@ -373,6 +384,7 @@ function isRuntimeIncident(value: unknown): value is RuntimeIncident {
 function isRuntimeIncidentCode(value: unknown): value is RuntimeIncidentCode {
   return value === 'bridge-auth-failed'
     || value === 'bridge-disconnected'
+    || value === 'bridge-extension-pairing-required'
     || value === 'continuity-invalidated'
     || value === 'table-feed-stale'
     || value === 'session-recovery-exhausted'

@@ -47,6 +47,27 @@ function normalizeTableId(value) {
   return trimmed.toUpperCase();
 }
 
+/**
+ * P0-1: 扩展持久身份（installId）。
+ *
+ * 扩展 ID 由 manifest 公钥推导、token 是打包明文常量，两者都不是身份边界；
+ * 真正的边界是「本机 installId + 操作员批准」。installId 首次运行随机生成并存
+ * chrome.storage.local，跨重连/跨 SW 重启不变；桥未批准前只回 pairingRequired。
+ */
+async function loadBridgeInstallId() {
+  const stored = await chrome.storage.local.get({ bridgeInstallId: '' });
+  if (typeof stored.bridgeInstallId === 'string' && /^[a-zA-Z0-9._-]{8,128}$/.test(stored.bridgeInstallId)) {
+    return stored.bridgeInstallId;
+  }
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  const installId = Array.from(bytes).map(byte => byte.toString(16).padStart(2, '0')).join('');
+  try {
+    await chrome.storage.local.set({ bridgeInstallId: installId });
+  } catch (_) {}
+  return installId;
+}
+
 async function loadFlags() {
   const stored = await chrome.storage.local.get({
     bridgeUrl: DEFAULT_BRIDGE_URL,
@@ -116,6 +137,15 @@ function bridgeOnSocketOpen() {
 }
 
 function bridgeOnSocketMessage(message, generation) {
+  // P0-1: 未批准的 installId 只会收到 pairingRequired；此时不下注、不上报牌桌数据。
+  if (message.kind === 'pairingRequired') {
+    console.warn('[bridge] awaiting operator approval for this extension install');
+    return;
+  }
+  if (message.kind === 'pairingApproved') {
+    console.info('[bridge] extension install approved by operator');
+    return;
+  }
   if (message.kind === 'betRequest') void handleBetRequest(message, generation);
   if (message.kind === 'command') void handleCommand(message, generation);
 }

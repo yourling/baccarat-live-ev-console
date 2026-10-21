@@ -29,6 +29,12 @@ const api = {
     ipcRenderer.invoke('console:set-auto-bet', tableId, armed, shoeId),
   setExecutionMode: (tableId: string, mode: 'shadow' | 'live') =>
     ipcRenderer.invoke('console:set-execution-mode', tableId, mode),
+  // FIX(D-P0-1): 扩展身份批准面。installId 是完整值（32 hex / UUID），
+  // 只在 IPC 请求里往返；渲染层展示用的是 snapshot.extensionApproval 的短 ID。
+  listPendingExtensions: () => ipcRenderer.invoke('console:list-pending-extensions'),
+  approveExtension: (installId: string) => ipcRenderer.invoke('console:approve-extension', installId),
+  revokeExtension: (installId: string) => ipcRenderer.invoke('console:revoke-extension', installId),
+  extensionApprovalState: () => ipcRenderer.invoke('console:extension-approval-state'),
   executeOneShotLiveBet: (command: OneShotLiveBetCommand): Promise<OneShotLiveBetResult> =>
     ipcRenderer.invoke('console:execute-one-shot-live-bet', command),
   executeOperationalWager: (command: DesktopOperationalWagerCommand): Promise<DesktopOperationalWagerResult> =>

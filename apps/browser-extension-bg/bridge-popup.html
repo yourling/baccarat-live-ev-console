@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Baccarat Bridge 身份</title>
+    <style>
+      body {
+        width: 300px;
+        margin: 0;
+        padding: 14px 16px;
+        font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        font-size: 12px;
+        color: #1D1D1F;
+        background: #FFFFFF;
+      }
+      h1 { margin: 0 0 10px; font-size: 13px; font-weight: 800; }
+      p { margin: 0 0 10px; color: #6E6E73; line-height: 1.55; }
+      .id-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 9px 10px;
+        border: 1px solid #D2D2D7;
+        border-radius: 6px;
+        background: #F5F5F7;
+      }
+      code {
+        flex: 1;
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+        font-size: 14px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        color: #000000;
+      }
+      button {
+        padding: 5px 10px;
+        border: 1px solid #C7C7CC;
+        border-radius: 5px;
+        background: #FFFFFF;
+        color: #0066CC;
+        font-size: 11px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      button:hover { background: #F5F5F7; }
+      .hint {
+        margin-top: 10px;
+        padding: 8px 10px;
+        border-left: 3px solid #B25000;
+        background: #FFF8F0;
+        color: #6E6E73;
+        line-height: 1.55;
+      }
+      .status { margin-top: 10px; color: #248A3D; font-weight: 700; }
+    </style>
+  </head>
+  <body>
+    <h1>本扩展身份（installId）</h1>
+    <p>桌面中控台批准本扩展时，会把待批准列表里的前 8 位与这里比对。两者一致才点批准。</p>
+    <div class="id-row">
+      <code id="install-id">读取中…</code>
+      <button id="copy" type="button">复制</button>
+    </div>
+    <div class="status" id="status"></div>
+    <div class="hint">
+      这个值在首次安装时随机生成并保存在本浏览器。如果它与你预期的不一致，说明配置被改动过，
+      不要批准——先确认来源。
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -189,7 +189,20 @@ export class PragmaticRuntimeParser extends SnapshotRuntimeParserBase {
     for (const table of snapshot.tables) {
       if (!table || typeof table.tableId !== 'string' || table.tableId.length === 0) continue;
       if (!isSelected(table.tableId)) continue;
-      this.ingestTable(table, snapshot.observedAt, events);
+      // FIX(C-P2-5): 逐桌隔离 —— 单桌解析异常不能连累同帧其他健康桌。
+      // 修复前 `parse()` 没有 try/catch，一张脏牌抛 TypeError 会让**整帧 3 桌**的
+      // 数据全部丢失且静默无日志（b10c 实证）。
+      const tableEvents: NormalizedEvent[] = [];
+      try {
+        this.ingestTable(table, snapshot.observedAt, tableEvents);
+      } catch (error) {
+        this.noteRejectedTable(table.tableId);
+        console.error(
+          `[bridge-parse] pragmatic table ${table.tableId}: ${error instanceof Error ? error.name : 'error'} — table dropped, other tables continue`,
+        );
+        continue;
+      }
+      events.push(...tableEvents);
     }
     return events;
   }
@@ -259,8 +272,9 @@ export class PragmaticRuntimeParser extends SnapshotRuntimeParserBase {
 
     const source: SnapshotSource | undefined =
       table.source === 'protocol' || table.source === 'dom' ? table.source : undefined;
-    const playerCards = parseCards(table.playerCards);
-    const bankerCards = parseCards(table.bankerCards);
+    // FIX(C-P2-5): 脏牌不再抛错，被拒数量记进 parserDiagnostics。
+    const playerCards = this.parseCardsFor(tableId, table.playerCards);
+    const bankerCards = this.parseCardsFor(tableId, table.bankerCards);
     const handKey = `${tableId}:${handId}`;
     const hasCardPayload = table.playerCards !== undefined || table.bankerCards !== undefined;
 

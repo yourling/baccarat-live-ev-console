@@ -26,7 +26,20 @@ export interface BridgeRoomDescriptor {
 }
 
 export type BridgeClientMessage = (
-  | { kind: 'hello'; extensionVersion: string; browser: string; timestamp: string; executorProfileId?: string }
+  | {
+    kind: 'hello';
+    extensionVersion: string;
+    browser: string;
+    timestamp: string;
+    executorProfileId?: string;
+    /** 扩展发件箱溢出后开启的新会话：序号基准已重置（P1-8a，信息性字段）。 */
+    seqReset?: boolean;
+  }
+  /**
+   * P0-1：安装在等待操作员批准的扩展回执。pending socket 只接受这一条与心跳，
+   * 其它消息一律丢弃；批准后由桥下发 `pairingApproved` 完成提升。
+   */
+  | { kind: 'pairingAck'; installId?: string; timestamp: string }
   | { kind: 'roomDiscovered'; room: BridgeRoomDescriptor }
   | { kind: 'roomUpdated'; room: BridgeRoomDescriptor }
   | { kind: 'tableEvent'; roomId: string; tableId: string; event: NormalizedEvent }
@@ -53,4 +66,11 @@ export type BridgeServerMessage =
   | { kind: 'executorLeaseRejected'; reason: string; activeLeaseId?: string; timestamp: string }
   | { kind: 'ping'; timestamp: string }
   | { kind: 'observe'; message: BridgeClientMessage }
-  | { kind: 'command'; name: string; tableIds?: readonly string[] };
+  | { kind: 'command'; name: string; tableIds?: readonly string[] }
+  /**
+   * P0-1：连接带 chrome-extension origin 且 token 通过，但 installId 缺失/未获批准。
+   * 该 socket 不占唯一扩展槽、不拿 executor lease、不 ingest 任何事件。
+   */
+  | { kind: 'pairingRequired'; installId?: string; serverVersion: string; timestamp: string }
+  /** P0-1：操作员批准后桥主动把 pending socket 提升为 extension 角色。 */
+  | { kind: 'pairingApproved'; installId: string; timestamp: string };

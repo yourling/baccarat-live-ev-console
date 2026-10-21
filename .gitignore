@@ -40,3 +40,6 @@ _q_*
 *.dmp
 .debug-journal.md
 
+# Code-review working area (briefs, findings, rerun scripts) — process artifact, not product
+review/
+

@@ -9,9 +9,10 @@
 - 对子 EV 策略与庄对/闲对单次 `BetIntent` 经过 `TableActor`、`RiskManager`、reservation、桥接回执、结算，以及按桌/靴/局/市场的重复保护。自动对子只在有效 `physical-shoe`（protocol-shuffle / road-wrap / 人工确认）上评估；已打过的靴空窗约 6 分钟后恢复也按漏掉的洗牌开新靴。第一次见到 shoeReset、待牌靴或 `unknown-monitor-session` 时不下对子，避免假 EV 和 `UNKNOWN` 回执。路子 #55 配剩余 407 张这种入桌数字不得当成 8 副新靴。
 - 四市场 `OperationalWager` 支持 `banker`、`player`、`bankerPair` 和 `playerPair`，用于手动操作与庄/闲保活。它也统一进入同一 actor/风控/reservation/结算链路，并按桌/靴/局/市场/来源防重。当前受控路径要求 `executionMode === 'live'`。
 - 页头「开启保活」与「开启自动投注」互相独立：保活只打庄/闲，对子策略只打庄对/闲对。保活不再扫完整监控列表，只在刚开盘的那一桌尝试；窗口剩余不足 5 秒或没有 `closesAt` 则跳过，并进入约 10 秒冷却后再试下一窗，不因此更新间隔计时。
-- 所有可到达平台的请求都要求 `physical-shoe`、已连接投影、当前下注窗口、未封靴和可用桥接。对子自动/one-shot/手动对子还要求窗口剩余至少 3 秒（`closesAt` 缺失则不评估）；窗口未就绪且未提交（`commitStarted===false`）的预提交拒绝可在同一局重试，已提交则标 UNKNOWN。`UNKNOWN` 会保留风险敞口并阻断当事桌后续执行，不把单桌未知敞口当成全局保活开关关闭；新一局出现上一局未结算 reservation 时同样失败关闭该桌。
-- 桌面运行监督器持久化每桌 live 批准和事故记录；默认裁剪到 200 条，但仍在生效的阻断事故绝不因历史上限被淘汰。进程重启会写入 `process-restarted` 断线事件、关掉执行器与无人值守授权，牌桌仍为 `live`，不会先降成 `shadow`。只有当前进程重新观察到新鲜数据、实体牌靴和恢复后的连续投影，且没有 `UNKNOWN` 或结算缺口时，才恢复无人值守授权。
-- 本机桥固定校验打包扩展 ID 和共享 loopback token，要求恰好一个扩展连接，并校验扩展会话内单调消息序号。连续性证明必须是 `cursor-v1:<64 lowercase hex>`，且由上一游标与下一条连续事件或实体新靴重置生成。
+- 所有可到达平台的请求都要求 `physical-shoe`、已连接投影、当前下注窗口、未封靴和可用桥接。对子自动/one-shot/手动对子还要求窗口剩余至少 3 秒（`closesAt` 缺失则不评估）；窗口未就绪且未提交（`commitStarted===false`）的预提交拒绝可在同一局重试，已提交则标 UNKNOWN。`UNKNOWN` 会保留风险敞口并阻断当事桌后续执行，不把单桌未知敞口当成全局保活开关关闭；**本桌存在其他手未结算的 reservation 时，自动对子同样失败关闭该桌**（记 `eligible=false` 决策，reason 含 `settlement-gap`）。
+- 桌面运行监督器持久化每桌 live 批准和事故记录；默认裁剪到 200 条，但仍在生效的阻断事故绝不因历史上限被淘汰。进程重启会写入 `process-restarted` 断线事件、关掉执行器与无人值守授权，牌桌仍为 `live`，不会先降成 `shadow`；**重启时还会把上一进程遗留的所有 `RESERVED` 敞口统一升级为 `UNKNOWN(restored-unsettled-exposure)`**，让它们进入可勾销队列（修复前这类敞口既不升级、换靴也不清、操作员也无法处置，会永久占用全局敞口与并发额度）。只有当前进程重新观察到新鲜数据、实体牌靴和恢复后的连续投影，且没有 `UNKNOWN` 或结算缺口时，才恢复无人值守授权。
+- **本机桥的身份边界是「扩展 installId + 操作员批准」，不是扩展 ID 或 token**：固定扩展 ID 可由 manifest 公钥推导、token 是源码明文，二者都不构成密钥；缺 `installId` 的连接一律只拿到 `pending` 角色（不占扩展槽、不拿 executor lease、不 ingest 任何牌桌事件、收不到 `betRequest`），只有桌面端点批准后它才升级为 `extension` 角色。三个扩展的工具栏 popup 会显示本扩展 installId 前 8 位，供操作员与桌面待批准列表做**带外比对**。桥仍要求恰好一个扩展连接，并校验扩展会话内单调消息序号；连续性证明必须是 `cursor-v1:<64 lowercase hex>`，且由**已校验的上一游标 payload hash** 与下一条连续事件或实体新靴重置生成（不再由任意 shaped 字符串自证）。
+- `/command` 只暴露只读诊断命令（`probeBetReadiness` / `replayRuntimeState` / `probeExtensionManifest`）。可改变真实下注状态的 `liveOn` / `liveOff` / `reloadExtension` 等**只能由桌面端通过桥内部广播触发**，不再接受任意本机 WS 客户端下发。
 - 页面诊断只发送长度、数量等元数据；桥接日志移除正文/HTML/网络载荷预览，并去除 URL 查询参数和 fragment。事故消息还会脱敏 URL、token、authorization、cookie 和 session 值。
 - 关闭桌面窗口即退出应用，并关闭监控、桥接、保活调度和账本服务。再次启动是新进程，不会沿用旧连接。
 
@@ -88,17 +89,20 @@ Electron 主进程默认加载 `apps/desktop/dist/index.html`；如需连接开�
 ## 核心验证点
 
 - 8 副新靴普通对子概率约 `7.4699%`；庄对/闲对对称。监控行分别显示庄对 EV 与闲对 EV；无物理牌靴时显示「待牌靴」，剩余张数为「未知」。
+- **真实均衡洗牌下对子概率并不随剩余张数上升**：均匀分布时剩 26 张的 p 只有约 4.00%。正 EV 只来自「某些点数剩余异常集中」这种稀疏形态（实测 4809 手里约 1.71%）。`PHYSICAL_SHOE_BETTABLE_REMAINING = 26` 的停注下限刻意牺牲约 64% 的理论 edge，换取避开切牌不确定性 —— 这是有意的保守，不要当成 bug 或"越到尾越该打"。
 - 同一事件流重放两次哈希一致；红牌当前局结算后才封存，红牌后不再开窗下注。
 - 事件账本幂等：相同 `eventId` + 相同 payload 返回 `duplicate`；`eventId` 相同 payload 不同或 `sourceSeq` 冲突抛 `LedgerConflictError`。`cardObserved` 只在内存热路径，进程退出后不从 SQLite 重放逐张牌面。
 - 手工副数修正会从全部已见牌重算剩余库存；若已见某点超过新副数容量则拒绝修正、桌状态不变。默认必须重新武装。人工确认牌靴只在平台未自动识别新靴时使用。
 - 断线会进入 `RESYNCING`；只有严格的 `cursor-v1` 证明和连续下一事件，或明确的 `physical-shoe` 新靴重置，才能恢复导出。扩展页面恢复事件本身不会伪造 `tableRestored`。
 - 对子自动下注只在 `betsopen` 窗口评估；窗口剩余不足 3 秒则跳过。预提交因窗口未就绪被拒后，同一局可以重试。换靴后仍保留近期 `handSettled`，以便决策行继续显示实际结果。
-- `BetIntent` 按桌/靴/局/市场防重；`OperationalWager` 按桌/靴/局/市场/来源防重。所有真实请求都先建立持久 reservation。
-- 风控状态与 reservations 会落盘并在重启后恢复；庄、闲、庄对、闲对均在 `handSettled` 后更新日/桌/靴盈亏，和局按 push 结算。
-- 影子模式不调用执行器；模拟模式保留 reservation 到 `handSettled` 按 `outcomes` 结算盈亏。桌面实盘监控桌会被强制为 `live`；`OperationalWager` 拒绝非 live 模式。
-- 桌面演示使用带种子的伪随机牌靴模拟；点击「开始持续模拟」后按局间隔生成牌面，点击「停止持续模拟」结束；关闭重开不会丢历史。
-- 监控层按桌导出时检测 sourceSeq 缺口、以消费方 ack 推进游标、支持从游标续传；影子源支持断线/自动恢复故障注入与 continuity proof 回调。
-- 浏览器桥支持房间发现、实时 tableEvent、断线/恢复通知和执行请求；桌面运行时要求固定扩展身份/token、恰好一个连接、连续扩展会话序号和 45 秒内的新鲜牌桌观测。
+- `BetIntent` 按桌/靴/局/市场防重；`OperationalWager` 按桌/靴/局/市场防重（**不按来源**）—— 保活、手动、自动对子在同一手同一市场共用同一个唯一性键，跨来源重复下注会被拒（`executionSource` 只作审计字段）。所有真实请求都先建立持久 reservation。
+- 风控状态与 reservations 会落盘并在重启后恢复；庄、闲、庄对、闲对均在 `handSettled` 后更新日/桌/靴盈亏，和局按 push 结算。跨靴的 `UNKNOWN` **不会**被下一靴同 `handId` 的结算自动确权，必须由操作员核对。
+- 影子模式不调用执行器；模拟模式保留 reservation 到 `handSettled` 按 `outcomes` 结算盈亏。桌面实盘监控桌会被强制为 `live`；`OperationalWager` 拒绝非 live 模式。**执行模式不支持从 live 降级**：`setExecutionMode(..., 'shadow')` 会直接报错，不会假装降级却仍在真金执行。
+- 桌面演示使用带种子的伪随机牌靴模拟；点击「开始持续模拟」后按局间隔生成牌面，点击「停止持续模拟」结束；关闭重开不会丢历史。演示表不参与自动下注与执行门控，也不会替换全局执行器（修复前演示期间会把真金桌的自动策略记成假 `UNKNOWN`）。
+- 监控层按桌导出时检测 sourceSeq 缺口、以消费方 ack 推进游标、支持从游标续传；影子源支持断线/自动恢复故障注入与 continuity proof 回调。导出缓冲溢出不丢事件上限：溢出后保留最近一段，并在**实体新靴重置**到达时自动恢复（修复前溢出会让该桌永久静默）。
+- 浏览器桥支持房间发现、实时 tableEvent、断线/恢复通知和执行请求；桌面运行时要求**已批准的扩展 installId**、恰好一个连接、连续扩展会话序号和 45 秒内的新鲜牌桌观测。
+- 「清除记录」只清事件/决策/回执/预留等审计数据并 `VACUUM`，**不会**重置日/桌/靴风控计数（修复前会 `DELETE FROM risk_state`，等于清账绕过止损）。
+- 烧牌模型默认为 `unknown`（无信息先验）：`pMean` 是**正确**的（精确后验边际化，与烧牌数无关），只有保守下界 `pLower` 偏乐观。三个 runtime 目前都不采集烧牌张数；实测把默认值改成 `countKnown(13)` 会让开火从 1.27 手/靴降到 0.001 手/靴（等于关掉策略），所以**不要改默认值**，正确修法是在采集侧补 `burnModelUpdated`。
 - 监控附着失败按 2s / 5s / 15s / 30s（封顶）持续重试。牌桌数据流停滞或会话过期时断开导出，不再整页重载 Pragmatic 弹窗。
 - 关闭桌面窗口会退出应用并关闭监控、桥接、保活调度和账本服务。
 - 页面诊断只传长度/数量元数据，桥接调试日志只保留脱敏 URL 和载荷长度，不记录正文、HTML 或原始网络载荷预览。

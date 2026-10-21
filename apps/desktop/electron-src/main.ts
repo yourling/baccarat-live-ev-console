@@ -1,5 +1,6 @@
 import { app, BrowserWindow, ipcMain } from 'electron';
 import path from 'node:path';
+import { appendFileSync } from 'node:fs';
 import { DesktopConsoleService } from './service.js';
 import { MainWindowRetainer } from './main-window-retainer.js';
 import { acquireSingleInstance } from './single-instance.js';
@@ -10,10 +11,15 @@ import {
   shouldHideMainWindowOnClose,
 } from './background-lifecycle.js';
 import { formatConsoleBuildLabel } from '../src/console-build-info.js';
+import { sanitizeIncidentMessage } from './runtime-supervisor.js';
 import {
+  parseDesktopExtensionInstallId,
   parseDesktopKeepaliveSettings,
+  parseDesktopMonitorTableIds,
   parseDesktopOperationalWagerCommand,
   parseDesktopPendingSettlementCommand,
+  parseDesktopTableSettings,
+  parseDesktopUnifiedTableSettings,
   parseDesktopUnknownWagerReconciliationCommand,
   parseDesktopUnknownWagerWriteOffCommand,
   parseOneShotLiveBetCommand,
@@ -32,6 +38,48 @@ let appQuitting = false;
 
 /** close() 的最长等待时间，超过就放弃干净关闭直接退出。 */
 const SERVICE_CLOSE_TIMEOUT_MS = 15_000;
+
+/**
+ * FIX(D-P2-14): 崩溃可观测性。
+ *
+ * 打包后的 portable 包用户现场**没有终端**，所有 console.error 都看不见；
+ * 唯一落盘的是 main-thread-stall.log。主进程的 uncaughtException /
+ * unhandledRejection 因此完全不可诊断。这里把两类顶层错误追加到
+ * `userData/crash.log`，复用事故消息的脱敏函数（去 URL 查询串 / token / cookie）。
+ *
+ * 语义选择：记录后**不退出**（Electron 主进程里直接退出会让用户莫名其妙丢窗口）；
+ * 且在 `app.isReady()` 之后才注册 —— 启动阶段失败仍由 Electron 自己的错误路径处理。
+ * handler 自身绝不抛错。
+ */
+function logCrash(kind: string, error: unknown): void {
+  try {
+    const userData = app.getPath('userData');
+    appendFileSync(
+      path.join(userData, 'crash.log'),
+      JSON.stringify({
+        at: new Date().toISOString(),
+        kind,
+        message: sanitizeIncidentMessage(error instanceof Error ? `${error.name}: ${error.message}` : String(error)),
+        stack: error instanceof Error && typeof error.stack === 'string'
+          ? sanitizeIncidentMessage(error.stack).slice(0, 2_000)
+          : undefined,
+      }) + '\n',
+    );
+  } catch {
+    // never throw in the handler
+  }
+}
+
+function installCrashHandlers(): void {
+  process.on('uncaughtException', error => {
+    logCrash('uncaughtException', error);
+    console.error('desktop main uncaughtException', error);
+  });
+  process.on('unhandledRejection', reason => {
+    logCrash('unhandledRejection', reason);
+    console.error('desktop main unhandledRejection', reason);
+  });
+}
 
 function isDesktopExecutionMode(value: unknown): value is DesktopExecutionMode {
   return value === 'shadow' || value === 'live';
@@ -59,9 +107,20 @@ async function createWindow(): Promise<void> {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      // FIX(D-P2-13): 安全基线。
+      // preload 只用 contextBridge + ipcRenderer（两者在 sandbox 下均可用），
+      // better-sqlite3 只跑在主进程，所以可以开启 renderer sandbox。
+      sandbox: true,
+      webSecurity: true,
       spellcheck: false,
     },
+  });
+  // FIX(D-P2-13): 拒绝一切新窗口；主窗口只在"同 URL"时允许导航。
+  // 目前渲染层没有任何外链/window.open，这两条是防御将来引入外部内容。
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  win.webContents.on('will-navigate', (event, url) => {
+    const current = win.webContents.getURL();
+    if (url !== current) event.preventDefault();
   });
   detachWindowsIme(win);
   win.webContents.on('did-fail-load', (_event, code, description, url) => {
@@ -73,6 +132,7 @@ async function createWindow(): Promise<void> {
   });
   win.webContents.on('render-process-gone', (_event, details) => {
     console.error('desktop renderer gone', details);
+    logCrash('render-process-gone', JSON.stringify(details));
   });
   win.webContents.on('preload-error', (_event, preloadPath, error) => {
     console.error('desktop preload error', preloadPath, error);
@@ -164,13 +224,24 @@ function registerIpc(): void {
     getService().applyManualCorrection(tableId, correction, shoeId));
   ipcMain.handle('console:update-risk-limits', (_event, limits) =>
     getService().updateRiskLimits(limits));
-  ipcMain.handle('console:update-table-settings', (_event, tableId: string, settings) =>
-    getService().updateTableSettings(tableId, settings));
-  ipcMain.handle('console:update-all-table-settings', (_event, settings) =>
-    getService().updateAllTableSettings(settings));
-  ipcMain.handle('console:update-monitor-table-ids', (_event, tableIds: readonly string[]) =>
-    getService().updateMonitorTableIds(tableIds));
+  ipcMain.handle('console:update-table-settings', (_event, tableId: unknown, settings: unknown) => {
+    if (typeof tableId !== 'string' || tableId.trim().length === 0) {
+      throw new TypeError('table id must be a non-empty string');
+    }
+    return getService().updateTableSettings(tableId, parseDesktopTableSettings(settings));
+  });
+  ipcMain.handle('console:update-all-table-settings', (_event, settings: unknown) =>
+    getService().updateAllTableSettings(parseDesktopUnifiedTableSettings(settings)));
+  ipcMain.handle('console:update-monitor-table-ids', (_event, tableIds: unknown) =>
+    getService().updateMonitorTableIds(parseDesktopMonitorTableIds(tableIds)));
   ipcMain.handle('console:clear-monitor-data', () => getService().clearMonitorData());
+  // FIX(D-P0-1): 扩展身份批准面。installId 必须是 32 hex / UUID 形状，非法直接拒。
+  ipcMain.handle('console:list-pending-extensions', () => getService().listPendingExtensions());
+  ipcMain.handle('console:approve-extension', (_event, installId: unknown) =>
+    getService().approveExtension(parseDesktopExtensionInstallId(installId)));
+  ipcMain.handle('console:revoke-extension', (_event, installId: unknown) =>
+    getService().revokeExtension(parseDesktopExtensionInstallId(installId)));
+  ipcMain.handle('console:extension-approval-state', () => getService().extensionApprovalState());
   ipcMain.handle('console:start-live-monitor', (_event, port?: number, executionMode?: 'shadow' | 'simulated' | 'live') =>
     getService().startLiveRoomMonitor(port ?? 17890, executionMode ?? 'live'));
   ipcMain.handle('console:stop-live-monitor', () => getService().stopLiveRoomMonitor());
@@ -189,6 +260,9 @@ if (acquireSingleInstance(app)) {
   });
 
   app.whenReady().then(async () => {
+    // FIX(D-P2-14): 只在 ready 之后注册崩溃兜底 —— 启动阶段失败仍走 Electron
+    // 自己的错误路径；注册后记录到 userData/crash.log 但不退出主进程。
+    installCrashHandlers();
     const stallLogPath = path.join(app.getPath('userData'), 'main-thread-stall.log');
     warnIfPreviousMainThreadStall(stallLogPath);
     stopMainThreadWatchdog = startMainThreadWatchdog({

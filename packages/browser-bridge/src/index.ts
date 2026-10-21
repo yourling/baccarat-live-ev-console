@@ -1,5 +1,6 @@
 export * from './protocol.js';
 export * from './identity.js';
+export * from './extension-approval.js';
 export * from './server.js';
 export * from './runtime-common.js';
 export * from './pragmatic-runtime.js';

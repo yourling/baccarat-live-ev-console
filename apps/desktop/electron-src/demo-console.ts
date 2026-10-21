@@ -99,6 +99,7 @@ export class DemoConsole {
     this.lastSeed = demo.seed;
     const amounts = { [demo.profiles[0].tableId]: 100, [demo.profiles[1].tableId]: 80 } as const;
     const configuredProfiles = new Map<string, TableProfile>();
+    const demoTableIds = demo.profiles.map(profile => profile.tableId);
     for (const profile of demo.profiles) {
       const existingActor = this.host.orchestrator.getActor(profile.tableId);
       const existingProfile = existingActor?.getProfile();
@@ -143,8 +144,6 @@ export class DemoConsole {
     };
     const monitor = new ShadowRoomMonitor({ rooms: [room] });
     const feeds: TableExport[] = [];
-    const previousExecutor = this.host.currentExecutor;
-    this.host.setOrchestratorExecutor(new SimulatedAdapter({ events: [] }));
     try {
       const rooms = await monitor.discoverRooms();
       for (const table of rooms[0].tables) {
@@ -195,7 +194,10 @@ export class DemoConsole {
       await this.host.orchestrator.flush();
     } finally {
       await monitor.close();
-      this.host.setOrchestratorExecutor(previousExecutor);
+      // FIX(D-P1-5): 只还原 **demo 专用 actor** 的 executor，绝不碰全局 executor。
+      for (const tableId of demoTableIds) {
+        this.host.orchestrator.getActor(tableId)?.setExecutor(null);
+      }
     }
     return this.host.snapshot();
   }

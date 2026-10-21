@@ -664,6 +664,10 @@ export class SqliteLedger {
       CREATE INDEX IF NOT EXISTS idx_reservations_table_created ON reservations(table_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_reservations_created ON reservations(created_at);
     `);
+    // FIX(B-P1-1): 活跃唯一性的权威判据是 saveReservation 的 (table,shoe,hand,market)
+    // 前置查询（以及 RiskManager 的内存活跃键）。上面的部分唯一索引仍按 source
+    // 放宽一档：老库里可能已经存在"跨来源双活跃行"（正是被审查发现的 bug 产物），
+    // 收紧索引会让这类库直接打不开。多连接并发兜底改由查询层 + 上层事务承担。
   }
 
   private rebuildDecisionWindowIndex(): void {
@@ -740,6 +744,14 @@ export class SqliteLedger {
     this.checkpoint();
   }
 
+  /**
+   * FIX(D-P2-2): 清除监控记录不能清零风控计数 —— 否则"清账"就把
+   * dayLoss/tableLosses/shoeLosses 归零，等于绕过止损。
+   *
+   * 这里只删事件/决策/收据/预留/受控下注审计；`risk_state` 保留（当日与每桌/
+   * 每靴亏损由 RiskManager 自己的 store 维持）。预留行被删后，重启时
+   * RiskManager 会按剩余预留重算 reservedExposure/pendingExecutions，落盘漂移自愈。
+   */
   clearMonitorData(): void {
     this.ephemeralEventsByTable.clear();
     this.ephemeralEventIds.clear();
@@ -749,7 +761,6 @@ export class SqliteLedger {
       this.db.prepare('DELETE FROM receipts').run();
       this.db.prepare('DELETE FROM reservations').run();
       this.db.prepare('DELETE FROM operational_wagers').run();
-      this.db.prepare('DELETE FROM risk_state').run();
     });
     this.setConfig<LiveFeedEpoch>(LIVE_FEED_EPOCH_KEY, {
       afterEventId: 0,
@@ -1078,12 +1089,20 @@ export class SqliteLedger {
     return updated;
   }
 
+  /**
+   * 按 (table, shoe, hand) 取权威结算。
+   *
+   * FIX(B-P1-2): 删掉"找不到精确匹配就只按 handId 回退"的分支 —— 那是跨靴误确权的
+   * 关键一环：平台换靴后 roundId 复位、BG 换靴 replay 会用旧 handId 在新 shoeId 上
+   * 重发 handSettled，回退逻辑会把别的靴的结算当成这一手的，把输记成赢、亏损记错靴桶。
+   * 现在 shoe 不匹配即返回 undefined（签名不变，调用方 service.ts 无需改动）。
+   */
   getHandSettlement(
     tableId: string,
     shoeId: string,
     handId: string,
   ): Extract<NormalizedEvent, { type: 'handSettled' }> | undefined {
-    const exact = this.db.prepare(`
+    const row = this.db.prepare(`
       SELECT payload FROM events
       WHERE table_id = ?
         AND type = 'handSettled'
@@ -1092,43 +1111,40 @@ export class SqliteLedger {
       ORDER BY id DESC
       LIMIT 1
     `).get(tableId, shoeId, handId) as { payload: string } | undefined;
-    if (exact) {
-      return JSON.parse(exact.payload) as Extract<NormalizedEvent, { type: 'handSettled' }>;
-    }
-    const fallback = this.db.prepare(`
-      SELECT payload FROM events
-      WHERE table_id = ?
-        AND type = 'handSettled'
-        AND json_extract(payload, '$.handId') = ?
-      ORDER BY id DESC
-      LIMIT 1
-    `).get(tableId, handId) as { payload: string } | undefined;
-    return fallback
-      ? JSON.parse(fallback.payload) as Extract<NormalizedEvent, { type: 'handSettled' }>
+    return row
+      ? JSON.parse(row.payload) as Extract<NormalizedEvent, { type: 'handSettled' }>
       : undefined;
   }
 
+  /**
+   * FIX(B-P1-1): 判重**不按来源** —— 保活/手动、自动对子/手动对子在同一手同一
+   * 市场只允许一笔真实下注。`source` 参数保留为可选的审计/排查过滤（传 undefined
+   * 即跨来源判重），不再参与唯一性判定。
+   */
   hasOperationalWager(
     tableId: string,
     shoeId: string,
     handId: string,
     market: string,
-    source: string,
+    source?: string,
   ): boolean {
+    const sourceClause = source === undefined ? '' : ' AND json_extract(payload, \'$.wager.source\') = ?';
+    const params = source === undefined
+      ? [tableId, shoeId, handId, market]
+      : [tableId, shoeId, handId, market, source];
     return Boolean(this.db.prepare(`
       SELECT 1
       FROM operational_wagers
       WHERE table_id = ?
         AND json_extract(payload, '$.wager.shoeId') = ?
         AND json_extract(payload, '$.wager.handId') = ?
-        AND json_extract(payload, '$.wager.market') = ?
-        AND json_extract(payload, '$.wager.source') = ?
+        AND json_extract(payload, '$.wager.market') = ?${sourceClause}
         AND (
           json_extract(payload, '$.status') != 'REJECTED'
           OR json_extract(payload, '$.receipt.raw.commitStarted') = 1
         )
       LIMIT 1
-    `).get(tableId, shoeId, handId, market, source));
+    `).get(...params));
   }
 
   getMonitorSummary(options: MonitorSummaryOptions = {}): MonitorSummary {
@@ -1992,8 +2008,10 @@ export class SqliteLedger {
   }
 
   /**
-   * RESERVED and UNKNOWN both hold exposure. The execution source is part of
-   * the key so strategy/manual/keepalive attempts remain independently auditable.
+   * RESERVED and UNKNOWN both hold exposure. FIX(B-P1-1): 活跃唯一性是
+   * (table, shoe, hand, market) —— executionSource 只是审计字段，不参与判重。
+   * 修复前这里带 source 过滤，保活+手动 / 自动对子+手动可以在同一手同一市场
+   * 各下一注（真金双倍敞口）。表结构不变，只改查询条件（老库无需迁移）。
    */
   saveReservation(reservation: RiskReservation): boolean {
     const active = this.db.prepare(
@@ -2003,7 +2021,6 @@ export class SqliteLedger {
          AND shoe_id = ?
          AND hand_id = ?
          AND market = ?
-         AND COALESCE(json_extract(payload, '$.executionSource'), 'strategy') = ?
          AND status IN ('RESERVED', 'UNKNOWN')
        LIMIT 1`
     ).get(
@@ -2011,7 +2028,6 @@ export class SqliteLedger {
       reservation.shoeId,
       reservation.handId,
       reservation.market,
-      reservation.executionSource ?? 'strategy',
     ) as { reservation_id: string } | undefined;
     if (active) {
       if (active.reservation_id === reservation.reservationId) return false;

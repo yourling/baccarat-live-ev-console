@@ -3,6 +3,18 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      FIX(D-P2-13): CSP 安全基线。
+      渲染层全部是本地打包资源（vite build 后 dist/ 相对路径加载），不加载任何
+      外部脚本/样式/字体，也不做 eval —— 因此可以用最严格的策略。
+      connect-src 'none'：渲染层只通过 preload 的 contextBridge 走 IPC，
+      不需要任何网络能力；这也顺手堵住"渲染层被注入后自行外联"。
+      style-src 需要 'unsafe-inline'：React 内联 style 属性与现有 CSS 变量注入在用。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
     <title>百家乐实时 EV 中控台 V1.0.1</title>
     <style>
       body { font-family: system-ui, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }

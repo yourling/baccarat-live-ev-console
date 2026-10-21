@@ -1429,12 +1429,30 @@ describe('desktop console demo sessions', () => {
     }
   });
 
-  it('can inject two demo sessions into the same ledger', async () => {
+  it('can inject two demo sessions into the same ledger without polluting live risk state', async () => {
     const service = new DesktopConsoleService(':memory:');
     try {
       await service.setAutomationEnabled(true);
       const first = await service.runDemo(25);
-      expect(first.receipts.length).toBeGreaterThan(0);
+      // FIX(D-P1-5): demo 不再替换全局执行器、也不再对 demo 表自动下注
+      // （canExecuteAutomaticBets 只对监控桌放行），所以 demo 既不该产生平台回执，
+      // 也不该产生敞口/亏损 —— 修复前这里会产生 2 笔 status=UNKNOWN /
+      // reason=executor-no-receipt 的假敞口（review 脚本 b9b 实证）。
+      expect(first.receipts).toHaveLength(0);
+      expect(first.reservations).toHaveLength(0);
+      expect(first.snapshot.riskState).toMatchObject({
+        reservedExposure: 0,
+        pendingExecutions: 0,
+        dayLoss: 0,
+        tableLosses: {},
+        shoeLosses: {},
+      });
+      // demo 的可观测性不能被牺牲：事件/决策/汇总仍然要进账本、两张 demo 表仍可见。
+      expect(first.events.length).toBeGreaterThan(0);
+      expect(first.decisions.length).toBeGreaterThan(0);
+      expect(Object.keys(first.snapshot.tables)).toEqual(
+        expect.arrayContaining(['table-1', 'table-2']),
+      );
       const light = service.snapshot({ includeHistory: false });
       expect(light.events.length).toBeLessThan(first.events.length);
       expect(light.summary.rows.length).toBeGreaterThan(0);
@@ -1451,6 +1469,8 @@ describe('desktop console demo sessions', () => {
       expect(second.decisions.length).toBeGreaterThanOrEqual(first.decisions.length);
       expect(second.decisions.some(decision => decision.eligible && decision.evLower < 0)).toBe(false);
       expect(Object.values(second.snapshot.tables).every(table => /^\d{12}-\d{3}$/.test(table.projection.shoeId))).toBe(true);
+      // 两次 demo 之后风控计数仍然干净（demo 与真金敞口完全隔离）。
+      expect(second.snapshot.riskState).toMatchObject({ dayLoss: 0, reservedExposure: 0 });
     } finally {
       await service.close();
     }
@@ -1616,15 +1636,34 @@ describe('desktop console demo sessions', () => {
       service['liveFeeds'].set('D055', freshLiveFeed('D055'));
       await service.injectEvent(monitorShoeEvent('D055', 'd055-live-gate-shoe', 'physical-shoe'));
 
-      // When: the operator switches this table to live and then back to shadow.
+      // When: the operator switches this table to live.
       const live = await service.setExecutionMode('D055', 'live');
-      const shadow = await service.setExecutionMode('D055', 'shadow');
 
       // Then: the extension gate and actor mode move together, while auto bet remains stopped.
       expect(setLiveBetEnabled.mock.calls).toEqual([[true]]);
       expect(live.snapshot.tables.D055?.executionMode).toBe('live');
       expect(live.snapshot.tables.D055?.projection.autoBetStatus).toBe('DISARMED');
-      expect(shadow.snapshot.tables.D055?.executionMode).toBe('live');
+
+      // FIX(D-P0-4): 切 shadow 必须**拒绝**，而不是静默 arm 真金执行器。
+      // 修复前 `_mode` 被丢弃，调用方以为降级、实际打开了 live gate + 装了 executor +
+      // 写入 manual 授权，随后手动下注 ACCEPTED 并发出真金请求（review 脚本 a1e 实证）。
+      const gateStateBefore = {
+        enabled: service['persistentLiveGateEnabled'],
+        executor: service['currentExecutor'],
+        authorizations: [...service['liveAuthorizationSources'].entries()],
+        gateCalls: [...setLiveBetEnabled.mock.calls],
+      };
+      await expect(service.setExecutionMode('D055', 'shadow'))
+        .rejects.toThrow('execution mode cannot be downgraded');
+      await expect(service.setExecutionMode('D055', 'simulated'))
+        .rejects.toThrow('execution mode cannot be downgraded');
+
+      // Then: 拒绝是"什么都没发生"—— gate / executor / 授权 / 桥调用次数全部不变。
+      expect(service['persistentLiveGateEnabled']).toBe(gateStateBefore.enabled);
+      expect(service['currentExecutor']).toBe(gateStateBefore.executor);
+      expect([...service['liveAuthorizationSources'].entries()]).toEqual(gateStateBefore.authorizations);
+      expect(setLiveBetEnabled.mock.calls).toEqual(gateStateBefore.gateCalls);
+      expect(service.snapshot().snapshot.tables.D055?.executionMode).toBe('live');
     } finally {
       setLiveBetEnabled.mockRestore();
       await service.close();
@@ -3066,7 +3105,23 @@ describe('desktop console demo sessions', () => {
     try {
       await service.setAutomationEnabled(true);
       const historical = await service.runDemo(25);
-      expect(historical.receipts.some(receipt => receipt.tableId !== 'D055')).toBe(true);
+      // FIX(D-P1-5): demo 不再产生 receipts（不再自动下注），所以历史非监控回执
+      // 改为直接写入账本来构造 —— 本用例要验证的是"汇总口径按监控表过滤"，
+      // 与回执怎么来的无关。
+      service['ledger'].saveReceipt({
+        receiptId: 'historical-non-monitor-receipt',
+        intentId: 'historical-non-monitor-intent',
+        reservationId: 'historical-non-monitor-reservation',
+        status: 'ACCEPTED',
+        amount: 20,
+        market: 'bankerPair',
+        mode: 'live',
+        createdAt: '2026-09-07T01:00:02.000Z',
+        externalRef: 'historical-non-monitor',
+      }, 'P001', 'shoe-P001', 'hand-P001', 'bankerPair');
+      const withHistory = service.snapshot();
+      expect(withHistory.receipts.some(receipt => receipt.tableId !== 'D055')).toBe(true);
+      expect(historical.events.length).toBeGreaterThan(0);
 
       await service.startLiveRoomMonitor(0);
       const filtered = await service.updateMonitorTableIds(['D055']);

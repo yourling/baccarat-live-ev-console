@@ -213,17 +213,87 @@ function cardCopyId(card: Card): string {
   return `${card.rank}${card.suit ?? ''}`;
 }
 
-function handHasInventory(projection: ShoeStateProjection, handId: string): boolean {
-  return (projection.cardInventoryKeys ?? []).some(key => key.startsWith(`${handId}:`));
-}
-
 /** 该手已经计入库存的牌数（用于发现"手内漏采"，见 TableActor 的缺牌计数）。 */
 export function countHandInventory(projection: ShoeStateProjection, handId: string): number {
   const prefix = `${handId}:`;
   return (projection.cardInventoryKeys ?? []).filter(key => key.startsWith(prefix)).length;
 }
 
-function consumeInventoryCard(projection: ShoeStateProjection, handId: string, card: Card, position: 'player' | 'banker'): void {
+/**
+ * FIX(C-P1-4): 把各 runtime 的 position 语义归一化到 'player' | 'banker'。
+ *
+ * `cardObserved.position` 在 contracts 里是可选字符串，三个 runtime 各有写法：
+ *   - runtime-common（Pragmatic/BG）：'player' / 'banker'
+ *   - winfinity-runtime：`${area}:${left|right|extra}`，如 'player:left'
+ *   - 部分历史事件完全不带 position
+ * 库存 key 是 `${handId}:${position}:${copyId}`，不归一化就永远对不上，
+ * 也就无法判断"这手在 player 侧到底计过几张"。
+ */
+function normalizePosition(position: string | undefined): 'player' | 'banker' | undefined {
+  if (position === undefined) return undefined;
+  if (position.startsWith('player') || position === 'p') return 'player';
+  if (position.startsWith('banker') || position === 'b') return 'banker';
+  return undefined;
+}
+
+type InventoryPositionTally = { player: number; banker: number; unknown: number };
+
+/**
+ * 按归一化 position 统计该手已计入库存的张数。
+ *
+ * key 形状：`${handId}:${position}:${copyId}`。`position` 段是 `*`（cardObserved
+ * 没带 position 时写的）或无法归一化时归入 `unknown` —— 这部分**不参与差集**，
+ * 宁可漏补也不双扣。
+ */
+function tallyHandInventory(projection: ShoeStateProjection, handId: string): InventoryPositionTally {
+  const tally: InventoryPositionTally = { player: 0, banker: 0, unknown: 0 };
+  const prefix = `${handId}:`;
+  for (const key of projection.cardInventoryKeys ?? []) {
+    if (!key.startsWith(prefix)) continue;
+    const rest = key.slice(prefix.length);
+    const separator = rest.indexOf(':');
+    const rawPosition = separator < 0 ? '' : rest.slice(0, separator);
+    const position = rawPosition.length === 0 || rawPosition === '*'
+      ? undefined
+      : normalizePosition(rawPosition);
+    if (position === undefined) tally.unknown += 1;
+    else tally[position] += 1;
+  }
+  return tally;
+}
+
+/**
+ * 该手还有几张牌没有进库存（补不回来的部分）。
+ *
+ * FIX(C-P1-4): 修复前 `applySettledHandCards` 只要该手有任意一张牌进过库存就
+ * 整手跳过补录，漏采的张永不扣减、`remainingTotal` 永久偏高；唯一检测是
+ * TableActor.missingUnobservedCards（只在内存、阈值 >10 才移出监控）。
+ * 现在按 position 差集补齐，并由本函数向 actor 暴露真实缺口，用于阻断下注。
+ *
+ * 语义：每个已计入的 key 都真实扣过一次库存（不论 position 能否识别），所以
+ * `unknown` 的 key 可以用来抵消任一 position 的缺口；两者都抵消不了的部分才是
+ * "确定缺的牌"。未采到任何一张时返回牌数（与"整手补录"前的旧检测一致，
+ * 调用方用"该手是否已有库存"自行区分重启补录与真实漏采）。
+ */
+export function countMissingHandCards(
+  projection: ShoeStateProjection,
+  handId: string,
+  playerCards: readonly unknown[],
+  bankerCards: readonly unknown[],
+): number {
+  const tally = tallyHandInventory(projection, handId);
+  const playerShort = Math.max(0, playerCards.length - tally.player);
+  const bankerShort = Math.max(0, bankerCards.length - tally.banker);
+  const coveredByUnknown = Math.min(tally.unknown, playerShort + bankerShort);
+  return Math.max(0, playerShort + bankerShort - coveredByUnknown);
+}
+
+function consumeInventoryCard(
+  projection: ShoeStateProjection,
+  handId: string,
+  card: Card,
+  position: 'player' | 'banker',
+): void {
   const copyId = cardCopyId(card);
   const inventoryKey = `${handId}:${position}:${copyId}`;
   projection.cardInventoryKeys = projection.cardInventoryKeys ?? [];
@@ -240,30 +310,56 @@ function consumeInventoryCard(projection: ShoeStateProjection, handId: string, c
   applyPhysicalShoeLifecycle(projection);
 }
 
+/**
+ * 用 handSettled 携带的完整牌面补齐该手漏采的库存。
+ *
+ * FIX(C-P1-4): 修复前是"该手只要有任意一张牌进过库存就整手跳过"，
+ * 手内漏采的张永不扣减 —— 4 张的手只采到 1 张时 `remainingTotal` 是 415 而不是
+ * 412。**确定成立的后果**是：剩余库存偏高 → 封靴线
+ * （`PHYSICAL_SHOE_UNDEALABLE_REMAINING`）与停注线
+ * （`PHYSICAL_SHOE_BETTABLE_REMAINING`）被整体推迟，等于在已过切牌线的靴上继续下注。
+ *
+ * FIX(P2-4) 方向断言更正：旧注释写"对子 EV 偏高"。审查用 30 个 seed 实测
+ * （`review/scripts/math/14-missed-card-direction.ts`，15 正 15 负）证明**方向不成立**：
+ * 漏采对子 EV 的污染方向取决于漏掉的是哪些 rank 的剩余分布，量级 < 0.35pp。
+ * 因此本修复的目标是"`remainingTotal` 不偏高、封靴/停注线不被推迟"，
+ * **不是**"修正 EV 偏高"；回归测试也只断言 remainingTotal / seenCards / 逐 rank
+ * 计数 / 幂等这些确定成立的量。
+ *
+ * 现在逐张按 position 差集补齐：
+ *   1. 统计该手已计入张数（player / banker / unknown）；
+ *   2. 每个 position 只补"应有张数 - 已计入张数"，从后往前补
+ *      （同一手里靠前的牌更可能已经被 cardObserved 采到，尾部才是漏掉的）；
+ *   3. `unknown` 的已计入 key 视为"可能属于任一 position"：它先抵掉缺口，
+ *      再决定还能补几张 —— 且任何时刻该手 key 总数不超过牌数，**绝不多扣**；
+ *   4. 一张都没采到时合计为 0，整手补录（重启后只有 handSettled 的正常路径）。
+ *
+ * 幂等：补完后该手 key 数等于牌数，再次调用差集为 0，不增不减。
+ * 返回补完后仍对不上的张数（未知 position 导致的残留），供诊断与缺牌计数。
+ */
 function applySettledHandCards(
   projection: ShoeStateProjection,
   handId: string,
   playerCards: readonly Card[],
   bankerCards: readonly Card[],
-): void {
-  // cardObserved 是内存热数据、handSettled 是持久数据（重启后只剩后者），
-  // 所以这里必须"重复调用不重复扣减"。整手跳过是这个约束下唯一安全的选择。
-  //
-  // 已知代价：只要该手有任意一张牌被 live 采到，整手补录就被跳过 —— 手内漏采
-  // 的那几张永不扣减，剩余库存偏多、对子 EV 偏高（实测 4 张的手只采到 1 张时
-  // remainingTotal 是 415 而不是 412）。
-  //
-  // 试过改成"逐张补齐"，**不安全**：去重 key 是 `${handId}:${position}:${copyId}`，
-  // 而 cardObserved 的 position 与这里的 'player'/'banker' 并不是同一套语义 ——
-  // winfinity-runtime 可能给出 `player:left` 甚至完全不带 position
-  // （contracts 里 position 是可选字段）。key 对不上就会重复扣减。
-  //
-  // 因此这里只负责"不重复扣"，把"手内漏采"交给上层检测：
-  // TableActor.applyHandSettlement 会比对结算牌数与已计入张数，累加
-  // missingUnobservedCards，进而触发 service 的缺牌移出监控。
-  if (handHasInventory(projection, handId)) return;
-  for (const card of playerCards) consumeInventoryCard(projection, handId, card, 'player');
-  for (const card of bankerCards) consumeInventoryCard(projection, handId, card, 'banker');
+): number {
+  const tally = tallyHandInventory(projection, handId);
+  const paperCards = playerCards.length + bankerCards.length;
+  // 每张已计入的 key 都已经扣过一张库存；该手最多还能补这么多张，否则就是双扣。
+  let headroom = Math.max(0, paperCards - tally.player - tally.banker - tally.unknown);
+  const playerShort = Math.max(0, playerCards.length - tally.player);
+  const bankerShort = Math.max(0, bankerCards.length - tally.banker);
+  // 从后往前补：front 的牌更可能已被 cardObserved 采到。
+  const playerBackfill = Math.min(playerShort, headroom);
+  headroom -= playerBackfill;
+  const bankerBackfill = Math.min(bankerShort, headroom);
+  for (const card of playerCards.slice(playerCards.length - playerBackfill)) {
+    consumeInventoryCard(projection, handId, card, 'player');
+  }
+  for (const card of bankerCards.slice(bankerCards.length - bankerBackfill)) {
+    consumeInventoryCard(projection, handId, card, 'banker');
+  }
+  return countMissingHandCards(projection, handId, playerCards, bankerCards);
 }
 
 function applyPhysicalShoeLifecycle(projection: ShoeStateProjection): void {
@@ -425,6 +521,8 @@ export function applyEvent(
       recoverLiveFeed(updated);
       acceptLivePlay(updated);
       if (beginHand(updated, event.handId) === 'stale') break;
+      // FIX(C-P1-4): 逐张按 position 差集补齐（修复"整手跳过"导致 remainingTotal 偏高）。
+      // 返回值是补不回来的张数，由 TableActor 计入缺牌数并阻断下注（C-P1-3）。
       applySettledHandCards(updated, event.handId, event.playerCards, event.bankerCards);
       if (updated.redCardSeen) {
         updated.status = 'WAITING_NEW_SHOE';

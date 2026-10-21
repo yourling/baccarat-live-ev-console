@@ -59,6 +59,7 @@
     }
   ],
   "action": {
-    "default_title": "Baccarat Room Bridge"
+    "default_title": "Baccarat Room Bridge",
+    "default_popup": "bridge-popup.html"
   }
 }

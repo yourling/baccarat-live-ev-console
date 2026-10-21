@@ -8,9 +8,15 @@ import {
   type BrowserBridgeRuntimeEvent,
 } from '../src/index.js';
 
+/**
+ * P0-1: 这些用例不传 `extensionApprovals`，桥处于兼容放行模式，但**带 installId** 是
+ * 必要条件（缺 installId 只能拿 pending 角色）。行为与修复前一致：单连接拿 lease。
+ */
+const TEST_INSTALL_ID = 'lease-test-install-01';
+
 function authenticatedExtensionClient(port: number): WebSocket {
   return new WebSocket(
-    `ws://127.0.0.1:${port}/?token=${BUNDLED_BROWSER_EXTENSION_TOKEN}`,
+    `ws://127.0.0.1:${port}/?token=${BUNDLED_BROWSER_EXTENSION_TOKEN}&installId=${TEST_INSTALL_ID}`,
     { origin: `chrome-extension://${BUNDLED_BROWSER_EXTENSION_ID}` },
   );
 }
@@ -208,7 +214,11 @@ describe('browser bridge executor lease', () => {
         first.once('close', () => resolve());
         first.close();
       });
-      await waitUntil(() => server.getExecutorStatus().active_executor_count === 1);
+      // FIX(P1-1 竞态): 旧写法等的是 active_executor_count === 1 —— 但 lease 在 close 前
+      // 就已经是 1（claimant 被 park，lease 仍 active），条件恒真，等于没等。
+      // 真正要等的是"旧 socket 已经从唯一扩展槽里消失"，否则紧接着的重连会撞上
+      // admitExtensionSocket 的 sockets.size > 0 判定。
+      await waitUntil(() => server.getExtensionStatus().connectionCount === 0);
       const acquiredBeforeRestart = events.filter(event => event.kind === 'executor-lease-acquired').length;
 
       const restarted = await openClient(port);
@@ -334,6 +344,58 @@ describe('browser bridge executor lease', () => {
       expect(messages.some(message => message.kind === 'betRequest')).toBe(false);
     } finally {
       client.close();
+      await server.close();
+    }
+  });
+
+  it('admits a reconnecting extension when the previous socket is already closed', async () => {
+    // FIX(P1-1): 旧实现无条件 `sockets.size > 0 → 1008`，扩展 SW 重启时新连接会被
+    // 永久挤掉（d-desktop P1-1 / executor-lease 重绑竞态）。现在只拒绝**仍然 OPEN** 的旧 socket。
+    const server = new BrowserBridgeServer({
+      port: 0,
+      betTimeoutMs: 1_000,
+      requireExtensionSequence: true,
+      allowedExtensionId: BUNDLED_BROWSER_EXTENSION_ID,
+      extensionToken: BUNDLED_BROWSER_EXTENSION_TOKEN,
+    });
+    const port = await server.start();
+    const first = await openClient(port);
+    try {
+      sendHello(first, {
+        sessionId: 'bridge-session-evict-1',
+        seq: 1,
+        profileId: 'chrome-profile-evict-01',
+      });
+      await waitUntil(() => server.getExtensionStatus().connectionCount === 1);
+
+      // 并发第二个连接：旧的仍然 OPEN → 必须 1008（唯一槽约束不能松）。
+      const concurrent = new WebSocket(
+        `ws://127.0.0.1:${port}/?token=${BUNDLED_BROWSER_EXTENSION_TOKEN}&installId=${TEST_INSTALL_ID}`,
+        { origin: `chrome-extension://${BUNDLED_BROWSER_EXTENSION_ID}` },
+      );
+      concurrent.on('error', () => undefined);
+      const concurrentClose = await new Promise<number>(resolve => {
+        const timer = setTimeout(() => resolve(-1), 1_000);
+        concurrent.on('close', code => { clearTimeout(timer); resolve(code); });
+      });
+      expect(concurrentClose).toBe(1008);
+
+      // 关闭旧连接后**不等** close 传播，立刻重连：必须被接纳（旧 socket 已被判死）。
+      first.close();
+      const restarted = new WebSocket(
+        `ws://127.0.0.1:${port}/?token=${BUNDLED_BROWSER_EXTENSION_TOKEN}&installId=${TEST_INSTALL_ID}`,
+        { origin: `chrome-extension://${BUNDLED_BROWSER_EXTENSION_ID}` },
+      );
+      restarted.on('error', () => undefined);
+      const opened = await new Promise<boolean>(resolve => {
+        const timer = setTimeout(() => resolve(false), 1_000);
+        restarted.once('open', () => { clearTimeout(timer); resolve(true); });
+        restarted.once('close', () => { clearTimeout(timer); resolve(false); });
+      });
+      expect(opened).toBe(true);
+      restarted.close();
+    } finally {
+      try { first.close(); } catch { /* already closed */ }
       await server.close();
     }
   });

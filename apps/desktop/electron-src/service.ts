@@ -38,6 +38,7 @@ import {
   BUNDLED_BROWSER_EXTENSION_TOKEN,
   BUNDLED_PLATFORM_DESCRIPTORS,
   BrowserBridgeServer,
+  MemoryExtensionApprovalStore,
   collapseWinfinityDuplicateTableIds,
   isCompleteBaccaratHand,
   isJoinableNewShoeRoadCount,
@@ -47,6 +48,7 @@ import {
   selectObservedGameCount,
   selectStableGameCount,
   selectWinfinityRoadCount,
+  type BridgeExtensionPendingEntry,
   type BrowserBridgeRuntimeEvent,
 } from '@baccarat/browser-bridge';
 import {
@@ -65,6 +67,7 @@ import {
 } from './operational-wager-coordinator.js';
 import {
   isExactOneShotLiveBetConfirmation,
+  shortExtensionInstallId,
   type DesktopConsoleSnapshot as ApiDesktopConsoleSnapshot,
   type DesktopRecordCounts,
   type DesktopRecordPage,
@@ -72,6 +75,7 @@ import {
   type DesktopRuntimeState,
   type DesktopPendingSettlementCommand,
   type DesktopPerformanceReport,
+  type DesktopExtensionApprovalState,
   type DesktopUnknownWagerReconciliationCommand,
   type DesktopUnknownWagerWriteOffCommand,
   type DesktopShoeEvidence,
@@ -133,6 +137,8 @@ const LIVE_MONITOR_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000] as const;
 const EMPTY_RECORD_COUNTS: DesktopRecordCounts = { events: 0, decisions: 0, ledger: 0 };
 const EMPTY_MONITOR_SUMMARY: MonitorSummary = { rows: [], incomePoints: [] };
 const ACCOUNTING_REFRESH_MIN_MS = 2_000;
+/** FIX(P2-5): 监控历史定期裁剪间隔（10 分钟，单次裁剪量小、不阻塞事件泵）。 */
+const MONITOR_HISTORY_COMPACT_INTERVAL_MS = 10 * 60_000;
 
 /**
  * 已提交的预留超过这个时长仍未收到结算，就升级为 UNKNOWN。
@@ -216,6 +222,17 @@ export interface DesktopSnapshotOptions extends MonitorSummaryOptions {
   includeSummary?: boolean;
 }
 
+/**
+ * FIX(D-P2-4): 写路径的轻量快照选项。
+ *
+ * 修复前每个写操作后返回给 UI 的 snapshot 都用默认 `includeHistory !== false`，
+ * 会全量 `listEvents()/listDecisions()/listReceipts()`：10 万条事件时单次 610ms /
+ * 32.5MB（review 脚本 b8b 实证），而下注/改设置/确认牌靴/勾销/批准事故全都走这条路。
+ *
+ * 只改**调用点**与各 console 切片，不动 `snapshot()` 默认值（首次加载与
+ * 账本/事件视图仍要全量）。
+ */
+const LIGHT_WRITE_SNAPSHOT: DesktopSnapshotOptions = { includeHistory: false };
 export interface DesktopConsoleSnapshot extends Omit<ApiDesktopConsoleSnapshot, 'snapshot' | 'summary' | 'demoError'> {
   dbPath: string;
   isOpen: boolean;
@@ -293,10 +310,21 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
   cachedRecordCounts?: DesktopRecordCounts;
   cachedSummary?: MonitorSummary;
   cachedLightSnapshot?: { key: string; at: number; value: DesktopConsoleSnapshot };
+  /** FIX(D-P2-4): 各 console 切片（下注/对账/勾销）的写路径快照选项。 */
+  readonly lightWriteSnapshotOptions: DesktopSnapshotOptions = LIGHT_WRITE_SNAPSHOT;
   private lastAccountingRefreshAt = 0;
   /** 本进程启动时刻。用于区分"运行期新产生的敞口"与"启动时从账本恢复的历史敞口"。 */
   private readonly runtimeStartedAt = Date.now();
   closing = false;
+  /**
+   * FIX(P2-5): 定期裁剪监控历史，防止账本无界增长。
+   *
+   * 修复前 `compactMonitorHistory()` / `pruneMonitorHistory()` **没有任何调用方**
+   * （审查实测 64 桌一个月约 417 万条事件 / 3.7GB，且全量 snapshot 会随之线性变慢）。
+   * `pruneMonitorHistory` 本身实现是安全的（每桌保留最近 N 手，且**永不裁剪**
+   * 仍有 RESERVED/UNKNOWN 敞口的手），缺的只是一个触发点。
+   */
+  private monitorHistoryPruneTimer?: NodeJS.Timeout;
   suppressDiscoveredMonitorAutoAdd = false;
   automationEnabled = false;
   readonly pendingGameCountByTable = new Map<string, number>();
@@ -418,6 +446,13 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
       this.applyUnifiedBetSettingsToTables(this.monitorTableIds);
     }
     this.startupFailCloseTask = this.initializeFailClosedRuntime();
+    // FIX(D-P1-1 wiring): 启动恢复必须把"上一进程遗留的 RESERVED 敞口"统一升级为
+    // UNKNOWN(restored-unsettled-exposure)。修复前 refreshAccountingIncidents 里的
+    // escalateOverdueReservations 用 notBefore=runtimeStartedAt 永久跳过重启前敞口，
+    // 而 expireOpenForShoe 又跳过有回执的预留 —— 结果那笔既不会升级、也不会被清理、
+    // 操作员还不能 writeOffUnknown（review 脚本 a7 / a2g 实证：永久占坑）。
+    // 这里不走 notBefore（那是运行期语义，保留不动），启动恢复专管跨进程收口。
+    this.orchestrator.escalateRestoredExposures();
     this.refreshAccountingIncidents();
   }
 
@@ -683,6 +718,33 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     this.ledger.checkpoint();
   }
 
+  /**
+   * FIX(P2-5): 启动定期裁剪。每 10 分钟一次，只裁剪"每桌最近 N 手"以外的历史，
+   * 且永不触碰仍有 RESERVED/UNKNOWN 敞口的手（见 `pruneMonitorHistory` 实现）。
+   *
+   * 为什么是 10 分钟：一靴约 45-80 分钟，10 分钟粒度既能让单次裁剪量很小（不是一次性
+   * 大事务卡住事件泵），也远快于 3.7GB/月 的增长速度。定时器 `unref()` 掉，不阻止进程退出。
+   */
+  startMonitorHistoryCompaction(intervalMs = MONITOR_HISTORY_COMPACT_INTERVAL_MS): void {
+    if (this.monitorHistoryPruneTimer !== undefined) return;
+    this.monitorHistoryPruneTimer = setInterval(() => {
+      if (this.closing) return;
+      try {
+        this.compactMonitorHistory();
+      } catch (error) {
+        // 裁剪失败不能影响下注/监控：记一条 degraded 事故即可。
+        this.recordLiveMonitorError(error, 'scheduler-failure', 'degraded');
+      }
+    }, Math.max(60_000, intervalMs));
+    this.monitorHistoryPruneTimer.unref?.();
+  }
+
+  stopMonitorHistoryCompaction(): void {
+    if (this.monitorHistoryPruneTimer === undefined) return;
+    clearInterval(this.monitorHistoryPruneTimer);
+    this.monitorHistoryPruneTimer = undefined;
+  }
+
   /** 聚合复盘报表（只读）：按靴汇总的结算/盈亏、UNKNOWN 敞口、断连排行。 */
   performanceReport(): DesktopPerformanceReport {
     const reservations = this.orchestrator.getReservations();
@@ -852,14 +914,59 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     }
   }
 
-  keepaliveTableReasons(tableId: string): LiveExecutionBlockReason[] {
+  /** FIX(D-P0-1): 保活/无人值守执行路径的阻断原因；授权是硬门控。 */
+  keepaliveTableReasons(
+    tableId: string,
+    requireAuthorization = true,
+  ): LiveExecutionBlockReason[] {
     // Fail-closed (#16 / AGENTS.md): keepalive is a platform-reaching path and
     // still requires physical-shoe. Do not strip physical-shoe-baseline-unknown.
-    return this.liveTableReasons(tableId);
+    const reasons = this.liveTableReasons(tableId);
+    // FIX(D-P0-1): 无人值守运行授权是保活路径的硬门控。
+    //
+    // 修复前这里只转调 liveTableReasons（桥/feed/牌靴/缺口/UNKNOWN），完全不看
+    // liveAuthorizationSources：多桌时 failCloseLiveExecution 因"别的桌还有授权"
+    // 直接 return，被撤销授权的那桌 promote 后首个窗口就能发真金保活
+    // （review 脚本 a1h / a1d 实证桥收到 source=keepalive 的请求）。
+    //
+    // requireAuthorization=false 只给 reconcileUnattendedExecution 用：那里的语义是
+    // "要不要**建立**授权"，如果把"尚未授权"也算成阻断原因，就永远建立不了授权
+    // （死锁）。执行路径（保活 tick / 手动受控下注）一律默认严格。
+    if (requireAuthorization && !this.liveAuthorizationSources.has(tableId)) {
+      reasons.push('table-not-authorized');
+    }
+    return reasons;
   }
 
-  manualLiveTableReasons(tableId: string, approved = true): LiveExecutionBlockReason[] {
-    return this.liveTableReasons(tableId, approved);
+  manualLiveTableReasons(
+    tableId: string,
+    approved = true,
+    allowNewAuthorization = true,
+  ): LiveExecutionBlockReason[] {
+    const reasons = this.liveTableReasons(tableId, approved);
+    // FIX(D-P0-1): 手动下注是操作员显式动作，**允许本次调用建立**运行授权
+    // （修复前 execute() 就是临时打开 live gate + operational executor，不要求
+    // 既有 liveAuthorizationSources；把未授权当成手动阻断会把首次手动下注锁死）。
+    // 只有调用方显式声明"本次不得新建授权"（只读预检 / UI 展示）时才追加该原因。
+    if (!allowNewAuthorization && !this.liveAuthorizationSources.has(tableId)) {
+      reasons.push('table-not-authorized');
+    }
+    return reasons;
+  }
+
+  /**
+   * FIX(D-P1-6): 当前是否存在**全局级**（tableId === undefined）blocked 事故。
+   *
+   * 修复前这类事故只影响 `runtimeSnapshot().status` 与 UI 横幅：桥在
+   * continuity-invalidated / session-recovery-exhausted 之后仍可能"已认证、连接数 1"，
+   * 单桌 liveTableReasons 为空，于是操作员看到"无人值守执行已阻断"却仍能手动下注
+   * （review 脚本 a1b 实证 ACCEPTED + 桥收到请求）。
+   */
+  activeGlobalBlockedIncidentCode(): RuntimeIncidentCode | undefined {
+    return this.runtimeIncidents.list().find(incident =>
+      incident.active
+      && incident.severity === 'blocked'
+      && incident.tableId === undefined)?.code;
   }
 
   private runtimeSnapshot(): DesktopRuntimeState {
@@ -953,6 +1060,8 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
         case 'extension-authenticated':
           this.runtimeIncidents.resolveAll('bridge-auth-failed');
           this.runtimeIncidents.resolveAll('bridge-disconnected');
+          // FIX(P0-1): 该 installId 已被批准并升级为 extension 角色，待批准事故自动收敛。
+          this.runtimeIncidents.resolveAll('bridge-extension-pairing-required');
           this.transportDownAt = undefined;
           this.beginRecoverySuppression();
           await this.reconcileUnattendedExecution();
@@ -972,6 +1081,17 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
             activeLeaseId: event.activeLeaseId,
             active_executor_count: this.browserBridge?.getExecutorStatus().active_executor_count ?? 0,
           }));
+          return;
+        case 'extension-pairing-required':
+          // FIX(P0-1): 未批准的扩展只能拿到 pending 角色（拿不到 lease、收不到 betRequest）。
+          // 这里只记一条 degraded 事故，**不阻断**真实执行路径——真正的阻断在桥层：
+          // pending socket 不属于 extension 角色，requestBet 会因"无已认证扩展"而失败关闭。
+          // installId 不写入事故消息（避免把本机标识留在持久化日志里），只进 pending 列表。
+          this.ensureRuntimeIncident({
+            code: 'bridge-extension-pairing-required',
+            severity: 'degraded',
+            message: 'browser extension awaiting operator approval',
+          });
           return;
         case 'extension-disconnected':
           this.operationalWagers.disableKeepaliveImmediately();
@@ -1229,6 +1349,16 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     this.browserBridge?.seedBgShoeSequences(this.ledger.listBgShoeGenerations());
   }
 
+  /**
+   * FIX(D-P0-1): 操作员批准名单。
+   *
+   * 内存版是**有意的**：批准关系必须随进程重启重新确认（fail-closed），
+   * 否则一次误批准会永久留在磁盘上。启动桥时把它传给 `BrowserBridgeServer`
+   * 即进入严格模式 —— 未批准的 installId 只能停在 pending，拿不到 executor
+   * lease、收不到 betRequest，伪造 Origin+token 的本机进程（b7d）因此无法接管。
+   */
+  readonly extensionApprovals = new MemoryExtensionApprovalStore();
+
   async startBrowserBridge(port = 17890): Promise<{ port: number }> {
     if (!this.browserBridge) {
       const bridge = new BrowserBridgeServer({
@@ -1238,6 +1368,7 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
         allowedExtensionIds: [...BUNDLED_BROWSER_EXTENSION_IDS],
         extensionToken: BUNDLED_BROWSER_EXTENSION_TOKEN,
         onRuntimeEvent: event => this.handleBridgeRuntimeEvent(event),
+        extensionApprovals: this.extensionApprovals,
       });
       const hostClaim = bridge.claimHostExecutionChannel('desktop-primary');
       if (!hostClaim.ok) {
@@ -1248,6 +1379,58 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
       this.seedBgShoeSequencesFromLedger();
     }
     return { port: this.browserBridgePort };
+  }
+
+  /** FIX(D-P0-1): 待批准的扩展身份（完整 installId 只在这里返回，供 IPC 使用）。 */
+  listPendingExtensions(): BridgeExtensionPendingEntry[] {
+    return this.browserBridge?.listPendingExtensions() ?? [];
+  }
+
+  /** FIX(D-P0-1): 批准某个扩展身份，立即把它的 pending 连接提升为 extension 角色。 */
+  approveExtension(installId: string): void {
+    const bridge = this.browserBridge;
+    if (!bridge) throw new Error('browser bridge is not running');
+    bridge.approveExtension(installId);
+    this.runtimeIncidents.resolveAll('bridge-extension-pairing-required');
+    this.cachedLightSnapshot = undefined;
+  }
+
+  /** FIX(D-P0-1): 撤销批准；正在使用该身份的扩展连接会被桥以 1008 关闭。 */
+  revokeExtension(installId: string): void {
+    const bridge = this.browserBridge;
+    if (!bridge) throw new Error('browser bridge is not running');
+    bridge.revokeExtension(installId);
+    this.cachedLightSnapshot = undefined;
+  }
+
+  /** FIX(D-P0-1): 批准状态（含 pending socket 计数），供 UI 渲染安全闸。 */
+  extensionApprovalState(): DesktopExtensionApprovalState {
+    const bridge = this.browserBridge;
+    if (!bridge) {
+      return {
+        strict: true,
+        pendingCount: 0,
+        unidentifiedPendingConnections: 0,
+        pending: [],
+        approved: [],
+      };
+    }
+    const state = bridge.getExtensionApprovalState();
+    return {
+      strict: state.strict,
+      pendingCount: state.pending.length,
+      unidentifiedPendingConnections: state.unidentifiedPendingConnections,
+      pending: state.pending.map(entry => ({
+        installIdShort: shortExtensionInstallId(entry.installId),
+        firstSeenAt: entry.firstSeenAt,
+        lastSeenAt: entry.lastSeenAt,
+      })),
+      approved: state.approved.map(installId => ({
+        installIdShort: shortExtensionInstallId(installId),
+        firstSeenAt: '',
+        lastSeenAt: '',
+      })),
+    };
   }
 
   async stopBrowserBridge(): Promise<void> {
@@ -1568,9 +1751,16 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     const events = includeHistory
       ? this.ledger.listEvents()
       : this.ledger.listRecentDisplayEventsForTables(displayedTableIds, 24);
-    const decisions = includeHistory ? this.ledger.listDecisions() : [];
-    const receipts = includeHistory ? this.ledger.listReceipts() : [];
-    const reservations = includeHistory ? this.orchestrator.getReservations() : [];
+    // FIX(D-P2-4): 轻量快照不再全量返回历史 events/decisions/receipts —— 10 万条事件时
+    // 单次 610ms / 32.5MB（review 脚本 b8b 实证），而所有写操作后都走这条路。
+    // 但**保留** UI 与操作员真实需要的运营态：
+    //  · reservations：内存里的预留（含刚结算的那笔），KPI/账本/勾销入口依赖；
+    //  · operationalWagers：受控下注审计尾巴（≤100 条，本来就是 tail 查询）。
+    // 历史复盘仍走 `queryRecords(...)` 分页与账本/事件视图的全量快照。
+    const decisions: ReturnType<SqliteLedger['listDecisions']> = includeHistory ? this.ledger.listDecisions() : [];
+    const receipts: ReturnType<SqliteLedger['listReceipts']> = includeHistory ? this.ledger.listReceipts() : [];
+    const reservations = this.orchestrator.getReservations();
+    const operationalWagers = this.ledger.listOperationalWagersTail();
     const monitorCandidates = this.monitorCandidates();
     const tableMetadata = this.tableMetadataSnapshot(monitorCandidates);
     const scopedTableIds = usingLiveMonitor ? displayedTableIds : undefined;
@@ -1595,7 +1785,10 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
       keepalive,
       automation: { enabled: this.automationEnabled },
       runtime: this.runtimeSnapshot(),
-      operationalWagers: includeHistory ? this.ledger.listOperationalWagersTail() : [],
+      // FIX(D-P2-4): 受控下注审计记录按记录内的 wager.tableId 过滤（记录本身没有 tableId 字段）。
+      operationalWagers: usingLiveMonitor
+        ? operationalWagers.filter(record => activeTableIds.has(record.wager.tableId))
+        : operationalWagers,
       events: filterToDisplayedTables(events),
       decisions: filterToDisplayedTables(decisions),
       receipts: filterToDisplayedTables(receipts),
@@ -1606,6 +1799,9 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
         ...summary,
         rows: summary.rows.filter(row => activeTableIds.has(row.tableId)),
       },
+      // FIX(D-P0-1): 批准状态进快照，UI 才能轮询到"有扩展等待批准"的安全闸。
+      // 只含 installId 前 8 位；完整值不进 snapshot。
+      extensionApproval: this.extensionApprovalState(),
       demoError: this.demoError,
     };
     if (lightKey) this.cachedLightSnapshot = { key: lightKey, at: now, value: result };
@@ -1661,9 +1857,22 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     };
   }
 
+  /**
+   * FIX(D-P2-4): 写操作后的轻量快照。
+   *
+   * 先作废 500ms 轻量快照缓存，再取新快照 —— 否则"改设置/确认牌靴/勾销之后紧接着
+   * 返回给渲染层的快照"可能命中写操作之前的缓存，UI 会显示旧配置（测试
+   * `snapshot-cache.test.ts` 正是守着这个坑）。
+   */
+  private lightWriteSnapshot(): DesktopConsoleSnapshot {
+    this.cachedLightSnapshot = undefined;
+    return this.snapshot(LIGHT_WRITE_SNAPSHOT);
+  }
+
   async updateTableSettings(tableId: string, settings: TableSettingsUpdate): Promise<DesktopConsoleSnapshot> {
     this.orchestrator.updateTableSettings(tableId, { ...settings, minEV: Math.max(0, settings.minEV) });
-    return this.snapshot();
+    // FIX(D-P2-4): 写路径只回轻量快照。
+    return this.lightWriteSnapshot();
   }
 
   async updateAllTableSettings(settings: TableSettingsUpdate): Promise<DesktopConsoleSnapshot> {
@@ -1678,7 +1887,8 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     this.persistUnifiedBetSettings(unified);
     this.ensureMonitorActors(this.monitorTableIds, unified);
     this.orchestrator.updateTableSettingsForTables(this.monitorTableIds, unified);
-    return this.snapshot();
+    // FIX(D-P2-4): 写路径只回轻量快照。
+    return this.lightWriteSnapshot();
   }
 
   async updateMonitorTableIds(tableIds: readonly string[]): Promise<DesktopConsoleSnapshot> {
@@ -1700,7 +1910,8 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     defaultBetAmount: number,
   ): Promise<DesktopConsoleSnapshot> {
     this.orchestrator.registerTable({ ...profile, minEV: Math.max(0, profile.minEV) }, 'live', defaultBetAmount);
-    return this.snapshot();
+    // FIX(D-P2-4): 写路径只回轻量快照。
+    return this.lightWriteSnapshot();
   }
 
   async injectEvent(event: NormalizedEvent): Promise<DesktopConsoleSnapshot> {
@@ -1713,7 +1924,8 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     if (!this.monitorTableIds.includes(tableId)) throw new Error(`table ${tableId} is not monitored`);
     this.browserBridge.confirmPhysicalShoe(tableId);
     await this.orchestrator.flush(tableId);
-    return this.snapshot();
+    // FIX(D-P2-4): 写路径只回轻量快照。
+    return this.lightWriteSnapshot();
   }
   async setAutoBet(tableId: string, armed: boolean, shoeId?: string): Promise<DesktopConsoleSnapshot> {
     return this.enqueueExecutionStateOperation(async () => {
@@ -1731,11 +1943,27 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
         }
       }
       await actor.setAutoBet(armed, shoeId);
-      return this.snapshot();
+      // FIX(D-P2-4): 写路径只回轻量快照。
+      return this.lightWriteSnapshot();
     });
   }
 
-  async setExecutionMode(tableId: string, _mode: 'shadow' | 'live'): Promise<DesktopConsoleSnapshot> {
+  /**
+   * 切换执行模式。
+   *
+   * FIX(D-P0-4): 修复前签名里的 `_mode` 被直接丢弃，函数体**无条件**执行
+   * liveApprovals.approve + setPersistentLiveGate(true) + 装真金 executor +
+   * liveAuthorizationSources.set('manual')。于是"切到影子模式"实际上是在 arm
+   * 真金执行器：操作员以为在演练，下一笔手动下注就 ACCEPTED 并发出真金请求
+   * （review 脚本 a1e 实证）。preload/IPC 都还暴露着这条路径。
+   *
+   * 本构建不支持 shadow/simulated 运行时（orchestrator 的 TableActor 也强制 live），
+   * 所以直接拒绝 —— fail-closed：宁可报错，也不能假装降级却打开真金通道。
+   */
+  async setExecutionMode(tableId: string, mode: 'shadow' | 'simulated' | 'live'): Promise<DesktopConsoleSnapshot> {
+    if (mode === 'shadow' || mode === 'simulated') {
+      throw new Error('execution mode cannot be downgraded from live; shadow simulation is not supported in this build');
+    }
     return this.enqueueExecutionStateOperation(async () => {
       await this.startupFailCloseTask;
       const actor = this.orchestrator.getActor(tableId);
@@ -1796,7 +2024,8 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
         market: settings.market,
         amount: settings.amount,
       });
-      return this.snapshot();
+      // FIX(D-P2-4): 写路径只回轻量快照。
+      return this.lightWriteSnapshot();
     });
   }
 
@@ -1812,7 +2041,8 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
         amount: current.amount,
       });
       await this.reconcileUnattendedExecution();
-      return this.snapshot();
+      // FIX(D-P2-4): 写路径只回轻量快照。
+      return this.lightWriteSnapshot();
     });
   }
 
@@ -1823,7 +2053,8 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
       this.ledger.setConfig(AUTOMATION_CONFIG_KEY, { enabled });
       await this.reconcilePairAutomation(enabled);
       await this.reconcileUnattendedExecution();
-      return this.snapshot();
+      // FIX(D-P2-4): 写路径只回轻量快照。
+      return this.lightWriteSnapshot();
     });
   }
 
@@ -1831,12 +2062,14 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     const normalized = incidentId.trim();
     if (normalized.length === 0) throw new TypeError('incident id must not be empty');
     this.runtimeIncidents.acknowledge(normalized);
-    return this.snapshot();
+    // FIX(D-P2-4): 写路径只回轻量快照。
+    return this.lightWriteSnapshot();
   }
 
   acknowledgeAllRuntimeIncidents(): DesktopConsoleSnapshot {
     this.runtimeIncidents.acknowledgeAllActive();
-    return this.snapshot();
+    // FIX(D-P2-4): 写路径只回轻量快照。
+    return this.lightWriteSnapshot();
   }
 
   async executeOneShotLiveBet(input: OneShotLiveBetCommand): Promise<OneShotLiveBetResult> {
@@ -1930,17 +2163,38 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     const actor = this.orchestrator.getActor(tableId);
     if (!actor) throw new Error(`unknown table ${tableId}`);
     await actor.applyManualCorrection(correction, shoeId);
-    return this.snapshot();
+    // FIX(D-P2-4): 写路径只回轻量快照。
+    return this.lightWriteSnapshot();
   }
 
   async updateRiskLimits(limits: RiskLimits): Promise<DesktopConsoleSnapshot> {
     this.orchestrator.updateRiskLimits(limits);
-    return this.snapshot();
+    // FIX(D-P2-4): 写路径只回轻量快照。
+    return this.lightWriteSnapshot();
   }
 
+  /**
+   * 清除监控记录。
+   *
+   * FIX(D-P2-2): 风控计数（dayLoss / tableLosses / shoeLosses）由
+   * `SqliteLedger.clearMonitorData()` 保留、`RiskManager` 自己也持有同一份状态，
+   * 所以"清账"不会把止损额度归零。这里加一道**兜底断言式保护**：万一上游
+   * 语义再被改回去，就在 service 层拒绝并报错，而不是静默把风控清零。
+   */
   async clearMonitorData(): Promise<DesktopConsoleSnapshot> {
     await this.stopDemo();
+    const riskBefore = this.orchestrator.getRiskState();
     await this.orchestrator.clearMonitorData();
+    const riskAfter = this.orchestrator.getRiskState();
+    const riskCountersPreserved = riskAfter.dayLoss === riskBefore.dayLoss
+      && JSON.stringify(riskAfter.tableLosses) === JSON.stringify(riskBefore.tableLosses)
+      && JSON.stringify(riskAfter.shoeLosses) === JSON.stringify(riskBefore.shoeLosses);
+    if (!riskCountersPreserved) {
+      throw new Error(
+        'clearMonitorData reset risk counters (dayLoss/tableLosses/shoeLosses); refusing to continue — '
+        + 'clearing records must not reset stop-loss accounting',
+      );
+    }
     this.cachedRecordCounts = undefined;
     this.cachedSummary = undefined;
     this.runtimeIncidents.resolveAll('table-feed-stale');
@@ -1956,11 +2210,14 @@ export class DesktopConsoleService implements WagerConsoleHost, MonitorConsoleHo
     if (this.liveMonitorActivated) this.ensureMonitorActors(this.monitorTableIds);
     this.demoConsole.lastSeed = undefined;
     this.demoError = undefined;
+    // 清除记录后 UI 需要重新拿全量（账本/事件视图），这里保留全量快照。
     return this.snapshot();
   }
 
   async close(): Promise<void> {
     this.closing = true;
+    // FIX(P2-5): 先停裁剪定时器，避免关闭过程中还在动账本。
+    this.stopMonitorHistoryCompaction();
     await this.enqueueExecutionStateOperation(async () => {
       await this.startupFailCloseTask;
       this.operationalWagers.close();

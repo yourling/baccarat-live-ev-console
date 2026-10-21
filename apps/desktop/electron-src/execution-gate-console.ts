@@ -47,7 +47,7 @@ export interface ExecutionGateHost {
     tableId?: string,
   ): void;
   refreshAccountingIncidents(force?: boolean): void;
-  keepaliveTableReasons(tableId: string): LiveExecutionBlockReason[];
+  keepaliveTableReasons(tableId: string, requireAuthorization?: boolean): LiveExecutionBlockReason[];
   liveTableReasons(tableId: string, approved?: boolean): LiveExecutionBlockReason[];
   currentMonitorTableIds(): readonly string[];
   rearmPairAutomation(tableId: string): Promise<void>;
@@ -58,26 +58,55 @@ export interface ExecutionGateHost {
 export class ExecutionGateConsole {
   constructor(private readonly host: ExecutionGateHost) {}
 
-  /** 启动期兜底：恢复的 feed 一律先按断开处理，等运行期事件重新确认。 */
+  /**
+   * 启动期兜底：恢复的 feed 一律先按断开处理，等运行期事件重新确认。
+   *
+   * FIX(D-P1-4): 修复前这里靠 `actor.getProjection()` 判断"上一进程是否 live"，
+   * 但 `service.ts` 构造里更早的 `resetLiveShoeTracking()` 已经把投影清空
+   * （shoeId='' / connectionStatus='CONNECTED' / WAITING_NEW_SHOE），条件
+   * `projection.shoeId && ...` 恒为假 → `connectionLost(process-restarted)` 是死分支，
+   * 重启后 UI 仍显示"已连接"（review 脚本 a2b/a2c 实证 connectionLost 数=0）。
+   *
+   * 现在判据改从**持久化**状态读：监控表 + liveApprovals（上次批准过 live 的桌）。
+   * 这些数据不依赖运行时投影，所以 reset 顺序不再影响它。写事件之后再清投影，
+   * 保证重启后是 DISCONNECTED / RESYNCING 而不是"CONNECTED 但无数据"。
+   */
   async initializeFailClosedRuntime(): Promise<void> {
-    for (const actor of this.host.orchestrator.listActors()) {
-      if (this.host.monitorTableIds.includes(actor.tableId) && actor.snapshot().executionMode !== 'live') {
-        this.host.orchestrator.updateTableExecutionMode(actor.tableId, 'live');
+    // ① 先清掉 replay 出来的上一进程投影（TableActor 构造里 replay(latestShoeOnly)
+    //    会让投影"半恢复"：seenCards 只补回 handSettled 的牌，cardObserved 已丢）。
+    //    这一步必须在写断线事件**之前** —— 否则 reset 会把刚写出来的 DISCONNECTED 覆盖
+    //    回 emptyProjection 的 CONNECTED，正是审查里"重启后仍显示已连接"的根因。
+    this.host.orchestrator.resetLiveShoeTracking();
+
+    // ② 再按**持久化**状态补写 process-restarted 断线事件。
+    //    判据不依赖运行时投影：监控列表（持久化）+ live 批准（持久化）。
+    const persistedLiveTableIds = new Set(this.host.liveApprovals.list());
+    const restartTableIds = this.host.monitorTableIds
+      .filter(tableId => persistedLiveTableIds.has(tableId));
+    for (const tableId of restartTableIds) {
+      const actor = this.host.orchestrator.getActor(tableId);
+      if (!actor) continue;
+      if (actor.snapshot().executionMode !== 'live') {
+        this.host.orchestrator.updateTableExecutionMode(tableId, 'live');
       }
-      const projection = actor.getProjection();
-      if (this.host.monitorTableIds.includes(actor.tableId) && projection.shoeId && projection.connectionStatus !== 'DISCONNECTED') {
-        await this.host.orchestrator.enqueue(actor.tableId, {
-          type: 'connectionLost',
-          eventId: newId('evt'),
-          tableId: actor.tableId,
-          timestamp: new Date().toISOString(),
-          sourceSeq: this.host.nextMonitorSourceSeq(actor.tableId),
-          source: 'console',
-          schemaVersion: EVENT_SCHEMA_VERSION,
-          reason: 'process-restarted',
-        });
-      }
+      await this.host.orchestrator.enqueue(tableId, {
+        type: 'connectionLost',
+        eventId: newId('evt'),
+        tableId,
+        timestamp: new Date().toISOString(),
+        sourceSeq: this.host.nextMonitorSourceSeq(tableId),
+        source: 'console',
+        schemaVersion: EVENT_SCHEMA_VERSION,
+        reason: 'process-restarted',
+      });
     }
+    // 未监控但注册过 actor 的桌（demo 表等）也要恢复成 live 模式；投影已在 ① 清空。
+    for (const actor of this.host.orchestrator.listActors()) {
+      if (this.host.monitorTableIds.includes(actor.tableId)) continue;
+      if (actor.snapshot().executionMode === 'live') continue;
+      this.host.orchestrator.updateTableExecutionMode(actor.tableId, 'live');
+    }
+
     this.host.liveAuthorizationSources.clear();
     this.host.transportDownAt = undefined;
     this.host.recoverySuppressUntil = 0;
@@ -85,8 +114,17 @@ export class ExecutionGateConsole {
     this.host.setOperationalWagerExecutor(false);
   }
 
-  canExecuteAutomaticBets(_tableId: string): boolean {
-    return this.host.automationEnabled;
+  /**
+   * 自动对子是否允许执行。
+   *
+   * FIX(D-P1-5): 修复前是 `_tableId => automationEnabled`，完全不分桌 —— demo 期间
+   * `demo-console` 把全局 executor 换成 SimulatedAdapter 后，真实监控桌的自动策略
+   * 会拿到 null 回执并记 UNKNOWN 假敞口（review 脚本 b9b 实证）。
+   * 现在只有"已选监控桌"才允许自动执行：demo 表不在 monitorTableIds 里，天然被排除。
+   */
+  canExecuteAutomaticBets(tableId: string): boolean {
+    if (!this.host.automationEnabled) return false;
+    return this.host.currentMonitorTableIds().includes(tableId);
   }
 
   async resetMonitorExecutionState(tableId: string): Promise<void> {
@@ -159,7 +197,9 @@ export class ExecutionGateConsole {
     for (const tableId of approvedTableIds) {
       const actor = this.host.orchestrator.getActor(tableId);
       if (!actor) continue;
-      const reasons = this.host.keepaliveTableReasons(tableId);
+      // FIX(D-P0-1): reconcile 的语义是"要不要**建立**授权"，所以这里必须排除
+      // `table-not-authorized` —— 否则每张未授权桌都算阻断原因，授权永远建不起来。
+      const reasons = this.host.keepaliveTableReasons(tableId, false);
       const authorization = this.host.liveAuthorizationSources.get(tableId);
       if (reasons.length > 0) {
         if (authorization === 'unattended') {

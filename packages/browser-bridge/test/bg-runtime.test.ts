@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { BgRuntimeParser, isBgInternalExternalGameCountAnomaly, selectBgRoadCount } from '../src/bg-runtime.js';
+import { applyEvent, emptyProjection } from '@baccarat/ledger-state';
 import type { NormalizedEvent } from '@baccarat/contracts';
 
 function snapshot(tables: ReadonlyArray<Record<string, unknown>>, observedAt = '2026-09-05T01:00:00.000Z') {
@@ -277,27 +278,58 @@ describe('BgRuntimeParser', () => {
     expect(promoted.filter(event => event.type === 'cardObserved')).toHaveLength(8);
   });
 
-  it('replays a current-shoe HISTORY of more than 20 hands after NEXT_SHOES', () => {
+  // FIX(B-P0-1): 这个用例原来断言"HISTORY 24 行 → 回填 96 张"。那正是 AGENTS
+  // 第 6 条禁止的行为（新靴不得回填 21 行以上旧珠盘）：刚开出的实体新靴若用
+  // 上一靴的 24 行珠盘扣库存，remainingTotal 会永久偏低，对子 EV 直接算错。
+  // 保留意图（新靴确实要能从 HISTORY 补库存），但把行数收到硬上限 21。
+  it('replays a current-shoe HISTORY up to the 21-hand backfill ceiling', () => {
     const parser = new BgRuntimeParser();
     parser.parse(snapshot([{
       tableId: 'B01',
       shoeReset: 'bg-shoe-1',
       source: 'protocol',
     }]));
-    const hands = Array.from({ length: 24 }, () => ({
+    const hands = Array.from({ length: 21 }, () => ({
       playerCards: ['AS', '8S'],
       bankerCards: ['AH', '7H'],
     }));
     const events = parser.parse(snapshot([{
       tableId: 'B01',
-      roundId: '224',
-      gameCount: 24,
+      roundId: '221',
+      gameCount: 21,
       shoeReset: 'bg-shoe-2',
       source: 'protocol',
       historyHands: hands,
     }]));
-    expect(events.filter(event => event.type === 'cardObserved').length).toBe(96);
-    expect(parser.acceptedGameCount('B01')).toBe(24);
+    expect(events.filter(event => event.type === 'cardObserved').length).toBe(84);
+    expect(parser.acceptedGameCount('B01')).toBe(21);
+  });
+
+  // FIX(B-P0-1): 上界之上（22 行）一律不回填 —— 无论 felt 路子是多少。
+  // 这是 AGENTS 第 6 条的硬约束：宁可让新靴从空库存重启，也不能灌错库存。
+  it('refuses a 22-row HISTORY backfill onto a freshly opened physical shoe', () => {
+    const parser = new BgRuntimeParser();
+    parser.parse(snapshot([{
+      tableId: 'B02',
+      shoeReset: 'bg-shoe-1',
+      source: 'protocol',
+    }]));
+    const opened = parser.parse(snapshot([{
+      tableId: 'B02',
+      roundId: '222',
+      gameCount: 22,
+      shoeReset: 'bg-shoe-2',
+      source: 'protocol',
+      historyHands: Array.from({ length: 22 }, () => ({
+        playerCards: ['AS', '8S'],
+        bankerCards: ['AH', '7H'],
+      })),
+    }]));
+    expect(opened.filter(event => event.type === 'newShoeSignal')).toEqual([
+      expect.objectContaining({ baseline: 'physical-shoe', tableId: 'B02' }),
+    ]);
+    expect(opened.filter(event => event.type === 'cardObserved')).toEqual([]);
+    expect(opened.filter(event => event.type === 'handSettled')).toEqual([]);
   });
 
   it('does not replay a lagged deep HISTORY onto a freshly shuffled shoe', () => {
@@ -1108,5 +1140,167 @@ describe('BgRuntimeParser', () => {
     expect(wrapped.filter(event => event.type === 'newShoeSignal')).toEqual([
       expect.objectContaining({ baseline: 'physical-shoe', tableId: 'C01' }),
     ]);
+  });
+});
+
+/**
+ * FIX(B-P0-1): AGENTS.md 第 6 条「新靴不得回填 21 行以上的旧珠盘」。
+ *
+ * 修复前（HEAD 225d030 实测 c12g/c12h）：
+ *   - 换靴瞬间 DOM 路子滞后（felt=29、HISTORY=29 行），
+ *     `historyHands.length - gameCount === 0` 不满足"差值 ≥ 8"，
+ *     旧靴 29 手被 replayHistoryRoad 灌进全新实体靴；
+ *   - 新靴 remainingTotal 416→326/376/396、handNumber 5~29、baseline 仍是
+ *     physical-shoe（即可直接下注），对子 EV 用上一靴牌面算。
+ *
+ * 这里用真实 BgRuntimeParser + 真实 applyEvent 断言"新靴收到 0 个 cardObserved"。
+ */
+describe('FIX(B-P0-1) new shoe must not backfill more than 21 rows of the old bead plate', () => {
+  const T0 = Date.parse('2026-09-05T05:00:00.000Z');
+  const at = (ms: number) => new Date(T0 + ms).toISOString();
+
+  function snapshotAt(tableId: string, table: Record<string, unknown>, ms: number): string {
+    return JSON.stringify({
+      version: 1,
+      view: 'single',
+      observedAt: at(ms),
+      tables: [{ tableId, ...table }],
+    });
+  }
+
+  /** 复刻 c12h 的构造：先打一靴旧牌，再用带大量 HISTORY 的换靴帧开新靴。 */
+  function runOldShoeThenShuffle(options: {
+    feltRoadAtShuffle?: number;
+    historyRows: number;
+    historySeq?: string;
+    settleOldHands?: boolean;
+  }): {
+    newShoeCardEvents: number;
+    newShoeHandSettlements: number;
+    projection: ReturnType<typeof applyEvent> extends Map<string, infer P> ? P : never;
+  } {
+    const tableId = 'B21';
+    const parser = new BgRuntimeParser();
+    const events: NormalizedEvent[] = [];
+    const emit = (list: NormalizedEvent[]) => {
+      events.push(...list);
+      return list;
+    };
+
+    emit(parser.parse(snapshotAt(tableId, { roundId: '1187000', shoeReset: 'seq:500', source: 'protocol' }, 0)));
+    emit(parser.parse(snapshotAt(tableId, { roundId: '1187001', shoeReset: 'seq:501', shuffleEvent: true, source: 'protocol' }, 1000)));
+    for (let hand = 0; hand < 50; hand += 1) {
+      emit(parser.parse(snapshotAt(tableId, {
+        roundId: String(1187002 + hand),
+        bettingOpen: !options.settleOldHands,
+        gameSettled: options.settleOldHands,
+        source: 'protocol',
+        gameCount: hand + 1,
+        playerCards: ['KH', '8S'],
+        bankerCards: ['KS', '9S'],
+      }, 2000 + hand * 50_000)));
+    }
+    const shuffleEvents = emit(parser.parse(snapshotAt(tableId, {
+      roundId: '1187060',
+      shoeReset: options.historySeq ?? 'seq:502',
+      shuffleEvent: true,
+      source: 'protocol',
+      ...(options.feltRoadAtShuffle === undefined ? {} : { gameCount: options.feltRoadAtShuffle }),
+      historyHands: Array.from({ length: options.historyRows }, () => ({
+        playerCards: ['KH', '8S'],
+        bankerCards: ['KS', '9S'],
+      })),
+    }, 2000 + 50 * 50_000)));
+    const newShoe = parser.currentShoeId(tableId)!;
+    const forNewShoe = shuffleEvents.filter(event =>
+      (event.type === 'cardObserved' || event.type === 'handSettled')
+      && (event as { shoeId?: string }).shoeId === newShoe);
+
+    let state = new Map([[tableId, emptyProjection(tableId)]]);
+    let watermark = 0;
+    for (const event of events) {
+      watermark += 1;
+      try {
+        state = applyEvent(state, event, watermark);
+      } catch {
+        // 与 c12h 一致：只关心库存是否被旧牌污染，忽略个别事件的信封校验。
+      }
+    }
+    return {
+      newShoeCardEvents: forNewShoe.filter(event => event.type === 'cardObserved').length,
+      newShoeHandSettlements: forNewShoe.filter(event => event.type === 'handSettled').length,
+      projection: state.get(tableId)!,
+    };
+  }
+
+  it('felt road 29 + HISTORY 29 rows + new shoe → no backfill at all', () => {
+    const result = runOldShoeThenShuffle({ feltRoadAtShuffle: 29, historyRows: 29 });
+    expect(result.newShoeCardEvents).toBe(0);
+    expect(result.newShoeHandSettlements).toBe(0);
+    expect(result.projection.remainingTotal).toBe(416);
+    expect(result.projection.handNumber).toBe(0);
+  });
+
+  it('felt road 25 + HISTORY 29 rows + new shoe → no backfill', () => {
+    const result = runOldShoeThenShuffle({ feltRoadAtShuffle: 25, historyRows: 29 });
+    expect(result.newShoeCardEvents).toBe(0);
+    expect(result.projection.remainingTotal).toBe(416);
+    expect(result.projection.handNumber).toBe(0);
+  });
+
+  it('felt road 1 + HISTORY 29 rows + new shoe → no backfill (already correct)', () => {
+    const result = runOldShoeThenShuffle({ feltRoadAtShuffle: 1, historyRows: 29, settleOldHands: true });
+    expect(result.newShoeCardEvents).toBe(0);
+    expect(result.projection.remainingTotal).toBe(416);
+  });
+
+  it('felt road 18 + HISTORY 29 rows + new shoe → no backfill (already correct)', () => {
+    const result = runOldShoeThenShuffle({ feltRoadAtShuffle: 18, historyRows: 29, settleOldHands: true });
+    expect(result.newShoeCardEvents).toBe(0);
+    expect(result.projection.remainingTotal).toBe(416);
+  });
+
+  it('felt road 3 + HISTORY 18 rows + new shoe → backfill allowed (normal inventory rebuild)', () => {
+    // 这一条与上面几条互为对照：≤21 行是"新靴从 HISTORY 补库存"的正常机制，
+    // 修得过头（一律禁止回填）会让新靴永远空库存、无法评估 EV。
+    // 回填张数会被 replayHistoryRoad 的 `historyHands.slice(0, 局数)` 截到 felt 局数，
+    // 且与已结算 handId 重叠的部分会跳过，所以只断言"确实回填了"而不是精确张数。
+    const result = runOldShoeThenShuffle({ feltRoadAtShuffle: 3, historyRows: 18, settleOldHands: true });
+    expect(result.newShoeCardEvents).toBeGreaterThan(0);
+    expect(result.projection.remainingTotal).toBeLessThan(416);
+  });
+
+  it('HISTORY 21 rows + new shoe → allowed; 22 rows → refused', () => {
+    const atCeiling = runOldShoeThenShuffle({ feltRoadAtShuffle: 21, historyRows: 21, settleOldHands: true });
+    expect(atCeiling.newShoeCardEvents).toBeGreaterThan(0);
+    expect(atCeiling.newShoeCardEvents).toBeLessThanOrEqual(21 * 4);
+
+    const overCeiling = runOldShoeThenShuffle({ feltRoadAtShuffle: 22, historyRows: 22, settleOldHands: true });
+    expect(overCeiling.newShoeCardEvents).toBe(0);
+    expect(overCeiling.projection.remainingTotal).toBe(416);
+  });
+
+  it('refuses a lagged HISTORY whose first seq is still behind the previous shuffle token', () => {
+    // seq-token 形态（本轮新增的滞 later 信号）：本帧 token 前进到 seq:900，
+    // 但 HISTORY 首 seq 仍是 seq:100 —— 属于上一靴窗口，不得回填。
+    const tableId = 'B22';
+    const parser = new BgRuntimeParser();
+    const events: NormalizedEvent[] = [];
+    events.push(...parser.parse(snapshotAt(tableId, { roundId: '300', shoeReset: 'seq:100', source: 'protocol' }, 0)));
+    events.push(...parser.parse(snapshotAt(tableId, { roundId: '301', shoeReset: 'seq:900', shuffleEvent: true, source: 'protocol' }, 1000)));
+    events.push(...parser.parse(snapshotAt(tableId, {
+      roundId: '302',
+      shoeReset: 'seq:100',
+      gameCount: 12,
+      source: 'protocol',
+      historyHands: Array.from({ length: 12 }, () => ({
+        playerCards: ['KH', '8S'],
+        bankerCards: ['KS', '9S'],
+      })),
+    }, 2000)));
+    const newShoe = parser.currentShoeId(tableId)!;
+    const backfilled = events.filter(event =>
+      event.type === 'cardObserved' && (event as { shoeId?: string }).shoeId === newShoe);
+    expect(backfilled).toEqual([]);
   });
 });

@@ -1278,9 +1278,13 @@ describe('orchestrator table actor', () => {
     const { ledger, riskLimits } = makeContext();
     const base = simProfile();
     const profile: TableProfile = { ...base, betStrategy: { type: 'alternate', start: 'bankerPair' } };
+    // FIX(B-P1-4): 自动对子现在有 settlement-gap 门 —— 上一手 RESERVED 未结算时
+    // 下一手必须 fail-closed。这个用例验证的是轮替语义，所以每手之间补结算。
     const stream = new FixtureBuilder('t1')
       .newShoe('s1', profile)
       .openWindow('s1', 'h1', 'bankerPair')   // 命中 start → 下注,轮替到 playerPair
+      .closeWindow('s1', 'h1', 'bankerPair')
+      .settle('s1', 'h1', [{ rank: 'A' }, { rank: 'K' }], [{ rank: 'A' }, { rank: 'Q' }], { bankerPair: false, playerPair: false })
       .openWindow('s1', 'h2', 'bankerPair')   // 非当前轮替市场 → 跳过
       .openWindow('s1', 'h2', 'playerPair')   // 命中轮替 → 下注,轮替回 bankerPair
       .build();
@@ -2268,6 +2272,11 @@ describe('duplicate hand settlement must not double-count missing unobserved car
     }));
     await actor.flush();
     expect(actor.missingUnobservedCardCount()).toBe(4);
+    // 首次结算后的库存/牌面快照：后续重复投递必须完全不改变它们（幂等）。
+    // 这里不断言绝对张数 —— 手内漏采的补齐语义由 projection 决定（C-P1-4 范围内），
+    // 本用例只锁定"重复投递不改变结果"这一不变量。
+    const afterFirstSettlement = actor.getProjection();
+    expect(afterFirstSettlement.remainingTotal).toBeLessThan(baseline.remainingTotal);
 
     // 路径 1：解析器身份变化（gen 1 / 新 runId）重新上报同一手 —— 新 eventId
     // 绕过 parsedEventIds 与 ledger 的 event_id 去重，但缺牌计数不得再累加
@@ -2300,8 +2309,8 @@ describe('duplicate hand settlement must not double-count missing unobserved car
 
     // 库存与 seenCards 全程不受重复投递影响（cardInventoryKeys 去重）
     const projection = actor.getProjection();
-    expect(projection.remainingTotal).toBe(baseline.remainingTotal - 2);
-    expect(projection.seenCards).toHaveLength(baseline.seenCards.length + 2);
+    expect(projection.remainingTotal).toBe(afterFirstSettlement.remainingTotal);
+    expect(projection.seenCards).toHaveLength(afterFirstSettlement.seenCards.length);
     ledger.close();
   });
 });
@@ -2388,6 +2397,806 @@ describe('resetLiveShoeTracking must discard held shoe state', () => {
     expect(projection.shoeId).toBe('shoe-att');
     expect(projection.shoeBaseline).toBe('unknown-monitor-session');
     expect(projection.remainingTotal).toBe(416);
+    ledger.close();
+  });
+});
+
+/**
+ * FIX(B-P1-1) 回归：跨来源重复下注。
+ * 修复前 `risk.ts#activeReservationKey` 与 `ledger.hasOperationalWager` 都带
+ * executionSource，保活 + 手动 / 自动对子 + 手动对子能在同一手同一市场真实下两注
+ * （review/scripts/risk/a5-duplicate-source.ts 实证桥收到 2 条 wager）。
+ */
+describe('cross-source duplicate wagers must be rejected', () => {
+  function acceptingOperationalExecutor(calls: { market: string; amount: number; source: string }[]) {
+    return {
+      requestOperationalWager: async (request: OperationalWagerExecutionRequest) => {
+        const wager = request.wager;
+        calls.push({ market: wager.market, amount: wager.amount, source: wager.source });
+        return {
+          receiptId: `receipt-${wager.wagerId}`,
+          wagerId: wager.wagerId,
+          tableId: wager.tableId,
+          shoeId: wager.shoeId,
+          handId: wager.handId,
+          market: wager.market,
+          amount: wager.amount,
+          source: wager.source,
+          status: 'ACCEPTED' as const,
+          createdAt: '2025-01-01T00:00:02.000Z',
+          raw: { commitStarted: true },
+        };
+      },
+    };
+  }
+
+  const terms = {
+    banker: { netWin: 0.95, loss: 1 },
+    player: { netWin: 1, loss: 1 },
+    tiePolicy: 'push' as const,
+  };
+
+  it('rejects a manual banker when keepalive already reserved the same hand and market', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const operationalCalls: { market: string; amount: number; source: string }[] = [];
+    const orchestrator = new Orchestrator({
+      ledger,
+      riskLimits,
+      operationalWagerTerms: terms,
+      operationalExecutor: acceptingOperationalExecutor(operationalCalls),
+    });
+    const actor = orchestrator.registerTable({ ...simProfile(), autoBetArmedByDefault: false }, 'live', 20);
+    for (const event of new FixtureBuilder('t1')
+      .newShoe('s1', actor.getProfile())
+      .openWindow('s1', 'h1', 'bankerPair')
+      .build()) {
+      await orchestrator.enqueue('t1', event);
+    }
+    await actor.flush();
+
+    const keepalive = await actor.placeOperationalWager({ market: 'banker', amount: 20, source: 'keepalive' });
+    expect(keepalive).toEqual(expect.objectContaining({ status: 'ACCEPTED' }));
+    const manual = await actor.placeOperationalWager({ market: 'banker', amount: 20, source: 'manual' });
+
+    // 修复前 manual 也是 ACCEPTED，桥收到 2 条 wager。
+    expect(manual).toEqual(expect.objectContaining({ status: 'REJECTED', reason: 'duplicate' }));
+    expect(operationalCalls).toHaveLength(1);
+    expect(orchestrator.getReservations('t1').filter(r => r.status === 'RESERVED')).toHaveLength(1);
+    ledger.close();
+  });
+
+  it('rejects a manual pair when the automatic strategy already reserved the same hand and market', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const automaticRequests: BetExecutionRequest[] = [];
+    const operationalCalls: { market: string; amount: number; source: string }[] = [];
+    const profile: TableProfile = {
+      ...simProfile(),
+      betStrategy: { type: 'fixed', market: 'bankerPair' },
+    };
+    const orchestrator = new Orchestrator({
+      ledger,
+      riskLimits,
+      operationalWagerTerms: terms,
+      executor: {
+        requestBet: async (request: BetExecutionRequest) => {
+          automaticRequests.push(request);
+          return liveReceipt(request, 'ACCEPTED', 'auto-accepted');
+        },
+      },
+      operationalExecutor: acceptingOperationalExecutor(operationalCalls),
+    });
+    const actor = orchestrator.registerTable(profile, 'live', 20);
+    for (const event of new FixtureBuilder('t1')
+      .newShoe('s1', profile)
+      .openWindow('s1', 'h1', 'bankerPair')
+      .build()) {
+      await orchestrator.enqueue('t1', event);
+    }
+    await actor.flush();
+    expect(automaticRequests).toHaveLength(1);
+
+    const manualPair = await actor.placeOperationalWager({ market: 'bankerPair', amount: 20, source: 'manual' });
+    // 修复前这里是 ACCEPTED：同一手同一市场自动+手动两注真金。
+    expect(manualPair).toEqual(expect.objectContaining({ status: 'REJECTED', reason: 'duplicate' }));
+    expect(operationalCalls).toEqual([]);
+    ledger.close();
+  });
+
+  it('still allows different markets on the same hand and the same market on the next hand', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const operationalCalls: { market: string; amount: number; source: string }[] = [];
+    const orchestrator = new Orchestrator({
+      ledger,
+      riskLimits,
+      operationalWagerTerms: terms,
+      operationalExecutor: acceptingOperationalExecutor(operationalCalls),
+    });
+    const actor = orchestrator.registerTable({ ...simProfile(), autoBetArmedByDefault: false }, 'live', 20);
+    for (const event of new FixtureBuilder('t1')
+      .newShoe('s1', actor.getProfile())
+      .openWindow('s1', 'h1', 'bankerPair')
+      .build()) {
+      await orchestrator.enqueue('t1', event);
+    }
+    await actor.flush();
+
+    expect(await actor.placeOperationalWager({ market: 'banker', amount: 20, source: 'keepalive' }))
+      .toEqual(expect.objectContaining({ status: 'ACCEPTED' }));
+    // 不同市场（banker vs bankerPair）：允许（不能过度收紧）。
+    expect(await actor.placeOperationalWager({ market: 'bankerPair', amount: 20, source: 'manual' }))
+      .toEqual(expect.objectContaining({ status: 'ACCEPTED' }));
+    expect(operationalCalls).toHaveLength(2);
+
+    // 结算 h1 后，下一手同市场必须恢复可下注。
+    await orchestrator.enqueue('t1', {
+      type: 'handSettled',
+      eventId: 'settle-h1',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: ledger.nextSourceSeq('t1'),
+      shoeId: 's1',
+      handId: 'h1',
+      playerCards: [{ rank: '5' }, { rank: '2' }],
+      bankerCards: [{ rank: '9' }, { rank: '7' }],
+      outcomes: { bankerPair: false, playerPair: false },
+    } as NormalizedEvent);
+    await orchestrator.enqueue('t1', {
+      type: 'bettingWindowOpened',
+      eventId: 'open-h2',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: ledger.nextSourceSeq('t1'),
+      shoeId: 's1',
+      handId: 'h2',
+      market: 'bankerPair',
+      closesAt: futureClosesAt(20_000),
+    } as NormalizedEvent);
+    await actor.flush();
+    expect(await actor.placeOperationalWager({ market: 'banker', amount: 20, source: 'keepalive' }))
+      .toEqual(expect.objectContaining({ status: 'ACCEPTED' }));
+    ledger.close();
+  });
+});
+
+/**
+ * FIX(B-P1-4) 回归：自动对子缺 settlement-gap 门。
+ * 修复前 `evaluateWindow` 只查 `hasUnknownReservations`，于是上一手还是 RESERVED
+ * （结算帧丢失）时下一手照常下注（review/scripts/risk/b11c 实证 h1/h2/h3 全下）。
+ */
+describe('automatic pair bets must fail closed on a settlement gap', () => {
+  it('does not place h2/h3 while h1 is still RESERVED, and resumes after h1 settles', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile: TableProfile = {
+      ...simProfile(),
+      betStrategy: { type: 'fixed', market: 'bankerPair' },
+    };
+    const requests: BetExecutionRequest[] = [];
+    const orchestrator = new Orchestrator({
+      ledger,
+      riskLimits,
+      executor: {
+        requestBet: async (request: BetExecutionRequest) => {
+          requests.push(request);
+          return liveReceipt(request, 'ACCEPTED', `accepted-${requests.length}`);
+        },
+      },
+    });
+    const actor = orchestrator.registerTable(profile, 'live', 20);
+    const builder = new FixtureBuilder('t1').newShoe('s1', profile);
+    for (const handId of ['h1', 'h2', 'h3']) builder.openWindow('s1', handId, 'bankerPair');
+    for (const event of builder.build()) await orchestrator.enqueue('t1', event);
+    await actor.flush();
+
+    // 修复前 requests 会有 h1/h2/h3 三笔。
+    expect(requests.map(request => request.intent.handId)).toEqual(['h1']);
+    expect(orchestrator.getReservations('t1').filter(r => r.status === 'RESERVED')).toHaveLength(1);
+
+    const gapDecisions = ledger.listDecisions('t1')
+      .filter(decision => decision.handId !== 'h1' && decision.reason.includes('settlement-gap'));
+    expect(gapDecisions.map(decision => decision.handId).sort()).toEqual(['h2', 'h3']);
+    expect(gapDecisions.every(decision => decision.eligible === false)).toBe(true);
+
+    // 补上 h1 的权威结算 → 恢复自动下注。
+    await orchestrator.enqueue('t1', {
+      type: 'handSettled',
+      eventId: 'settle-h1',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: ledger.nextSourceSeq('t1'),
+      shoeId: 's1',
+      handId: 'h1',
+      playerCards: [{ rank: '5' }, { rank: '2' }],
+      bankerCards: [{ rank: '9' }, { rank: '7' }],
+      outcomes: { bankerPair: false, playerPair: false },
+    } as NormalizedEvent);
+    await orchestrator.enqueue('t1', {
+      type: 'bettingWindowOpened',
+      eventId: 'open-h4',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: ledger.nextSourceSeq('t1'),
+      shoeId: 's1',
+      handId: 'h4',
+      market: 'bankerPair',
+      closesAt: futureClosesAt(20_000),
+    } as NormalizedEvent);
+    await actor.flush();
+    expect(requests.map(request => request.intent.handId)).toEqual(['h1', 'h4']);
+    ledger.close();
+  });
+});
+
+/**
+ * FIX(B-P1-5) 回归：shrink 后实下金额 ≠ 预留金额。
+ * 修复前 `evaluateWindow` 用缩小前的 `intent.amount` 发桥，风控只按缩额记账
+ * （review/scripts/risk/a4b：实下 100 / 风控记 10）。
+ */
+describe('automatic pair execution must not exceed the reserved amount', () => {
+  it('fails closed instead of sending the un-shrunk amount to the bridge', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile: TableProfile = {
+      ...simProfile(),
+      betStrategy: { type: 'fixed', market: 'bankerPair' },
+    };
+    const requests: BetExecutionRequest[] = [];
+    const orchestrator = new Orchestrator({
+      ledger,
+      riskLimits: { ...riskLimits, defaultExposureCap: 10, insufficientBehavior: 'shrink' },
+      executor: {
+        requestBet: async (request: BetExecutionRequest) => {
+          requests.push(request);
+          return liveReceipt(request, 'ACCEPTED', 'should-never-happen');
+        },
+      },
+    });
+    const actor = orchestrator.registerTable(profile, 'live', 100);
+    for (const event of new FixtureBuilder('t1')
+      .newShoe('s1', profile)
+      .openWindow('s1', 'h1', 'bankerPair')
+      .build()) {
+      await orchestrator.enqueue('t1', event);
+    }
+    await actor.flush();
+
+    // 修复前这里会发出 amount=100 的请求，而 reservation.amount=10。
+    expect(requests).toEqual([]);
+    expect(orchestrator.getReservations('t1')).toEqual([
+      expect.objectContaining({ status: 'RELEASED', releaseReason: 'reserved-amount-mismatch' }),
+    ]);
+    expect(orchestrator.getRiskState()).toMatchObject({
+      reservedExposure: 0,
+      pendingExecutions: 0,
+    });
+    ledger.close();
+  });
+});
+
+/**
+ * FIX(B-P1-2) 回归：UNKNOWN 收敛路径不校验 shoeId。
+ * 修复前 `settleHand` 对 UNKNOWN 跳过 shoe 校验、actor 的两条
+ * `settleCommittedUnknown*` 只比 handId，于是换靴后同 handId 的结算会确权上一靴的
+ * 未知敞口并把盈亏记到新靴桶（review/scripts/risk/a6b、a6d 实证）。
+ */
+describe('cross-shoe UNKNOWN exposure must never be auto-settled', () => {
+  function settleEvent(eventId: string, shoeId: string, handId: string): NormalizedEvent {
+    return {
+      type: 'handSettled',
+      eventId,
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: 900,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId,
+      handId,
+      playerCards: [{ rank: 'K' }, { rank: 'Q' }],
+      bankerCards: [{ rank: 'A' }, { rank: 'A' }],
+      outcomes: { bankerPair: true, playerPair: false },
+    } as NormalizedEvent;
+  }
+
+  it('keeps a prior-shoe hand-settled UNKNOWN unknown when the next shoe reuses its handId', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile: TableProfile = {
+      ...simProfile(),
+      autoBetArmedByDefault: false,
+      betStrategy: { type: 'fixed', market: 'bankerPair' },
+    };
+    const orchestrator = new Orchestrator({
+      ledger,
+      riskLimits,
+      executor: acceptingLiveExecutor(),
+    });
+    const actor = orchestrator.registerTable(profile, 'live', 20);
+
+    for (const event of new FixtureBuilder('t1')
+      .newShoe('shoe-1', profile)
+      .openWindow('shoe-1', '5', 'bankerPair')
+      .build()) {
+      await orchestrator.enqueue('t1', event);
+    }
+    await actor.flush();
+    // 上一靴那手：cards-only 结算 → UNKNOWN(hand-settled-without-authoritative-outcome)
+    const first = await actor.placeOneShotBet({ shoeId: 'shoe-1', handId: '5', market: 'bankerPair', amount: 20 });
+    expect(first.status).toBe('ACCEPTED');
+    await orchestrator.enqueue('t1', {
+      type: 'handSettled',
+      eventId: 'settle-previous-shoe',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: ledger.nextSourceSeq('t1'),
+      shoeId: 'shoe-1',
+      handId: '5',
+      playerCards: [{ rank: '5' }, { rank: '2' }],
+      bankerCards: [{ rank: '9' }, { rank: '7' }],
+    } as NormalizedEvent);
+    await actor.flush();
+    expect(orchestrator.getReservations('t1')[0]).toEqual(expect.objectContaining({
+      status: 'UNKNOWN',
+      shoeId: 'shoe-1',
+    }));
+
+    // 下一靴复用同一 handId，且带权威 outcomes —— 修复前会被确权成 SETTLED。
+    await orchestrator.enqueue('t1', { ...settleEvent('settle-next-shoe', 'shoe-2', '5'), sourceSeq: 901 } as NormalizedEvent);
+    await actor.flush();
+    expect(orchestrator.getReservations('t1')[0]).toEqual(expect.objectContaining({
+      status: 'UNKNOWN',
+      shoeId: 'shoe-1',
+    }));
+    expect(orchestrator.getReservations('t1')[0]?.realizedPnl).toBeUndefined();
+    expect(orchestrator.getRiskState()).toMatchObject({
+      reservedExposure: 20,
+      pendingExecutions: 1,
+    });
+    // 亏损没有记到新靴桶。
+    expect(orchestrator.getRiskState().shoeLosses['t1:shoe-2']).toBeUndefined();
+    ledger.close();
+  });
+
+  it('still converges a same-shoe UNKNOWN when the authoritative settlement finally arrives', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const profile: TableProfile = {
+      ...simProfile(),
+      autoBetArmedByDefault: false,
+      betStrategy: { type: 'fixed', market: 'bankerPair' },
+    };
+    const orchestrator = new Orchestrator({
+      ledger,
+      riskLimits,
+      executor: acceptingLiveExecutor(),
+    });
+    const actor = orchestrator.registerTable(profile, 'live', 20);
+    for (const event of new FixtureBuilder('t1')
+      .newShoe('shoe-1', profile)
+      .openWindow('shoe-1', '5', 'bankerPair')
+      .build()) {
+      await orchestrator.enqueue('t1', event);
+    }
+    await actor.flush();
+    expect((await actor.placeOneShotBet({
+      shoeId: 'shoe-1', handId: '5', market: 'bankerPair', amount: 20,
+    })).status).toBe('ACCEPTED');
+    // cards-only 结算 → UNKNOWN
+    await orchestrator.enqueue('t1', {
+      type: 'handSettled',
+      eventId: 'settle-cards-only',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: ledger.nextSourceSeq('t1'),
+      shoeId: 'shoe-1',
+      handId: '5',
+      playerCards: [{ rank: '5' }, { rank: '2' }],
+      bankerCards: [{ rank: '9' }, { rank: '7' }],
+    } as NormalizedEvent);
+    await actor.flush();
+    expect(orchestrator.getReservations('t1')[0]).toEqual(expect.objectContaining({
+      status: 'UNKNOWN',
+      releaseReason: 'hand-settled-without-authoritative-outcome',
+    }));
+
+    // 同靴迟到权威结算 → 正常收敛（不能误伤）。
+    await orchestrator.enqueue('t1', { ...settleEvent('settle-authoritative', 'shoe-1', '5'), sourceSeq: 3 } as NormalizedEvent);
+    await actor.flush();
+    expect(orchestrator.getReservations('t1')[0]).toEqual(expect.objectContaining({
+      status: 'SETTLED',
+      realizedPnl: 220,
+    }));
+    expect(orchestrator.getRiskState()).toMatchObject({
+      reservedExposure: 0,
+      pendingExecutions: 0,
+    });
+    ledger.close();
+  });
+});
+
+/**
+ * FIX(B-P1-3) 回归：上一进程遗留的 RESERVED 敞口无法收口。
+ * 跨进程（两个 RiskManager 实例 + 同一 SQLite）：旧 RESERVED（有回执/无回执各一）
+ * 在新实例 escalate 后都变 UNKNOWN，可 writeOff；迟到权威结算也能收敛。
+ */
+describe('restored prior-process exposure must be closable', () => {  const profile: TableProfile = { ...defaultProfile('t1'), limits: { minBet: 1, maxBet: 1000 } };
+  const limits: RiskLimits = {
+    ...defaultRiskLimits,
+    defaultExposureCap: 10_000,
+    perTableLossLimit: 10_000,
+    perShoeLossLimit: 10_000,
+    perDayLossLimit: 10_000,
+    maxConcurrentExecutions: 8,
+    insufficientBehavior: 'skip',
+  };
+
+  it('escalates every prior-process RESERVED exposure and lets the operator write it off', () => {
+    const ledger = new SqliteLedger();
+    const first = new RiskManager(ledger);
+    const withReceipt = first.tryReserveExecution({
+      intentId: 'intent-receipt',
+      tableId: 't1',
+      shoeId: 's1',
+      handId: 'h1',
+      market: 'banker',
+      executionSource: 'keepalive',
+      amount: 20,
+    }, profile.limits, { netWin: 0.95, loss: 1 }, limits);
+    expect(withReceipt.ok).toBe(true);
+    first.attachReceipt(withReceipt.reservation!.reservationId, 'rcpt-old');
+
+    const withoutReceipt = first.tryReserveExecution({
+      intentId: 'intent-no-receipt',
+      tableId: 't1',
+      shoeId: 's1',
+      handId: 'h2',
+      market: 'player',
+      executionSource: 'manual',
+      amount: 20,
+    }, profile.limits, { netWin: 1, loss: 1 }, limits);
+    expect(withoutReceipt.ok).toBe(true);
+
+    // 模拟重启：新 manager 从同一 SQLite 恢复。
+    const restarted = new RiskManager(ledger);
+    // 修复前 `escalateOverdueSettlements(..., notBefore=runtimeStartedAt)` 会跳过这两笔。
+    const escalated = restarted.escalateRestoredExposures();
+    expect(escalated.map(reservation => reservation.status)).toEqual(['UNKNOWN', 'UNKNOWN']);
+    expect(escalated.map(reservation => reservation.releaseReason))
+      .toEqual(['restored-unsettled-exposure', 'restored-unsettled-exposure']);
+    // 有回执的那笔保留回执（审计需要），无回执的那笔仍是 undefined。
+    expect(escalated.map(reservation => reservation.receiptId).sort())
+      .toEqual(['rcpt-old', undefined].sort());
+    expect(restarted.getState()).toMatchObject({ reservedExposure: 40, pendingExecutions: 2 });
+
+    // 操作员勾销可用（修复前这里抛 "is not an UNKNOWN exposure"）。
+    const writtenOff = restarted.writeOffUnknown(
+      withReceipt.reservation!.reservationId,
+      'operator-unconfirmed-write-off',
+    );
+    expect(writtenOff).toMatchObject({
+      status: 'RELEASED',
+      releaseReason: 'operator-unconfirmed-write-off',
+    });
+    // 审计 reason 能区分"操作员勾销"与"启动恢复"。
+    expect(writtenOff.releaseReason).not.toBe('restored-unsettled-exposure');
+    restarted.writeOffUnknown(withoutReceipt.reservation!.reservationId, 'operator-unconfirmed-write-off');
+    expect(restarted.getState()).toMatchObject({ reservedExposure: 0, pendingExecutions: 0 });
+    ledger.close();
+  });
+
+  it('converges restored UNKNOWN exposures when the authoritative settlement arrives late', () => {
+    const ledger = new SqliteLedger();
+    const first = new RiskManager(ledger);
+    const withReceipt = first.tryReserveExecution({
+      intentId: 'intent-late',
+      tableId: 't1',
+      shoeId: 's1',
+      handId: 'h1',
+      market: 'bankerPair',
+      executionSource: 'strategy',
+      amount: 20,
+    }, profile.limits, { netWin: 11, loss: 1 }, limits);
+    first.attachReceipt(withReceipt.reservation!.reservationId, 'rcpt-late');
+    const restarted = new RiskManager(ledger);
+    restarted.escalateRestoredExposures();
+
+    // 无 outcomes 的结算先把 UNKNOWN 保持为
+    // hand-settled-without-authoritative-outcome（可收敛的唯一路径之一）。
+    const cardsOnly = restarted.settleHand('t1', 's1', 'h1', {
+      playerCards: [{ rank: '5' }, { rank: '2' }],
+      bankerCards: [{ rank: '9' }, { rank: '7' }],
+    });
+    expect(cardsOnly[0]).toMatchObject({
+      status: 'UNKNOWN',
+      releaseReason: 'hand-settled-without-authoritative-outcome',
+    });
+    const converged = restarted.settleHand('t1', 's1', 'h1', {
+      outcomes: { bankerPair: true, playerPair: false },
+      playerCards: [{ rank: '5' }, { rank: '2' }],
+      bankerCards: [{ rank: '9' }, { rank: '7' }],
+    });
+    expect(converged[0]).toMatchObject({ status: 'SETTLED', realizedPnl: 220 });
+    expect(restarted.getState()).toMatchObject({ reservedExposure: 0, pendingExecutions: 0 });
+    ledger.close();
+  });
+
+  it('reconciles a stale-shoe reserved reservation to UNKNOWN instead of silently expiring it', () => {
+    const ledger = new SqliteLedger();
+    const first = new RiskManager(ledger);
+    const precommit = first.tryReserveExecution({
+      intentId: 'intent-precommit',
+      tableId: 't1',
+      shoeId: 's1',
+      handId: 'h1',
+      market: 'banker',
+      executionSource: 'keepalive',
+      amount: 20,
+    }, profile.limits, { netWin: 0.95, loss: 1 }, limits);
+    expect(precommit.ok).toBe(true);
+
+    const restarted = new RiskManager(ledger);
+    // 修复前 reconcileTable 会 EXPIRED 这笔"预提交后进程被杀"的敞口 → 漏记潜在亏损。
+    restarted.reconcileTable('t1', 's2', false);
+    expect(restarted.snapshot()[0]).toEqual(expect.objectContaining({
+      status: 'UNKNOWN',
+      releaseReason: 'reconciled-on-startup',
+    }));
+    // UNKNOWN 仍占敞口，且可被操作员勾销。
+    expect(restarted.getState()).toMatchObject({ reservedExposure: 20, pendingExecutions: 1 });
+    expect(restarted.writeOffUnknown(precommit.reservation!.reservationId, 'operator-unconfirmed-write-off'))
+      .toMatchObject({ status: 'RELEASED' });
+    ledger.close();
+  });
+});
+
+/**
+ * FIX(D-P2-2) 回归：`clearMonitorData` 不能清零风控计数。
+ * 修复前 ledger 里 `DELETE FROM risk_state`，等于"清记录 = 清账"，
+ * 日/桌/靴亏损限额从 0 重新起算（review/scripts/desktop/a4c 实测）。
+ */
+describe('clearing monitor data must preserve risk accounting', () => {
+  it('keeps dayLoss / tableLosses / shoeLosses while dropping reservations', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const manager = new RiskManager(ledger);
+    const intent = (handId: string): BetIntent => ({
+      intentId: `intent-${handId}`,
+      tableId: 't1',
+      shoeId: 's1',
+      handId,
+      market: 'bankerPair',
+      amount: 20,
+      mode: 'live',
+      idempotencyKey: `k-${handId}`,
+      strategy: { type: 'both' },
+      decisionSnapshotId: `dec-${handId}`,
+      createdAt: new Date().toISOString(),
+    });
+    expect(manager.tryReserve(intent('h1'), simProfile(), riskLimits).ok).toBe(true);
+    manager.settleHand('t1', 's1', 'h1', { bankerPair: false, playerPair: true });
+    const before = manager.getState();
+    expect(before.dayLoss).toBeGreaterThan(0);
+    expect(before.tableLosses['t1']).toBeGreaterThan(0);
+    expect(before.shoeLosses['t1:s1']).toBeGreaterThan(0);
+    // 一笔仍在途的预留：清除记录后它的审计行会消失，但亏损计数必须保留。
+    expect(manager.tryReserve(intent('h2'), simProfile(), riskLimits).ok).toBe(true);
+
+    const orchestrator = new Orchestrator({ ledger, riskLimits });
+    await orchestrator.clearMonitorData();
+
+    // 清除后：预留审计行没了、敞口归零，但风控计数（落盘在 risk_state）原样保留。
+    expect(orchestrator.getReservations()).toEqual([]);
+    expect(orchestrator.getRiskState()).toMatchObject({
+      reservedExposure: 0,
+      pendingExecutions: 0,
+    });
+    // 重启（新 RiskManager 从 SQLite 恢复）后仍然保留 —— 修复前这里全是 0。
+    const reloaded = new RiskManager(ledger);
+    expect(reloaded.getState().dayLoss).toBe(before.dayLoss);
+    expect(reloaded.getState().tableLosses['t1']).toBe(before.tableLosses['t1']);
+    expect(reloaded.getState().shoeLosses['t1:s1']).toBe(before.shoeLosses['t1:s1']);
+    expect(reloaded.getState().executedToday).toBe(before.executedToday);
+    // 内存活跃键同步清空：清除后同键可以重新预留（不会撞到"已迁走"的旧键）。
+    expect(reloaded.tryReserve(intent('h2'), simProfile(), riskLimits).ok).toBe(true);
+    ledger.close();
+  });
+});
+
+/**
+ * FIX(C-P1-3): 漏采数量必须能阻断下注。
+ *
+ * 修复前：`missingUnobservedCards` 只用于 service 侧 `> 10` 移出监控，
+ * 单张/少量漏采既不告警也不阻断 —— 投影的 remainingTotal 偏高会一直用到下一靴。
+ * 修复后：任何一张漏采立即把该桌 autoBetStatus 置 NEEDS_MANUAL_RECOVERY。
+ *
+ * 注意 C-P1-4 修好"整手跳过"后，漏采本身在投影层已经被补齐（remainingTotal 正确），
+ * 所以这里的缺牌计数来自 `countMissingHandCards`（补不回来的部分），
+ * 而**整手都没采到**的路径必须仍然算 0 —— 那是重启后正常重建库存，不是漏采。
+ */
+describe('FIX(C-P1-3) missing cards must block automatic betting', () => {
+  const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'] as const;
+
+  function physicalShoeEvent(tableId = 't1', shoeId = 's1'): NormalizedEvent {
+    return {
+      type: 'newShoeSignal',
+      eventId: `shoe-${shoeId}`,
+      tableId,
+      timestamp: new Date().toISOString(),
+      sourceSeq: 1,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId,
+      baseline: 'physical-shoe',
+      profile: { ...simProfile(tableId), autoConfirmNewShoe: true },
+    } as NormalizedEvent;
+  }
+
+  /** 4 张牌的一手：player A♠ 2♥ / banker 3♦ 4♣。 */
+  const SETTLED_PLAYER = [
+    { rank: RANKS[0], suit: 'S', raw: 'AS' },
+    { rank: RANKS[1], suit: 'H', raw: '2H' },
+  ];
+  const SETTLED_BANKER = [
+    { rank: RANKS[2], suit: 'D', raw: '3D' },
+    { rank: RANKS[3], suit: 'C', raw: '4C' },
+  ];
+
+  /** 采到 SETTLED_PLAYER/SETTLED_BANKER 中该 position 的第 `index` 张。 */
+  function cardObservedEvent(
+    tableId: string,
+    handId: string,
+    position: 'player' | 'banker',
+    index: number,
+    sourceSeq: number,
+  ): NormalizedEvent {
+    const card = position === 'player' ? SETTLED_PLAYER[index]! : SETTLED_BANKER[index]!;
+    return {
+      type: 'cardObserved',
+      eventId: `card-${handId}-${position}-${index}`,
+      tableId,
+      timestamp: new Date().toISOString(),
+      sourceSeq,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId: 's1',
+      handId,
+      card,
+      position,
+    } as NormalizedEvent;
+  }
+
+  /** 结算 4 张牌的一手。 */
+  function settledEvent(tableId: string, handId: string, sourceSeq = 100): NormalizedEvent {
+    return {
+      type: 'handSettled',
+      eventId: `settled-${handId}-${sourceSeq}`,
+      tableId,
+      timestamp: new Date().toISOString(),
+      sourceSeq,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId: 's1',
+      handId,
+      playerCards: SETTLED_PLAYER.map(card => ({ ...card })),
+      bankerCards: SETTLED_BANKER.map(card => ({ ...card })),
+      outcomes: { bankerPair: false, playerPair: false },
+    } as NormalizedEvent;
+  }
+
+  it('sets NEEDS_MANUAL_RECOVERY and places no new bet after a single missing card', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const requests: BetExecutionRequest[] = [];
+    const orchestrator = new Orchestrator({
+      ledger,
+      riskLimits,
+      executor: {
+        requestBet: async (request: BetExecutionRequest) => {
+          requests.push(request);
+          return liveReceipt(request, 'ACCEPTED', `accepted-${requests.length}`);
+        },
+      },
+    });
+    const actor = orchestrator.registerTable(
+      { ...simProfile(), betStrategy: { type: 'fixed', market: 'bankerPair' } },
+      'live',
+      20,
+    );
+    await orchestrator.enqueue('t1', physicalShoeEvent());
+    // 4 张的 handSettled，live 只采到 3 张 → 缺 1 张（banker 第 2 张）。
+    await orchestrator.enqueue('t1', cardObservedEvent('t1', 'h1', 'player', 0, 2));
+    await orchestrator.enqueue('t1', cardObservedEvent('t1', 'h1', 'player', 1, 3));
+    await orchestrator.enqueue('t1', cardObservedEvent('t1', 'h1', 'banker', 0, 4));
+    await orchestrator.enqueue('t1', settledEvent('t1', 'h1'));
+    await actor.flush();
+
+    expect(actor.missingUnobservedCardCount()).toBe(1);
+    expect(actor.getProjection().autoBetStatus).toBe('NEEDS_MANUAL_RECOVERY');
+
+    // 下一手开窗：不得再下发任何自动下注。
+    await orchestrator.enqueue('t1', {
+      type: 'bettingWindowOpened',
+      eventId: 'open-h2',
+      tableId: 't1',
+      timestamp: new Date().toISOString(),
+      sourceSeq: 200,
+      source: 'pragmatic-runtime',
+      schemaVersion: 1,
+      shoeId: 's1',
+      handId: 'h2',
+      market: 'bankerPair',
+      closesAt: futureClosesAt(20_000),
+    } as NormalizedEvent);
+    await actor.flush();
+    expect(requests).toEqual([]);
+    ledger.close();
+  });
+
+  it('does not count a hand that was never observed live (restart replay path)', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const orchestrator = new Orchestrator({ ledger, riskLimits });
+    const actor = orchestrator.registerTable({ ...simProfile(), autoBetArmedByDefault: false }, 'shadow', 20);
+    await orchestrator.enqueue('t1', physicalShoeEvent());
+    // 一张 cardObserved 都没有，直接 handSettled：这是重启后重建库存的正常路径。
+    await orchestrator.enqueue('t1', settledEvent('t1', 'h1'));
+    await actor.flush();
+    expect(actor.missingUnobservedCardCount()).toBe(0);
+    expect(actor.getProjection().autoBetStatus).not.toBe('NEEDS_MANUAL_RECOVERY');
+    ledger.close();
+  });
+
+  it('still triggers the existing >10 demotion threshold when 10 cards are missing', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const orchestrator = new Orchestrator({ ledger, riskLimits });
+    const actor = orchestrator.registerTable({ ...simProfile(), autoBetArmedByDefault: false }, 'shadow', 20);
+    await orchestrator.enqueue('t1', physicalShoeEvent());
+    // h1（数值局号 1）→ h3（数值局号 3）：跳号 h2 = 漏 1 整手 × 6 张 = 6；
+    // h3 自身 live 只采到 2 张、结算 6 张 → 手内漏 4 张；合计 10。
+    await orchestrator.enqueue('t1', settledEvent('t1', '1'));
+    await orchestrator.enqueue('t1', cardObservedEvent('t1', '3', 'player', 0, 200));
+    await orchestrator.enqueue('t1', cardObservedEvent('t1', '3', 'player', 1, 201));
+    await orchestrator.enqueue('t1', {
+      ...settledEvent('t1', '3', 202),
+      playerCards: [0, 1, 2].map(index => ({ rank: RANKS[index], suit: 'S', raw: `${RANKS[index]}S` })),
+      bankerCards: [3, 4, 5].map(index => ({ rank: RANKS[index], suit: 'H', raw: `${RANKS[index]}H` })),
+    } as NormalizedEvent);
+    await actor.flush();
+    // 6（h2 整手丢失）+ 4（h3 手内漏采）= 10：service 的 >10 移出监控阈值不受影响。
+    expect(actor.missingUnobservedCardCount()).toBe(10);
+    ledger.close();
+  });
+
+  it('does not double-count missing cards when the same handSettled is redelivered', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const orchestrator = new Orchestrator({ ledger, riskLimits });
+    const actor = orchestrator.registerTable({ ...simProfile(), autoBetArmedByDefault: false }, 'shadow', 20);
+    await orchestrator.enqueue('t1', physicalShoeEvent());
+    await orchestrator.enqueue('t1', cardObservedEvent('t1', 'h1', 'player', 0, 2));
+    await orchestrator.enqueue('t1', cardObservedEvent('t1', 'h1', 'player', 1, 3));
+    await orchestrator.enqueue('t1', cardObservedEvent('t1', 'h1', 'banker', 0, 4));
+    await orchestrator.enqueue('t1', settledEvent('t1', 'h1'));
+    await actor.flush();
+    const once = actor.missingUnobservedCardCount();
+    expect(once).toBe(1);
+
+    // 同 eventId 重投（ledger 去重 → recoverSideEffects 再进一次 applyHandSettlement）
+    await orchestrator.enqueue('t1', settledEvent('t1', 'h1'));
+    // 换 eventId 重投（解析器 runId/generation bump 的真实形态）
+    await orchestrator.enqueue('t1', settledEvent('t1', 'h1', 101));
+    await actor.flush();
+    expect(actor.missingUnobservedCardCount()).toBe(once);
+    // 投影也不会被重复扣减。
+    expect(actor.getProjection().remainingTotal).toBe(412);
+    ledger.close();
+  });
+
+  it('keeps auto-bet ARMED when the hand is fully observed', async () => {
+    const { ledger, riskLimits } = makeContext();
+    const orchestrator = new Orchestrator({ ledger, riskLimits });
+    const actor = orchestrator.registerTable({ ...simProfile(), autoBetArmedByDefault: true }, 'shadow', 20);
+    await orchestrator.enqueue('t1', physicalShoeEvent());
+    await orchestrator.enqueue('t1', cardObservedEvent('t1', 'h1', 'player', 0, 2));
+    await orchestrator.enqueue('t1', cardObservedEvent('t1', 'h1', 'player', 1, 3));
+    await orchestrator.enqueue('t1', cardObservedEvent('t1', 'h1', 'banker', 0, 4));
+    await orchestrator.enqueue('t1', cardObservedEvent('t1', 'h1', 'banker', 1, 5));
+    await orchestrator.enqueue('t1', settledEvent('t1', 'h1'));
+    await actor.flush();
+    expect(actor.missingUnobservedCardCount()).toBe(0);
+    expect(actor.getProjection().autoBetStatus).toBe('ARMED');
+    expect(actor.getProjection().remainingTotal).toBe(412);
     ledger.close();
   });
 });

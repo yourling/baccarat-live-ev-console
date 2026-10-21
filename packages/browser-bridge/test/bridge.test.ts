@@ -132,14 +132,19 @@ const acceptedLiveReceipt: BetReceipt = {
 
 const EXTENSION_ORIGIN = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
 const VALID_CONTINUITY_PROOF = cursorContinuityProof({ test: 'bridge-restore' });
+/**
+ * P0-1: 这些用例不传 `extensionApprovals`，桥处于兼容放行模式（allowUnapprovedExtensions
+ * 默认 true）—— 但**带 installId** 仍是必要条件，缺 installId 的连接只会拿 pending 角色。
+ */
+const TEST_INSTALL_ID = 'test-install-0001';
 
 function extensionClient(port: number): WebSocket {
-  return new WebSocket(`ws://127.0.0.1:${port}`, { origin: EXTENSION_ORIGIN });
+  return new WebSocket(`ws://127.0.0.1:${port}/?installId=${TEST_INSTALL_ID}`, { origin: EXTENSION_ORIGIN });
 }
 
 function authenticatedExtensionClient(port: number): WebSocket {
   return new WebSocket(
-    `ws://127.0.0.1:${port}/?token=${BUNDLED_BROWSER_EXTENSION_TOKEN}`,
+    `ws://127.0.0.1:${port}/?token=${BUNDLED_BROWSER_EXTENSION_TOKEN}&installId=${TEST_INSTALL_ID}`,
     { origin: `chrome-extension://${BUNDLED_BROWSER_EXTENSION_ID}` },
   );
 }
@@ -1888,6 +1893,101 @@ describe('bounded bridge buffers', () => {
     expect(tableExport.health().bufferDepth).toBeLessThanOrEqual(4_096);
     expect(disconnects).toContain('table-export-buffer-overflow:D055');
     expect(tableExport.health().lastError).toContain('4096');
+  });
+
+  /**
+   * FIX(C-P1-3): 溢出后必须能自愈。
+   *
+   * 修复前 `ingestEvent` 在 `pendingOverflowed` 时对**所有**事件 return，
+   * 连唯一合法的恢复信号（实体新靴重置，允许跳号重建库存）也被吞掉 →
+   * `drain()` 再也不会被调用 → 该桌永久静默（b9b 实证事件全丢）。
+   * 现在溢出后仍放行 `newShoeSignal(baseline='physical-shoe')`，恢复后
+   * 后续事件不再被丢弃。
+   */
+  it('recovers a table export after a pending-buffer overflow via a physical shoe reset', async () => {
+    const server = new BrowserBridgeServer();
+    const tableExport = server['getOrCreateExport']('dafabet-pragmatic', 'D055') as unknown as {
+      start(sink: unknown): Promise<void>;
+      ingestEvent(event: NormalizedEvent): void;
+      health(): { bufferDepth: number; state: string; lastError?: string };
+      stop(): Promise<void>;
+    };
+    const delivered: NormalizedEvent[] = [];
+    let release: (() => void) | null = null;
+    let blocked = false;
+    await tableExport.start({
+      onBatch: async (batch: { events: NormalizedEvent[] }) => {
+        delivered.push(...batch.events);
+        if (!blocked) {
+          // 第一条之后卡住消费者，制造真实积压。
+          blocked = true;
+          await new Promise<void>(resolve => { release = resolve; });
+        }
+      },
+    });
+
+    const cards = (seq: number): NormalizedEvent => ({
+      type: 'cardObserved',
+      eventId: `overflow-card-${seq}`,
+      tableId: 'D055',
+      timestamp: new Date().toISOString(),
+      sourceSeq: seq,
+      source: 'room-monitor',
+      schemaVersion: 1,
+      shoeId: 'shoe-1',
+      handId: 'h1',
+      card: { rank: 'A', suit: 'S' },
+      position: `p${seq}`,
+    } as NormalizedEvent);
+
+    for (let seq = 1; seq <= 5_000; seq += 1) tableExport.ingestEvent(cards(seq));
+    expect(tableExport.health().state).toBe('DISCONNECTED');
+    expect(tableExport.health().lastError).toContain('4096');
+
+    // 释放消费者。此时中间 seq 已永久丢失，普通事件不应再被接受。
+    (release as unknown as () => void)?.();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const beforeReset = delivered.length;
+    tableExport.ingestEvent(cards(6_001));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(delivered.length).toBe(beforeReset);
+
+    // 唯一合法出口：实体新靴重置 → 允许跳号重建，恢复为 CONNECTED。
+    tableExport.ingestEvent({
+      type: 'newShoeSignal',
+      eventId: 'overflow-physical-reset',
+      tableId: 'D055',
+      timestamp: new Date().toISOString(),
+      sourceSeq: 7_000,
+      source: 'room-monitor',
+      schemaVersion: 1,
+      shoeId: 'shoe-2',
+      baseline: 'physical-shoe',
+    } as NormalizedEvent);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(tableExport.health().state).toBe('CONNECTED');
+
+    // 恢复后事件不再被静默丢弃。
+    const afterRecovery = delivered.length;
+    for (let offset = 0; offset < 5; offset += 1) {
+      tableExport.ingestEvent({
+        type: 'handSettled',
+        eventId: `overflow-settled-${offset}`,
+        tableId: 'D055',
+        timestamp: new Date().toISOString(),
+        sourceSeq: 7_001 + offset,
+        source: 'room-monitor',
+        schemaVersion: 1,
+        shoeId: 'shoe-2',
+        handId: `hs-${offset}`,
+        playerCards: [{ rank: 'A' }, { rank: 'K' }],
+        bankerCards: [{ rank: '2' }, { rank: '3' }],
+        outcomes: { bankerPair: false, playerPair: false },
+      } as NormalizedEvent);
+    }
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(delivered.length - afterRecovery).toBe(5);
+    await tableExport.stop();
   });
 
   it('keeps the winfinity ws alias buffer bounded when no public id can be inferred', () => {

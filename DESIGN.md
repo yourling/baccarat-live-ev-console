@@ -6,36 +6,43 @@
 
 ## 1. Atmosphere & Identity
 
-这是一个低干扰、深色的实时运营中控台：信息密度高，但以清晰的层级、稳定的表格节奏和克制的青绿状态色来建立可信感。识别特征是“暗色控制台 + 薄边界 + 状态点”，操作层始终服从实时牌桌状态，不使用装饰性图形干扰判断。
+这是一个低干扰、**浅色**的实时运营中控台（Apple 风格浅色调，1.0.21 起）：信息密度高，但以清晰的层级、稳定的表格节奏和克制的蓝色主操作色来建立可信感。识别特征是“浅色画布 + 薄边界 + 状态点”，操作层始终服从实时牌桌状态，不使用装饰性图形干扰判断。
+
+> **文档与实现对齐说明（1.0.23）**：1.0.21 的主题重做（`d04a7ed`）把实现从深色切换为浅色，但当时未同步更新本文，
+> 导致 §1/§2/§7 与代码 100% 相反。本次修复按 `apps/desktop/src/ui/styles.css:1-26` 的**实际 token** 重写了
+> §1/§2/§7，并修正 §4/§6/§8 里与实现不符的承诺。以本文与 `styles.css` 一致为准；改配色时请同时改两处。
 
 ## 2. Color
 
 ### Palette
 
-| Role | Token | Dark value | Usage |
+下表是 `apps/desktop/src/ui/styles.css` 中 `:root` 的**实际取值**（浅色主题）。
+
+| Role | Token | Light value | Usage |
 |---|---|---:|---|
-| Canvas | `--surface-canvas` | `#0b1118` | 页面背景 |
-| Panel | `--surface-panel` | `#101923` | 摘要、筛选器、卡片 |
-| Raised panel | `--surface-raised` | `#111c26` | 设置区与强调面板 |
-| Field | `--surface-field` | `#0c141d` | 输入与选择器 |
-| Overlay | `--surface-overlay` | `rgb(3 8 12 / 82%)` | 全屏模态遮罩 |
-| Text primary | `--text-primary` | `#e6edf3` | 正文与数据 |
-| Text strong | `--text-strong` | `#f4f7fa` | 标题与关键数值 |
-| Text muted | `--text-muted` | `#8ea3b3` | 说明与元数据 |
-| Border | `--border-default` | `#263846` | 卡片、分隔线 |
-| Border strong | `--border-strong` | `#334657` | 输入与可交互边框 |
-| Accent | `--accent-primary` | `#14856b` | 主操作 |
-| Accent hover | `--accent-hover` | `#1a9c7c` | 主操作悬停 |
-| Confirmation accent | `--confirmation-primary` | `#11745f` | 确认弹窗普通确认操作 |
-| Confirmation accent hover | `--confirmation-primary-hover` | `#147d66` | 确认弹窗普通确认悬停 |
-| Focus | `--focus-ring` | `#51b99d` | 输入与拖拽目标 |
-| Success | `--status-success` | `#3bc49b` | 连接、健康状态 |
-| Warning | `--status-warning` | `#d9a441` | 风险、同步与注意项 |
-| Danger | `--status-danger` | `#df6262` | 错误与破坏性操作 |
+| Canvas | `--surface-canvas` | `#F5F5F7` | 页面背景 |
+| Panel | `--surface-panel` | `#FFFFFF` | 摘要、筛选器、卡片 |
+| Raised panel | `--surface-raised` | `#FFFFFF` | 设置区与强调面板 |
+| Field | `--surface-field` | `#F5F5F7` | 输入与选择器 |
+| Overlay | `--surface-overlay` | `rgb(29 29 31 / 35%)` | 全屏模态遮罩 |
+| Text primary | `--text-primary` | `#1D1D1F` | 正文与数据 |
+| Text strong | `--text-strong` | `#000000` | 标题与关键数值 |
+| Text muted | `--text-muted` | `#6E6E73` | 说明与元数据 |
+| Border | `--border-default` | `#D2D2D7` | 卡片、分隔线 |
+| Border strong | `--border-strong` | `#C7C7CC` | 输入与可交互边框 |
+| Accent | `--accent-primary` | `#0066CC` | 主操作 |
+| Accent hover | `--accent-hover` | `#0071E3` | 主操作悬停 |
+| Confirmation accent | `--confirmation-primary` | `#0066CC` | 确认弹窗普通确认操作 |
+| Confirmation accent hover | `--confirmation-primary-hover` | `#0071E3` | 确认弹窗普通确认悬停 |
+| Focus | `--focus-ring` | `#0071E3` | 输入与拖拽目标 |
+| Success | `--status-success` | `#248A3D` | 连接、健康状态 |
+| Warning | `--status-warning` | `#B25000` | 风险、同步与注意项 |
+| Danger | `--status-danger` | `#D70015` | 错误与破坏性操作 |
 
 ### Rules
-- 青绿色只表达连接、可用或主要提交动作；金色只表达需要注意的状态；红色只表达错误或破坏性动作。
-- 新控件沿用现有深色层级和边界色，不引入额外品牌色。
+- 蓝色只表达连接、可用或主要提交动作；棕色只表达需要注意的状态；红色只表达错误或破坏性动作。
+- 新控件沿用现有浅色层级和边界色，不引入额外品牌色。
+- 启动底色与主题必须一致：`index.html` 的内联背景与 `main.ts` 的 `backgroundColor` 都用 `--surface-canvas` 的浅色值，避免启动瞬间闪深色（1.0.23 已修正）。
 
 ## 3. Typography
 
@@ -144,16 +151,21 @@
 
 ## 7. Depth & Surface
 
-采用 **borders-only + tonal-shift**：使用 `#0b1118 → #101923 → #111c26` 的表面层级与 1px 边界区分区域，不使用大阴影。可投放目标不增加阴影，只使用边框和背景色。
+采用 **borders-only + tonal-shift**：使用 `#F5F5F7 → #FFFFFF` 的表面层级与 1px 边界（`#D2D2D7`）区分区域，不使用大阴影。可投放目标不增加阴影，只使用边框和背景色。
+
+> 浅色主题下"层级差"比深色更弱，因此**依赖边界而不依赖阴影**这一点更关键：新增区块时必须给 1px `--border-default` 边界，不要靠 `box-shadow` 造层级。
 
 ## 8. Accessibility Constraints & Accepted Debt
 
 - 目标：WCAG 2.2 AA；正文对比度至少 4.5:1；每个输入和按钮都有可见焦点状态。
 - 牌桌当前局号必须提供文字，不得只通过颜色或图标表达。
 - 无物理牌靴时不得用颜色或占位 EV 暗示可下注。
+- **`prefers-reduced-motion`**：实现方式为全局 `@media (prefers-reduced-motion: reduce)` 把过渡/动画压到最小（见 `styles.css` 末尾），不需要每个组件单独写。
+- **键盘焦点**：不得用 `outline: none` 抹掉焦点态；输入与按钮统一使用 `--focus-ring` 的 `:focus-visible` 环。
 - 拖放排序为鼠标增强操作；将提供稳定的保存顺序，必要时可通过重载保持；键盘完整重排不在本轮范围。
 
 | Item | Location | Why accepted | Owner / Exit |
 |---|---|---|---|
 | 键盘逐项移动桌台 | 监控行排序 | 当前请求明确为拖拽排序，先保证鼠标与触控板可靠 | 需要无障碍排序需求时补齐上移/下移按钮 |
+| 卡片视图缺行内下注控件 | `App.tsx` 的 `MonitorTableCard` | 1.0.21 引入卡片视图时只做了只读摘要，手动下注仍在表格视图 | 需要卡片视图直接下注时补折叠式 `OperationalWagerControls` |
 | 真实资金发布授权 | 打包应用与真实站点运行 | 工程链路和失败关闭已实现，但尚无独立真实站点非资金长稳报告、产品/安全审批和资金授权 | 完成外部验收、合规确认和正式发布审批 |

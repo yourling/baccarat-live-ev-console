@@ -1,5 +1,6 @@
 import type {
   DesktopConsoleSnapshot,
+  DesktopExtensionApprovalState,
   DesktopPerformanceReport,
   DesktopKeepaliveStrategySettings,
   DesktopOperationalWagerCommand,
@@ -14,6 +15,13 @@ import type {
   OneShotLiveBetResult,
 } from './api-types';
 import type { BetTier, ManualCorrection, RiskLimits, TableProfile } from '@baccarat/contracts';
+
+/** FIX(D-P0-1): 桥层 pending 扩展条目（完整 installId，仅 IPC 面可见）。 */
+interface DesktopExtensionApprovalPending {
+  readonly installId: string;
+  readonly firstSeenAt: string;
+  readonly lastSeenAt: string;
+}
 
 declare global {
   interface ImportMetaEnv {
@@ -39,6 +47,10 @@ declare global {
       registerTable: (profile: TableProfile, mode: 'shadow' | 'simulated' | 'live', amount: number) => Promise<DesktopConsoleSnapshot>;
       setAutoBet: (tableId: string, armed: boolean, shoeId?: string) => Promise<DesktopConsoleSnapshot>;
       setExecutionMode: (tableId: string, mode: 'shadow' | 'live') => Promise<DesktopConsoleSnapshot>;
+      listPendingExtensions: () => Promise<readonly DesktopExtensionApprovalPending[]>;
+      approveExtension: (installId: string) => Promise<void>;
+      revokeExtension: (installId: string) => Promise<void>;
+      extensionApprovalState: () => Promise<DesktopExtensionApprovalState>;
       executeOneShotLiveBet: (command: OneShotLiveBetCommand) => Promise<OneShotLiveBetResult>;
       executeOperationalWager: (command: DesktopOperationalWagerCommand) => Promise<DesktopOperationalWagerResult>;
       reconcileUnknownOperationalWager: (command: DesktopUnknownWagerReconciliationCommand) => Promise<DesktopConsoleSnapshot>;

@@ -2,6 +2,7 @@ import type { OperationalWagerMarket } from '@baccarat/adapter-contract';
 import type { DecisionHandRecord, MonitorSummary, OperationalWagerRecord } from '@baccarat/ledger-state';
 import type {
   BetReceipt,
+  BetTier,
   BettingMarket,
   DecisionSnapshot,
   NormalizedEvent,
@@ -180,6 +181,8 @@ export interface DesktopAutomationState {
 export type DesktopRuntimeIncidentCode =
   | 'bridge-auth-failed'
   | 'bridge-disconnected'
+  // FIX(P0-1): 有扩展连上但本机身份未被操作员批准。
+  | 'bridge-extension-pairing-required'
   | 'continuity-invalidated'
   | 'table-feed-stale'
   | 'session-recovery-exhausted'
@@ -328,6 +331,88 @@ export function parseDesktopKeepaliveSettings(value: unknown): DesktopKeepaliveS
 
 export type DesktopRecordKind = 'events' | 'decisions' | 'ledger';
 
+/** IPC 写入面的入参解析器（FIX(D-P2-13)，与 parseDesktopKeepaliveSettings 同级）。 */
+
+export interface DesktopTableSettingsPayload {
+  readonly minEV: number;
+  readonly betTiers: BetTier[];
+  readonly defaultBetAmount: number;
+  readonly monitorUrl?: string;
+}
+
+function readBetTiers(value: unknown): BetTier[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new TypeError('betTiers must be an array');
+  return value.map((tier, index) => {
+    if (typeof tier !== 'object' || tier === null || Array.isArray(tier)) {
+      throw new TypeError(`betTiers[${index}] must be an object`);
+    }
+    const minEV = Reflect.get(tier, 'minEV');
+    const amount = Reflect.get(tier, 'amount');
+    if (typeof minEV !== 'number' || !Number.isFinite(minEV) || minEV < 0) {
+      throw new TypeError(`betTiers[${index}].minEV must be a non-negative finite number`);
+    }
+    if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+      throw new TypeError(`betTiers[${index}].amount must be a positive finite number`);
+    }
+    return { minEV, amount };
+  });
+}
+
+function readSettingsFields(value: unknown): {
+  minEV: number;
+  betTiers: BetTier[];
+  defaultBetAmount: number;
+  monitorUrl?: string;
+} {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('table settings must be an object');
+  }
+  const minEV = Reflect.get(value, 'minEV');
+  const defaultBetAmount = Reflect.get(value, 'defaultBetAmount');
+  if (typeof minEV !== 'number' || !Number.isFinite(minEV)) {
+    throw new TypeError('minEV must be a finite number');
+  }
+  if (typeof defaultBetAmount !== 'number' || !Number.isFinite(defaultBetAmount) || defaultBetAmount <= 0) {
+    throw new TypeError('defaultBetAmount must be a positive finite number');
+  }
+  const monitorUrl = Reflect.get(value, 'monitorUrl');
+  if (monitorUrl !== undefined && typeof monitorUrl !== 'string') {
+    throw new TypeError('monitorUrl must be a string when provided');
+  }
+  return {
+    minEV,
+    betTiers: readBetTiers(Reflect.get(value, 'betTiers')),
+    defaultBetAmount,
+    ...(monitorUrl === undefined ? {} : { monitorUrl }),
+  };
+}
+
+export function parseDesktopTableSettings(value: unknown): DesktopTableSettingsPayload {
+  return readSettingsFields(value);
+}
+
+export function parseDesktopUnifiedTableSettings(
+  value: unknown,
+): Omit<DesktopTableSettingsPayload, 'monitorUrl'> {
+  const { monitorUrl: _ignored, ...rest } = readSettingsFields(value);
+  return rest;
+}
+
+/** 监控桌 ID 列表：必须是字符串数组，逐项 trim 后非空，去重后不超过 64 张。 */
+export function parseDesktopMonitorTableIds(value: unknown): string[] {
+  if (!Array.isArray(value)) throw new TypeError('monitor table ids must be an array');
+  const normalized: string[] = [];
+  for (const candidate of value) {
+    if (typeof candidate !== 'string') throw new TypeError('monitor table id must be a string');
+    const trimmed = candidate.trim();
+    if (trimmed.length === 0) continue;
+    if (!normalized.includes(trimmed)) normalized.push(trimmed);
+  }
+  if (normalized.length > 64) throw new RangeError('at most 64 monitor tables are supported');
+  return normalized;
+}
+
 export interface DesktopRecordQuery extends DesktopSnapshotOptions {
   kind: DesktopRecordKind;
   page: number;
@@ -388,6 +473,48 @@ export interface DesktopRecordCounts {
   ledger: number;
 }
 
+/**
+ * FIX(D-P0-1): 扩展身份批准面。
+ *
+ * installId 是扩展首次运行时生成的随机身份（32 hex / UUID 形状）。它**不是密钥**，
+ * 但"哪个 installId 可以接管真金下注通道"必须由操作员显式批准 —— 桥侧只把批准的
+ * installId 提升为 extension 角色。渲染层只拿得到前 8 位（`installIdShort`），
+ * 完整 installId 只在 IPC 请求里往返，不落 snapshot。
+ */
+export interface DesktopExtensionApprovalEntry {
+  readonly installIdShort: string;
+  readonly firstSeenAt: string;
+  readonly lastSeenAt: string;
+}
+
+export interface DesktopExtensionApprovalState {
+  /** 严格模式：未批准的扩展只能停在 pending（拿不到 lease、收不到 betRequest）。 */
+  readonly strict: boolean;
+  readonly pendingCount: number;
+  readonly unidentifiedPendingConnections: number;
+  readonly pending: readonly DesktopExtensionApprovalEntry[];
+  readonly approved: readonly DesktopExtensionApprovalEntry[];
+}
+
+/** 32 hex（扩展默认）或 UUID；其它形状一律拒绝，避免 UI 把垃圾传给桥。 */
+const EXTENSION_INSTALL_ID_SHAPE = /^(?:[0-9a-f]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;
+
+export function isDesktopExtensionInstallId(value: unknown): value is string {
+  return typeof value === 'string' && EXTENSION_INSTALL_ID_SHAPE.test(value);
+}
+
+export function parseDesktopExtensionInstallId(value: unknown): string {
+  if (!isDesktopExtensionInstallId(value)) {
+    throw new TypeError('extension install id must be 32 hex characters or a UUID');
+  }
+  return value;
+}
+
+/** 只把前 8 位暴露给渲染层；完整 installId 不进 snapshot。 */
+export function shortExtensionInstallId(installId: string): string {
+  return installId.slice(0, 8);
+}
+
 export interface DesktopConsoleSnapshot {
   dbPath: string;
   isOpen: boolean;
@@ -410,6 +537,8 @@ export interface DesktopConsoleSnapshot {
   demoRunning: boolean;
   demoSpeed: number;
   summary: MonitorSummary;
+  /** FIX(D-P0-1): 扩展身份批准状态（只含 installId 前 8 位，完整值不进 snapshot）。 */
+  extensionApproval: DesktopExtensionApprovalState;
   demoError?: string;
 }
 

@@ -124,13 +124,30 @@ export async function executeControlledOperationalWager(
   const handId = command.source === 'manual'
     ? (projection.status === 'BETTING_WINDOW' && liveHandId ? liveHandId : manualHandId ?? liveHandId ?? `manual-test-${wagerId}`)
     : liveHandId ?? `manual-test-${wagerId}`;
+  // FIX(B-P1-1): 跨来源判重 —— 保活/手动、自动对子/手动对子在同一手同一市场
+  // 只能存在一笔真实下注。修复前这里把 source 传进判重，导致两个来源同下
+  // （review 脚本 a5 实证桥收到 2 条 wager）。source 只保留在审计字段里。
+  const existingReceipt = context.ledger.getReceipt(context.tableId, shoeId, handId, command.market);
+  if (existingReceipt !== undefined && !isUncommittedRejection(existingReceipt.receipt)) {
+    return rejected('duplicate');
+  }
+  // 任意来源的受控下注审计行（非 REJECTED，或非法提交后的确定态）同样算重复。
   if (context.ledger.hasOperationalWager(
     context.tableId,
     shoeId,
     handId,
     command.market,
-    command.source,
   )) {
+    return rejected('duplicate');
+  }
+  // 任意来源的活跃 reservation（RESERVED / UNKNOWN）同样算重复：自动对子策略
+  // 的 reservation 没有 operational_wagers 审计行，只能从风控快照里看。
+  if (context.riskManager.snapshot(context.tableId).some(reservation => (
+    reservation.shoeId === shoeId
+    && reservation.handId === handId
+    && reservation.market === command.market
+    && (reservation.status === 'RESERVED' || reservation.status === 'UNKNOWN')
+  ))) {
     return rejected('duplicate');
   }
 
@@ -328,6 +345,17 @@ function receiptCommitStarted(receipt: OperationalWagerReceipt): boolean {
   return typeof receipt.raw === 'object'
     && receipt.raw !== null
     && Reflect.get(receipt.raw, 'commitStarted') === true;
+}
+
+/**
+ * 明确"没提交"的旧回执不算重复：那条路径本来就可以同局重试（与 one-shot 的
+ * `hasDuplicate` 判定一致）。除此之外的任何回执（含 ACCEPTED / UNKNOWN /
+ * 已提交的 REJECTED）都代表这一手这一市场真的动过钱，必须判重。
+ */
+function isUncommittedRejection(receipt: { status: string; raw?: unknown }): boolean {
+  return receipt.status === 'REJECTED'
+    && !(typeof receipt.raw === 'object' && receipt.raw !== null
+      && Reflect.get(receipt.raw, 'commitStarted') === true);
 }
 
 function operationalReceiptFromError(error: unknown): OperationalWagerReceipt | undefined {

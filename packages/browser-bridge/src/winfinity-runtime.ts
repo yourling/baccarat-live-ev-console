@@ -364,6 +364,21 @@ export class WinfinityRuntimeParser {
   }
 
   parseFrame(raw: string): NormalizedEvent[] {
+    try {
+      return this.parseFrameUnsafe(raw);
+    } catch (error) {
+      // FIX(C-P2-5): Winfinity 的牌面解析本身已是 fail-soft（`RANK` 映射 + 类型守卫，
+      // 不认识/脏 rank 直接 continue），但协议帧的其他字段仍是 unknown 形状。
+      // 与 Pragmatic/BG 保持一致的隔离语义：单帧异常不升级成调用方崩溃，
+      // 记一次脱敏诊断并丢弃该帧。
+      console.error(
+        `[bridge-parse] winfinity frame: ${error instanceof Error ? error.name : 'error'} — frame dropped`,
+      );
+      return [];
+    }
+  }
+
+  private parseFrameUnsafe(raw: string): NormalizedEvent[] {
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);

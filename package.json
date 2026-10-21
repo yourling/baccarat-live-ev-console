@@ -1,6 +1,6 @@
 {
   "name": "baccarat-ev-console",
-  "version": "1.0.22",
+  "version": "1.0.23",
   "private": true,
   "workspaces": [
     "packages/*",
@@ -11,6 +11,7 @@
     "sync:ext": "node scripts/sync-extension-shared.mjs",
     "check:ext": "node scripts/check-extension-syntax.mjs",
     "check:version": "node scripts/check-version-sync.mjs",
+    "verify:package": "npm run verify:package -w @baccarat/desktop",
     "test": "vitest run --config vitest.config.ts",
     "test:watch": "vitest --config vitest.config.ts",
     "dev:web": "npm run dev -w @baccarat/desktop",

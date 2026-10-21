@@ -19,6 +19,7 @@ import type { DecisionHandRecord, OperationalWagerRecord } from '@baccarat/ledge
 import type {
   DesktopConsoleSnapshot,
   DesktopBeadHand,
+  DesktopExtensionApprovalState,
   DesktopKeepaliveState,
   DesktopRecordPage,
   DesktopRecordQuery,
@@ -29,10 +30,7 @@ import type {
   ReceiptRow,
   TableActorSnapshot,
 } from '../api-types';
-import {
-  planExecutionModeChange,
-  type ExecutionMode,
-} from './execution-mode';
+import { type ExecutionMode } from './execution-mode';
 import { useConfirmationDialog } from './confirmation-dialog';
 import {
   OperationalWagerControls,
@@ -238,6 +236,8 @@ export function App() {
   const [pendingLiveExecutionTableId, setPendingLiveExecutionTableId] = useState<string | null>(null);
   const [alertCenterOpen, setAlertCenterOpen] = useState(false);
   const [acknowledgingIncidentId, setAcknowledgingIncidentId] = useState<string | null>(null);
+  /** FIX(D-P0-1): 正在批准/撤销的扩展短 ID（防重复点击）。 */
+  const [extensionBusyId, setExtensionBusyId] = useState<string | null>(null);
   const recordRequestSequenceRef = useRef(0);
   const {
     snapshot,
@@ -284,6 +284,9 @@ export function App() {
       description: '将清除全部事件、决策和下注账本记录，并重置当前监控状态。',
       details: [
         { label: '将被清除', value: '事件、决策、下注账本' },
+        // FIX(D-P2-2): 说清楚"清账 ≠ 清额度" —— 修复前 SqliteLedger.clearMonitorData
+        // 会 DELETE risk_state，等于一键把当日/每桌/每靴亏损归零、绕过止损。
+        { label: '不会重置', value: '风控计数（当日/每桌/每靴亏损、已执行金额）' },
         { label: '仍会保留', value: '牌桌与下注设置' },
       ],
       confirmLabel: '继续',
@@ -829,15 +832,65 @@ export function App() {
     }
   }
 
-  function requestExecutionModeChange(tableId: string, mode: ExecutionMode) {
-    switch (planExecutionModeChange(mode).kind) {
-      case 'apply-shadow':
-        setPendingLiveExecutionTableId(null);
-        void setExecutionMode(tableId, 'shadow');
-        return;
-      case 'confirm-live':
-        setPendingLiveExecutionTableId(tableId);
-        return;
+  /**
+   * FIX(D-P0-1): 批准 / 撤销浏览器扩展身份。
+   *
+   * 这是真金通道的安全闸：未批准的扩展只能停在 pending，拿不到 executor lease、
+   * 收不到 betRequest。因此批准动作必须是**两次显式确认**并写明后果，撤销则
+   * 立即断开正在使用该身份的扩展。批准/撤销后立刻刷新快照，不等 2 秒轮询。
+   */
+  async function approveExtension(installIdShort: string) {
+    if (!window.desktop) return;
+    // snapshot 只带前 8 位（脱敏）；完整 installId 从桥的 pending 列表里反查。
+    const pending = await window.desktop.listPendingExtensions();
+    const resolved = pending.find(entry => entry.installId.slice(0, 8) === installIdShort);
+    if (resolved === undefined) {
+      setError('该扩展已不在待批准列表（可能已断开），请刷新后重试');
+      return;
+    }
+    const confirmed = await confirm({
+      title: '批准浏览器扩展',
+      description: '批准后该扩展身份可以向本机下发真实下注请求。仅在你刚刚安装/重装扩展时批准。',
+      details: [
+        { label: '扩展身份', value: installIdShort + '…' },
+        { label: '批准后', value: '该扩展可接管本机 executor 与真金下注通道' },
+        { label: '如不确定', value: '取消，并检查浏览器里安装的扩展来源' },
+      ],
+      confirmLabel: '确认批准',
+      tone: 'danger',
+    });
+    if (!confirmed) return;
+    setExtensionBusyId(installIdShort);
+    setError(null);
+    try {
+      await window.desktop.approveExtension(resolved.installId);
+      setSnapshot(await window.desktop.snapshot({ includeHistory: false }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExtensionBusyId(null);
+    }
+  }
+
+  async function revokeExtension(installIdShort: string) {
+    if (!window.desktop) return;
+    const confirmed = await confirm({
+      title: '撤销扩展批准',
+      description: '撤销后该扩展会立即被断开，且无法再接管本机 executor 与真金下注通道。',
+      details: [{ label: '扩展身份', value: installIdShort + '…' }],
+      confirmLabel: '确认撤销',
+      tone: 'danger',
+    });
+    if (!confirmed) return;
+    setExtensionBusyId(installIdShort);
+    setError(null);
+    try {
+      await window.desktop.revokeExtension(installIdShort);
+      setSnapshot(await window.desktop.snapshot({ includeHistory: false }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExtensionBusyId(null);
     }
   }
 
@@ -940,6 +993,8 @@ export function App() {
         </div>
       </aside>
       <div className="app-main">
+      {/* FIX(P2-7): DESIGN.md §4「桌面内容宽度不超过 1480px」。侧边栏 IA 下 shell 必须全宽，1480 上限落在主区内层容器上。 */}
+      <div className="app-main__inner">
       <header className="app-header">
         <div className="header-actions">
           <button
@@ -973,6 +1028,31 @@ export function App() {
       )}
       {error && <div className="notice notice--danger">{error}</div>}
       {snapshot?.demoError && <div className="notice notice--danger">运行提示：{snapshot.demoError}</div>}
+      {/*
+        FIX(D-P0-1): 扩展待批准是**安全闸**，不是软提示。未批准的扩展拿不到
+        executor lease、收不到 betRequest，也就意味着监控与下注当前不可用 ——
+        操作员必须在这里就能看到并处置，而不是翻告警中心。
+      */}
+      {snapshot && snapshot.extensionApproval.pendingCount > 0 && (
+        <div className="notice notice--warning" role="alert">
+          <span>
+            有 {snapshot.extensionApproval.pendingCount} 个浏览器扩展等待批准（
+            {snapshot.extensionApproval.pending.map(entry => entry.installIdShort).join('、')}
+            ）—— 监控/下注当前不可用。
+          </span>
+          <button
+            className="button button--small button--primary"
+            type="button"
+            onClick={() => setAlertCenterOpen(true)}
+          >去批准</button>
+        </div>
+      )}
+      {snapshot && snapshot.extensionApproval.unidentifiedPendingConnections > 0 && (
+        <div className="notice notice--danger" role="alert">
+          有 {snapshot.extensionApproval.unidentifiedPendingConnections} 个未知扩展尝试连接但未上报身份，
+          已被拒绝。请确认浏览器里安装的扩展来源。
+        </div>
+      )}
       {snapshot && snapshot.runtime.status !== 'healthy' && (
         <div className={cx('notice', snapshot.runtime.status === 'blocked' ? 'notice--danger' : 'notice--warning')}>
           {snapshot.runtime.status === 'blocked' ? '无人值守执行已阻断' : '无人值守运行已降级'}
@@ -1015,6 +1095,10 @@ export function App() {
           acknowledgingIncidentId={acknowledgingIncidentId}
           onAcknowledge={incidentId => void acknowledgeRuntimeIncident(incidentId)}
           onAcknowledgeAll={() => void acknowledgeAllRuntimeIncidents()}
+          extensionApproval={snapshot.extensionApproval}
+          extensionBusyId={extensionBusyId}
+          onApproveExtension={installId => void approveExtension(installId)}
+          onRevokeExtension={installId => void revokeExtension(installId)}
           onClose={() => setAlertCenterOpen(false)}
         />
       )}
@@ -1342,7 +1426,6 @@ export function App() {
           }}
           onArm={() => void setAutoBet(selectedMonitorTable.tableId, true, selectedMonitorTable.projection.shoeId || undefined)}
           onDisarm={() => void setAutoBet(selectedMonitorTable.tableId, false, selectedMonitorTable.projection.shoeId || undefined)}
-          onExecutionModeChange={mode => requestExecutionModeChange(selectedMonitorTable.tableId, mode)}
           onConfirmLiveMode={() => {
             setPendingLiveExecutionTableId(null);
             void setExecutionMode(selectedMonitorTable.tableId, 'live');
@@ -1393,6 +1476,7 @@ export function App() {
         />
       )}
       {dialog}
+      </div>
     </div>
     </div>
   );
@@ -1707,7 +1791,6 @@ function MonitorTableSettingsDialog(props: {
   onClose: () => void;
   onArm: () => void;
   onDisarm: () => void;
-  onExecutionModeChange: (mode: ExecutionMode) => void;
   onConfirmLiveMode: () => void;
   onCancelLiveMode: () => void;
   onConfirmShoe: () => void;
@@ -2629,6 +2712,10 @@ function AlertCenter(props: {
   acknowledgingIncidentId: string | null;
   onAcknowledge: (incidentId: string) => void;
   onAcknowledgeAll: () => void;
+  extensionApproval: DesktopExtensionApprovalState;
+  extensionBusyId: string | null;
+  onApproveExtension: (installIdShort: string) => void;
+  onRevokeExtension: (installIdShort: string) => void;
   onClose: () => void;
 }) {
   const pendingCount = props.incidents.filter(incident =>
@@ -2653,6 +2740,59 @@ function AlertCenter(props: {
             <button className="button button--small button--ghost" type="button" onClick={props.onClose}>关闭</button>
           </div>
         </header>
+        {/*
+          FIX(D-P0-1): 扩展身份批准区。未批准的扩展拿不到 executor lease、
+          收不到 betRequest —— 这是真金通道的准入闸，必须在这里可处置。
+        */}
+        {(props.extensionApproval.pendingCount > 0 || props.extensionApproval.approved.length > 0
+          || props.extensionApproval.unidentifiedPendingConnections > 0) && (
+          <section className="alert-center__extensions" aria-label="浏览器扩展身份">
+            <h3>浏览器扩展身份</h3>
+            {props.extensionApproval.unidentifiedPendingConnections > 0 && (
+              <p className="text--danger">
+                有 {props.extensionApproval.unidentifiedPendingConnections} 个未知扩展尝试连接但未上报身份，已被拒绝。
+              </p>
+            )}
+            {props.extensionApproval.pendingCount > 0 && (
+              <>
+                <p className="muted">
+                  待批准 {props.extensionApproval.pendingCount} 个。批准后该扩展可以向本机下发真实下注请求；
+                  仅在你刚刚安装/重装扩展时批准。
+                </p>
+                <ul className="alert-center__extension-list">
+                  {props.extensionApproval.pending.map(entry => (
+                    <li key={entry.installIdShort}>
+                      <code>{entry.installIdShort}…</code>
+                      <span className="muted">首次 {formatDateTime(entry.firstSeenAt)}</span>
+                      <button
+                        className="button button--small button--primary"
+                        type="button"
+                        disabled={props.extensionBusyId !== null}
+                        onClick={() => props.onApproveExtension(entry.installIdShort)}
+                      >批准</button>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+            {props.extensionApproval.approved.length > 0 && (
+              <ul className="alert-center__extension-list">
+                {props.extensionApproval.approved.map(entry => (
+                  <li key={entry.installIdShort}>
+                    <code>{entry.installIdShort}…</code>
+                    <span className="muted">已批准</span>
+                    <button
+                      className="button button--small button--danger-ghost"
+                      type="button"
+                      disabled={props.extensionBusyId !== null}
+                      onClick={() => props.onRevokeExtension(entry.installIdShort)}
+                    >撤销</button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        )}
         <div className="alert-center__list">
           {props.incidents.length === 0 && <div className="empty-state">暂无告警事件</div>}
           {props.incidents.map(incident => {
@@ -2816,6 +2956,7 @@ function runtimeIncidentCodeLabel(code: DesktopRuntimeIncident['code']): string 
   const labels: Record<DesktopRuntimeIncident['code'], string> = {
     'bridge-auth-failed': '浏览器桥认证失败',
     'bridge-disconnected': '浏览器桥断开',
+    'bridge-extension-pairing-required': '扩展待批准',
     'continuity-invalidated': '牌桌连续性失效',
     'table-feed-stale': '牌桌数据过期',
     'session-recovery-exhausted': '会话恢复失败',

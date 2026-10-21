@@ -434,3 +434,36 @@ export const STANDARD_COMMISSION_BACCARAT_TERMS: OperationalWagerTerms = {
   tiePolicy: 'push',
 };
 
+/**
+ * 风控预留（reservation）的 `releaseReason` 审计词表。
+ *
+ * 这些取值只用于审计/告警分类，不改变状态机语义；新增常量不影响已有形状，
+ * 因为 `RiskReservation.releaseReason` 仍是自由字符串（历史行需要原样保留）。
+ *
+ * FIX(B-P1-3/D-P1-1): 操作员勾销与"启动恢复判未知"必须能区分 ——
+ * 前者是人为决定（不宣称输赢），后者是系统在启动时对"上一进程遗留敞口"的
+ * 保守归类（迟到权威结算仍可自动收敛）。
+ */
+export const RISK_RELEASE_REASONS = {
+  /** 操作员确认无法核实平台结果，主动勾销（不宣称输赢）。 */
+  operatorWriteOff: 'operator-unconfirmed-write-off',
+  /** 启动恢复：上一进程遗留的 RESERVED 敞口，结果未知。 */
+  restoredUnsettledExposure: 'restored-unsettled-exposure',
+  /** 启动对账：无回执的跨靴/封靴 RESERVED，改为未知。 */
+  reconciledOnStartup: 'reconciled-on-startup',
+  /** 运行期超时未结算（有回执）。 */
+  unsettledPastTimeout: 'unsettled-past-timeout',
+  /** 结算到了但没有权威 outcomes。 */
+  handSettledWithoutOutcome: 'hand-settled-without-authoritative-outcome',
+  /** 金额被风控缩小，与请求金额不一致 → fail-closed 不执行。 */
+  reservedAmountMismatch: 'reserved-amount-mismatch',
+} as const;
+
+/** 可被迟到权威结算自动收敛的 UNKNOWN reason（唯一事实来源）。 */
+export const SETTLEABLE_UNKNOWN_RELEASE_REASONS: readonly string[] = [
+  RISK_RELEASE_REASONS.handSettledWithoutOutcome,
+  RISK_RELEASE_REASONS.unsettledPastTimeout,
+  RISK_RELEASE_REASONS.restoredUnsettledExposure,
+  RISK_RELEASE_REASONS.reconciledOnStartup,
+];
+

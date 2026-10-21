@@ -14,3 +14,17 @@
 * 所有共享契约修改必须谨慎，合并前需同步测试夹具。
 * 中控台版本从 `1.0.0` 起。每次合入修改将 `apps/desktop/src/console-build-info.ts` 的 `CONSOLE_VERSION`、根 `package.json` 与 `apps/desktop/package.json` 的 patch +1（1.0.0 → 1.0.1）。界面与窗口标题显示 `V1.0.0+abc1234`（短 SHA）。
 * 使用 gh 管理仓库操作。
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs for this repo live as GitHub Issues, driven by the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical triage roles with their default strings (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+single-context: one `GLOSSARY.md` at the repo root, architecture decisions in `docs/adr/`. See `docs/agents/domain.md`.

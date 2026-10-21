@@ -27,6 +27,20 @@ export const ROAD_WRAP_MIN_PREVIOUS = 10;
 export const ROAD_WRAP_MIN_DROP = 8;
 const GAME_COUNT_CATCH_UP_MAX = 5;
 export const MAX_BACCARAT_SHOE_HANDS = 80;
+/**
+ * 新开出的实体靴最多允许用 HISTORY 珠盘回填多少手。
+ *
+ * AGENTS.md 第 6 条：「新靴不得回填 21 行以上的旧珠盘」。换靴瞬间 DOM 路子
+ * 与 HISTORY 会同时滞后（felt=29、HISTORY=29 行），此时
+ * `historyHands.length - gameCount === 0`，靠"差值 ≥ 8"的历史守卫拦不住，
+ * 上一靴的 29 手旧牌会被灌进全新实体靴（remainingTotal 416→326）。
+ *
+ * 注意与 `EARLY_SHOE_ROAD_MAX = 20` 的语义区分（那个常量在 bg-runtime 里）：
+ * 20 是"这条 felt 路子仍属于早期靴"的判定上限，服务 wrap/correction 启发式；
+ * 21 是**回填上限**，只约束"刚开出的实体新靴可以从 HISTORY 补多少手库存"。
+ * 两者语义不同，不要合并成一个常量。
+ */
+export const MAX_BACKFILL_HANDS = 21;
 /** A dealt shoe silent this long is shuffling. Missed NEXT_SHOES during stale. */
 export const SHUFFLE_IDLE_GAP_MS = 6 * 60 * 1000;
 
@@ -112,20 +126,60 @@ export function mergeHandCards(
 
 const CARD_PATTERN = /^(10|[2-9AJQK]|[01])([SHDC])([0-8])?$/i;
 
-export function parseCard(value: string): Card | null {
-  const match = CARD_PATTERN.exec(value.trim());
+/**
+ * FIX(C-P2-5): 牌面解析必须对脏输入 fail-soft。
+ *
+ * 修复前签名是 `parseCard(value: string)`，直接 `value.trim()` —— 上游快照里
+ * 出现 `null`/数字/对象时抛 TypeError。而 `pragmatic-runtime` / `bg-runtime` 的
+ * `parse()` 是逐桌调用的、没有 try/catch，于是一张坏牌会让**同帧其他桌的数据
+ * 全部丢失**（`b10c-dirty-card-poisoning.ts` 实证），且静默无日志。
+ *
+ * 现在：非 string → 返回 null（不抛）；格式不匹配 → 返回 null。
+ * `parseCards` 过滤掉 null，并由 `parseCardsWithDiagnostics` 暴露被拒数量，
+ * 供 runtime 的 `parse()` 记账/告警。
+ */
+export function parseCard(value: unknown): Card | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  const match = CARD_PATTERN.exec(trimmed);
   if (!match) return null;
   const rankToken = match[1]!.toUpperCase();
   const rank = (rankToken === '0' ? '10' : rankToken === '1' ? 'A' : rankToken) as CardRank;
   return {
     rank,
     suit: match[2]!.toUpperCase(),
-    raw: value.trim().toUpperCase(),
+    raw: trimmed.toUpperCase(),
   };
 }
 
-export function parseCards(values: readonly string[] | undefined): Card[] {
-  return (values ?? []).map(parseCard).filter((card): card is Card => card !== null);
+/** 牌面解析的可观测结果：`rejected` 是被丢弃的脏牌数量（用于诊断/告警）。 */
+export interface ParsedCards {
+  readonly cards: Card[];
+  readonly rejected: number;
+}
+
+/**
+ * FIX(C-P2-5): 宽松解析 —— 过滤掉脏牌并**记录**丢了几张。
+ * 旧调用点仍可用 `parseCards`（只返回牌数组，语义不变）。
+ */
+export function parseCardsWithDiagnostics(values: readonly unknown[] | undefined): ParsedCards {
+  const input = values ?? [];
+  const cards: Card[] = [];
+  let rejected = 0;
+  for (const value of input) {
+    const card = parseCard(value);
+    if (card === null) {
+      rejected += 1;
+      continue;
+    }
+    cards.push(card);
+  }
+  return { cards, rejected };
+}
+
+export function parseCards(values: readonly unknown[] | undefined): Card[] {
+  return parseCardsWithDiagnostics(values).cards;
 }
 
 export function cardPoint(card: { rank: string }): number {
@@ -262,11 +316,56 @@ export abstract class SnapshotRuntimeParserBase {
   private readonly finishedHands = new Set<string>();
   private readonly evidenceByTable = new Map<string, ParserShoeEvidence>();
   private readonly lastHandAtByTable = new Map<string, number>();
+  /** FIX(C-P2-5): 脏牌/单桌解析失败的可观测计数，按桌累计（便于 UI/日志告警）。 */
+  private readonly diagnosticsByTable = new Map<string, { rejectedCards: number; rejectedTables: number }>();
 
   protected readonly options: SnapshotParserOptions;
 
   protected constructor(options: SnapshotParserOptions) {
     this.options = options;
+  }
+
+  /**
+   * FIX(C-P2-5): 该桌累计被丢弃的脏牌张数与解析失败的桌次数。
+   *
+   * `parse()` 现在对每桌 try/catch、`parseCards` 过滤脏牌，但"丢弃"必须可观测 ——
+   * 否则又回到"静默"这个原始问题。调用方（桥/adapter）可在 health 或日志里读它。
+   */
+  parserDiagnostics(tableId: string): { rejectedCards: number; rejectedTables: number } {
+    const current = this.diagnosticsByTable.get(tableId);
+    return current === undefined ? { rejectedCards: 0, rejectedTables: 0 } : { ...current };
+  }
+
+  /** 累计一次脏牌丢弃。 */
+  protected noteRejectedCards(tableId: string, rejected: number): void {
+    if (rejected <= 0) return;
+    const current = this.diagnosticsByTable.get(tableId) ?? { rejectedCards: 0, rejectedTables: 0 };
+    this.diagnosticsByTable.set(tableId, {
+      rejectedCards: current.rejectedCards + rejected,
+      rejectedTables: current.rejectedTables,
+    });
+  }
+
+  /** 累计一次单桌解析失败（同帧其他桌必须继续）。 */
+  protected noteRejectedTable(tableId: string): void {
+    const current = this.diagnosticsByTable.get(tableId) ?? { rejectedCards: 0, rejectedTables: 0 };
+    this.diagnosticsByTable.set(tableId, {
+      rejectedCards: current.rejectedCards,
+      rejectedTables: current.rejectedTables + 1,
+    });
+  }
+
+  /** 牌面解析并记账（FIX(C-P2-5)：脏牌不抛、不静默）。 */
+  protected parseCardsFor(tableId: string, values: readonly unknown[] | undefined): Card[] {
+    const parsed = parseCardsWithDiagnostics(values);
+    this.noteRejectedCards(tableId, parsed.rejected);
+    if (parsed.rejected > 0) {
+      // 脱敏：只报张数与桌号，不打印原始帧内容（可能含 session/token）。
+      console.warn(
+        `[bridge-parse] ${this.options.platformId} table ${tableId}: dropped ${parsed.rejected} malformed card(s)`,
+      );
+    }
+    return parsed.cards;
   }
 
   currentShoeId(tableId: string): string | undefined {

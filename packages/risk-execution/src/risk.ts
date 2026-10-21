@@ -1,4 +1,6 @@
 import {
+  RISK_RELEASE_REASONS,
+  SETTLEABLE_UNKNOWN_RELEASE_REASONS,
   assertValidRiskLimits,
   assertValidTableProfile,
   type BetIntent,
@@ -53,23 +55,52 @@ function holdsRiskExposure(status: RiskReservation['status']): boolean {
 }
 
 /**
+ * 启动恢复时把"上一进程遗留的 RESERVED 敞口"升级为 UNKNOWN 的审计原因。
+ * 与 `RISK_RELEASE_REASONS.restoredUnsettledExposure` 同值（contracts 是事实来源），
+ * 这里重新导出保持 risk-execution 的既有导入路径可用。
+ */
+export const RESTORED_UNSETTLED_EXPOSURE_REASON = RISK_RELEASE_REASONS.restoredUnsettledExposure;
+
+/**
  * 这些 UNKNOWN 只是"下注已提交、但等不到权威结算"的暂态，一旦该手的结算
  * 到达就应当自动收敛。其它 UNKNOWN（回执不匹配、窗口不对等）表示执行结果
  * 本身就不可信，不能用后来的结算去反推，必须走操作员确认流程。
+ *
+ * FIX(B-P1-3): 词表下沉到 contracts（`SETTLEABLE_UNKNOWN_RELEASE_REASONS`），
+ * 含 `restored-unsettled-exposure`（启动恢复的上一进程敞口）与
+ * `reconciled-on-startup`（无回执的跨靴 RESERVED 改判未知）：两者都代表
+ * "下注早已交给桥、只是本地没等到结算"，迟到权威结算必须能自动收敛。
+ * `settleHand` 现在严格按 shoeId 匹配，不会跨靴张冠李戴。
  */
 function isSettleableUnknown(reason: string | undefined): boolean {
-  return reason === 'hand-settled-without-authoritative-outcome'
-    || reason === 'unsettled-past-timeout';
+  return reason !== undefined && SETTLEABLE_UNKNOWN_RELEASE_REASONS.includes(reason);
 }
 
+/**
+ * 活跃预留的**唯一性键**：同桌、同靴、同手、同市场只允许一笔下注。
+ *
+ * FIX(B-P1-1): 唯一性键刻意**不含 executionSource** —— 保活 / 手动 / 自动对子 /
+ * one-shot 只是审计来源，不能因为来源不同就在同一手同一市场真实下两注。
+ * 需要区分来源的审计查询请用 `activeReservationAuditKey()`。
+ */
 export function activeReservationKey(
+  tableId: string,
+  shoeId: string,
+  handId: string,
+  market: string,
+): string {
+  return `${tableId}:${shoeId}:${handId}:${market}`;
+}
+
+/** 审计用键：唯一键 + 执行来源，仅用于报表/排查，不参与判重。 */
+export function activeReservationAuditKey(
   tableId: string,
   shoeId: string,
   handId: string,
   market: string,
   executionSource: ExecutionSource = 'strategy',
 ): string {
-  return `${tableId}:${shoeId}:${handId}:${market}:${executionSource}`;
+  return `${activeReservationKey(tableId, shoeId, handId, market)}:${executionSource}`;
 }
 
 export function shoeLossKey(tableId: string, shoeId: string): string {
@@ -110,7 +141,7 @@ export class RiskManager {
         this.reservations.set(r.reservationId, r);
         if (holdsRiskExposure(r.status)) {
           this.activeByKey.set(
-            activeReservationKey(r.tableId, r.shoeId, r.handId, r.market, r.executionSource),
+            activeReservationKey(r.tableId, r.shoeId, r.handId, r.market),
             r.reservationId,
           );
           recomputedExposure += r.maxLoss;
@@ -153,6 +184,20 @@ export class RiskManager {
     this.reservations.clear();
     this.activeByKey.clear();
     this.state = emptyRiskState(asOfDate);
+    this.persistState();
+  }
+
+  /**
+   * FIX(D-P2-2): "清除监控记录"只丢弃预留（审计行由 ledger 删除），
+   * **保留**当日/每桌/每靴亏损与当日成交额 —— 清记录不是清账，
+   * 不能成为绕过 `perDayLossLimit` / `perTableLossLimit` / `perShoeLossLimit` 的入口。
+   * 只把敞口与并发归零（对应未结算预留已不存在）。
+   */
+  dropReservationsKeepingAccounting(): void {
+    this.reservations.clear();
+    this.activeByKey.clear();
+    this.state.reservedExposure = 0;
+    this.state.pendingExecutions = 0;
     this.persistState();
   }
 
@@ -200,7 +245,6 @@ export class RiskManager {
       intent.shoeId,
       intent.handId,
       intent.market,
-      intent.executionSource,
     );
     if (this.activeByKey.has(key)) {
       return { ok: false, reason: 'duplicate:already-reserved' };
@@ -378,6 +422,35 @@ export class RiskManager {
     return escalated;
   }
 
+  /**
+   * 启动恢复：把上一进程遗留的**所有** RESERVED 敞口升级为 UNKNOWN。
+   *
+   * FIX(B-P1-3 / D-P1-1): `escalateOverdueSettlements` 用 `notBefore=runtimeStartedAt`
+   * 跳过重启前的敞口、`expireOpenForShoe` 又跳过有回执的预留，结果是上一进程
+   * "已提交未结算"的那笔既不会升级、也不会被清理，更不能被操作员勾销 ——
+   * 永久占用 `reservedExposure` / `pendingExecutions`（全局额度黑洞）。
+   *
+   * 这里不再看 `createdAt` 与 `receiptId`：本进程启动时仍为 RESERVED 的预留，
+   * 一律代表"上一进程留下的、结果未知的敞口"。升级为 UNKNOWN 后：
+   * - 敞口继续占用（未知的钱不能当没发生）；
+   * - 进入 unknown-execution 告警与操作员勾销流程；
+   * - `isSettleableUnknown(RESTORED_UNSETTLED_EXPOSURE_REASON)` 为真，
+   *   迟到的权威结算仍能自动收敛。
+   *
+   * 注意：调用点在生产 side（service.ts 启动序列），本包只负责实现与导出。
+   */
+  escalateRestoredExposures(reason: string = RESTORED_UNSETTLED_EXPOSURE_REASON): RiskReservation[] {
+    this.rollDayIfNeeded();
+    const restored: RiskReservation[] = [];
+    for (const reservation of this.snapshot()) {
+      if (reservation.status !== 'RESERVED') continue;
+      if (!this.markUnknown(reservation.reservationId, reason, reservation.receiptId)) continue;
+      const updated = this.reservations.get(reservation.reservationId);
+      if (updated) restored.push(structuredClone(updated));
+    }
+    return restored;
+  }
+
   settleUnknown(
     reservationId: string,
     settlement: {
@@ -528,14 +601,18 @@ export class RiskManager {
     _profile?: TableProfile,
   ): RiskReservation[] {
     this.rollDayIfNeeded();
+    // FIX(B-P1-2): UNKNOWN 也必须校验 shoeId。跨靴同 handId 的结算（换靴后 roundId
+    // 复位的平台、BG 换靴 replay 都会造出这种事件）不能拿去"确权"上一靴的未知敞口：
+    // 那样会把输记成赢、把亏损记到错误靴桶，还会错误释放仍然真实的敞口。
+    // 跨靴 UNKNOWN 保持 UNKNOWN，留给操作员核对。
     const matches = this.snapshot().filter(
       r => (
         r.status === 'RESERVED'
         || (r.status === 'UNKNOWN' && isSettleableUnknown(r.releaseReason))
       )
       && r.tableId === tableId
-      && r.handId === handId
-      && (r.shoeId === shoeId || r.status === 'UNKNOWN'),
+      && r.shoeId === shoeId
+      && r.handId === handId,
     );
     if (matches.length === 0) return [];
 
@@ -557,7 +634,8 @@ export class RiskManager {
         nextState.executedToday += updated.amount;
         nextState.dayLoss -= updated.realizedPnl;
         nextState.tableLosses[tableId] = (nextState.tableLosses[tableId] ?? 0) - updated.realizedPnl;
-        nextState.shoeLosses[shoeLossKey(tableId, shoeId)] = (nextState.shoeLosses[shoeLossKey(tableId, shoeId)] ?? 0) - updated.realizedPnl;
+        nextState.shoeLosses[shoeLossKey(updated.tableId, updated.shoeId)] =
+          (nextState.shoeLosses[shoeLossKey(updated.tableId, updated.shoeId)] ?? 0) - updated.realizedPnl;
       }
       settled.push(updated);
     }
@@ -575,7 +653,6 @@ export class RiskManager {
         updated.shoeId,
         updated.handId,
         updated.market,
-        updated.executionSource,
       );
       if (holdsRiskExposure(updated.status)) this.activeByKey.set(key, updated.reservationId);
       else this.activeByKey.delete(key);
@@ -617,19 +694,36 @@ export class RiskManager {
         updated.shoeId,
         updated.handId,
         updated.market,
-        updated.executionSource,
       ));
     }
     this.state = nextState;
     return expired;
   }
 
+  /**
+   * 启动对账：该桌存在"与当前投影不同靴 / 已封靴"的**未提交** RESERVED 时收口。
+   *
+   * FIX(B-P1-3 / D-P1-1): 修复前这里直接 `expireOpenForShoe(..., 'reconciled-on-startup')`
+   * —— 把上一进程"预提交后被杀"的预留当成"没发生"释放掉。如果那笔其实已经成交，
+   * 本地账本就会漏记一笔真金亏损（dayLoss/tableLosses 低计），且不留 UNKNOWN 线索。
+   * 预提交后进程被杀 = 结果未知，必须进 UNKNOWN 让操作员核对，不能当没发生。
+   * 因此本方法对"没有回执"的跨靴 RESERVED 不再产生 EXPIRED，改为 `markUnknown`；
+   * `reconciled-on-startup` 已加入可自动收敛的 UNKNOWN reason，迟到的同靴权威结算
+   * 仍能正常确权。
+   *
+   * 带回执的不动：它确实提交过（回执是平台证据），一律交给启动序列的
+   * `escalateRestoredExposures()` 用 `restored-unsettled-exposure` 统一升级，
+   * 避免这里在 TableActor 构造期就把"已确认成交"的行判成未知。
+   */
   reconcileTable(tableId: string, currentShoeId: string, currentShoeSealed: boolean): void {
     const stale = this.snapshot().filter(
-      r => r.status === 'RESERVED' && r.tableId === tableId && (r.shoeId !== currentShoeId || currentShoeSealed),
+      r => r.status === 'RESERVED'
+        && r.receiptId === undefined
+        && r.tableId === tableId
+        && (r.shoeId !== currentShoeId || currentShoeSealed),
     );
     for (const r of stale) {
-      this.expireOpenForShoe(tableId, r.shoeId, 'reconciled-on-startup');
+      this.markUnknown(r.reservationId, 'reconciled-on-startup');
     }
   }
 
@@ -646,7 +740,6 @@ export class RiskManager {
       updated.shoeId,
       updated.handId,
       updated.market,
-      updated.executionSource,
     );
     if (holdsRiskExposure(updated.status)) this.activeByKey.set(key, updated.reservationId);
     else this.activeByKey.delete(key);

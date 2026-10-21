@@ -36,7 +36,7 @@ export class FakeWebSocket {
   readonly listeners = new Map<string, SocketListener[]>();
   readyState = FakeWebSocket.OPEN;
 
-  constructor(_url: string) {
+  constructor(readonly url: string) {
     FakeWebSocket.instances.push(this);
   }
 
@@ -366,6 +366,7 @@ export async function createHarness(options: HarnessOptions = {}) {
     return [];
   });
   const eventTarget = { addListener: vi.fn() };
+  const storageState: Record<string, unknown> = {};
   const sendMessage = vi.fn().mockImplementation(async (
     _tabId: number,
     message: Readonly<Record<string, unknown>>,
@@ -377,16 +378,22 @@ export async function createHarness(options: HarnessOptions = {}) {
   const chrome = {
     storage: {
       local: {
+        // 有状态的 storage 模拟：P0-1 的 installId 必须"写进去再读出来"是同一个值，
+        // 否则每次 loadBridgeInstallId() 都会生成新 id，测试也无法验证持久化。
         get: vi.fn().mockImplementation(async (defaults: Readonly<Record<string, unknown>>) => ({
           ...defaults,
+          ...storageState,
           liveBetEnabled: options.liveBetEnabled ?? true,
         })),
-        set: vi.fn().mockResolvedValue(undefined),
-        remove: vi.fn().mockResolvedValue(undefined),
+        set: vi.fn().mockImplementation(async (values: Readonly<Record<string, unknown>>) => {
+          Object.assign(storageState, values);
+        }),
+        remove: vi.fn().mockImplementation(async (key: string) => {
+          delete storageState[key];
+        }),
       },
       onChanged: eventTarget,
-    },
-    alarms: {
+    },    alarms: {
       create: vi.fn(),
       onAlarm: eventTarget,
     },
@@ -451,6 +458,12 @@ export async function createHarness(options: HarnessOptions = {}) {
     `hmacSha256Hex = async (secret, payload) => __signExecutorPayload(String(secret || ''), String(payload || ''));`,
     context,
   );
+  // P0-1: 让 background.js 的 loadBridgeInstallId() 走真实实现（写入 chrome.storage.local），
+  // 再把它写进去的值读出来供用例断言连接 URL 带上了 installId。
+  const installId = await (async (): Promise<string> => {
+    const loaded: unknown = await vm.runInContext('loadBridgeInstallId()', context);
+    return typeof loaded === 'string' ? loaded : '';
+  })();
   const pragmaticProtocolRoundId = options.pragmaticProtocolRoundId === undefined
     ? '1726012345'
     : options.pragmaticProtocolRoundId;
@@ -537,6 +550,10 @@ export async function createHarness(options: HarnessOptions = {}) {
     socket,
     executorLease,
     emitUnsigned: originalEmit,
+    /** P0-1: 扩展持久 installId（background.js 的 loadBridgeInstallId 会写入 storage）。 */
+    installId,
+    /** 有状态 storage 的当前内容（P0-1 持久化断言用）。 */
+    storageState,
     runNextTimer: (): boolean => {
       const callback = scheduledTimers.shift();
       if (!callback) return false;

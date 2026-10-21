@@ -57,6 +57,12 @@ import type {
   PlatformCaptureMessage,
 } from './platform-adapter.js';
 import { PLATFORM_REGISTRY, isLiveBridgeRoomId } from './identity.js';
+import {
+  extensionInstallIdFromRequestUrl,
+  normalizeExtensionInstallId,
+  type BridgeExtensionApprovalStore,
+  type BridgeExtensionPendingEntry,
+} from './extension-approval.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { ExecutorLeaseRegistry, type HostExecutionChannelClaimResult } from './executor-lease.js';
@@ -90,6 +96,23 @@ export interface BrowserBridgeServerOptions {
   allowedExtensionId?: string;
   allowedExtensionIds?: readonly string[];
   extensionToken?: string;
+  /**
+   * FIX(P0-1): 操作员批准名单。传入时进入**严格模式**：只有 store 里 isApproved 的
+   * installId 才能拿到 extension 角色；桌面端应注入落盘实现。
+   */
+  extensionApprovals?: BridgeExtensionApprovalStore;
+  /**
+   * FIX(P0-1): 未传 `extensionApprovals` 时的兼容开关。
+   *
+   * - `extensionApprovals` 已传 → 本开关无效（严格模式）。
+   * - 未传 store 且本开关为 true（**不传 store 时的默认值**）→ 带 installId 的扩展一律放行，
+   *   保持既有单测/demo 脚本的行为（`new BrowserBridgeServer()` 的语义）。
+   * - 显式 false → 严格模式但没有 store，等价于「没有任何已批准 installId」。
+   *
+   * 注意：无论哪种取值，**缺 installId 的旧式连接都只拿 pending 角色**（P0-1 攻击面：
+   * 伪造 Origin + 明文 token 的本机进程拿不到 installId，因此无法占住扩展槽）。
+   */
+  allowUnapprovedExtensions?: boolean;
   onRuntimeEvent?: (event: BrowserBridgeRuntimeEvent) => void;
 }
 
@@ -97,6 +120,10 @@ export type BrowserBridgeRuntimeEvent =
   | { readonly kind: 'extension-auth-failed'; readonly reason: string; readonly timestamp: string }
   | { readonly kind: 'extension-connected'; readonly timestamp: string }
   | { readonly kind: 'extension-authenticated'; readonly sessionId: string; readonly timestamp: string }
+  // FIX(P0-1): 扩展已连上但本机身份（installId）尚未被操作员批准。
+  // 该连接只拿到 pending 角色：无 executor lease、不下发 betRequest、不 ingest 牌桌事件。
+  // installId 只用于本地待批准列表，不写日志、不进事故消息。
+  | { readonly kind: 'extension-pairing-required'; readonly installId: string; readonly timestamp: string }
   | { readonly kind: 'extension-disconnected'; readonly reason: string; readonly timestamp: string }
   | { readonly kind: 'continuity-invalidated'; readonly reason: string; readonly timestamp: string }
   | { readonly kind: 'execution-gate-revoked'; readonly reason: string; readonly timestamp: string }
@@ -272,28 +299,33 @@ const TABLE_EXPORT_PENDING_LIMIT = 4_096;
  */
 const MAX_BRIDGE_MESSAGE_BYTES = 8 * 1_048_576;
 /**
- * 允许从本机回环转发的扩展命令白名单。command 客户端可以提交任意字符串，
- * 不校验的话，本机任意进程都能让扩展执行 liveOn / liveOff / reloadExtension。
- * 集合必须覆盖三个扩展实际处理的所有命令。
+ * 允许从本机回环转发的扩展命令白名单。
+ *
+ * FIX(P0-2): `/command` 只校验可伪造的 loopback Origin，本机任意进程都能连上。
+ * 因此这里**只保留只读/诊断命令**；会改变扩展安全姿态的命令
+ * （liveOn / liveOff / reloadExtension / trustedOn / trustedOff / calibrate /
+ * calibrateClear / startPragmaticNetworkCapture / stopPragmaticNetworkCapture）
+ * 已从白名单删除 —— 它们只允许由桌面端进程内直接调用（`setLiveBetEnabled()` 等走
+ * `broadcastToSockets`，不经过本白名单），扩展侧对应的处理分支保留。
+ *
+ * 新增命令前先问一句：本机任意进程能下发它吗？能，就别加。
  */
 const BRIDGE_COMMAND_NAMES: ReadonlySet<string> = new Set([
-  'liveOn',
-  'liveOff',
-  'reloadExtension',
   'probeBetReadiness',
   'replayRuntimeState',
   'probeExtensionManifest',
-  'calibrate',
-  'calibrateClear',
-  'startPragmaticNetworkCapture',
-  'stopPragmaticNetworkCapture',
-  'trustedOn',
-  'trustedOff',
 ]);
 const EXTENSION_HEARTBEAT_TIMEOUT_MS = 15_000;
 const EXTENSION_DISCONNECT_GRACE_MS = 8_000;
 
-type BridgeSocketRole = 'extension' | 'observer' | 'command';
+/**
+ * FIX(P0-1): socket 角色。
+ * - `extension`：Origin + token 通过，且 installId 已被操作员批准（或桥处于兼容放行模式）；
+ * - `extension-pending`：Origin + token 通过，但 installId 缺失/未批准 —— 只能收 pairingRequired、
+ *   回 pairingAck/心跳，拿不到 lease、不 ingest 事件、**不占唯一扩展槽**；
+ * - `observer` / `command`：回环观察/命令客户端（本轮不引入认证，P0-2 只收窄命令面）。
+ */
+type BridgeSocketRole = 'extension' | 'extension-pending' | 'observer' | 'command';
 
 function allowedExtensionIdSet(
   identity: Pick<BrowserBridgeServerOptions, 'allowedExtensionId' | 'allowedExtensionIds'> = {},
@@ -306,16 +338,28 @@ function allowedExtensionIdSet(
   return new Set(ids);
 }
 
+/**
+ * FIX(P0-1): 扩展角色判定。
+ *
+ * 只判 Origin+token 已经不够（两者都是公开常量），还必须有可被操作员批准的本机身份。
+ * 缺 installId 一律 pending —— 这是 b7d 伪造 Origin+token 攻击被拦住的**唯一**理由，
+ * 不要在兼容模式下放宽它。
+ */
 function bridgeSocketRole(
   origin: string,
   requestUrl: string | undefined,
-  identity: Pick<BrowserBridgeServerOptions, 'allowedExtensionId' | 'allowedExtensionIds' | 'extensionToken'> = {},
+  identity: Pick<
+    BrowserBridgeServerOptions,
+    'allowedExtensionId' | 'allowedExtensionIds' | 'extensionToken'
+  > = {},
+  extensionApproved: (installId: string | undefined) => boolean = () => false,
 ): BridgeSocketRole | null {
   const path = bridgeRequestPath(requestUrl);
   if (isExtensionOrigin(origin, allowedExtensionIdSet(identity))) {
-    return path === '/' && hasExtensionToken(requestUrl, identity.extensionToken)
+    if (path !== '/' || !hasExtensionToken(requestUrl, identity.extensionToken)) return null;
+    return extensionApproved(extensionInstallIdFromRequestUrl(requestUrl))
       ? 'extension'
-      : null;
+      : 'extension-pending';
   }
   if (!isLoopbackObserverOrigin(origin)) return null;
   if (path === OBSERVER_PATH) return 'observer';
@@ -718,6 +762,26 @@ class BridgeTableExport implements TableExport {
   private transportContinuous = true;
   private disconnectReason?: string;
   private pendingOverflowed = false;
+  /**
+   * FIX(P1-11): 桥独立记录"上一事件的真实 payload hash"。
+   *
+   * 以前 cursor.payloadHash 写的是 event.eventId（不是 hash），且没有任何代码校验它，
+   * 所谓 cursor-v1 continuity proof 完全由桥自己用"自己的 cursor + 自己刚收到的事件"生成
+   * （自证）。现在：
+   *  - cursor.payloadHash 改为真实的 sha256(stableStringify(event))；
+   *  - restoreFromPending 生成 proof 前，先校验 pending 里下一条候选事件确实与本对象
+   *    独立记录的 hash 一致（`verifiedPayloadHash`），否则不恢复、保持 DISCONNECTED。
+   * 攻击者仍可伪造事件进入 pending，但**必须**先让桥 ingest 到一条真实事件，
+   * 才能在游标里留下可被后续恢复校验的 hash —— 这拦住了"新 session 任意一条消息就恢复"。
+   */
+  private lastVerifiedPayloadHash = '';
+  /** 与 cursor.sourceSeq 对应的、桥独立计算的 payload hash（恢复校验基准）。 */
+  private lastVerifiedSeq = 0;
+  /**
+   * FIX(P1-11): 仅由 `restoreFromPending()` 在校验通过后写入，`handleRestored()` 消费一次。
+   * 任何其它路径（未来的新入口/测试直调）都拿不到匹配的 proof，恢复请求会被拒绝。
+   */
+  private pendingRestoreProof?: string;
 
   constructor(
     roomId: string,
@@ -725,6 +789,7 @@ class BridgeTableExport implements TableExport {
     private readonly staleAfterMs: number,
     private readonly onDisconnected?: (tableId: string, reason: string) => void,
     private readonly onObserved?: (tableId: string) => void,
+    private readonly onContinuityRejected?: (tableId: string, reason: string) => void,
   ) {
     this.roomId = roomId;
     this.tableId = tableId;
@@ -796,7 +861,24 @@ class BridgeTableExport implements TableExport {
   }
 
   ingestEvent(event: NormalizedEvent): void {
-    if (this.stopped || this.pendingOverflowed) return;
+    // FIX(C-P1-3): 溢出后不能无条件吞掉一切事件 —— 那会让本对象永久静默。
+    //
+    // 溢出时 pending 被裁剪、中间一段 sourceSeq 永久丢失，`transportContinuous`
+    // 也因此失效；此时唯一合法的出口是"实体新靴重置"（它允许跳号重建库存）。
+    // 但修复前这里在 `pendingOverflowed` 时对**所有**事件 return，连那条唯一的
+    // 实体洗牌信号也被吞掉，`drain()`/`restoreFromPending()` 再也不会被调用，
+    // 于是该桌永久不可恢复（b9b 实证 5 条 handSettled 全丢）。
+    //
+    // 现在：溢出后仍放行 `newShoeSignal(baseline='physical-shoe')`，它是协议层
+    // 给出的"可以跳号重建"的权威信号，放行后 drain → restoreFromPending 会
+    // 走 physicalReset 分支把 export 救回 CONNECTED 并复位 pendingOverflowed。
+    // 其它事件继续丢弃（它们已无法与丢掉的 seq 对齐，留着只会污染）。
+    if (this.stopped) return;
+    if (this.pendingOverflowed) {
+      const isPhysicalReset = event.type === 'newShoeSignal'
+        && event.baseline === 'physical-shoe';
+      if (!isPhysicalReset) return;
+    }
     this.noteObservation();
     if (event.type === 'newShoeSignal') this.shuffleHoldUntil = Date.now() + SHUFFLE_HOLD_MS;
     this.pending.push(event);
@@ -813,6 +895,14 @@ class BridgeTableExport implements TableExport {
    * 缓冲已经涨到上限，说明我们既不消费、也无法恢复（典型是 paused 且等不到
    * 可重放的实体洗牌）。继续堆积只会把进程 OOM 掉，所以保留最近一段用于
    * 诊断、其余丢弃，并主动承认连接已断开，交回上层做重连/移除。
+   *
+   * FIX(C-P1-3): 修复前这里只置 `pendingOverflowed = true` 就返回，而
+   * `ingestEvent()` 在 `pendingOverflowed` 时直接 return —— `drain()` 再也不会被调用，
+   * `handleRestored()` 唯一的两条触发路径（`drain()` / `noteObservation()`）全断，
+   * 于是该桌此后所有事件静默丢失、永久不可恢复（b9b 实证 5 条 handSettled 全丢）。
+   * 现在裁剪后立刻尝试 drain 一次：只要消费者已经恢复（慢消费者结束、shuffle hold
+   * 到期），`restoreFromPending()` 就能在这条调用里把 pending 排空并把该桌救回
+   * CONNECTED。drain 内部有 `processing` 单飞保护，不会递归。
    */
   private overflowPendingBuffer(): void {
     this.pending = this.pending.slice(-TABLE_EXPORT_PENDING_LIMIT);
@@ -822,23 +912,75 @@ class BridgeTableExport implements TableExport {
       `pending buffer for ${this.tableId} exceeded ${TABLE_EXPORT_PENDING_LIMIT} events`,
     );
     this.handleDisconnect(reason);
+    // FIX(C-P1-3): 立即尝试自愈。此刻若消费者仍卡住，drain 会安全地失败返回，
+    // 状态保持 DISCONNECTED（由 noteObservation 的恢复分支兜底）；若消费者已恢复，
+    // 则在这一条调用里直接恢复，不必等下一次事件（下一次事件本来也会被丢）。
+    if (this.started && !this.stopped) {
+      void this.drain();
+    }
   }
 
   noteObservation(): void {
     this.lastObservationAt = Date.now();
     this.onObserved?.(this.tableId);
+    // FIX(C-P1-3): 恢复分支从"只认 table-feed-stale"扩展为"也认导出缓冲溢出"。
+    // 溢出后该桌仍可能有观测活动（DOM 心跳、其它 frame 的 noteObservation），
+    // 只要还有观测就说明链路活着、值得尝试恢复 —— 否则 pendingOverflowed
+    // 只能靠 ingestEvent 复位，而 ingestEvent 在 pendingOverflowed 时直接 return，
+    // 形成死锁。两条改动互为保险：drain 覆盖"消费者恢复"场景，本分支覆盖
+    // "后续观测到达"场景。
+    const recoverableDisconnect = this.disconnectReason === 'table-feed-stale'
+      || (this.disconnectReason?.startsWith('table-export-buffer-overflow:') ?? false);
     if (
       this.started
       && !this.stopped
       && this.state === 'DISCONNECTED'
-      && this.disconnectReason === 'table-feed-stale'
+      && recoverableDisconnect
     ) {
-      void this.handleRestored(cursorContinuityProof({
-        tableId: this.tableId,
-        reason: 'table-feed-stale-resume',
-        observedAt: this.lastObservationAt,
-      }));
+      // FIX(P1-11): stale 恢复也必须过"上一游标与桥独立记录一致"的校验，
+      // proof 由 verifiedRestoreProof() 统一生成（不再是任意 shaped 字符串）。
+      void this.restoreFromObservation();
     }
+  }
+
+  private async restoreFromObservation(): Promise<void> {
+    const proof = this.verifiedRestoreProof({
+      tableId: this.tableId,
+      // FIX(C-P1-3): 溢出恢复与 stale 恢复共用这条路径，reason 要能区分二者，
+      // 否则排障时会把"缓冲溢出"误读成"数据流变陈旧"。
+      reason: this.disconnectReason?.startsWith('table-export-buffer-overflow:') === true
+        ? 'table-export-buffer-overflow-resume'
+        : 'table-feed-stale-resume',
+      observedAt: this.lastObservationAt,
+    });
+    if (proof === undefined) {
+      this.rejectContinuity(
+        `restore-cursor-mismatch:${this.tableId}`,
+        'previous cursor payload hash does not match the bridge payload hash',
+      );
+      return;
+    }
+    await this.handleRestored(proof);
+  }
+
+  /**
+   * FIX(P1-11): 生成"可被 handleRestored 接受"的 proof。
+   *
+   * 前置条件（唯一授权来源）：
+   *  - 游标自洽：`cursor.sourceSeq` 与桥独立记录的 `lastVerifiedSeq` 一致，
+   *    且 `cursor.payloadHash` 与 `lastVerifiedPayloadHash` 一致；
+   *  - 调用方提供的证据（observation 或"上一游标 + 下一条真实事件 hash"）。
+   *
+   * 不满足时返回 undefined，调用方必须放弃恢复。
+   */
+  private verifiedRestoreProof(evidence: Record<string, unknown>): string | undefined {
+    if (this.cursor.sourceSeq > 0) {
+      if (this.lastVerifiedSeq !== this.cursor.sourceSeq) return undefined;
+      if (this.cursor.payloadHash !== this.lastVerifiedPayloadHash) return undefined;
+    }
+    const proof = cursorContinuityProof(evidence);
+    this.pendingRestoreProof = proof;
+    return proof;
   }
 
   markTransportContinuous(): void {
@@ -872,7 +1014,26 @@ class BridgeTableExport implements TableExport {
   async handleRestored(proof: string): Promise<void> {
     if (this.stopped) return;
     if (!isValidContinuityProof(proof)) return;
-    if (this.state === 'CONNECTED' && !this.paused) return;
+    if (this.state === 'CONNECTED' && !this.paused) {
+      this.pendingRestoreProof = undefined;
+      return;
+    }
+    // FIX(P1-11): 只接受桥自己用**已校验游标**生成的 proof。
+    //
+    // 以前这里只校验 proof 的字符串形状，任何调用方给一个 `cursor-v1:<64hex>` 就能把导出
+    // 恢复成 CONNECTED —— 连续性证明是自证的。现在 proof 必须与本对象刚刚记下的
+    // `pendingRestoreProof` 完全一致，而那一份是在校验过
+    // "上一游标 payloadHash === 桥独立记录的上一事件 hash" 之后才生成的。
+    // 不匹配 → 保持 DISCONNECTED，并交给上层记 continuity-invalidated 事故。
+    const expectedProof = this.pendingRestoreProof;
+    this.pendingRestoreProof = undefined;
+    if (expectedProof === undefined || expectedProof !== proof) {
+      this.rejectContinuity(
+        `restore-proof-rejected:${this.tableId}`,
+        'unverified restore proof',
+      );
+      return;
+    }
     if (this.restoreInFlight !== undefined) {
       await this.restoreInFlight;
       return;
@@ -903,6 +1064,27 @@ class BridgeTableExport implements TableExport {
     void this.drain();
   }
 
+  /** 连续性证明被拒绝：保持 DISCONNECTED，并把原因交给上层记 incident。 */
+  private rejectContinuity(reason: string, detail: string): void {
+    this.transportContinuous = false;
+    this.error = new Error(`${reason}: ${detail}`);
+    console.error('[bridge-continuity-rejected]', this.tableId, reason, detail);
+    this.handleDisconnect(reason);
+    this.onContinuityRejected?.(this.tableId, reason);
+  }
+
+  /**
+   * FIX(P1-11): 上一游标自洽校验 + 下一条事件的真实 payload hash。
+   *
+   * 返回 undefined 表示"当前游标与桥独立记录不一致"，调用方必须放弃恢复。
+   */
+  private verifiedNextEventHash(nextEvent: NormalizedEvent): string | undefined {
+    if (this.cursor.sourceSeq > 0) {
+      if (this.lastVerifiedSeq !== this.cursor.sourceSeq) return undefined;
+      if (this.cursor.payloadHash !== this.lastVerifiedPayloadHash) return undefined;
+    }
+    return sha256(stableStringify(nextEvent));
+  }
   private async drain(): Promise<void> {
     if (this.processing) {
       this.drainRequested = true;
@@ -927,6 +1109,7 @@ class BridgeTableExport implements TableExport {
           this.handleDisconnect(reason);
           return;
         }
+        const payloadHash = sha256(stableStringify(event));
         const batch: TableEventBatch = {
           tableId: this.tableId,
           events: [event],
@@ -934,13 +1117,16 @@ class BridgeTableExport implements TableExport {
             tableId: this.tableId,
             sourceSeq: event.sourceSeq,
             eventId: event.eventId,
-            payloadHash: event.eventId,
+            // FIX(P1-11): 真实 payload hash，不再是 eventId（两者语义完全不同）。
+            payloadHash,
           },
           kind: this.cursor.sourceSeq > 0 ? 'replay' : 'live',
         };
         await this.sink!.onBatch(batch);
         this.pending.shift();
         this.cursor = batch.cursor;
+        this.lastVerifiedPayloadHash = payloadHash;
+        this.lastVerifiedSeq = event.sourceSeq;
         this.lastEmittedSeq = event.sourceSeq;
       }
     } catch (error) {
@@ -978,16 +1164,28 @@ class BridgeTableExport implements TableExport {
       );
       return false;
     }
+    // FIX(P1-11): 先校验上一游标与桥独立记录真实的 payload hash 一致，再生成 proof。
+    // 不一致（游标被外部改写 / 事件被识别为伪造）→ 放弃恢复，保持 DISCONNECTED。
+    const nextPayloadHash = this.verifiedNextEventHash(nextEvent);
+    if (nextPayloadHash === undefined) {
+      this.rejectContinuity(
+        `restore-cursor-mismatch:${this.tableId}`,
+        'previous cursor payload hash does not match the bridge payload hash',
+      );
+      return false;
+    }
     const proof = cursorContinuityProof({
       tableId: this.tableId,
       previousCursor: this.cursor,
       nextEvent: {
         sourceSeq: nextEvent.sourceSeq,
         eventId: nextEvent.eventId,
-        payloadHash: sha256(stableStringify(nextEvent)),
+        payloadHash: nextPayloadHash,
       },
       physicalReset: isPhysicalReset,
     });
+    // 只把这份刚生成的 proof 授权给紧随其后的 handleRestored()，一次性消费。
+    this.pendingRestoreProof = proof;
     await this.handleRestored(proof);
     if (this.state === 'CONNECTED' && !this.paused) this.transportContinuous = true;
     return this.state === 'CONNECTED' && !this.paused;
@@ -1047,6 +1245,26 @@ export class BrowserBridgeServer implements RoomMonitor {
   private readonly socketExecutorProfile = new Map<WebSocket, string>();
   private readonly socketExecutorClaimant = new Map<WebSocket, string>();
 
+  /**
+   * FIX(P0-1): 待批准扩展连接。
+   *
+   * 与 `sockets`（唯一扩展槽）完全分开：pending 连接不占槽、不进 `getExtensionStatus()`、
+   * 不拿 lease、不 ingest 任何事件。installId 缺失的连接也会进来（installId 为 undefined），
+   * 它们在 `listPendingExtensions()` 里以 `unidentified-*` 形式暴露给操作员。
+   */
+  private readonly pendingExtensionSockets = new Map<WebSocket, string | undefined>();
+  /** 每个 socket 的角色快照：批准后需要把 pending socket 就地提升为 extension。 */
+  private readonly socketRole = new Map<WebSocket, BridgeSocketRole>();
+  /**
+   * pending 连接的桥侧首次/最后出现时间（store 不实现 notePending 时的兜底，
+   * 也是 `listPendingExtensions()` 的即时视图）。
+   */
+  private readonly pendingExtensionSeenAt = new Map<string, { firstSeenAt: string; lastSeenAt: string }>();
+  /** 每个 extension 角色 socket 绑定的 installId（撤销/审计用，不对外暴露）。 */
+  private readonly socketInstallId = new Map<WebSocket, string>();
+  private readonly extensionApprovals?: BridgeExtensionApprovalStore;
+  private readonly allowUnapprovedExtensions: boolean;
+
   constructor(options: BrowserBridgeServerOptions = {}) {
     this.options = options;
     this.platformAdapters = PLATFORM_REGISTRY.getAll().map(descriptor => {
@@ -1072,6 +1290,12 @@ export class BrowserBridgeServer implements RoomMonitor {
       options.extensionDisconnectGraceMs ?? EXTENSION_DISCONNECT_GRACE_MS,
     );
     this.requireExtensionSequence = options.requireExtensionSequence ?? false;
+    // FIX(P0-1): 传 store = 严格模式；不传 store 时默认兼容放行（旧单测/demo 语义）。
+    // 显式 allowUnapprovedExtensions: false 在无 store 时等于「没有任何已批准 installId」。
+    this.extensionApprovals = options.extensionApprovals;
+    this.allowUnapprovedExtensions = options.extensionApprovals !== undefined
+      ? false
+      : (options.allowUnapprovedExtensions ?? true);
     this.configuredSelectedTables = options.selectedTableIds === undefined
       ? undefined
       : new Set(
@@ -1080,6 +1304,85 @@ export class BrowserBridgeServer implements RoomMonitor {
           .filter(tableId => tableId.length > 0),
       );
     this.refreshEffectiveSelectedTables();
+  }
+
+  /**
+   * FIX(P0-1): 扩展 installId 是否放行。
+   *
+   * 缺 installId 一律不放行（返回 false → pending）。兼容模式只放宽「带 installId 但未批准」，
+   * 否则伪造 Origin+token 的本机进程（b7d 攻击面）仍能接管扩展槽。
+   */
+  private isExtensionInstallApproved(installId: string | undefined): boolean {
+    const normalized = normalizeExtensionInstallId(installId);
+    if (normalized === undefined) return false;
+    if (this.extensionApprovals?.isApproved(normalized) === true) return true;
+    return this.allowUnapprovedExtensions;
+  }
+
+  // -- 操作员批准面（桌面端接线用） ------------------------------------------
+
+  /** 当前待批准的扩展身份（含桥侧即时观测，未落盘）。installId 仅本地可见。 */
+  listPendingExtensions(): BridgeExtensionPendingEntry[] {
+    return [...this.pendingExtensionSeenAt.entries()]
+      .map(([installId, seen]) => ({ installId, ...seen }))
+      .sort((left, right) => right.lastSeenAt.localeCompare(left.lastSeenAt));
+  }
+
+  /** 便捷视图：当前待批准连接的 installId 列表（不含 store 里历史 pending）。 */
+  getExtensionPendingInstallIds(): string[] {
+    return [...new Set(
+      [...this.pendingExtensionSockets.values()].filter((value): value is string => value !== undefined),
+    )];
+  }
+
+  /** 操作员批准某个 installId：立即把该 installId 的 pending socket 提升为 extension 角色。 */
+  approveExtension(installId: string): void {
+    const normalized = normalizeExtensionInstallId(installId);
+    if (normalized === undefined) throw new Error('invalid extension install id');
+    this.extensionApprovals?.approve(normalized);
+    this.pendingExtensionSeenAt.delete(normalized);
+    this.extensionApprovals?.forgetPending(normalized);
+    for (const [socket, pendingInstallId] of [...this.pendingExtensionSockets]) {
+      if (pendingInstallId !== normalized) continue;
+      this.promotePendingExtension(socket, normalized);
+    }
+  }
+
+  /** 撤销批准：断开正在使用该 installId 的扩展连接（若有）。 */
+  revokeExtension(installId: string): void {
+    const normalized = normalizeExtensionInstallId(installId);
+    if (normalized === undefined) return;
+    this.extensionApprovals?.revoke(normalized);
+    this.pendingExtensionSeenAt.delete(normalized);
+    for (const [socket, role] of [...this.socketRole]) {
+      if (role !== 'extension') continue;
+      if (this.socketInstallId.get(socket) !== normalized) continue;
+      socket.close(1008, 'extension approval revoked');
+    }
+  }
+
+  /** 批准状态快照（桌面端用于渲染「待批准 / 已批准」列表）。 */
+  getExtensionApprovalState(): {
+    readonly strict: boolean;
+    readonly allowUnapprovedExtensions: boolean;
+    readonly approved: string[];
+    readonly pending: BridgeExtensionPendingEntry[];
+    readonly pendingConnections: number;
+    readonly unidentifiedPendingConnections: number;
+  } {
+    const pending = this.listPendingExtensions();
+    let unidentifiedPendingConnections = 0;
+    for (const installId of this.pendingExtensionSockets.values()) {
+      if (installId === undefined) unidentifiedPendingConnections += 1;
+    }
+    return {
+      strict: this.extensionApprovals !== undefined || !this.allowUnapprovedExtensions,
+      allowUnapprovedExtensions: this.allowUnapprovedExtensions,
+      approved: this.extensionApprovals?.listApproved() ?? [],
+      pending,
+      pendingConnections: this.pendingExtensionSockets.size,
+      unidentifiedPendingConnections,
+    };
   }
 
   async start(): Promise<number> {
@@ -1091,8 +1394,16 @@ export class BrowserBridgeServer implements RoomMonitor {
       // 一个畸形/失控的客户端（扩展或本机进程）能把进程直接撑爆。
       maxPayload: MAX_BRIDGE_MESSAGE_BYTES,
       verifyClient: (info: { origin: string; secure: boolean; req: IncomingMessage }) => {
-        const role = bridgeSocketRole(info.origin, info.req.url, this.options);
-        if (role === null && info.origin.startsWith('chrome-extension://')) {
+        // 注意：ws 对不带 Origin 头的客户端会传 undefined（类型声明是 string）。
+        // 这里必须按 unknown 处理，否则本地进程只要不发 Origin 就能让 verifyClient 抛错。
+        const origin = typeof info.origin === 'string' ? info.origin : '';
+        const role = bridgeSocketRole(
+          origin,
+          info.req.url,
+          this.options,
+          installId => this.isExtensionInstallApproved(installId),
+        );
+        if (role === null && origin.startsWith('chrome-extension://')) {
           this.emitRuntimeEvent({
             kind: 'extension-auth-failed',
             reason: 'extension identity or token rejected',
@@ -1110,36 +1421,41 @@ export class BrowserBridgeServer implements RoomMonitor {
     const address = wss.address();
     this.port = typeof address === 'object' && address ? address.port : 0;
     wss.on('connection', (socket, request) => {
-      const role = bridgeSocketRole(String(request.headers.origin ?? ''), request.url, this.options);
+      const role = bridgeSocketRole(
+        String(request.headers.origin ?? ''),
+        request.url,
+        this.options,
+        installId => this.isExtensionInstallApproved(installId),
+      );
       if (role === null) {
         socket.close(1008, 'unauthorized bridge client');
         return;
       }
+      this.socketRole.set(socket, role);
       if (role === 'observer') {
         this.observers.add(socket);
       } else if (role === 'command') {
         this.commandClients.add(socket);
+      } else if (role === 'extension-pending') {
+        // FIX(P0-1): 未批准的扩展身份只能停在 pending：不占唯一扩展槽、不拿 lease、
+        // 不 ingest 任何事件。批准后由 approveExtension() 就地提升。
+        this.registerPendingExtension(socket, extensionInstallIdFromRequestUrl(request.url));
       } else {
-        if (this.sockets.size > 0) {
-          socket.close(1008, 'extension already connected');
-          return;
-        }
-        this.clearExtensionDisconnectGrace();
-        this.sockets.add(socket);
-        this.socketLastSeenAt.set(socket, Date.now());
-        this.extensionConnected = true;
-        this.emitRuntimeEvent({
-          kind: 'extension-connected',
-          timestamp: new Date().toISOString(),
-        });
-        this.maybeGrantLegacyExecutorLease(socket);
+        this.admitExtensionSocket(socket, extensionInstallIdFromRequestUrl(request.url));
       }
       socket.on('message', data => {
         if (role === 'observer') return;
         try {
           const message: unknown = JSON.parse(data.toString());
-          if (role === 'command' && !isBridgeCommand(message)) return;
-          if (role === 'extension') {
+          const currentRole = this.socketRole.get(socket) ?? role;
+          if (currentRole === 'command' && !isBridgeCommand(message)) return;
+          if (currentRole === 'extension-pending') {
+            // pending 连接只接受"我在等批准"的回执与心跳，其它一律丢弃。
+            if (!this.isPendingExtensionControlMessage(message)) return;
+            this.touchPendingExtension(socket);
+            return;
+          }
+          if (currentRole === 'extension') {
             this.socketLastSeenAt.set(socket, Date.now());
             if (!this.acceptExtensionSequence(message, socket)) return;
           }
@@ -1149,18 +1465,22 @@ export class BrowserBridgeServer implements RoomMonitor {
         }
       });
       socket.on('error', () => {
-        if (role !== 'extension') return;
+        if ((this.socketRole.get(socket) ?? role) !== 'extension') return;
         this.rejectPendingBets(new Error(LIVE_BET_CONNECTION_LOST_ERROR), socket);
       });
       socket.on('close', (code, rawReason) => {
-        if (role === 'observer') {
+        const currentRole = this.socketRole.get(socket) ?? role;
+        this.socketRole.delete(socket);
+        this.pendingExtensionSockets.delete(socket);
+        if (currentRole === 'observer') {
           this.observers.delete(socket);
           return;
         }
-        if (role === 'command') {
+        if (currentRole === 'command') {
           this.commandClients.delete(socket);
           return;
         }
+        if (currentRole === 'extension-pending') return;
         this.rejectPendingBets(new Error(LIVE_BET_CONNECTION_LOST_ERROR), socket);
         const claimantId = this.socketExecutorClaimant.get(socket);
         if (claimantId) this.executorLeases.release(claimantId);
@@ -1170,6 +1490,7 @@ export class BrowserBridgeServer implements RoomMonitor {
         this.socketBridgeSession.delete(socket);
         this.socketExecutorProfile.delete(socket);
         this.socketExecutorClaimant.delete(socket);
+        this.socketInstallId.delete(socket);
         if (this.sockets.size === 0 && this.extensionConnected) {
           this.scheduleExtensionDisconnect(rawReason.toString() || `websocket-close-${code}`);
         }
@@ -1179,6 +1500,10 @@ export class BrowserBridgeServer implements RoomMonitor {
         serverVersion: '0.1.0',
         timestamp: new Date().toISOString(),
       } satisfies BridgeServerMessage));
+      if (role === 'extension-pending') {
+        // 明确的配对信号：客户端据此提示操作员"去桌面端点批准"。
+        this.sendPairingRequired(socket, extensionInstallIdFromRequestUrl(request.url));
+      }
     });
     this.ensureFreshnessTimer();
     return this.port;
@@ -1193,15 +1518,21 @@ export class BrowserBridgeServer implements RoomMonitor {
     if (this.extensionConnected) {
       this.finalizeExtensionDisconnect('browser-bridge-stopped');
     }
-    for (const socket of [...this.sockets, ...this.observers, ...this.commandClients]) socket.close();
+    for (const socket of [...this.sockets, ...this.observers, ...this.commandClients, ...this.pendingExtensionSockets.keys()]) {
+      socket.close();
+    }
     this.sockets.clear();
     this.observers.clear();
     this.commandClients.clear();
+    this.pendingExtensionSockets.clear();
+    this.socketRole.clear();
+    this.pendingExtensionSeenAt.clear();
     this.socketLastSeenAt.clear();
     this.socketHeartbeatStrikes.clear();
     this.socketBridgeSession.clear();
     this.socketExecutorProfile.clear();
     this.socketExecutorClaimant.clear();
+    this.socketInstallId.clear();
     this.executorLeases.clear();
     if (this.wss) {
       const wss = this.wss;
@@ -1209,6 +1540,183 @@ export class BrowserBridgeServer implements RoomMonitor {
       await new Promise<void>(resolve => wss.close(() => resolve()));
     }
     this.rejectPendingBets(new Error('browser bridge stopped before bet result'));
+  }
+
+  // -- FIX(P0-1): pending / approval 生命周期 --------------------------------
+
+  /**
+   * 登记一条待批准的扩展连接。
+   *
+   * 关键：**不加入 `this.sockets`**，因此 `getExtensionStatus().connectionCount` 不含它、
+   * `setLiveBetEnabled()`/`requestBet()` 也看不到它；它也不会挤掉真扩展。
+   */
+  private registerPendingExtension(socket: WebSocket, rawInstallId: string | undefined): void {
+    const installId = normalizeExtensionInstallId(rawInstallId);
+    this.pendingExtensionSockets.set(socket, installId);
+    this.socketRole.set(socket, 'extension-pending');
+    this.socketLastSeenAt.set(socket, Date.now());
+    const now = new Date().toISOString();
+    if (installId !== undefined) {
+      const previous = this.pendingExtensionSeenAt.get(installId);
+      this.pendingExtensionSeenAt.set(installId, {
+        firstSeenAt: previous?.firstSeenAt ?? now,
+        lastSeenAt: now,
+      });
+      // store 若实现了 recordPending（落盘实现通常需要），同步一份。
+      const store = this.extensionApprovals as
+        | (BridgeExtensionApprovalStore & { recordPending?: (id: string) => void })
+        | undefined;
+      try {
+        store?.recordPending?.(installId);
+      } catch {
+        // 落盘失败不能拖垮连接：桥侧内存视图仍然有效。
+      }
+    }
+    this.emitRuntimeEvent({
+      kind: 'extension-pairing-required',
+      installId: installId ?? '',
+      timestamp: now,
+    });
+  }
+
+  private touchPendingExtension(socket: WebSocket): void {
+    const installId = this.pendingExtensionSockets.get(socket);
+    this.socketLastSeenAt.set(socket, Date.now());
+    if (installId === undefined) return;
+    const now = new Date().toISOString();
+    const previous = this.pendingExtensionSeenAt.get(installId);
+    this.pendingExtensionSeenAt.set(installId, {
+      firstSeenAt: previous?.firstSeenAt ?? now,
+      lastSeenAt: now,
+    });
+  }
+
+  /** pending socket 只允许这两类消息；其它消息（tableEvent/betResult/hello/…）一律丢弃。 */
+  private isPendingExtensionControlMessage(message: unknown): boolean {
+    if (typeof message !== 'object' || message === null || Array.isArray(message)) return false;
+    const kind = Reflect.get(message, 'kind');
+    return kind === 'pairingAck' || kind === 'heartbeat' || kind === 'keepalive';
+  }
+
+  private sendPairingRequired(socket: WebSocket, rawInstallId: string | undefined): void {
+    const installId = normalizeExtensionInstallId(rawInstallId);
+    const payload: BridgeServerMessage = {
+      kind: 'pairingRequired',
+      ...(installId === undefined ? {} : { installId }),
+      serverVersion: '0.1.0',
+      timestamp: new Date().toISOString(),
+    };
+    try {
+      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
+    } catch {
+      // 单个连接发送失败不影响批准流程。
+    }
+  }
+
+  /**
+   * 把 socket 提升为 extension 角色。
+   *
+   * 唯一扩展槽约束：提升前若已有别的 extension socket，**按"批准优先"**关掉旧的并
+   * emit `extension-disconnected`（reason 明确写清原因），不静默踢掉。
+   */
+  private promotePendingExtension(socket: WebSocket, installId: string): void {
+    if (socket.readyState !== WebSocket.OPEN) {
+      this.pendingExtensionSockets.delete(socket);
+      this.socketRole.delete(socket);
+      return;
+    }
+    const previous = [...this.sockets];
+    if (previous.length > 0) {
+      const previousInstallIds = previous.map(candidate => this.socketInstallId.get(candidate) ?? 'unknown');
+      for (const candidate of previous) {
+        this.socketRole.set(candidate, 'extension');
+        candidate.close(1008, 'extension replaced by approved install');
+      }
+      this.emitRuntimeEvent({
+        kind: 'extension-disconnected',
+        reason: `extension-replaced-by-approved-install:${previousInstallIds.length}`,
+        timestamp: new Date().toISOString(),
+      });
+      for (const candidate of previous) {
+        this.sockets.delete(candidate);
+        this.socketLastSeenAt.delete(candidate);
+        this.socketHeartbeatStrikes.delete(candidate);
+        this.socketBridgeSession.delete(candidate);
+        this.socketInstallId.delete(candidate);
+        const claimantId = this.socketExecutorClaimant.get(candidate);
+        if (claimantId) this.executorLeases.release(claimantId);
+        this.socketExecutorClaimant.delete(candidate);
+        this.socketExecutorProfile.delete(candidate);
+        this.socketRole.delete(candidate);
+      }
+    }
+    this.pendingExtensionSockets.delete(socket);
+    this.admitExtensionSocket(socket, installId);
+    try {
+      socket.send(JSON.stringify({
+        kind: 'pairingApproved',
+        installId,
+        timestamp: new Date().toISOString(),
+      } satisfies BridgeServerMessage));
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * 把已验证身份（installId 已批准）的 socket 纳入唯一扩展槽。
+   *
+   * FIX(P1-1/P0-1)：唯一槽只约束**仍然活着**的扩展 socket。
+   *
+   * 旧实现在 `this.sockets.size > 0` 时无条件 1008 —— 但扩展 SW 重启时，旧 socket
+   * 往往已经进入 CLOSING/CLOSED（服务端的 'close' 事件还没跑），新连接就会被永久挤掉
+   * （正是 d-desktop P1-1 的"第二扩展永久 1008"现象，也是 executor-lease 重绑用例的竞态源）。
+   * 现在先回收已死 socket，只有"旧的确实还是 OPEN"才拒绝。
+   */
+  private admitExtensionSocket(socket: WebSocket, rawInstallId: string | undefined): void {
+    const installId = normalizeExtensionInstallId(rawInstallId);
+    this.evictClosedExtensionSockets();
+    if (this.sockets.size > 0) {
+      socket.close(1008, 'extension already connected');
+      return;
+    }
+    this.clearExtensionDisconnectGrace();
+    this.sockets.add(socket);
+    this.socketRole.set(socket, 'extension');
+    if (installId !== undefined) this.socketInstallId.set(socket, installId);
+    this.socketLastSeenAt.set(socket, Date.now());
+    this.extensionConnected = true;
+    this.emitRuntimeEvent({
+      kind: 'extension-connected',
+      timestamp: new Date().toISOString(),
+    });
+    this.maybeGrantLegacyExecutorLease(socket);
+  }
+
+  /**
+   * 回收已经不可写的扩展 socket（SW 重启/半关闭连接）。
+   *
+   * 只清理 `sockets` 集合与 per-socket 映射，**不**在这里 emit extension-disconnected ——
+   * 断线事件仍然由 'close' 处理器按 grace 语义统一发。'close' 处理器随后会因
+   * `sockets` 里已有新的活 socket（或已被清空）而幂等跳过重复清理。
+   */
+  private evictClosedExtensionSockets(): void {
+    for (const existing of [...this.sockets]) {
+      if (existing.readyState === WebSocket.OPEN) continue;
+      this.sockets.delete(existing);
+      this.rejectPendingBets(new Error(LIVE_BET_CONNECTION_LOST_ERROR), existing);
+      // 旧连接可能还占着 lease claimant：park 掉（保留 leaseId/secret），
+      // 让新连接能 rebind 同一个 leaseId —— 这正是 SW 重启的语义。
+      const claimantId = this.socketExecutorClaimant.get(existing);
+      if (claimantId) this.executorLeases.release(claimantId);
+      this.socketLastSeenAt.delete(existing);
+      this.socketHeartbeatStrikes.delete(existing);
+      this.socketBridgeSession.delete(existing);
+      this.socketExecutorProfile.delete(existing);
+      this.socketExecutorClaimant.delete(existing);
+      this.socketInstallId.delete(existing);
+      try { existing.close(); } catch { /* already closed */ }
+    }
   }
 
   getPort(): number {
@@ -2238,6 +2746,12 @@ export class BrowserBridgeServer implements RoomMonitor {
         this.socketHeartbeatStrikes.delete(socket);
         socket.close(4001, 'extension heartbeat stale');
       }
+      // FIX(P0-1): 待批准连接也不能无限期占着内存/句柄，超时未再出现即回收。
+      for (const socket of [...this.pendingExtensionSockets.keys()]) {
+        const lastSeenAt = this.socketLastSeenAt.get(socket) ?? 0;
+        if (now - lastSeenAt <= this.extensionHeartbeatTimeoutMs) continue;
+        socket.close(4001, 'extension pairing stale');
+      }
       for (const exportInstance of this.exports.values()) {
         exportInstance.checkFreshness(now);
       }
@@ -2271,6 +2785,15 @@ export class BrowserBridgeServer implements RoomMonitor {
         this.emitRuntimeEvent({
           kind: 'table-disconnected',
           tableId: disconnectedTableId,
+          reason,
+          timestamp: new Date().toISOString(),
+        });
+      },
+      undefined,
+      // FIX(P1-11): 伪造/缺失 payload hash 的恢复请求必须留下可见事故。
+      (_rejectedTableId, reason) => {
+        this.emitRuntimeEvent({
+          kind: 'continuity-invalidated',
           reason,
           timestamp: new Date().toISOString(),
         });

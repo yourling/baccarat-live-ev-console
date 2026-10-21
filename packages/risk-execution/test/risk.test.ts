@@ -286,7 +286,10 @@ describe('risk manager', () => {
     }));
   });
 
-  it('uses execution source in operational reservation idempotency', () => {
+  it('does not let execution source bypass operational reservation idempotency', () => {
+    // FIX(B-P1-1) 回归：修复前唯一性键带 executionSource，于是保活 + 手动可以在
+    // 同一手同一市场各下一注（review/scripts/risk/a5-duplicate-source.ts 实证）。
+    // source 只是审计字段，不参与唯一性。
     const m = new RiskManager();
     const reserve = (executionSource: 'manual' | 'keepalive') => m.tryReserveExecution({
       intentId: newId('opw'),
@@ -300,7 +303,37 @@ describe('risk manager', () => {
 
     expect(reserve('manual').ok).toBe(true);
     expect(reserve('manual').reason).toBe('duplicate:already-reserved');
-    expect(reserve('keepalive').ok).toBe(true);
+    // 修复前这里 ok=true（跨来源双下）。
+    expect(reserve('keepalive')).toEqual(expect.objectContaining({
+      ok: false,
+      reason: 'duplicate:already-reserved',
+    }));
+    // 不同市场仍然各自可下（不能过度收紧）。
+    expect(m.tryReserveExecution({
+      intentId: newId('opw'),
+      tableId: 't1',
+      shoeId: 's-source',
+      handId: 'h-source',
+      market: 'playerPair',
+      executionSource: 'manual',
+      amount: 10,
+    }, profile.limits, { netWin: 11, loss: 1 }, limits).ok).toBe(true);
+    // 结算上一手后，下一手可以正常下注（不会过度收紧到跨手阻塞）。
+    m.settleHand('t1', 's-source', 'h-source', {
+      outcomes: { bankerPair: false, playerPair: false },
+      playerCards: [{ rank: '5' }, { rank: '2' }],
+      bankerCards: [{ rank: '9' }, { rank: '7' }],
+    }, profile);
+    expect(m.getState().pendingExecutions).toBe(0);
+    expect(m.tryReserveExecution({
+      intentId: newId('opw'),
+      tableId: 't1',
+      shoeId: 's-source',
+      handId: 'h-next',
+      market: 'banker',
+      executionSource: 'keepalive',
+      amount: 10,
+    }, profile.limits, { netWin: 0.95, loss: 1 }, limits).ok).toBe(true);
   });
 
   it('keeps an ambiguous acknowledgement active even after the hand settles', () => {
@@ -461,6 +494,69 @@ describe('risk manager', () => {
     expect(m.hasUnknownReservations('t1')).toBe(false);
   });
 
+  it('converges both settleable UNKNOWN reasons from a late authoritative settlement', () => {
+    // FIX(B-P1-2/B-P1-3) 回归：`unsettled-past-timeout` 与
+    // `restored-unsettled-exposure` 两个可收敛 reason 都必须被同靴迟到结算收敛。
+    for (const reason of ['unsettled-past-timeout', 'restored-unsettled-exposure'] as const) {
+      const m = new RiskManager();
+      const reserved = m.tryReserve(intent('s1', 'h1'), profile, limits);
+      expect(reserved.ok).toBe(true);
+      m.markUnknown(reserved.reservation!.reservationId, reason, 'receipt-x');
+      const settled = m.settleHand('t1', 's1', 'h1', {
+        bankerPair: false,
+        playerPair: false,
+      });
+      expect(settled).toHaveLength(1);
+      expect(settled[0]).toMatchObject({ status: 'SETTLED', releaseReason: reason });
+      expect(m.getState()).toMatchObject({ reservedExposure: 0, pendingExecutions: 0 });
+    }
+  });
+
+  it('never settles an UNKNOWN from a different shoe even when handId matches', () => {
+    // FIX(B-P1-2) 回归：修复前 UNKNOWN 分支 `r.shoeId === shoeId || r.status === 'UNKNOWN'`
+    // 让换靴后同 handId 的结算清掉上一靴的未知敞口（review a6b 实证 realizedPnl 记错靴）。
+    const m = new RiskManager();
+    const reserved = m.tryReserve(intent('shoe-old', 'h1'), profile, limits);
+    expect(reserved.ok).toBe(true);
+    m.markUnknown(reserved.reservation!.reservationId, 'unsettled-past-timeout', 'receipt-old');
+
+    const settled = m.settleHand('t1', 'shoe-new', 'h1', {
+      bankerPair: true,
+      playerPair: false,
+    });
+    expect(settled).toEqual([]);
+    expect(m.snapshot()[0]).toMatchObject({
+      status: 'UNKNOWN',
+      shoeId: 'shoe-old',
+    });
+    expect(m.snapshot()[0]?.realizedPnl).toBeUndefined();
+    // 亏损没有记到新靴桶。
+    expect(m.getState().shoeLosses['t1:shoe-new']).toBeUndefined();
+    expect(m.getState()).toMatchObject({ reservedExposure: 10, pendingExecutions: 1 });
+  });
+
+  it('escalates every restored RESERVED exposure regardless of age or receipt', () => {
+    // FIX(B-P1-3) 回归：修复前 notBefore=runtimeStartedAt + "必须有 receiptId"
+    // 让上一进程的敞口永远停在 RESERVED，既不能升级也不能勾销。
+    const m = new RiskManager();
+    const withReceipt = m.tryReserve(intent('s1', 'h1'), profile, limits);
+    const withoutReceipt = m.tryReserve(intent('s1', 'h2'), profile, limits);
+    expect(withReceipt.ok && withoutReceipt.ok).toBe(true);
+    m.attachReceipt(withReceipt.reservation!.reservationId, 'receipt-old');
+
+    const escalated = m.escalateRestoredExposures();
+    expect(escalated).toHaveLength(2);
+    expect(escalated.every(reservation => (
+      reservation.status === 'UNKNOWN'
+      && reservation.releaseReason === 'restored-unsettled-exposure'
+    ))).toBe(true);
+    // 敞口继续占用（未知的钱不能当没发生）。
+    expect(m.getState()).toMatchObject({ reservedExposure: 20, pendingExecutions: 2 });
+    // 操作员可以勾销（修复前抛 "is not an UNKNOWN exposure"）。
+    expect(m.writeOffUnknown(withoutReceipt.reservation!.reservationId, 'operator-unconfirmed-write-off'))
+      .toMatchObject({ status: 'RELEASED', releaseReason: 'operator-unconfirmed-write-off' });
+  });
+
   it('still refuses to auto-settle an UNKNOWN whose execution result itself is untrustworthy', () => {
     const m = new RiskManager();
     const reserved = m.tryReserve(intent('s1', 'h1'), profile, limits);
@@ -497,6 +593,7 @@ describe('risk manager', () => {
     expect(reserved.ok).toBe(true);
     first.attachReceipt(reserved.reservation!.reservationId, 'accepted-receipt');
 
+    // 换靴信号到达时，有回执的 RESERVED 不再被静默清理（FIX(B-P1-3)：不能当没发生）。
     expect(first.expireOpenForShoe('t1', 's1', 'new-shoe-signal')).toEqual([]);
     expect(first.snapshot()[0]).toMatchObject({
       status: 'RESERVED',
@@ -505,6 +602,8 @@ describe('risk manager', () => {
     expect(first.getState()).toMatchObject({ reservedExposure: 10, pendingExecutions: 1 });
 
     const restarted = new RiskManager(ledger);
+    // 带回执的跨靴预留不在这里改状态：它确实提交过（回执是平台证据），
+    // 由启动序列的 escalateRestoredExposures() 统一升级为 UNKNOWN。
     restarted.reconcileTable('t1', 's2', false);
     expect(restarted.snapshot()[0]).toMatchObject({
       status: 'RESERVED',
@@ -523,6 +622,30 @@ describe('risk manager', () => {
       executedToday: 10,
       dayLoss: 10,
     });
+    ledger.close();
+  });
+
+  it('reconciles a cross-shoe reserved reservation to UNKNOWN instead of silently expiring it', () => {
+    // FIX(B-P1-3/D-P1-1) 回归：预提交后进程被杀 = 结果未知，必须进 UNKNOWN 让操作员
+    // 核对；修复前 reconcileTable 直接 EXPIRED（若那笔其实成交 = 漏记真金亏损）。
+    const ledger = new SqliteLedger();
+    const first = new RiskManager(ledger);
+    const reserved = first.tryReserve(intent('s1', 'h1'), profile, limits);
+    expect(reserved.ok).toBe(true);
+
+    const restarted = new RiskManager(ledger);
+    restarted.reconcileTable('t1', 's2', false);
+    expect(restarted.snapshot()[0]).toMatchObject({
+      status: 'UNKNOWN',
+      releaseReason: 'reconciled-on-startup',
+    });
+    // 敞口继续占用，且迟到权威结算仍能收敛（同一靴）。
+    expect(restarted.getState()).toMatchObject({ reservedExposure: 10, pendingExecutions: 1 });
+    const settled = restarted.settleHand('t1', 's1', 'h1', {
+      bankerPair: true,
+      playerPair: false,
+    });
+    expect(settled[0]).toMatchObject({ status: 'SETTLED' });
     ledger.close();
   });
 

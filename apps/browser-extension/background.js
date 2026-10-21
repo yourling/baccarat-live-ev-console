@@ -169,6 +169,30 @@ const pragmaticCdpSeenResponses = new Set();
 const pragmaticCdpResponseCandidates = new Map();
 const pragmaticCdpStreams = new Map();
 
+/**
+ * P0-1: 扩展持久身份。
+ *
+ * 扩展 ID 由 manifest 里的公钥推导，token 是打包时写死的明文常量 —— 两者都不是
+ * 身份边界。真正的边界是「本机 installId + 操作员批准」：installId 在首次运行时
+ * 随机生成、写进 chrome.storage.local，桥只有在该 id 被桌面端点批准后
+ * 才授予 extension 角色（否则只回 pairingRequired，拿不到 lease、收不到 betRequest）。
+ *
+ * 更换浏览器 profile / 重装扩展会生成新 id，需要在桌面端重新批准 —— 这是预期行为。
+ */
+async function loadBridgeInstallId() {
+  const stored = await chrome.storage.local.get({ bridgeInstallId: '' });
+  if (typeof stored.bridgeInstallId === 'string' && /^[a-zA-Z0-9._-]{8,128}$/.test(stored.bridgeInstallId)) {
+    return stored.bridgeInstallId;
+  }
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  const installId = Array.from(bytes).map(byte => byte.toString(16).padStart(2, '0')).join('');
+  try {
+    await chrome.storage.local.set({ bridgeInstallId: installId });
+  } catch (_) {}
+  return installId;
+}
+
 async function loadFlags() {
   const stored = await chrome.storage.local.get({
     bridgeUrl: DEFAULT_BRIDGE_URL,
@@ -177,8 +201,7 @@ async function loadFlags() {
     liveBetEnabled: false,
     cdpClickPoint: null,
     executorProfileId: '',
-  });
-  // Keeper tab create/reload is stripped: extension must not orchestrate reconnect pages.
+  });  // Keeper tab create/reload is stripped: extension must not orchestrate reconnect pages.
   autoKeeperEnabled = false;
   trustedKeepaliveEnabled = !!stored.trustedKeepalive;
   liveBetSessionEnabled = !!stored.liveBetEnabled;
@@ -301,6 +324,15 @@ async function connect() {
     }
     if (message.kind === 'executorLeaseRejected') {
       executorLease = null;
+      return;
+    }
+    // P0-1: 操作员尚未批准本机 installId。不发牌桌数据、不下注，只提示操作员去桌面端批准。
+    if (message.kind === 'pairingRequired') {
+      console.warn('[bridge] awaiting operator approval for this extension install');
+      return;
+    }
+    if (message.kind === 'pairingApproved') {
+      console.info('[bridge] extension install approved by operator');
       return;
     }
     if (message.kind === 'betRequest') {

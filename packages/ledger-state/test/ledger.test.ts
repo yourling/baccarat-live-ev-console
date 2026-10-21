@@ -292,8 +292,10 @@ describe('ledger replay', () => {
     expect(r1.hash).toBe(r2.hash);
     const p1 = r1.state.get('t1')!;
     expect(p1.status).toBe('TRACKING');
-    expect(p1.remainingTotal).toBe(414);
-    expect(p1.seenCards.length).toBe(2);
+    // FIX(C-P1-4): 旧值是 414 —— 因为 h1 已有 2 张 cardObserved 时整手补录被跳过，
+    // 漏采的 Q♣/Q♠ 永不扣减。按 position 差集补齐后是 416-4=412（正确）。
+    expect(p1.remainingTotal).toBe(412);
+    expect(p1.seenCards.length).toBe(4);
     led.close();
   });
 
@@ -680,7 +682,10 @@ describe('ledger replay', () => {
     expect(state.redCardSeen).toBe(true);
     expect(state.sealed).toBe(true);
     expect(state.status).toBe('WAITING_NEW_SHOE');
-    expect(state.seenCards.length).toBe(2);
+    // FIX(C-P1-4): 旧值是 2 —— h1 已有 2 张 cardObserved 时整手补录被跳过，
+    // 漏采的 10/J 永不扣减。按 position 差集补齐后 4 张全部入账（正确）。
+    expect(state.seenCards.length).toBe(4);
+    expect(state.remainingTotal).toBe(412);
   });
 
   it('new shoe signal seals previous shoe and never mixes counts', () => {
@@ -1116,7 +1121,9 @@ describe('reservations active-key semantics (tombstone regression)', () => {
     }
   });
 
-  it('keeps UNKNOWN active per execution source across restart-safe persistence', () => {
+  it('does not keep a second active reservation for the same window across execution sources', () => {
+    // FIX(B-P1-1) 回归：修复前活跃唯一性含 executionSource，于是"保活 + 手动"
+    // 可以在同一手同一市场各留一笔活跃预留（= 真实双下）。source 只用于审计。
     const ledger = new SqliteLedger();
     const unknown: RiskReservation = {
       ...rsv('unknown-keepalive'),
@@ -1125,17 +1132,20 @@ describe('reservations active-key semantics (tombstone regression)', () => {
       status: 'UNKNOWN',
     };
     expect(ledger.saveReservation(unknown)).toBe(true);
+    // 同来源同窗口：同一 reservation 重复保存 → duplicate。
+    expect(ledger.saveReservation(unknown)).toBe(false);
+    // 同窗口的另一笔（同来源或跨来源）都是重复：拒绝。
     expect(() => ledger.saveReservation({
       ...unknown,
       reservationId: 'unknown-keepalive-duplicate',
       intentId: 'intent-duplicate',
     })).toThrow(LedgerConflictError);
-    expect(ledger.saveReservation({
+    expect(() => ledger.saveReservation({
       ...unknown,
       reservationId: 'manual-same-window',
       intentId: 'intent-manual',
       executionSource: 'manual',
-    })).toBe(true);
+    })).toThrow(LedgerConflictError);
     ledger.close();
   });
 });
@@ -1945,7 +1955,11 @@ describe('monitor history retention', () => {
       status: 'SETTLED',
       outcomes: { bankerPair: true, playerPair: false },
     });
-    expect(ledger.getHandSettlement('t1', 'shoe-6', 'same-hand')?.shoeId).toBe('shoe-2');
+    // FIX(B-P1-2): getHandSettlement 不再"只按 handId"回退 —— 决策页的
+    // (table, handId) 身份回填是 UI 展示语义，与"结算确权"是两回事；
+    // 用错靴查必须返回 undefined，否则跨靴同 handId 会确权到上一靴的 UNKNOWN。
+    expect(ledger.getHandSettlement('t1', 'shoe-2', 'same-hand')?.shoeId).toBe('shoe-2');
+    expect(ledger.getHandSettlement('t1', 'shoe-6', 'same-hand')).toBeUndefined();
     ledger.close();
   });
 

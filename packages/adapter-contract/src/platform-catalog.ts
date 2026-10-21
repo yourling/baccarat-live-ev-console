@@ -4,10 +4,14 @@
  * browser-bridge 的 identity.ts、扩展 background.js 的 DEFAULT_BRIDGE_TOKEN、
  * 以及桌面中控 UI 都从这里取值，不得各自硬编码。
  *
- * 注意：extensionId 由 manifest key 固定，跨机器/重构建保持稳定；
- * bridgeToken 不是密钥（扩展静态打包，构建期必须写死），它只是把
- * "同机其它扩展"挡在外面的一层额外标识，真正的访问边界是
- * chrome-extension origin 校验 + 扩展 ID 白名单。
+ * P0-1（审查修复）后的安全语义，请勿再按旧说法描述：
+ * - extensionId 由 manifest key（**公钥**）固定，任何人拿到扩展包都能构建出同一 ID，
+ *   所以 extensionId 只是**平台归属标识**，不是身份边界；
+ * - bridgeToken 扩展静态打包、构建期必须写死，同样不是密钥 —— 它只做**噪声过滤**
+ *   （挡住误连/扫端口的普通客户端），不构成安全边界；
+ * - 真正的身份边界是「扩展首次运行生成的 installId + 操作员批准名单」，
+ *   由 browser-bridge 的 BridgeExtensionApprovalStore 强制：未批准的 installId
+ *   只能停在 pairingRequired，拿不到 extension 角色 / executor lease / 任何事件。
  */
 import type { PlatformAdapterDescriptor } from './platform.js';
 

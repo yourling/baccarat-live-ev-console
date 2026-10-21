@@ -239,7 +239,8 @@ h2 { color: #000000; font-size: 18px; }
   padding: 0 9px;
   border: 1px solid #C7C7CC;
   border-radius: 4px;
-  outline: none;
+  outline: 2px solid transparent;
+  outline-offset: 1px;
   background: #F5F5F7;
   color: #1D1D1F;
   font-size: 12px;
@@ -353,7 +354,8 @@ h2 { color: #000000; font-size: 18px; }
 .expand-hint { grid-column: 1 / -1; color: #86868B; }
 
 .monitor-row__details { border-top: 1px solid #D2D2D7; background: #F0F0F2; }
-.monitor-row__details summary { padding: 10px 16px; outline: none; color: #6E6E73; cursor: pointer; font-size: 12px; font-weight: 700; list-style-position: inside; }
+.monitor-row__details summary { padding: 10px 16px; outline: 2px solid transparent;
+  outline-offset: 1px; color: #6E6E73; cursor: pointer; font-size: 12px; font-weight: 700; list-style-position: inside; }
 .monitor-row__details summary:hover { color: #1D1D1F; }
 .detail-grid { display: grid; grid-template-columns: 1.1fr 1.2fr 1fr 1fr; gap: 1px; border-top: 1px solid #D2D2D7; background: #D2D2D7; }
 .detail-block { min-width: 0; padding: 14px 16px; background: #FFFFFF; }
@@ -478,7 +480,8 @@ h2 { color: #000000; font-size: 18px; }
   padding: 0 8px;
   border: 1px solid #C7C7CC;
   border-radius: 4px;
-  outline: none;
+  outline: 2px solid transparent;
+  outline-offset: 1px;
   background: #F5F5F7;
   color: #1D1D1F;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -511,7 +514,8 @@ h2 { color: #000000; font-size: 18px; }
   padding: 0 8px;
   border: 1px solid #C7C7CC;
   border-radius: 4px;
-  outline: none;
+  outline: 2px solid transparent;
+  outline-offset: 1px;
   background: #F5F5F7;
   color: #1D1D1F;
   font-size: 12px;
@@ -793,6 +797,29 @@ h2 { color: #000000; font-size: 18px; }
 .alert-center__header > div:first-child { display: grid; gap: 4px; }
 .alert-center__header span { color: #6E6E73; font-size: 11px; }
 .alert-center__actions { display: flex; gap: 7px; }
+/* FIX(D-P0-1): 扩展身份批准区 —— 真金通道准入闸，视觉上要与普通告警区分开。 */
+.alert-center__extensions {
+  display: grid;
+  gap: 7px;
+  padding: 12px 16px;
+  border-bottom: 1px solid #D2D2D7;
+  background: #FFF8E6;
+}
+.alert-center__extensions h3 { margin: 0; font-size: 12px; font-weight: 600; color: #1D1D1F; }
+.alert-center__extensions p { margin: 0; font-size: 11px; color: #6E6E73; }
+.alert-center__extension-list { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.alert-center__extension-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 9px;
+  border: 1px solid #E5E5EA;
+  border-radius: 6px;
+  background: #FFFFFF;
+  font-size: 11px;
+}
+.alert-center__extension-list code { font-size: 11px; color: #1D1D1F; }
+.alert-center__extension-list .button { margin-left: auto; }
 .alert-center__list { display: grid; gap: 7px; overflow: auto; padding: 12px; }
 .alert-event {
   position: relative;
@@ -945,6 +972,10 @@ h2 { color: #000000; font-size: 18px; }
 .app-sidebar__count--danger { background: rgba(215, 0, 21, 0.14); }
 .app-sidebar__status { margin-top: auto; font-size: 12px; }
 .app-main { flex: 1 1 auto; min-width: 0; padding: 20px 24px 32px; }
+/* FIX(P2-7): 侧边栏 IA 下 `.app-shell` 必须全宽（侧栏贴左 + 主区撑满），
+   DESIGN.md §4 的「内容宽度不超过 1480px」改为落在**主区内层容器**上，
+   否则侧栏会再吃掉 220px，宽屏上监控表反而更窄。 */
+.app-main__inner { width: min(1480px, 100%); margin: 0 auto; }
 
 /* 厅房 chip（第一期仅展示） */
 .platform-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
@@ -1009,3 +1040,16 @@ h2 { color: #000000; font-size: 18px; }
 }
 
 .odds-baseline__note { margin: 0; font-size: 13px; }
+
+/* FIX(P2-11): DESIGN.md §6/§8 承诺"减少动态偏好下无动画或仅保留不透明度变化"，
+   但实现里此前 0 处 media query。这里用全局兜底把过渡/动画压到不影响判读的程度。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+}

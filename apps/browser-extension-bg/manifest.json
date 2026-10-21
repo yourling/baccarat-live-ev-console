@@ -63,7 +63,8 @@
     }
   ],
   "action": {
-    "default_title": "点击重载 BG 桥接扩展"
+    "default_title": "点击重载 BG 桥接扩展",
+    "default_popup": "bridge-popup.html"
   },
   "commands": {
     "reload-extension": {

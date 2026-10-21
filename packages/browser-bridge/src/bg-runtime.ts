@@ -13,6 +13,7 @@ import {
 import { BG_PLATFORM_ID } from '@baccarat/adapter-contract';
 import {
   MAX_BACCARAT_SHOE_HANDS,
+  MAX_BACKFILL_HANDS,
   ROAD_WRAP_MAX,
   ROAD_WRAP_MIN_DROP,
   ROAD_WRAP_MIN_PREVIOUS,
@@ -365,7 +366,21 @@ export class BgRuntimeParser extends SnapshotRuntimeParserBase {
       const tableId = normalizeBgTableId(table.tableId);
       if (tableId === undefined) continue;
       if (!isSelected(tableId)) continue;
-      this.ingestTable({ ...table, tableId }, snapshot.observedAt, events);
+      // FIX(C-P2-5): 逐桌隔离 —— 单桌解析异常不能连累同帧其他健康桌。
+      // 修复前 `parse()` 没有 try/catch，一张脏牌抛 TypeError 会让**整帧 3 桌**的
+      // 数据全部丢失且静默无日志（b10c 实证）。现在本桌丢弃 + 计数 + 脱敏日志，
+      // 其余桌继续产出事件。
+      const tableEvents: NormalizedEvent[] = [];
+      try {
+        this.ingestTable({ ...table, tableId }, snapshot.observedAt, tableEvents);
+      } catch (error) {
+        this.noteRejectedTable(tableId);
+        console.error(
+          `[bridge-parse] bg table ${tableId}: ${error instanceof Error ? error.name : 'error'} — table dropped, other tables continue`,
+        );
+        continue;
+      }
+      events.push(...tableEvents);
     }
     return events;
   }
@@ -396,6 +411,11 @@ export class BgRuntimeParser extends SnapshotRuntimeParserBase {
       this.lastHandAtMs(tableId),
       Date.parse(observedAt),
     );
+    // FIX(B-P0-1): 必须在 ingestShoeReset **之前**取上一帧的 shuffle token。
+    // ingestShoeReset 一旦接受新 token 就会把 lastShoeResetToken 前进到本帧，
+    // 之后再去比较就只能得到 `historySeq === lastResetSeq`（恒等），
+    // 既抓不到"滞后 HISTORY"，按 reviewer 建议的 `<=` 还会把所有回填全禁掉。
+    const previousShoeToken = this.lastShoeResetToken(tableId);
     this.ingestShoeReset(table, observedAt, events, idleShuffle);
     if (idleShuffle && !openedPhysicalShoe(events, tableId)) {
       this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
@@ -404,6 +424,7 @@ export class BgRuntimeParser extends SnapshotRuntimeParserBase {
 
     const lastResetSeq = seqFromShoeReset(this.lastShoeResetToken(tableId));
     const historySeq = seqFromShoeReset(table.shoeReset);
+    const previousResetSeq = seqFromShoeReset(previousShoeToken);
     const laggedPreviousShoeRoad = this.currentEvidenceReason(tableId) === 'protocol-shuffle'
       && lastResetSeq !== undefined
       && historySeq !== undefined
@@ -495,11 +516,30 @@ export class BgRuntimeParser extends SnapshotRuntimeParserBase {
       && (gameCount === undefined
         || gameCount <= ROAD_WRAP_MAX
         || historyHands.length - gameCount >= ROAD_WRAP_MIN_DROP);
+    // FIX(B-P0-1): AGENTS.md 第 6 条「新靴不得回填 21 行以上的旧珠盘」。
+    // 换靴瞬间 DOM 路子与 HISTORY 会同时滞后（felt=29、HISTORY=29 行）：
+    // 此时 historyHands.length - gameCount === 0，上面那条"差值 >= 8"的守卫
+    // 不成立，上一靴的 29 手旧牌会被 replayHistoryRoad 灌进全新实体靴
+    // （实测 remainingTotal 416→326、handNumber 29、baseline 仍是 physical-shoe）。
+    // 本帧刚开出实体靴时，只要 HISTORY 超过回填上限就一律不回填 —— 宁可让
+    // 新靴从空库存开始，也不能用上一靴的牌面扣库存（对子 EV 直接算错）。
+    const exceedsBackfillLimit = openedPhysical && historyHands.length > MAX_BACKFILL_HANDS;
+    // FIX(B-P0-1): HISTORY 首 seq 仍落在**上一帧**的 shuffle token 之前，说明
+    // 这一包珠盘还是上一靴的窗口 —— 这是"滞后 HISTORY"最可靠的信号。
+    // 用上一帧的 token（previousResetSeq）而不是本帧更新后的 token：
+    // BG 的 token 是 `seq:<HISTORY 首局 id>`，本帧 token 天然等于本帧 HISTORY
+    // 首 seq，拿它比只能得到恒等，既抓不到滞后也会把正常补库存全部禁掉
+    // （例如"换靴 + felt 局 3 + HISTORY 18 行"必须仍然允许回填）。
+    const historyFromPreviousShoe = historySeq !== undefined
+      && previousResetSeq !== undefined
+      && historySeq <= previousResetSeq;
     const canReplayHistory = physical
       && historyHands.length > 0
       && historyHands.length <= MAX_BACCARAT_SHOE_HANDS
       && !laggedPreviousShoeRoad
       && !previousShoeHistory
+      && !exceedsBackfillLimit
+      && !historyFromPreviousShoe
       && (openedPhysical || historyHands.length > trackedHands);
     if (canReplayHistory) {
       const replayLiveSeq = parseHandSeq(this.lastRoundFor(tableId));
@@ -521,8 +561,9 @@ export class BgRuntimeParser extends SnapshotRuntimeParserBase {
     this.ensureShoe(tableId, 'unknown-monitor-session', observedAt, events);
 
     const source = table.source === 'protocol' || table.source === 'dom' ? table.source : undefined;
-    const playerCards = parseCards(table.playerCards);
-    const bankerCards = parseCards(table.bankerCards);
+    // FIX(C-P2-5): 脏牌不再抛错，被拒数量记进 parserDiagnostics（脏牌本桌丢、别桌不受影响）。
+    const playerCards = this.parseCardsFor(tableId, table.playerCards);
+    const bankerCards = this.parseCardsFor(tableId, table.bankerCards);
     const lead = bankerCards[0] ? cardIdentity(bankerCards[0]) : undefined;
     if (lead && playerCards.length > 0 && handId) {
       const leadHandKey = `${tableId}:${handId}`;
@@ -825,8 +866,8 @@ export class BgRuntimeParser extends SnapshotRuntimeParserBase {
     for (let index = 0; index < hands.length; index += 1) {
       const hand = hands[index]!;
       const handId = String(startSeq + index);
-      const playerCards = parseCards(hand.playerCards);
-      const bankerCards = parseCards(hand.bankerCards);
+      const playerCards = this.parseCardsFor(tableId, hand.playerCards);
+      const bankerCards = this.parseCardsFor(tableId, hand.bankerCards);
       this.setHandsThisShoe(tableId, index + 1);
       this.setLastRound(tableId, handId, observedAt);
       const handKey = `${tableId}:${handId}`;

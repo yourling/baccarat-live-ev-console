@@ -17,7 +17,7 @@ import { DesktopConsoleService } from '../electron-src/service.js';
 function physicalShoe(tableId: string, sourceSeq = 1): Extract<NormalizedEvent, { type: 'newShoeSignal' }> {
   return {
     type: 'newShoeSignal',
-    eventId: `shoe-${tableId}-${sourceSeq}`,
+    eventId: `shoe-${tableId}-${sourceSeq}-${Math.random().toString(36).slice(2, 8)}`,
     tableId,
     timestamp: '2026-08-27T01:00:00.000Z',
     sourceSeq,
@@ -27,6 +27,21 @@ function physicalShoe(tableId: string, sourceSeq = 1): Extract<NormalizedEvent, 
     baseline: 'physical-shoe',
     profile: { ...defaultProfile(tableId), autoConfirmNewShoe: true },
   };
+}
+
+/**
+ * FIX(D-P1-4): 重启路径现在真的会写 `connectionLost(process-restarted)` 并消耗
+ * `allocateSourceSeq`，所以测试里再手工注入固定 sourceSeq=1 的事件会撞
+ * `LedgerConflictError`。所有注入都改成从账本水位分配。
+ */
+function nextShoe(
+  service: DesktopConsoleService,
+  tableId: string,
+  shoeId = `shoe-${tableId}`,
+): Extract<NormalizedEvent, { type: 'newShoeSignal' }> {
+  const sourceSeq = service['ledger'].nextSourceSeq(tableId);
+  const event = physicalShoe(tableId, sourceSeq);
+  return { ...event, eventId: `shoe-${tableId}-${sourceSeq}-${shoeId}`, shoeId };
 }
 
 function openWindow(
@@ -287,8 +302,19 @@ describe('DesktopConsoleService unattended runtime', () => {
         restarted['browserBridge'] = bridge;
         restarted['liveFeeds'].set('D055', freshFeed('D055'));
         restarted['liveFeeds'].set('D066', freshFeed('D066'));
-        await restarted.injectEvent(physicalShoe('D055'));
-        await restarted.injectEvent(physicalShoe('D066'));
+
+        // FIX(D-P1-4) 校验：重启后真实写入 process-restarted 断线事件，
+        // 且顺序上不会把刚写出的 DISCONNECTED 再覆盖回 CONNECTED。
+        await restarted['startupFailCloseTask'];
+        const restartEvents = restarted['ledger'].listEvents('D055')
+          .filter(event => event.type === 'connectionLost');
+        expect(restartEvents).toHaveLength(1);
+        expect(restartEvents[0]).toMatchObject({ type: 'connectionLost', reason: 'process-restarted' });
+        expect(restarted.snapshot().snapshot.tables.D055?.projection.connectionStatus)
+          .toBe('DISCONNECTED');
+
+        await restarted.injectEvent(nextShoe(restarted, 'D055'));
+        await restarted.injectEvent(nextShoe(restarted, 'D066'));
 
         const enabled = await restarted.setKeepaliveEnabled(true);
         expect(enabled.keepalive.enabled).toBe(true);
@@ -375,7 +401,7 @@ describe('DesktopConsoleService unattended runtime', () => {
     }
   });
 
-  it('restores a legacy-expired ACCEPTED wager as pending exposure on startup', async () => {
+  it('restores a prior-process committed exposure as a writable-off UNKNOWN on startup', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'baccarat-unattended-accepted-repair-'));
     const dbPath = join(directory, 'console.sqlite');
     const first = new DesktopConsoleService(dbPath);
@@ -439,21 +465,35 @@ describe('DesktopConsoleService unattended runtime', () => {
       try {
         await restarted['startupFailCloseTask'];
         const snapshot = restarted.snapshot();
-        expect(snapshot.reservations).toContainEqual(expect.objectContaining({
+        // FIX(fix-b P1-3 / D-P1-1 语义变更): `reconcileTable` 不再把"与当前投影
+        // 不同靴"的 RESERVED 直接 EXPIRED（那等于把已提交敞口当没发生 → 漏记亏损），
+        // 而是升级为 UNKNOWN(restored-unsettled-exposure)：敞口继续占用、进入
+        // unknown-execution 告警、迟到结算可自动收敛、操作员也可以 writeOffUnknown。
+        const restored = snapshot.reservations.find(row =>
+          row.reservationId === reservation.reservationId);
+        expect(restored).toMatchObject({
           reservationId: reservation.reservationId,
-          status: 'RESERVED',
+          status: 'UNKNOWN',
+          releaseReason: 'restored-unsettled-exposure',
           receiptId: reservation.receiptId,
-        }));
+        });
         expect(snapshot.snapshot.riskState).toMatchObject({
           reservedExposure: 20,
           pendingExecutions: 1,
         });
+        // 该桌已不处于结算缺口（敞口已转成显式可处置的 UNKNOWN），
+        // 但仍必须有 unknown-execution 事故把操作员引到勾销入口。
         expect(snapshot.runtime.incidents).toContainEqual(expect.objectContaining({
-          code: 'settlement-gap',
+          code: 'unknown-execution',
           tableId: 'D066',
           active: true,
         }));
         expect(snapshot.keepalive.enabled).toBe(false);
+        // 关键：这条敞口现在**可以被操作员处置**（修复前既不能升级也不能勾销）。
+        expect(restarted.snapshot().runtime.tables.D066?.reasons)
+          .toContain('unknown-execution-pending');
+        expect(restarted['wagerConsole']['runtimeBlockReason']('D066', 'manual'))
+          .toContain('unknown-execution-pending');
         expect(restarted['ledger'].getConfig<{ repairs: unknown[] }>(
           'ledger:accepted-reservation-repairs:v1',
         )?.repairs).toHaveLength(1);

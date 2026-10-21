@@ -784,5 +784,53 @@ describe('extension executor lease gate', () => {
       ([injection]) => isPragmaticFinalInjection(injection.func),
     )).toBe(true);
   });
+
+  /**
+   * FIX(P0-1): 扩展必须在连接 URL 上带持久 installId。
+   * 修复前桥只校验可复制的 Origin + 明文 token；现在身份边界是「installId + 操作员批准」。
+   */
+  it('puts a persistent installId on the bridge connection URL (P0-1)', async () => {
+    const harness = await createHarness();
+    expect(harness.installId).toMatch(/^[a-f0-9]{32}$/);
+    const url = new URL(harness.socket.url);
+    expect(url.searchParams.get('installId')).toBe(harness.installId);
+    // token 仍在（只做噪声过滤），但不再是身份边界。
+    expect(url.searchParams.get('token')).toBeTruthy();
+    // 持久化：写回 chrome.storage.local，重启用同一个 id。
+    expect(harness.storageState.bridgeInstallId).toBe(harness.installId);
+  });
+
+  /**
+   * FIX(P0-1): 未批准时只收到 pairingRequired，扩展必须保持静默（不执行命令、不下注）。
+   */
+  it('ignores downstream commands while the installId awaits operator approval (P0-1)', async () => {
+    const harness = await createHarness();
+    harness.socket.emit('message', {
+      data: JSON.stringify({ kind: 'pairingRequired', serverVersion: '0.1.0', timestamp: '2026-10-20T00:00:00.000Z' }),
+    });
+    await flushBetHarnessAsyncWork();
+    // pairingRequired 之后不应被当成 command / betRequest 处理。
+    expect(harness.executeScript).not.toHaveBeenCalled();
+  });
+
+  /**
+   * FIX(P1-8a): outbox 溢出不再静默丢最早消息；扩展会重置会话并主动断开重连。
+   */
+  it('resets the bridge session instead of silently dropping outbox messages (P1-8a)', async () => {
+    const harness = await createHarness();
+    harness.socket.emit('open');
+    // 模拟断线：socket 不再是 OPEN 状态，后续 send 全部进入 outbox。
+    harness.socket.readyState = 3;
+    vm.runInContext(
+      `for (let i = 0; i < 520; i += 1) send({ kind: 'heartbeat', index: i });`,
+      harness.context,
+    );
+    await flushBetHarnessAsyncWork();
+    // 溢出即清空 + 标记需要新会话（旧实现是 outbox.shift() 静默丢最早一条）。
+    const outboxLength: number = vm.runInContext('outbox.length', harness.context);
+    const overflowed: boolean = vm.runInContext('outboxOverflowed', harness.context);
+    expect(overflowed).toBe(true);
+    expect(outboxLength).toBe(0);
+  });
 });
 
